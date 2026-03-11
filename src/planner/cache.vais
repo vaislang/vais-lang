@@ -28,7 +28,7 @@ S PlanCacheKey {
 X PlanCacheKey {
     # Create a new cache key from normalized SQL
     F new(normalized_sql: Str) -> PlanCacheKey {
-        ~hash := fnv1a_hash(&normalized_sql);
+        hash := mut fnv1a_hash(&normalized_sql);
         PlanCacheKey {
             hash,
             normalized_sql,
@@ -87,13 +87,13 @@ X PlanCacheEntry {
     }
 
     # Mark as used (update last_used and hit_count)
-    F touch(~self, timestamp: u64) {
+    F touch(mut self, timestamp: u64) {
         self.last_used = timestamp;
         self.hit_count += 1;
     }
 
     # Link to a prepared statement
-    F link_prepared(~self, name: Str) {
+    F link_prepared(mut self, name: Str) {
         self.prepared_stmt_name = Some(name);
     }
 
@@ -132,7 +132,7 @@ X PlanCacheStats {
 
     # Calculate hit rate (0.0 - 1.0)
     F hit_rate(self) -> f64 {
-        ~total := self.hits + self.misses;
+        total := mut self.hits + self.misses;
         I total == 0 {
             0.0
         } E {
@@ -172,18 +172,18 @@ X PlanCache {
     }
 
     # Get current timestamp and increment
-    F next_timestamp(~self) -> u64 {
-        ~ts := self.timestamp;
+    F next_timestamp(mut self) -> u64 {
+        ts := mut self.timestamp;
         self.timestamp += 1;
         ts
     }
 
     # Get a cached plan (returns reference)
-    F get(~self, key: &PlanCacheKey) -> Option<&HybridPlanNode> {
-        ~ts := self.next_timestamp();
+    F get(mut self, key: &PlanCacheKey) -> Option<&HybridPlanNode> {
+        ts := mut self.next_timestamp();
 
         # Linear scan (fast enough for 256 entries)
-        L ~entry: self.entries.iter_mut() {
+        L mut entry: self.entries.iter_mut() {
             I entry.key.eq(key) {
                 entry.touch(ts);
                 self.stats.hits += 1;
@@ -196,10 +196,10 @@ X PlanCache {
     }
 
     # Get a cached plan with cost
-    F get_with_cost(~self, key: &PlanCacheKey) -> Option<(&HybridPlanNode, &HybridCost)> {
-        ~ts := self.next_timestamp();
+    F get_with_cost(mut self, key: &PlanCacheKey) -> Option<(&HybridPlanNode, &HybridCost)> {
+        ts := mut self.next_timestamp();
 
-        L ~entry: self.entries.iter_mut() {
+        L mut entry: self.entries.iter_mut() {
             I entry.key.eq(key) {
                 entry.touch(ts);
                 self.stats.hits += 1;
@@ -213,16 +213,16 @@ X PlanCache {
 
     # Put a new plan in the cache
     F put(
-        ~self,
+        mut self,
         key: PlanCacheKey,
         plan: HybridPlanNode,
         cost: HybridCost,
         tables: Vec<Str>,
     ) {
-        ~ts := self.next_timestamp();
+        ts := mut self.next_timestamp();
 
         # Check I key already exists (update case)
-        L ~entry: self.entries.iter_mut() {
+        L mut entry: self.entries.iter_mut() {
             I entry.key.eq(&key) {
                 entry.plan = plan;
                 entry.cost = cost;
@@ -238,20 +238,20 @@ X PlanCache {
         }
 
         # Insert new entry
-        ~entry := PlanCacheEntry.new(key, plan, cost, tables, ts);
+        entry := mut PlanCacheEntry.new(key, plan, cost, tables, ts);
         self.entries.push(entry);
         self.stats.entries = self.entries.len();
     }
 
     # Evict the least recently used entry (linear scan)
-    F evict_lru(~self) {
+    F evict_lru(mut self) {
         I self.entries.len() == 0 {
             R;
         }
 
         # Find entry with oldest last_used timestamp
-        ~min_idx: u64 = 0;
-        ~min_last_used = self.entries[0].last_used;
+        min_idx: u64 := mut 0;
+        min_last_used := mut self.entries[0].last_used;
 
         L i: 1..self.entries.len() {
             I self.entries[i].last_used < min_last_used {
@@ -267,9 +267,9 @@ X PlanCache {
 
     # Invalidate all plans referencing a table (for DDL operations)
     # Returns count of entries removed
-    F invalidate_table(~self, table_name: &Str) -> u32 {
-        ~removed = 0u32;
-        ~i: u64 = 0;
+    F invalidate_table(mut self, table_name: &Str) -> u32 {
+        removed := mut 0u32;
+        i: u64 := mut 0;
 
         L {  # W: i < self.entries.len()
             I self.entries[i].references_table(table_name) {
@@ -286,14 +286,14 @@ X PlanCache {
     }
 
     # Invalidate all cached plans (for schema changes)
-    F invalidate_all(~self) {
+    F invalidate_all(mut self) {
         self.entries.clear();
         self.stats.entries = 0;
     }
 
     # Link a cached plan to a prepared statement
-    F link_prepared(~self, key: &PlanCacheKey, name: Str) -> bool {
-        L ~entry: self.entries.iter_mut() {
+    F link_prepared(mut self, key: &PlanCacheKey, name: Str) -> bool {
+        L mut entry: self.entries.iter_mut() {
             I entry.key.eq(key) {
                 entry.link_prepared(name);
                 R true;
@@ -340,21 +340,21 @@ F normalize_query(sql: &Str) -> Str {
     #
     # Simplified implementation: text-level replacement
 
-    ~normalized = Str.new();
-    ~param_idx: u32 = 1;
-    ~i: u64 = 0;
-    ~bytes := sql.as_bytes();
-    ~len := bytes.len();
+    normalized := mut Str.new();
+    param_idx: u32 := mut 1;
+    i: u64 := mut 0;
+    bytes := mut sql.as_bytes();
+    len := mut bytes.len();
 
     L i < len {
-        ~ch := bytes[i];
+        ch := mut bytes[i];
 
         # String literal: 'abc' or "abc"
         I ch == 0x27 || ch == 0x22 {  # ' or "
-            ~quote := ch;
+            quote := mut ch;
             i += 1;
             # Skip until closing quote
-            ~found_close = false;
+            found_close := mut false;
             L i < len && !found_close {
                 I bytes[i] == quote {
                     i += 1;
@@ -373,9 +373,9 @@ F normalize_query(sql: &Str) -> Str {
         # Number literal
         E I ch >= 0x30 && ch <= 0x39 {  # '0'..'9'
             # Skip number
-            ~in_number = true;
+            in_number := mut true;
             L i < len && in_number {
-                ~c := bytes[i];
+                c := mut bytes[i];
                 I (c >= 0x30 && c <= 0x39) || c == 0x2E || c == 0x65 || c == 0x45 {
                     # digit or . or e or E
                     i += 1;
@@ -404,7 +404,7 @@ F normalize_query(sql: &Str) -> Str {
 # Extract tables referenced in a plan
 # Walks the HybridPlanNode tree and collects all table names from scan nodes
 F extract_tables(plan: &HybridPlanNode) -> Vec<Str> {
-    ~tables = Vec.new();
+    tables := mut Vec.new();
 
     M plan {
         HybridPlanNode.SqlPlan { plan, .. } => {
@@ -420,14 +420,14 @@ F extract_tables(plan: &HybridPlanNode) -> Vec<Str> {
             tables.push(params.table_name.clone());
         },
         HybridPlanNode.ScoreFusion { left, right, .. } => {
-            ~left_tables := extract_tables(left);
-            ~right_tables := extract_tables(right);
+            left_tables := mut extract_tables(left);
+            right_tables := mut extract_tables(right);
             L t: left_tables.iter() { tables.push(t.clone()); }
             L t: right_tables.iter() { tables.push(t.clone()); }
         },
         HybridPlanNode.CrossEngineJoin { left, right, .. } => {
-            ~left_tables := extract_tables(left);
-            ~right_tables := extract_tables(right);
+            left_tables := mut extract_tables(left);
+            right_tables := mut extract_tables(right);
             L t: left_tables.iter() { tables.push(t.clone()); }
             L t: right_tables.iter() { tables.push(t.clone()); }
         },

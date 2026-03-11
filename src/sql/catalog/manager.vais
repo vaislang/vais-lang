@@ -132,34 +132,34 @@ X CatalogManager {
 
     # Load all catalog entries from the B+Tree into in-memory caches
     # Called once at database startup. Scans the entire catalog tree.
-    F load_from_disk(~self, pool: &~BufferPool) -> Result<(), VaisError> {
+    F load_from_disk(mut self, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Scan the entire B+Tree from first to last entry
-        ~range = KeyRange.all();
-        ~entries = range_scan_bounded(&self.catalog_tree, &range, pool)?;
+        range := mut KeyRange.all();
+        entries := mut range_scan_bounded(&self.catalog_tree, &range, pool)?;
 
-        ~max_table_id: u32 = FIRST_USER_TABLE_ID;
-        ~max_index_id: u32 = 0;
+        max_table_id: u32 := mut FIRST_USER_TABLE_ID;
+        max_index_id: u32 := mut 0;
 
         L (key, tid): &entries {
             # Decode TID to locate the tuple in the heap
-            ~(page_id, slot_id) = decode_tid(*tid);
+            (page_id, slot_id) := mut decode_tid(*tid);
 
             # Read the heap page containing this catalog entry
-            ~frame_id = pool.fetch_page(FILE_ID_DATA, page_id)?;
-            ~page_data = pool.get_page(frame_id);
-            ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
-            ~tuple = heap.read_tuple(slot_id)?;
+            frame_id := mut pool.fetch_page(FILE_ID_DATA, page_id)?;
+            page_data := mut pool.get_page(frame_id);
+            heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
+            tuple := mut heap.read_tuple(slot_id)?;
             pool.unpin_page(frame_id, false);
 
             # Determine entry type from the first byte of user data (catalog tag)
-            ~user_data = tuple.get_data();
+            user_data := mut tuple.get_data();
             I user_data.len() > 0 {
-                ~tag = user_data[0];
-                ~buf = ByteBuffer.from_slice(user_data.as_slice());
+                tag := mut user_data[0];
+                buf := mut ByteBuffer.from_slice(user_data.as_slice());
 
                 M tag {
                     CATALOG_TAG_TABLE => {
-                        ~info = TableInfo.deserialize(&buf)?;
+                        info := mut TableInfo.deserialize(&buf)?;
                         # Track highest table_id for next_table_id allocation
                         I info.table_id >= max_table_id {
                             max_table_id = info.table_id + 1;
@@ -167,17 +167,17 @@ X CatalogManager {
                         self.tables.insert(info.name.clone(), info);
                     },
                     CATALOG_TAG_COLUMN => {
-                        ~info = ColumnInfo.deserialize(&buf)?;
-                        ~table_id = info.table_id;
+                        info := mut ColumnInfo.deserialize(&buf)?;
+                        table_id := mut info.table_id;
                         # Add to columns cache, creating the Vec if needed
                         I !self.columns.contains_key(&table_id) {
                             self.columns.insert(table_id, Vec.new());
                         }
-                        ~col_vec = self.columns.get_mut(&table_id)!;
+                        col_vec := mut self.columns.get_mut(&table_id)!;
                         col_vec.push(info);
                     },
                     CATALOG_TAG_INDEX => {
-                        ~info = IndexInfo.deserialize(&buf)?;
+                        info := mut IndexInfo.deserialize(&buf)?;
                         # Track highest index_id for next_index_id allocation
                         I info.index_id >= max_index_id {
                             max_index_id = info.index_id + 1;
@@ -186,19 +186,19 @@ X CatalogManager {
                     },
                     # Security catalog entries (Phase 10)
                     CATALOG_TAG_USER => {
-                        ~entry = UserCatalogEntry.deserialize(&buf)?;
+                        entry := mut UserCatalogEntry.deserialize(&buf)?;
                         self.users.insert(entry.username.clone(), entry);
                     },
                     CATALOG_TAG_ROLE => {
-                        ~entry = RoleCatalogEntry.deserialize(&buf)?;
+                        entry := mut RoleCatalogEntry.deserialize(&buf)?;
                         self.roles.insert(entry.role_name.clone(), entry);
                     },
                     CATALOG_TAG_GRANT => {
-                        ~entry = GrantCatalogEntry.deserialize(&buf)?;
+                        entry := mut GrantCatalogEntry.deserialize(&buf)?;
                         self.grants.push(entry);
                     },
                     CATALOG_TAG_POLICY => {
-                        ~entry = PolicyCatalogEntry.deserialize(&buf)?;
+                        entry := mut PolicyCatalogEntry.deserialize(&buf)?;
                         self.policies.push(entry);
                     },
                     _ => {
@@ -227,11 +227,11 @@ X CatalogManager {
     # Returns the assigned table_id on success
     # Errors: VAIS-0110004 if table already exists
     F create_table(
-        ~self,
+        mut self,
         name: Str,
         columns: Vec<ColumnInfo>,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<u32, VaisError> {
         # Check that the table does not already exist
@@ -240,38 +240,38 @@ X CatalogManager {
         }
 
         # Allocate a new table_id
-        ~table_id = self.get_next_table_id();
+        table_id := mut self.get_next_table_id();
 
         # Allocate the first heap page for this table
-        ~first_page_id = pool.allocate_page(FILE_ID_DATA)?;
+        first_page_id := mut pool.allocate_page(FILE_ID_DATA)?;
 
         # Initialize the heap page
-        ~heap = HeapPage.new(first_page_id, pool.page_size);
-        ~heap_frame = pool.fetch_page(FILE_ID_DATA, first_page_id)?;
-        ~flushed = heap.flush();
+        heap := mut HeapPage.new(first_page_id, pool.page_size);
+        heap_frame := mut pool.fetch_page(FILE_ID_DATA, first_page_id)?;
+        flushed := mut heap.flush();
         pool.write_page(heap_frame, flushed)?;
         pool.unpin_page(heap_frame, true);
 
         # Create TableInfo
-        ~table_info = TableInfo.new(table_id, name.clone(), columns.len() as u16, first_page_id);
+        table_info := mut TableInfo.new(table_id, name.clone(), columns.len() as u16, first_page_id);
 
         # Serialize and insert TableInfo into catalog B+Tree
-        ~table_buf = ByteBuffer.with_capacity(256);
+        table_buf := mut ByteBuffer.with_capacity(256);
         table_info.serialize(&table_buf);
-        ~table_bytes = table_buf.to_vec();
+        table_bytes := mut table_buf.to_vec();
 
-        ~table_catalog_key = table_info.to_catalog_key();
-        ~table_tid = self.insert_catalog_entry(&table_catalog_key, &table_bytes, pool, gcm, txn_id)?;
+        table_catalog_key := mut table_info.to_catalog_key();
+        table_tid := mut self.insert_catalog_entry(&table_catalog_key, &table_bytes, pool, gcm, txn_id)?;
 
         # Insert each column into the catalog B+Tree
-        ~pk_columns = Vec.new();
-        ~col_infos = Vec.with_capacity(columns.len());
+        pk_columns := mut Vec.new();
+        col_infos := mut Vec.with_capacity(columns.len());
 
         L i: 0..columns.len() {
-            ~col = &columns[i];
+            col := mut &columns[i];
 
             # Create ColumnInfo with the assigned table_id
-            ~col_info = ColumnInfo {
+            col_info := mut ColumnInfo {
                 table_id,
                 column_index: col.column_index,
                 name: col.name.clone(),
@@ -290,10 +290,10 @@ X CatalogManager {
             }
 
             # Serialize and insert column
-            ~col_buf = ByteBuffer.with_capacity(128);
+            col_buf := mut ByteBuffer.with_capacity(128);
             col_info.serialize(&col_buf);
-            ~col_bytes = col_buf.to_vec();
-            ~col_catalog_key = col_info.to_catalog_key();
+            col_bytes := mut col_buf.to_vec();
+            col_catalog_key := mut col_info.to_catalog_key();
             self.insert_catalog_entry(&col_catalog_key, &col_bytes, pool, gcm, txn_id)?;
 
             col_infos.push(col_info);
@@ -305,10 +305,10 @@ X CatalogManager {
 
         # Auto-create primary key index if any column is marked as primary key
         I pk_columns.len() > 0 {
-            ~pk_index_name = "pk_{name}";
-            ~pk_root_page = pool.allocate_page(FILE_ID_DATA)?;
+            pk_index_name := mut "pk_{name}";
+            pk_root_page := mut pool.allocate_page(FILE_ID_DATA)?;
 
-            ~pk_index = IndexInfo.new_primary(
+            pk_index := mut IndexInfo.new_primary(
                 self.get_next_index_id(),
                 pk_index_name.clone(),
                 table_id,
@@ -317,16 +317,16 @@ X CatalogManager {
             );
 
             # Serialize and insert PK index
-            ~idx_buf = ByteBuffer.with_capacity(128);
+            idx_buf := mut ByteBuffer.with_capacity(128);
             pk_index.serialize(&idx_buf);
-            ~idx_bytes = idx_buf.to_vec();
+            idx_bytes := mut idx_buf.to_vec();
 
             # Insert with the primary index key "I:" + name
-            ~idx_catalog_key = pk_index.to_catalog_key();
+            idx_catalog_key := mut pk_index.to_catalog_key();
             self.insert_catalog_entry(&idx_catalog_key, &idx_bytes, pool, gcm, txn_id)?;
 
             # Also insert the table-to-index reverse lookup key "IT:" + table_id + ":" + name
-            ~idx_table_key = pk_index.to_table_index_key();
+            idx_table_key := mut pk_index.to_table_index_key();
             self.insert_catalog_entry(&idx_table_key, &idx_bytes, pool, gcm, txn_id)?;
 
             # Update index cache
@@ -339,36 +339,36 @@ X CatalogManager {
     # Drop a table and all its associated columns and indexes
     # Errors: VAIS-0110001 if table does not exist
     F drop_table(
-        ~self,
+        mut self,
         name: Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         # Look up the table
-        ~table_info = M self.tables.get(&name) {
+        table_info := mut M self.tables.get(&name) {
             Some(info) => info.clone(),
             None => { R Err(err_table_not_found(name)); },
         };
 
-        ~table_id = table_info.table_id;
+        table_id := mut table_info.table_id;
 
         # Remove table entry from catalog B+Tree
-        ~table_catalog_key = table_key(&name);
+        table_catalog_key := mut table_key(&name);
         self.delete_catalog_entry(&table_catalog_key, pool, gcm, txn_id)?;
 
         # Remove all column entries for this table
-        ~col_start = columns_key_prefix(table_id);
-        ~col_end = columns_key_end(table_id);
-        ~col_range = KeyRange.half_open(col_start, col_end);
-        ~col_entries = range_scan_bounded(&self.catalog_tree, &col_range, pool)?;
+        col_start := mut columns_key_prefix(table_id);
+        col_end := mut columns_key_end(table_id);
+        col_range := mut KeyRange.half_open(col_start, col_end);
+        col_entries := mut range_scan_bounded(&self.catalog_tree, &col_range, pool)?;
         L (col_key, _): &col_entries {
             self.delete_catalog_entry(col_key, pool, gcm, txn_id)?;
         }
 
         # Remove all index entries for this table
         # First, find indexes via cache
-        ~index_names_to_drop = Vec.new();
+        index_names_to_drop := mut Vec.new();
         L (idx_name, idx_info): self.indexes.iter() {
             I idx_info.table_id == table_id {
                 index_names_to_drop.push(idx_name.clone());
@@ -377,13 +377,13 @@ X CatalogManager {
 
         L idx_name: &index_names_to_drop {
             # Remove the "I:" key
-            ~idx_key = index_key(idx_name);
+            idx_key := mut index_key(idx_name);
             self.delete_catalog_entry(&idx_key, pool, gcm, txn_id)?;
 
             # Remove the "IT:" reverse lookup key
             M self.indexes.get(idx_name) {
                 Some(idx_info) => {
-                    ~it_key = idx_info.to_table_index_key();
+                    it_key := mut idx_info.to_table_index_key();
                     self.delete_catalog_entry(&it_key, pool, gcm, txn_id)?;
                 },
                 None => {},
@@ -406,7 +406,7 @@ X CatalogManager {
 
     # Get all columns for a table, ordered by column_index
     F get_columns(self, table_id: u32) -> Vec<&ColumnInfo> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         M self.columns.get(&table_id) {
             Some(col_vec) => {
                 L col: col_vec {
@@ -436,12 +436,12 @@ X CatalogManager {
     # Get a table and all its columns together
     # Errors: VAIS-0110001 if table does not exist
     F get_table_schema(self, name: &Str) -> Result<(TableInfo, Vec<ColumnInfo>), VaisError> {
-        ~table = M self.tables.get(name) {
+        table := mut M self.tables.get(name) {
             Some(info) => info.clone(),
             None => { R Err(err_table_not_found(name.clone())); },
         };
 
-        ~cols = Vec.new();
+        cols := mut Vec.new();
         M self.columns.get(&table.table_id) {
             Some(col_vec) => {
                 L col: col_vec {
@@ -461,7 +461,7 @@ X CatalogManager {
 
     # List all tables
     F all_tables(self) -> Vec<&TableInfo> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L (_, info): self.tables.iter() {
             result.push(info);
         }
@@ -475,10 +475,10 @@ X CatalogManager {
     # Create a new index
     # Errors: VAIS-0110005 if index already exists
     F create_index(
-        ~self,
+        mut self,
         info: IndexInfo,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         # Check that the index does not already exist
@@ -487,16 +487,16 @@ X CatalogManager {
         }
 
         # Serialize and insert into catalog B+Tree
-        ~idx_buf = ByteBuffer.with_capacity(128);
+        idx_buf := mut ByteBuffer.with_capacity(128);
         info.serialize(&idx_buf);
-        ~idx_bytes = idx_buf.to_vec();
+        idx_bytes := mut idx_buf.to_vec();
 
         # Insert with the primary key "I:" + name
-        ~idx_catalog_key = info.to_catalog_key();
+        idx_catalog_key := mut info.to_catalog_key();
         self.insert_catalog_entry(&idx_catalog_key, &idx_bytes, pool, gcm, txn_id)?;
 
         # Insert the table-to-index reverse lookup key "IT:" + table_id + ":" + name
-        ~idx_table_key = info.to_table_index_key();
+        idx_table_key := mut info.to_table_index_key();
         self.insert_catalog_entry(&idx_table_key, &idx_bytes, pool, gcm, txn_id)?;
 
         # Update in-memory cache
@@ -508,24 +508,24 @@ X CatalogManager {
     # Drop an index by name
     # Errors: VAIS-0110003 if index does not exist
     F drop_index(
-        ~self,
+        mut self,
         name: Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         # Look up the index
-        ~idx_info = M self.indexes.get(&name) {
+        idx_info := mut M self.indexes.get(&name) {
             Some(info) => info.clone(),
             None => { R Err(err_index_not_found(name)); },
         };
 
         # Remove from catalog B+Tree
-        ~idx_key = index_key(&name);
+        idx_key := mut index_key(&name);
         self.delete_catalog_entry(&idx_key, pool, gcm, txn_id)?;
 
         # Remove the table-to-index reverse lookup key
-        ~it_key = idx_info.to_table_index_key();
+        it_key := mut idx_info.to_table_index_key();
         self.delete_catalog_entry(&it_key, pool, gcm, txn_id)?;
 
         # Update in-memory cache
@@ -541,7 +541,7 @@ X CatalogManager {
 
     # Get all indexes for a given table
     F get_indexes_for_table(self, table_id: u32) -> Vec<&IndexInfo> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L (_, info): self.indexes.iter() {
             I info.table_id == table_id {
                 result.push(info);
@@ -561,20 +561,20 @@ X CatalogManager {
 
     # Register a user in the catalog
     F register_user(
-        ~self,
+        mut self,
         entry: UserCatalogEntry,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         I self.users.contains_key(&entry.username) {
             R Err(VaisError.new("VAIS-0902001", "User '{entry.username}' already exists"));
         }
 
-        ~buf = ByteBuffer.with_capacity(128);
+        buf := mut ByteBuffer.with_capacity(128);
         entry.serialize(&buf);
-        ~bytes = buf.to_vec();
-        ~catalog_key = entry.to_catalog_key();
+        bytes := mut buf.to_vec();
+        catalog_key := mut entry.to_catalog_key();
         self.insert_catalog_entry(&catalog_key, &bytes, pool, gcm, txn_id)?;
 
         self.users.insert(entry.username.clone(), entry);
@@ -583,17 +583,17 @@ X CatalogManager {
 
     # Remove a user from the catalog
     F unregister_user(
-        ~self,
+        mut self,
         username: &Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         I !self.users.contains_key(username) {
             R Err(VaisError.new("VAIS-0910001", "User '{username}' not found"));
         }
 
-        ~catalog_key = user_key(username);
+        catalog_key := mut user_key(username);
         self.delete_catalog_entry(&catalog_key, pool, gcm, txn_id)?;
         self.users.remove(username);
         Ok(())
@@ -611,7 +611,7 @@ X CatalogManager {
 
     # List all users
     F all_users(self) -> Vec<&UserCatalogEntry> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L (_, entry): self.users.iter() {
             result.push(entry);
         }
@@ -624,20 +624,20 @@ X CatalogManager {
 
     # Register a role in the catalog
     F register_role(
-        ~self,
+        mut self,
         entry: RoleCatalogEntry,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         I self.roles.contains_key(&entry.role_name) {
             R Err(VaisError.new("VAIS-0902002", "Role '{entry.role_name}' already exists"));
         }
 
-        ~buf = ByteBuffer.with_capacity(128);
+        buf := mut ByteBuffer.with_capacity(128);
         entry.serialize(&buf);
-        ~bytes = buf.to_vec();
-        ~catalog_key = entry.to_catalog_key();
+        bytes := mut buf.to_vec();
+        catalog_key := mut entry.to_catalog_key();
         self.insert_catalog_entry(&catalog_key, &bytes, pool, gcm, txn_id)?;
 
         self.roles.insert(entry.role_name.clone(), entry);
@@ -646,17 +646,17 @@ X CatalogManager {
 
     # Remove a role from the catalog
     F unregister_role(
-        ~self,
+        mut self,
         role_name: &Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         I !self.roles.contains_key(role_name) {
             R Err(VaisError.new("VAIS-0910002", "Role '{role_name}' not found"));
         }
 
-        ~catalog_key = role_key(role_name);
+        catalog_key := mut role_key(role_name);
         self.delete_catalog_entry(&catalog_key, pool, gcm, txn_id)?;
         self.roles.remove(role_name);
         Ok(())
@@ -674,7 +674,7 @@ X CatalogManager {
 
     # List all roles
     F all_roles(self) -> Vec<&RoleCatalogEntry> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L (_, entry): self.roles.iter() {
             result.push(entry);
         }
@@ -687,16 +687,16 @@ X CatalogManager {
 
     # Register a grant in the catalog
     F register_grant(
-        ~self,
+        mut self,
         entry: GrantCatalogEntry,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
-        ~buf = ByteBuffer.with_capacity(128);
+        buf := mut ByteBuffer.with_capacity(128);
         entry.serialize(&buf);
-        ~bytes = buf.to_vec();
-        ~catalog_key = entry.to_catalog_key();
+        bytes := mut buf.to_vec();
+        catalog_key := mut entry.to_catalog_key();
         self.insert_catalog_entry(&catalog_key, &bytes, pool, gcm, txn_id)?;
 
         self.grants.push(entry);
@@ -705,18 +705,18 @@ X CatalogManager {
 
     # Remove a grant from the catalog (by role_id + object_name)
     F unregister_grant(
-        ~self,
+        mut self,
         role_id: u64,
         object_name: &Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
-        ~catalog_key = grant_key(role_id, object_name);
+        catalog_key := mut grant_key(role_id, object_name);
         self.delete_catalog_entry(&catalog_key, pool, gcm, txn_id)?;
 
         # Remove from in-memory cache (find and remove matching entry)
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.grants.len() {
             I self.grants[i].role_id == role_id && self.grants[i].object_name == *object_name {
                 self.grants.remove(i);
@@ -730,7 +730,7 @@ X CatalogManager {
 
     # Get all grants for a specific role
     F get_grants_for_role(self, role_id: u64) -> Vec<&GrantCatalogEntry> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L entry: &self.grants {
             I entry.role_id == role_id {
                 result.push(entry);
@@ -741,7 +741,7 @@ X CatalogManager {
 
     # Get all grants on a specific object
     F get_grants_for_object(self, object_name: &Str) -> Vec<&GrantCatalogEntry> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L entry: &self.grants {
             I entry.object_name == *object_name {
                 result.push(entry);
@@ -761,10 +761,10 @@ X CatalogManager {
 
     # Register a policy in the catalog
     F register_policy(
-        ~self,
+        mut self,
         entry: PolicyCatalogEntry,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         # Check for duplicate policy name on same table
@@ -777,10 +777,10 @@ X CatalogManager {
             }
         }
 
-        ~buf = ByteBuffer.with_capacity(128);
+        buf := mut ByteBuffer.with_capacity(128);
         entry.serialize(&buf);
-        ~bytes = buf.to_vec();
-        ~catalog_key = entry.to_catalog_key();
+        bytes := mut buf.to_vec();
+        catalog_key := mut entry.to_catalog_key();
         self.insert_catalog_entry(&catalog_key, &bytes, pool, gcm, txn_id)?;
 
         self.policies.push(entry);
@@ -789,18 +789,18 @@ X CatalogManager {
 
     # Remove a policy from the catalog (by table_name + policy_name)
     F unregister_policy(
-        ~self,
+        mut self,
         table_name: &Str,
         policy_name: &Str,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
-        ~catalog_key = policy_key(table_name, policy_name);
+        catalog_key := mut policy_key(table_name, policy_name);
         self.delete_catalog_entry(&catalog_key, pool, gcm, txn_id)?;
 
         # Remove from in-memory cache
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.policies.len() {
             I self.policies[i].table_name == *table_name && self.policies[i].policy_name == *policy_name {
                 self.policies.remove(i);
@@ -814,7 +814,7 @@ X CatalogManager {
 
     # Get all policies for a specific table
     F get_policies_for_table(self, table_name: &Str) -> Vec<&PolicyCatalogEntry> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L entry: &self.policies {
             I entry.table_name == *table_name {
                 result.push(entry);
@@ -843,15 +843,15 @@ X CatalogManager {
     # ========================================================================
 
     # Allocate and return the next table_id, then increment the counter
-    F get_next_table_id(~self) -> u32 {
-        ~id = self.next_table_id;
+    F get_next_table_id(mut self) -> u32 {
+        id := mut self.next_table_id;
         self.next_table_id += 1;
         id
     }
 
     # Allocate and return the next index_id, then increment the counter
-    F get_next_index_id(~self) -> u32 {
-        ~id = self.next_index_id;
+    F get_next_index_id(mut self) -> u32 {
+        id := mut self.next_index_id;
         self.next_index_id += 1;
         id
     }
@@ -863,25 +863,25 @@ X CatalogManager {
     # Insert a catalog entry: serialize to a heap tuple, insert into a catalog page,
     # then insert the (key -> TID) mapping into the catalog B+Tree
     F insert_catalog_entry(
-        ~self,
+        mut self,
         catalog_key: &[u8],
         serialized_data: &[u8],
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<u32, VaisError> {
         # Create MVCC metadata for this catalog tuple
-        ~mvcc = MvccTupleMeta.new_insert(txn_id, 0);
+        mvcc := mut MvccTupleMeta.new_insert(txn_id, 0);
 
         # Create the tuple with the serialized catalog data
-        ~tuple = Tuple.new(mvcc, serialized_data.to_vec());
+        tuple := mut Tuple.new(mvcc, serialized_data.to_vec());
 
         # Find or allocate a heap page with enough space for this tuple
-        ~tuple_size = tuple.on_page_size();
-        ~(page_id, slot_id) = self.insert_tuple_into_catalog_page(&tuple, pool, gcm, txn_id)?;
+        tuple_size := mut tuple.on_page_size();
+        (page_id, slot_id) := mut self.insert_tuple_into_catalog_page(&tuple, pool, gcm, txn_id)?;
 
         # Encode the TID from (page_id, slot_id)
-        ~tid = encode_tid(page_id, slot_id);
+        tid := mut encode_tid(page_id, slot_id);
 
         # Insert the key -> TID mapping into the catalog B+Tree
         btree_insert(&self.catalog_tree, catalog_key, tid, txn_id, gcm, pool)?;
@@ -893,23 +893,23 @@ X CatalogManager {
     # Tries to insert into the first available catalog page, allocates a new one if needed
     # Returns (page_id, slot_id) of the inserted tuple
     F insert_tuple_into_catalog_page(
-        ~self,
+        mut self,
         tuple: &Tuple,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(u32, u16), VaisError> {
         # For simplicity, allocate a dedicated page for each catalog entry group
         # In production, we would track a catalog_data_page list and try each
-        ~page_id = pool.allocate_page(FILE_ID_DATA)?;
-        ~frame_id = pool.fetch_page(FILE_ID_DATA, page_id)?;
+        page_id := mut pool.allocate_page(FILE_ID_DATA)?;
+        frame_id := mut pool.fetch_page(FILE_ID_DATA, page_id)?;
 
         # Initialize a fresh heap page
-        ~heap = HeapPage.new(page_id, pool.page_size);
-        ~slot_id = heap.insert_tuple(tuple)?;
+        heap := mut HeapPage.new(page_id, pool.page_size);
+        slot_id := mut heap.insert_tuple(tuple)?;
 
         # Flush the page
-        ~flushed = heap.flush();
+        flushed := mut heap.flush();
         pool.write_page(frame_id, flushed)?;
         pool.unpin_page(frame_id, true);
 
@@ -919,24 +919,24 @@ X CatalogManager {
     # Delete a catalog entry by its B+Tree key
     # Marks the corresponding heap tuple as expired and removes from B+Tree
     F delete_catalog_entry(
-        ~self,
+        mut self,
         catalog_key: &[u8],
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
     ) -> Result<(), VaisError> {
         # Look up the TID from the B+Tree
         M self.catalog_tree.search(catalog_key, pool)? {
             Some(tid) => {
                 # Decode TID to locate the heap tuple
-                ~(page_id, slot_id) = decode_tid(tid);
+                (page_id, slot_id) := mut decode_tid(tid);
 
                 # Mark the tuple as expired (MVCC delete)
-                ~frame_id = pool.fetch_page(FILE_ID_DATA, page_id)?;
-                ~page_data = pool.get_page(frame_id);
-                ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+                frame_id := mut pool.fetch_page(FILE_ID_DATA, page_id)?;
+                page_data := mut pool.get_page(frame_id);
+                heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
                 heap.delete_tuple(slot_id, txn_id, 0)?;
-                ~flushed = heap.flush();
+                flushed := mut heap.flush();
                 pool.write_page(frame_id, flushed)?;
                 pool.unpin_page(frame_id, true);
 

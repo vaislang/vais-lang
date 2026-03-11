@@ -136,17 +136,17 @@ X VectorEngine {
         }
 
         # Initialize metadata (empty index)
-        ~meta = HnswMeta.new(config.clone(), index_id);
+        meta := mut HnswMeta.new(config.clone(), index_id);
 
         # Initialize components
-        ~store = VectorStore.new(config.dim, pool, allocator, bitmap);
-        ~node_store = HnswNodeStore.new(&store);
-        ~distance_computer = DistanceComputer.new(config.metric);
-        ~layer_mgr = LayerManager.new(pool, allocator)?;
-        ~wal_mgr = HnswWalManager.new(gcm)?;
-        ~cow_store = CowNeighborStore.new()?;
-        ~quantization = QuantizationManager.new(config.quantization_strategy)?;
-        ~lock = HnswLock.new();
+        store := mut VectorStore.new(config.dim, pool, allocator, bitmap);
+        node_store := mut HnswNodeStore.new(&store);
+        distance_computer := mut DistanceComputer.new(config.metric);
+        layer_mgr := mut LayerManager.new(pool, allocator)?;
+        wal_mgr := mut HnswWalManager.new(gcm)?;
+        cow_store := mut CowNeighborStore.new()?;
+        quantization := mut QuantizationManager.new(config.quantization_strategy)?;
+        lock := mut HnswLock.new();
 
         Ok(VectorEngine {
             config,
@@ -173,7 +173,7 @@ X VectorEngine {
     # ========================================================================
 
     ## Open engine: load meta page and upper layers from disk
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         I self.is_open {
             R Ok(());
         }
@@ -201,14 +201,14 @@ X VectorEngine {
     }
 
     ## Close engine: flush dirty pages, release resources
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         I !self.is_open {
             R Ok(());
         }
 
         # Flush metadata page
-        ~meta_buf = ByteBuffer.new();
-        self.meta.serialize(&~meta_buf)?;
+        meta_buf := mut ByteBuffer.new();
+        self.meta.serialize(&mut meta_buf)?;
         self.pool.write_page(FILE_ID_VECTORS, self.index_id, &meta_buf.to_vec())?;
 
         # Unpin all upper layers
@@ -230,7 +230,7 @@ X VectorEngine {
     ## Create new HNSW index: allocate meta page, register in catalog
     F create_index(
         config: HnswConfig,
-        catalog: &~CatalogManager,
+        catalog: &mut CatalogManager,
         pool: &BufferPool,
         allocator: &PageAllocator,
         gcm: &GroupCommitManager,
@@ -256,11 +256,11 @@ X VectorEngine {
         catalog.create_index(index_info, txn_id)?;
 
         # Create engine instance
-        ~engine = VectorEngine.new(config, meta_page_id, pool, allocator, gcm)?;
+        engine := mut VectorEngine.new(config, meta_page_id, pool, allocator, gcm)?;
 
         # Initialize metadata page
-        ~meta_buf = ByteBuffer.new();
-        engine.meta.serialize(&~meta_buf)?;
+        meta_buf := mut ByteBuffer.new();
+        engine.meta.serialize(&mut meta_buf)?;
         pool.write_page(FILE_ID_VECTORS, meta_page_id, &meta_buf.to_vec())?;
 
         # WAL-log index creation
@@ -278,7 +278,7 @@ X VectorEngine {
     }
 
     ## Drop index: mark as deleted, release pages
-    F drop_index(~self, catalog: &~CatalogManager, txn_id: u64) -> Result<(), VaisError> {
+    F drop_index(mut self, catalog: &mut CatalogManager, txn_id: u64) -> Result<(), VaisError> {
         I !self.is_open {
             R Err(err_vector_engine_closed());
         }
@@ -319,7 +319,7 @@ X VectorEngine {
     ## Insert vector: write to storage, insert into HNSW graph, WAL-log
     ## Returns node_id (unique identifier for this vector)
     F insert(
-        ~self,
+        mut self,
         vector: &[f32],
         txn_id: u64,
         cmd_id: u32,
@@ -337,16 +337,16 @@ X VectorEngine {
         }
 
         # Acquire write lock
-        ~write_guard = self.lock.write_lock(txn_id)?;
+        write_guard := mut self.lock.write_lock(txn_id)?;
 
         # 1. Write vector to storage (allocate page space)
-        ~(vec_page_id, vec_offset) = self.store.write_vector(vector, txn_id, cmd_id)?;
+        (vec_page_id, vec_offset) := mut self.store.write_vector(vector, txn_id, cmd_id)?;
 
         # 2. Allocate node ID and create HnswNode
-        ~node_id = self.node_store.allocate_node_id();
-        ~rng = LayerRng.new(node_id);  # Seed with node_id for determinism
-        ~random_layer = rng.random_layer(self.config.m);
-        ~new_node = HnswNode.new(node_id, vec_page_id, vec_offset, random_layer, txn_id, cmd_id);
+        node_id := mut self.node_store.allocate_node_id();
+        rng := mut LayerRng.new(node_id);  # Seed with node_id for determinism
+        random_layer := mut rng.random_layer(self.config.m);
+        new_node := mut HnswNode.new(node_id, vec_page_id, vec_offset, random_layer, txn_id, cmd_id);
 
         # 3. Insert into HNSW graph
         self.meta = hnsw_insert(
@@ -376,7 +376,7 @@ X VectorEngine {
     ## Soft-delete vector: mark as deleted, WAL-log
     ## Actual removal happens during GC
     F delete(
-        ~self,
+        mut self,
         node_id: u64,
         txn_id: u64,
         cmd_id: u32,
@@ -386,10 +386,10 @@ X VectorEngine {
         }
 
         # Acquire write lock
-        ~write_guard = self.lock.write_lock(txn_id)?;
+        write_guard := mut self.lock.write_lock(txn_id)?;
 
         # Look up node to get vector page location
-        ~node = self.node_store.load_node(node_id)?;
+        node := mut self.node_store.load_node(node_id)?;
 
         # Soft-delete in storage (set txn_id_expire)
         self.store.delete_vector(node.vector_page_id, node.vector_offset, txn_id, cmd_id)?;
@@ -443,7 +443,7 @@ X VectorEngine {
         }
 
         # Acquire read lock
-        ~read_guard = self.lock.read_lock()?;
+        read_guard := mut self.lock.read_lock()?;
 
         # Use provided ef_search or default
         ef := M ef_search {
@@ -452,7 +452,7 @@ X VectorEngine {
         };
 
         # MVCC-filtered search
-        ~result = mvcc_filtered_search(
+        result := mut mvcc_filtered_search(
             query,
             k,
             ef,
@@ -514,7 +514,7 @@ X VectorEngine {
     ## Bulk load vectors: efficient batch insertion
     ## Bypasses WAL if config.bypass_wal = true (requires checkpoint after)
     F bulk_load(
-        ~self,
+        mut self,
         vectors: &[&[f32]],
         config: BulkLoadConfig,
         txn_id: u64,
@@ -534,15 +534,15 @@ X VectorEngine {
         }
 
         # Acquire write lock
-        ~write_guard = self.lock.write_lock(txn_id)?;
+        write_guard := mut self.lock.write_lock(txn_id)?;
 
         # Create bulk loader
-        ~loader = BulkLoader.new(
-            &~self.meta,
+        loader := mut BulkLoader.new(
+            &mut self.meta,
             &self.config,
-            &~self.store,
-            &~self.layer_mgr,
-            &~self.cow_store,
+            &mut self.store,
+            &mut self.layer_mgr,
+            &mut self.cow_store,
             self.pool,
             config,
         )?;
@@ -592,7 +592,7 @@ X VectorEngine {
         result: SearchResult,
         ctx: &ExecContext,
     ) -> Result<Vec<VectorSearchRow>, VaisError> {
-        ~rows = Vec.new();
+        rows := mut Vec.new();
 
         L entry: result.entries {
             # Fetch original row from heap page

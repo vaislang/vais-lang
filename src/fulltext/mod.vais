@@ -109,16 +109,16 @@ X FullTextEngine {
         allocator: &PageAllocator,
         gcm: &GroupCommitManager,
     ) -> FullTextEngine {
-        ~tokenizer = Tokenizer.from_config(&config);
-        ~bm25_scorer = BM25Scorer.with_params(config.bm25_k1, config.bm25_b);
-        ~dict_index = DictionaryIndex.new(NULL_PAGE, config.page_size);
-        ~posting_store = PostingStore.new(config.page_size, pool, allocator);
-        ~deletion_bitmap = DeletionBitmap.new();
-        ~doc_freq_tracker = DocFreqTracker.new();
-        ~wal_mgr = FullTextWalManager.new(gcm);
-        ~lock = FullTextLock.new();
-        ~ddl = FullTextDDL.new(pool, allocator, gcm, config.page_size);
-        ~meta = FullTextMeta.new(config);
+        tokenizer := mut Tokenizer.from_config(&config);
+        bm25_scorer := mut BM25Scorer.with_params(config.bm25_k1, config.bm25_b);
+        dict_index := mut DictionaryIndex.new(NULL_PAGE, config.page_size);
+        posting_store := mut PostingStore.new(config.page_size, pool, allocator);
+        deletion_bitmap := mut DeletionBitmap.new();
+        doc_freq_tracker := mut DocFreqTracker.new();
+        wal_mgr := mut FullTextWalManager.new(gcm);
+        lock := mut FullTextLock.new();
+        ddl := mut FullTextDDL.new(pool, allocator, gcm, config.page_size);
+        meta := mut FullTextMeta.new(config);
 
         FullTextEngine {
             config,
@@ -144,7 +144,7 @@ X FullTextEngine {
     # ========================================================================
 
     ## Open engine: load meta page, dictionary index
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         I self.is_open {
             R Ok(());
         }
@@ -159,7 +159,7 @@ X FullTextEngine {
             self.dict_index.load_cache(self.pool)?;
 
             # Sync doc freq tracker from dictionary
-            ~entries = self.dict_index.scan_all_terms(self.pool)?;
+            entries := mut self.dict_index.scan_all_terms(self.pool)?;
             self.doc_freq_tracker.recalibrate_from_dict(&entries);
             self.doc_freq_tracker.set_total_docs(self.meta.total_docs);
             self.doc_freq_tracker.set_avg_doc_length(self.meta.avg_doc_length);
@@ -170,7 +170,7 @@ X FullTextEngine {
     }
 
     ## Close engine: flush dirty pages, release resources
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         I !self.is_open {
             R Ok(());
         }
@@ -192,7 +192,7 @@ X FullTextEngine {
 
     ## Index a document: tokenize, insert postings, update dictionary, WAL-log
     F index_document(
-        ~self,
+        mut self,
         txn_id: u64,
         doc_id: u64,
         text: &Str,
@@ -203,22 +203,22 @@ X FullTextEngine {
         }
 
         # Acquire write lock
-        ~_guard = self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock()?;
 
         # Tokenize text
-        ~term_freqs = self.tokenizer.tokenize_with_freqs(text);
-        ~total_tokens: u32 = 0;
+        term_freqs := mut self.tokenizer.tokenize_with_freqs(text);
+        total_tokens: u32 := mut 0;
 
         # Process each unique term
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < term_freqs.len() {
-            ~tf_info = &term_freqs[i];
-            ~term_hash = fnv1a_hash(&tf_info.term);
+            tf_info := mut &term_freqs[i];
+            term_hash := mut fnv1a_hash(&tf_info.term);
 
             total_tokens += tf_info.freq;
 
             # Create PostingEntry
-            ~entry = PostingEntry.new(
+            entry := mut PostingEntry.new(
                 doc_id,
                 tf_info.freq,
                 tf_info.positions.clone(),
@@ -227,9 +227,9 @@ X FullTextEngine {
             );
 
             # Lookup or create dictionary entry
-            ~dict_entry = self.dict_index.lookup_term(&tf_info.term, self.pool)?;
-            ~head_page = M dict_entry {
-                Some(~de) => de.posting_head_page,
+            dict_entry := mut self.dict_index.lookup_term(&tf_info.term, self.pool)?;
+            head_page := mut M dict_entry {
+                Some(mut de) => de.posting_head_page,
                 None => {
                     # WAL-log dictionary insert
                     self.wal_mgr.log_dict_insert(txn_id, &tf_info.term, NULL_PAGE)?;
@@ -239,14 +239,14 @@ X FullTextEngine {
             };
 
             # Serialize entry for WAL
-            ~entry_bytes = entry.to_bytes();
+            entry_bytes := mut entry.to_bytes();
 
             # WAL-log posting append
-            ~result_page = I head_page == NULL_PAGE { 0 } E { head_page };
+            result_page := mut I head_page == NULL_PAGE { 0 } E { head_page };
             self.wal_mgr.log_posting_append(txn_id, term_hash, result_page, &entry_bytes)?;
 
             # Append to posting list
-            ~(page_id, slot_idx, new_head) = self.posting_store.append_entry(
+            (page_id, slot_idx, new_head) := mut self.posting_store.append_entry(
                 head_page, &entry, term_hash, txn_id, self.gcm,
             )?;
 
@@ -286,7 +286,7 @@ X FullTextEngine {
 
     ## Delete a document from the index: expire postings, update stats
     F delete_document(
-        ~self,
+        mut self,
         txn_id: u64,
         doc_id: u64,
         cmd_id: u32,
@@ -296,21 +296,21 @@ X FullTextEngine {
         }
 
         # Acquire write lock
-        ~_guard = self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock()?;
 
         # Iterate all dictionary entries and expire postings for this doc_id
-        ~dict_entries = self.dict_index.scan_all_terms(self.pool)?;
-        ~total_expired_tokens: u64 = 0;
+        dict_entries := mut self.dict_index.scan_all_terms(self.pool)?;
+        total_expired_tokens: u64 := mut 0;
 
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < dict_entries.len() {
-            ~de = &dict_entries[i];
+            de := mut &dict_entries[i];
 
             # Read all entries from this posting list
-            ~postings = self.posting_store.read_all_entries(de.posting_head_page)?;
+            postings := mut self.posting_store.read_all_entries(de.posting_head_page)?;
 
             # Find and expire entries for this doc_id
-            ~j: u64 = 0;
+            j: u64 := mut 0;
             L j < postings.len() {
                 I postings[j].doc_id == doc_id && postings[j].is_active() {
                     # WAL-log posting delete
@@ -358,7 +358,7 @@ X FullTextEngine {
 
     ## Search using BM25 scoring: tokenize query, lookup postings, score, rank
     F search(
-        ~self,
+        mut self,
         query_text: &Str,
         top_k: u32,
         snapshot: &Snapshot,
@@ -369,10 +369,10 @@ X FullTextEngine {
         }
 
         # Acquire read lock
-        ~_guard = self.lock.read_lock()?;
+        _guard := mut self.lock.read_lock()?;
 
         # Create and execute M executor
-        ~executor = FullTextMatchExecutor.new(0, query_text.clone(), top_k);
+        executor := mut FullTextMatchExecutor.new(0, query_text.clone(), top_k);
         executor.execute_search(
             &self.tokenizer,
             &self.dict_index,
@@ -386,11 +386,11 @@ X FullTextEngine {
 
         # Collect results
         executor.open();
-        ~results = Vec.new();
-        ~has_more = true;
+        results := mut Vec.new();
+        has_more := mut true;
         L has_more {
             M executor.next() {
-                Some(~result) => results.push(result),
+                Some(mut result) => results.push(result),
                 None => { has_more = false; },
             }
         }
@@ -401,7 +401,7 @@ X FullTextEngine {
 
     ## Phrase search: find exact phrase matches
     F phrase_search(
-        ~self,
+        mut self,
         query_text: &Str,
         top_k: u32,
         snapshot: &Snapshot,
@@ -411,12 +411,12 @@ X FullTextEngine {
             R Err(err_fulltext_engine_closed());
         }
 
-        ~_guard = self.lock.read_lock()?;
+        _guard := mut self.lock.read_lock()?;
 
         # Tokenize query into terms
-        ~tokens = self.tokenizer.tokenize(query_text);
-        ~terms = Vec.new();
-        ~i: u64 = 0;
+        tokens := mut self.tokenizer.tokenize(query_text);
+        terms := mut Vec.new();
+        i: u64 := mut 0;
         L i < tokens.len() {
             terms.push(tokens[i].term.clone());
             i += 1;
@@ -427,13 +427,13 @@ X FullTextEngine {
         }
 
         # Collect posting entries per term
-        ~posting_entries_per_term: Vec<Vec<PostingEntry>> = Vec.new();
+        posting_entries_per_term: Vec<Vec<PostingEntry>> := mut Vec.new();
         i = 0;
         L i < terms.len() {
-            ~dict_entry = self.dict_index.lookup_term(&terms[i], self.pool)?;
+            dict_entry := mut self.dict_index.lookup_term(&terms[i], self.pool)?;
             M dict_entry {
-                Some(~de) => {
-                    ~entries = self.posting_store.read_all_entries(de.posting_head_page)?;
+                Some(mut de) => {
+                    entries := mut self.posting_store.read_all_entries(de.posting_head_page)?;
                     posting_entries_per_term.push(entries);
                 },
                 None => {
@@ -445,8 +445,8 @@ X FullTextEngine {
         }
 
         # Execute phrase search
-        ~searcher = PhraseSearcher.new(0);
-        ~results = searcher.search_phrase(
+        searcher := mut PhraseSearcher.new(0);
+        results := mut searcher.search_phrase(
             &terms,
             &posting_entries_per_term,
             snapshot,
@@ -463,7 +463,7 @@ X FullTextEngine {
 
     ## Boolean query search (AND/OR/NOT with optional quoted phrases)
     F boolean_search(
-        ~self,
+        mut self,
         query_str: &Str,
         top_k: u32,
         snapshot: &Snapshot,
@@ -473,36 +473,36 @@ X FullTextEngine {
             R Err(err_fulltext_engine_closed());
         }
 
-        ~_guard = self.lock.read_lock()?;
+        _guard := mut self.lock.read_lock()?;
 
         # Parse query
-        ~query = BooleanQueryParser.parse(query_str)?;
+        query := mut BooleanQueryParser.parse(query_str)?;
 
         # For each term in the query, run a BM25 search and collect results
-        ~term_results: Vec<(Str, Vec<(u64, f64)>)> = Vec.new();
-        ~query_terms = FullTextEngine.extract_terms_from_query(&query);
+        term_results: Vec<(Str, Vec<(u64, f64)>)> := mut Vec.new();
+        query_terms := mut FullTextEngine.extract_terms_from_query(&query);
 
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < query_terms.len() {
-            ~term = &query_terms[i];
-            ~dict_entry = self.dict_index.lookup_term(term, self.pool)?;
+            term := mut &query_terms[i];
+            dict_entry := mut self.dict_index.lookup_term(term, self.pool)?;
             M dict_entry {
-                Some(~de) => {
-                    ~entries = self.posting_store.read_all_entries(de.posting_head_page)?;
-                    ~visible = filter_visible_postings(&entries, snapshot, clog);
+                Some(mut de) => {
+                    entries := mut self.posting_store.read_all_entries(de.posting_head_page)?;
+                    visible := mut filter_visible_postings(&entries, snapshot, clog);
 
                     # Score each visible entry
                     # Use avg_doc_length as doc_length approximation since
                     # PostingEntry does not store per-document token counts
-                    ~approx_doc_length = I self.meta.avg_doc_length > 0.0 {
+                    approx_doc_length := mut I self.meta.avg_doc_length > 0.0 {
                         self.meta.avg_doc_length as u32
                     } E {
                         1
                     };
-                    ~scored: Vec<(u64, f64)> = Vec.new();
-                    ~j: u64 = 0;
+                    scored: Vec<(u64, f64)> := mut Vec.new();
+                    j: u64 := mut 0;
                     L j < visible.len() {
-                        ~score = self.bm25_scorer.score(
+                        score := mut self.bm25_scorer.score(
                             visible[j].term_freq,
                             de.doc_freq,
                             approx_doc_length,
@@ -522,16 +522,16 @@ X FullTextEngine {
         }
 
         # Execute boolean query
-        ~executor = BooleanQueryExecutor.new();
-        ~results = executor.execute(&query, &term_results);
+        executor := mut BooleanQueryExecutor.new();
+        results := mut executor.execute(&query, &term_results);
 
         # Sort by score descending and limit
-        ~sorted = results;
+        sorted := mut results;
         # Simple selection sort
-        ~k: u64 = 0;
+        k: u64 := mut 0;
         L k < sorted.len() {
-            ~max_idx = k;
-            ~m: u64 = k + 1;
+            max_idx := mut k;
+            m: u64 := mut k + 1;
             L m < sorted.len() {
                 I sorted[m].1 > sorted[max_idx].1 {
                     max_idx = m;
@@ -539,7 +539,7 @@ X FullTextEngine {
                 m += 1;
             }
             I max_idx != k {
-                ~tmp = sorted[k];
+                tmp := mut sorted[k];
                 sorted[k] = sorted[max_idx];
                 sorted[max_idx] = tmp;
             }
@@ -551,7 +551,7 @@ X FullTextEngine {
         }
 
         # Convert to ScoredDoc
-        ~scored_docs = Vec.new();
+        scored_docs := mut Vec.new();
         i = 0;
         L i < sorted.len() {
             scored_docs.push(ScoredDoc { doc_id: sorted[i].0, score: sorted[i].1 });
@@ -563,7 +563,7 @@ X FullTextEngine {
 
     ## Hybrid search: BM25 + vector similarity fusion
     F hybrid_search(
-        ~self,
+        mut self,
         query_text: &Str,
         vector_results: &Vec<ScoredDoc>,
         config: &HybridSearchConfig,
@@ -575,11 +575,11 @@ X FullTextEngine {
         }
 
         # Get BM25 results
-        ~bm25_match_results = self.search(query_text, config.top_k * 2, snapshot, clog)?;
+        bm25_match_results := mut self.search(query_text, config.top_k * 2, snapshot, clog)?;
 
         # Convert to ScoredDoc
-        ~bm25_results = Vec.new();
-        ~i: u64 = 0;
+        bm25_results := mut Vec.new();
+        i: u64 := mut 0;
         L i < bm25_match_results.len() {
             bm25_results.push(ScoredDoc {
                 doc_id: bm25_match_results[i].doc_id,
@@ -589,8 +589,8 @@ X FullTextEngine {
         }
 
         # Fuse results
-        ~pipeline = HybridSearchPipeline.from_config(config);
-        ~fused = pipeline.hybrid_search(&bm25_results, vector_results, config.top_k);
+        pipeline := mut HybridSearchPipeline.from_config(config);
+        fused := mut pipeline.hybrid_search(&bm25_results, vector_results, config.top_k);
 
         Ok(fused)
     }
@@ -601,16 +601,16 @@ X FullTextEngine {
 
     ## Run posting list compaction (GC)
     F compact(
-        ~self,
+        mut self,
         low_water_mark: u64,
     ) -> Result<CompactionStats, VaisError> {
         I !self.is_open {
             R Err(err_fulltext_engine_closed());
         }
 
-        ~_guard = self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock()?;
 
-        ~compactor = PostingListCompactor.new(
+        compactor := mut PostingListCompactor.new(
             self.config.page_size,
             self.pool,
             self.allocator,
@@ -618,17 +618,17 @@ X FullTextEngine {
             100,  # max_pages_per_second
         );
 
-        ~dict_entries = self.dict_index.scan_all_terms(self.pool)?;
+        dict_entries := mut self.dict_index.scan_all_terms(self.pool)?;
 
         # Build (term_hash, head_page) pairs
-        ~term_pages: Vec<(u64, u32)> = Vec.new();
-        ~i: u64 = 0;
+        term_pages: Vec<(u64, u32)> := mut Vec.new();
+        i: u64 := mut 0;
         L i < dict_entries.len() {
             term_pages.push((dict_entries[i].term_hash, dict_entries[i].posting_head_page));
             i += 1;
         }
 
-        ~stats = compactor.compact_all(&term_pages, low_water_mark)?;
+        stats := mut compactor.compact_all(&term_pages, low_water_mark)?;
 
         Ok(stats)
     }
@@ -668,32 +668,32 @@ X FullTextEngine {
 
     # Extract all terms from a query AST (for boolean query execution)
     F extract_terms_from_query(query: &Query) -> Vec<Str> {
-        ~terms = Vec.new();
+        terms := mut Vec.new();
         M query {
-            Query.Term(~tq) => {
+            Query.Term(mut tq) => {
                 terms.push(tq.term.clone());
             },
-            Query.Phrase(~pq) => {
-                ~i: u64 = 0;
+            Query.Phrase(mut pq) => {
+                i: u64 := mut 0;
                 L i < pq.terms.len() {
                     terms.push(pq.terms[i].clone());
                     i += 1;
                 }
             },
-            Query.Boolean(~bq) => {
-                ~i: u64 = 0;
+            Query.Boolean(mut bq) => {
+                i: u64 := mut 0;
                 L i < bq.clauses.len() {
-                    ~clause_query = M &bq.clauses[i] {
-                        BooleanClause.Must(~q) => q,
-                        BooleanClause.Should(~q) => q,
-                        BooleanClause.MustNot(~q) => q,
+                    clause_query := mut M &bq.clauses[i] {
+                        BooleanClause.Must(mut q) => q,
+                        BooleanClause.Should(mut q) => q,
+                        BooleanClause.MustNot(mut q) => q,
                     };
-                    ~sub_terms = FullTextEngine.extract_terms_from_query(clause_query);
-                    ~j: u64 = 0;
+                    sub_terms := mut FullTextEngine.extract_terms_from_query(clause_query);
+                    j: u64 := mut 0;
                     L j < sub_terms.len() {
                         # Deduplicate
-                        ~found = false;
-                        ~k: u64 = 0;
+                        found := mut false;
+                        k: u64 := mut 0;
                         L k < terms.len() && !found {
                             I terms[k] == sub_terms[j] {
                                 found = true;

@@ -37,11 +37,11 @@ X UndoLog {
 
     # Write an undo entry and return its undo_ptr
     # The undo_ptr encodes (file_id, page_id, offset) for direct access
-    F write_entry(~self, entry: &UndoEntry, pool: &~BufferPool) -> Result<u64, VaisError> {
-        ~guard = self.lock.lock();
+    F write_entry(mut self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<u64, VaisError> {
+        guard := mut self.lock.lock();
 
-        ~entry_size = entry.serialized_size();
-        ~available_space = self.available_space_in_current_page();
+        entry_size := mut entry.serialized_size();
+        available_space := mut self.available_space_in_current_page();
 
         # Check if we need a new page
         I entry_size > available_space {
@@ -49,22 +49,22 @@ X UndoLog {
         }
 
         # Serialize the entry to a buffer
-        ~buf = ByteBuffer.with_capacity(entry_size as u64);
+        buf := mut ByteBuffer.with_capacity(entry_size as u64);
         entry.serialize(&buf);
-        ~entry_data = buf.as_bytes();
+        entry_data := mut buf.as_bytes();
 
         # Fetch the current undo page
-        ~frame_id = pool.fetch_page(self.file_id, self.current_page_id)?;
-        ~frame = pool.get_frame_mut(frame_id);
+        frame_id := mut pool.fetch_page(self.file_id, self.current_page_id)?;
+        frame := mut pool.get_frame_mut(frame_id);
 
         # Write entry data at current offset
-        ~page_data = frame.get_data_mut();
-        ~write_offset = self.current_offset as u64;
+        page_data := mut frame.get_data_mut();
+        write_offset := mut self.current_offset as u64;
         page_data[write_offset..(write_offset + entry_size as u64)]
             .copy_from_slice(entry_data);
 
         # Update page header's free_space_offset and item_count
-        ~header = PageHeader.read_from_page(page_data)?;
+        header := mut PageHeader.read_from_page(page_data)?;
         header.free_space_offset = (self.current_offset + entry_size) as u16;
         header.item_count += 1;
         header.write_to_page(page_data);
@@ -73,7 +73,7 @@ X UndoLog {
         frame.mark_dirty();
 
         # Encode undo_ptr for this entry
-        ~undo_ptr = encode_undo_ptr(
+        undo_ptr := mut encode_undo_ptr(
             self.file_id,
             self.current_page_id,
             self.current_offset as u16
@@ -91,28 +91,28 @@ X UndoLog {
     }
 
     # Read an undo entry by its undo_ptr
-    F read_entry(self, undo_ptr: u64, pool: &~BufferPool) -> Result<UndoEntry, VaisError> {
+    F read_entry(self, undo_ptr: u64, pool: &mut BufferPool) -> Result<UndoEntry, VaisError> {
         I undo_ptr == NULL_UNDO_PTR {
             R Err(err_internal("Cannot read null undo pointer"));
         }
 
         # Decode undo_ptr
-        ~(file_id, page_id, offset) = decode_undo_ptr(undo_ptr);
+        (file_id, page_id, offset) := mut decode_undo_ptr(undo_ptr);
 
         I file_id != self.file_id {
             R Err(err_internal("Invalid undo file_id: {file_id}, expected {self.file_id}"));
         }
 
         # Fetch the undo page
-        ~frame_id = pool.fetch_page(file_id, page_id)?;
-        ~frame = pool.get_frame(frame_id);
-        ~page_data = frame.get_data();
+        frame_id := mut pool.fetch_page(file_id, page_id)?;
+        frame := mut pool.get_frame(frame_id);
+        page_data := mut frame.get_data();
 
         # Create a ByteBuffer starting at the offset
-        ~buf = ByteBuffer.from_slice(&page_data[offset as u64..]);
+        buf := mut ByteBuffer.from_slice(&page_data[offset as u64..]);
 
         # Deserialize the entry
-        ~entry = UndoEntry.deserialize(&buf)?;
+        entry := mut UndoEntry.deserialize(&buf)?;
 
         # Unpin the page
         pool.unpin_page(frame_id)?;
@@ -122,12 +122,12 @@ X UndoLog {
 
     # Read a chain of undo entries by following prev_undo_ptr links
     # Returns entries in reverse chronological order (newest first)
-    F read_chain(self, undo_ptr: u64, pool: &~BufferPool) -> Result<Vec<UndoEntry>, VaisError> {
-        ~entries = Vec.new();
-        ~current_ptr = undo_ptr;
+    F read_chain(self, undo_ptr: u64, pool: &mut BufferPool) -> Result<Vec<UndoEntry>, VaisError> {
+        entries := mut Vec.new();
+        current_ptr := mut undo_ptr;
 
         L current_ptr != NULL_UNDO_PTR {
-            ~entry = self.read_entry(current_ptr, pool)?;
+            entry := mut self.read_entry(current_ptr, pool)?;
             current_ptr = entry.prev_undo_ptr;
             entries.push(entry);
         }
@@ -137,24 +137,24 @@ X UndoLog {
 
     # Calculate available space in current page
     F available_space_in_current_page(self) -> u32 {
-        ~page_body_size = self.page_size - PAGE_HEADER_SIZE;
+        page_body_size := mut self.page_size - PAGE_HEADER_SIZE;
         page_body_size - (self.current_offset - PAGE_HEADER_SIZE)
     }
 
     # Allocate a new undo page when current page is full
-    F allocate_new_page(~self, pool: &~BufferPool) -> Result<(), VaisError> {
+    F allocate_new_page(mut self, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Get the next page ID
         # In a full implementation, this would allocate from the freelist
         # For now, we simply increment the page ID
-        ~new_page_id = self.current_page_id + 1;
+        new_page_id := mut self.current_page_id + 1;
 
         # Initialize the new undo page with a header
-        ~frame_id = pool.fetch_page(self.file_id, new_page_id)?;
-        ~frame = pool.get_frame_mut(frame_id);
-        ~page_data = frame.get_data_mut();
+        frame_id := mut pool.fetch_page(self.file_id, new_page_id)?;
+        frame := mut pool.get_frame_mut(frame_id);
+        page_data := mut frame.get_data_mut();
 
         # Initialize page header
-        ~header = PageHeader.new(
+        header := mut PageHeader.new(
             new_page_id,
             PAGE_TYPE_UNDO_LOG,
             0  # engine_tag: common

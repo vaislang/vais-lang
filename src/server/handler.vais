@@ -44,11 +44,11 @@ X QueryHandler {
     # Process a single framed message and return response bytes.
     # Returns Vec of response byte buffers to send to client.
     F handle_message(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~msg_type = msg.msg_type;
+        msg_type := mut msg.msg_type;
 
         I msg_type == MSG_TYPE_QUERY {
             self.handle_simple_query(msg, pool)
@@ -77,13 +77,13 @@ X QueryHandler {
 
     # Handle simple query: parse SQL → execute → return results
     F handle_simple_query(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~sql = deserialize_query(&reader)?;
-        ~responses = Vec.new();
+        reader := mut msg.payload_reader();
+        sql := mut deserialize_query(&reader)?;
+        responses := mut Vec.new();
 
         # Update connection state to InQuery
         pool.with_connection(self.conn_id, |conn| {
@@ -94,7 +94,7 @@ X QueryHandler {
         # parse_sql -> HybridPlanner.execute_query / Executor.execute_dml / DDL / txn mgmt
         # Placeholder: return empty result with CommandComplete
 
-        ~tag = classify_sql_tag(&sql);
+        tag := mut classify_sql_tag(&sql);
         responses.push(serialize_command_complete(&tag));
 
         # Return to Ready state
@@ -103,7 +103,7 @@ X QueryHandler {
         })??;
 
         # Send ReadyForQuery
-        ~txn_state = pool.with_connection_ref(self.conn_id, |conn| {
+        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
             M conn.get_txn_state() {
                 TransactionState.Idle => TransactionState.Idle,
                 TransactionState.InBlock => TransactionState.InBlock,
@@ -121,12 +121,12 @@ X QueryHandler {
 
     # Handle Parse: prepare a statement
     F handle_parse(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~stmt_info = deserialize_parse(&reader)?;
+        reader := mut msg.payload_reader();
+        stmt_info := mut deserialize_parse(&reader)?;
 
         # FUTURE(integration): Parse SQL and validate parameter types via sql/parser
         # Currently stores the prepared statement without validation
@@ -142,18 +142,18 @@ X QueryHandler {
 
     # Handle Bind: bind parameters to a prepared statement → create portal
     F handle_bind(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~bind_params = deserialize_bind(&reader)?;
+        reader := mut msg.payload_reader();
+        bind_params := mut deserialize_bind(&reader)?;
 
         # Store portal in connection
         U server/connection.PortalInfo;
 
         pool.with_connection(self.conn_id, |conn| {
-            ~portal = PortalInfo.new(
+            portal := mut PortalInfo.new(
                 bind_params.portal_name.clone(),
                 bind_params.stmt_name.clone(),
                 bind_params.param_values,
@@ -167,13 +167,13 @@ X QueryHandler {
 
     # Handle Execute: execute a bound portal
     F handle_execute(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~exec_msg = deserialize_execute(&reader)?;
-        ~responses = Vec.new();
+        reader := mut msg.payload_reader();
+        exec_msg := mut deserialize_execute(&reader)?;
+        responses := mut Vec.new();
 
         # FUTURE(integration): Look up portal, resolve bound statement + params, execute
         # Placeholder: return empty CommandComplete
@@ -185,17 +185,17 @@ X QueryHandler {
 
     # Handle Describe: return parameter/column descriptions
     F handle_describe(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~desc_msg = deserialize_describe(&reader)?;
-        ~responses = Vec.new();
+        reader := mut msg.payload_reader();
+        desc_msg := mut deserialize_describe(&reader)?;
+        responses := mut Vec.new();
 
         I desc_msg.describe_type == 0x53 {
             # Describe Statement ('S')
-            ~param_types = pool.with_connection_ref(self.conn_id, |conn| {
+            param_types := mut pool.with_connection_ref(self.conn_id, |conn| {
                 M conn.get_prepared_stmt(&desc_msg.name) {
                     Ok(stmt) => stmt.param_types.clone(),
                     Err(_) => Vec.new(),
@@ -204,7 +204,7 @@ X QueryHandler {
             responses.push(serialize_param_desc(&param_types));
 
             # Also send RowDescription if available
-            ~result_cols = pool.with_connection_ref(self.conn_id, |conn| {
+            result_cols := mut pool.with_connection_ref(self.conn_id, |conn| {
                 M conn.get_prepared_stmt(&desc_msg.name) {
                     Ok(stmt) => {
                         I stmt.has_result_columns() {
@@ -230,12 +230,12 @@ X QueryHandler {
 
     # Handle CloseStmt: close a prepared statement or portal
     F handle_close_stmt(
-        ~self,
+        mut self,
         msg: &FramedMessage,
-        pool: &~ConnectionPool,
+        pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        ~reader = msg.payload_reader();
-        ~close_msg = deserialize_close_stmt(&reader)?;
+        reader := mut msg.payload_reader();
+        close_msg := mut deserialize_close_stmt(&reader)?;
 
         I close_msg.close_type == 0x53 {
             # Close Statement
@@ -254,14 +254,14 @@ X QueryHandler {
     }
 
     # Handle Sync: mark end of extended query sequence
-    F handle_sync(~self, pool: &~ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+    F handle_sync(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
         # Clear all portals
         pool.with_connection(self.conn_id, |conn| {
             conn.clear_portals();
         })?;
 
         # Send ReadyForQuery
-        ~txn_state = pool.with_connection_ref(self.conn_id, |conn| {
+        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
             M conn.get_txn_state() {
                 TransactionState.Idle => TransactionState.Idle,
                 TransactionState.InBlock => TransactionState.InBlock,
@@ -269,13 +269,13 @@ X QueryHandler {
             }
         })?;
 
-        ~responses = Vec.new();
+        responses := mut Vec.new();
         responses.push(serialize_ready(&txn_state));
         Ok(responses)
     }
 
     # Handle Terminate: client disconnecting
-    F handle_terminate(~self, pool: &~ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+    F handle_terminate(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
         pool.remove_connection(self.conn_id);
         Ok(Vec.new())  # No response sent for terminate
     }
@@ -291,13 +291,13 @@ U server/types.ConnectionState;
 # Classify SQL string to a command tag for CommandComplete
 # Examines the first keyword to determine the command type
 F classify_sql_tag(sql: &Str) -> Str {
-    ~bytes = sql.as_bytes();
-    ~len = bytes.len();
+    bytes := mut sql.as_bytes();
+    len := mut bytes.len();
 
     # Skip leading whitespace
-    ~pos: u64 = 0;
+    pos: u64 := mut 0;
     L pos < len {
-        ~ch = bytes[pos];
+        ch := mut bytes[pos];
         I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
             pos = len;  # exit
         } E {
@@ -306,10 +306,10 @@ F classify_sql_tag(sql: &Str) -> Str {
     }
 
     # Reset pos to first non-whitespace
-    ~start: u64 = 0;
-    ~s: u64 = 0;
+    start: u64 := mut 0;
+    s: u64 := mut 0;
     L s < len {
-        ~ch = bytes[s];
+        ch := mut bytes[s];
         I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
             start = s;
             s = len;
@@ -319,9 +319,9 @@ F classify_sql_tag(sql: &Str) -> Str {
     }
 
     # Find end of first word
-    ~end = start;
+    end := mut start;
     L end < len {
-        ~ch = bytes[end];
+        ch := mut bytes[end];
         I ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 59 {
             end = end;  # found boundary, keep position
             L end < len { end = len; }  # exit outer loop
@@ -331,14 +331,14 @@ F classify_sql_tag(sql: &Str) -> Str {
     }
 
     # Extract first word and uppercase it
-    ~word = Vec.new();
-    ~w: u64 = start;
-    ~word_end = end;
+    word := mut Vec.new();
+    w: u64 := mut start;
+    word_end := mut end;
     I word_end > start + 20 {
         word_end = start + 20;  # limit to 20 chars
     }
     L w < word_end {
-        ~ch = bytes[w];
+        ch := mut bytes[w];
         # To uppercase: if 'a'-'z' (97-122), subtract 32
         I ch >= 97 && ch <= 122 {
             word.push(ch - 32);

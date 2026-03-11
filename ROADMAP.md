@@ -57,6 +57,17 @@ VaisDB solves the fundamental problem of RAG and AI agent systems: **4 databases
 | 13 | Documentation | ✅ Complete | 3/3 (100%) |
 | 14 | Code Quality | ✅ Complete | 3/3 (100%) |
 | 15 | Commit & Performance | ✅ Complete | 6/6 (100%) |
+| 16 | Vais 문법 동기화 | ✅ Complete | 2/2 (100%) |
+
+---
+
+## Phase 16: Vais 문법 동기화 (2026-03-11)
+모드: 자동진행
+- [x] 1. if-let 문법 오류 수정 — cow.vais 3곳 (impl-sonnet) ✅
+  변경: src/vector/hnsw/cow.vais (3곳 I let Some(...) → M expr { Some(...) => ..., _ => {} })
+- [x] 2. ~ → mut 키워드 마이그레이션 — 231 파일 (impl-sonnet) ✅
+  변경: 231 files, 11,254 insertions (~var→mut var, ~self→mut self, &~→&mut 전체 마이그레이션)
+진행률: 2/2 (100%)
 
 ---
 

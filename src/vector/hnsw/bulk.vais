@@ -96,19 +96,19 @@ X BulkLoadConfig {
 
     # Enable WAL bypass for faster initial load
     # WARNING: Requires checkpoint after bulk load completes
-    F with_wal_bypass(~self) -> BulkLoadConfig {
+    F with_wal_bypass(mut self) -> BulkLoadConfig {
         self.skip_wal = true;
         self
     }
 
     # Set progress reporting interval
-    F with_progress_interval(~self, interval: u64) -> BulkLoadConfig {
+    F with_progress_interval(mut self, interval: u64) -> BulkLoadConfig {
         self.progress_interval = interval;
         self
     }
 
     # Set RNG seed for deterministic layer assignment
-    F with_seed(~self, seed: u64) -> BulkLoadConfig {
+    F with_seed(mut self, seed: u64) -> BulkLoadConfig {
         self.seed = seed;
         self
     }
@@ -147,17 +147,17 @@ X BulkLoadProgress {
     }
 
     # Update phase
-    F set_phase(~self, phase: Str) {
+    F set_phase(mut self, phase: Str) {
         self.current_phase = phase;
     }
 
     # Update inserted count
-    F set_inserted(~self, count: u64) {
+    F set_inserted(mut self, count: u64) {
         self.inserted_vectors = count;
     }
 
     # Update elapsed time
-    F set_elapsed(~self, ms: u64) {
+    F set_elapsed(mut self, ms: u64) {
         self.elapsed_ms = ms;
     }
 
@@ -207,7 +207,7 @@ X BulkLoadResult {
 
     # Get human-readable summary
     F to_string(self) -> Str {
-        ~wal_status = I self.wal_skipped { "skipped" } E { "enabled" };
+        wal_status := mut I self.wal_skipped { "skipped" } E { "enabled" };
         "Bulk load completed: {self.vectors_inserted} vectors, {self.layers_built} layers, {self.elapsed_ms}ms (WAL: {wal_status})"
     }
 }
@@ -262,8 +262,8 @@ X BulkLoader {
         config.validate()?;
 
         # Initialize RNG with seed (use simple value if seed is 0)
-        ~seed = I config.seed == 0 { 12345u64 } E { config.seed };
-        ~rng = LayerRng.new(seed);
+        seed := mut I config.seed == 0 { 12345u64 } E { config.seed };
+        rng := mut LayerRng.new(seed);
 
         Ok(BulkLoader { config, rng })
     }
@@ -293,13 +293,13 @@ X BulkLoader {
     #
     # Returns: BulkLoadResult with statistics
     F bulk_insert<S: NodeStore>(
-        ~self,
+        mut self,
         vectors: &[&[f32]],
-        ~meta: HnswMeta,
-        store: &~S,
-        vector_store: &~VectorStore,
+        mut meta: HnswMeta,
+        store: &mut S,
+        vector_store: &mut VectorStore,
         distance: &DistanceComputer,
-        gcm: Option<&~GroupCommitManager>,
+        gcm: Option<&mut GroupCommitManager>,
         txn_id: u64
     ) -> Result<BulkLoadResult, VaisError> {
         # Validate inputs
@@ -313,36 +313,36 @@ X BulkLoader {
         }
 
         # Initialize progress tracking
-        ~start_time_ms = 0u64;  # In real implementation, use system time
-        ~progress = BulkLoadProgress.new(vectors.len());
+        start_time_ms := mut 0u64;  # In real implementation, use system time
+        progress := mut BulkLoadProgress.new(vectors.len());
 
         # Phase 1: Store all vectors to pages
         progress.set_phase("storing_vectors");
-        ~vector_metas = self.store_vectors_batch(
+        vector_metas := mut self.store_vectors_batch(
             vectors,
             vector_store,
             store,
             txn_id,
-            &~progress
+            &mut progress
         )?;
 
         # Phase 2: Build HNSW graph by inserting nodes sequentially
         progress.set_phase("building_index");
-        ~max_layer_built = self.build_graph(
+        max_layer_built := mut self.build_graph(
             vectors,
             &vector_metas,
-            &~meta,
+            &mut meta,
             store,
             distance,
             gcm,
             txn_id,
-            &~progress
+            &mut progress
         )?;
 
         # Phase 3: Update meta
         progress.set_phase("updating_meta");
-        ~end_time_ms = 0u64;  # In real implementation, use system time
-        ~elapsed_ms = end_time_ms - start_time_ms;
+        end_time_ms := mut 0u64;  # In real implementation, use system time
+        elapsed_ms := mut end_time_ms - start_time_ms;
         progress.set_elapsed(elapsed_ms);
 
         Ok(BulkLoadResult.new(
@@ -356,36 +356,36 @@ X BulkLoader {
     # Phase 1: Store all vectors to pages in batches
     # Returns vector metadata (node_id, layer, page_id, offset) for each vector
     F store_vectors_batch<S: NodeStore>(
-        ~self,
+        mut self,
         vectors: &[&[f32]],
-        vector_store: &~VectorStore,
-        store: &~S,
+        vector_store: &mut VectorStore,
+        store: &mut S,
         txn_id: u64,
-        progress: &~BulkLoadProgress
+        progress: &mut BulkLoadProgress
     ) -> Result<Vec<VectorMeta>, VaisError> {
-        ~vector_metas = Vec.with_capacity(vectors.len());
+        vector_metas := mut Vec.with_capacity(vectors.len());
 
         # Process vectors in batches
-        ~i = 0;
+        i := mut 0;
         L i < vectors.len() {
             # Determine batch end
-            ~batch_end = I i + self.config.batch_size < vectors.len() {
+            batch_end := mut I i + self.config.batch_size < vectors.len() {
                 i + self.config.batch_size
             } E {
                 vectors.len()
             };
 
             # Process batch
-            ~j = i;
+            j := mut i;
             L j < batch_end {
                 # Allocate node ID
-                ~node_id = store.allocate_node_id();
+                node_id := mut store.allocate_node_id();
 
                 # Assign random layer
-                ~layer = self.rng.random_layer(meta.config.m);
+                layer := mut self.rng.random_layer(meta.config.m);
 
                 # Store vector to page
-                ~(page_id, offset) = vector_store.write_vector(
+                (page_id, offset) := mut vector_store.write_vector(
                     vectors[j],
                     txn_id,
                     0  # cmd_id = 0 for bulk load
@@ -420,26 +420,26 @@ X BulkLoader {
     # Reuses hnsw_insert for each node to maintain correctness
     # Returns maximum layer built
     F build_graph<S: NodeStore>(
-        ~self,
+        mut self,
         vectors: &[&[f32]],
         vector_metas: &[VectorMeta],
-        meta: &~HnswMeta,
-        store: &~S,
+        meta: &mut HnswMeta,
+        store: &mut S,
         distance: &DistanceComputer,
-        gcm: Option<&~GroupCommitManager>,
+        gcm: Option<&mut GroupCommitManager>,
         txn_id: u64,
-        progress: &~BulkLoadProgress
+        progress: &mut BulkLoadProgress
     ) -> Result<u8, VaisError> {
-        ~max_layer = 0u8;
+        max_layer := mut 0u8;
 
         # Insert nodes one by one using hnsw_insert
-        ~i = 0;
+        i := mut 0;
         L i < vector_metas.len() {
-            ~vmeta = &vector_metas[i];
-            ~vector = vectors[vmeta.vector_index];
+            vmeta := mut &vector_metas[i];
+            vector := mut vectors[vmeta.vector_index];
 
             # Create HNSW node
-            ~node = HnswNode.new(
+            node := mut HnswNode.new(
                 vmeta.node_id,
                 vmeta.page_id,
                 vmeta.offset,
@@ -450,7 +450,7 @@ X BulkLoader {
 
             # Insert into HNSW graph
             # If skip_wal, pass None for gcm (handled by caller check)
-            ~updated_meta = I self.config.skip_wal {
+            updated_meta := mut I self.config.skip_wal {
                 # Skip WAL: create dummy GCM-like behavior
                 # In real implementation, hnsw_insert should handle Option<GCM>
                 # For now, we assume caller ensures gcm is None when skip_wal=true
@@ -506,15 +506,15 @@ X BulkLoader {
     F insert_without_wal<S: NodeStore>(
         node: HnswNode,
         vector: &[f32],
-        meta: &~HnswMeta,
+        meta: &mut HnswMeta,
         config: &HnswConfig,
-        store: &~S,
+        store: &mut S,
         distance: &DistanceComputer,
         txn_id: u64
     ) -> Result<HnswMeta, VaisError> {
         # This would be a copy of hnsw_insert logic but without WAL writes
         # For simplicity, we assume hnsw_insert can handle gcm=None
-        # In production, refactor hnsw_insert to accept Option<&~GroupCommitManager>
+        # In production, refactor hnsw_insert to accept Option<&mut GroupCommitManager>
 
         # Placeholder: return error for now
         Err(err_bulk_load_failed("WAL-free insertion not yet implemented"))
@@ -529,13 +529,13 @@ X BulkLoader {
 # Returns suggested batch size for given vector dimension and memory budget
 F calculate_optimal_batch_size(dim: u32, memory_budget_mb: u32) -> u64 {
     # Each vector: MVCC (32B) + f32 * dim
-    ~bytes_per_vector = 32 + (dim * 4);
+    bytes_per_vector := mut 32 + (dim * 4);
 
     # Convert memory budget to bytes
-    ~budget_bytes = memory_budget_mb * 1024 * 1024;
+    budget_bytes := mut memory_budget_mb * 1024 * 1024;
 
     # Calculate batch size (with 80% safety margin)
-    ~batch_size = (budget_bytes * 80 / 100) / bytes_per_vector;
+    batch_size := mut (budget_bytes * 80 / 100) / bytes_per_vector;
 
     # Clamp to reasonable range [100, 10000]
     I batch_size < 100 {
@@ -551,16 +551,16 @@ F calculate_optimal_batch_size(dim: u32, memory_budget_mb: u32) -> u64 {
 # Returns memory estimate in MB
 F estimate_bulk_load_memory(dim: u32, vector_count: u64) -> u32 {
     # Vector storage: MVCC + data
-    ~vector_storage_bytes = vector_count * (32 + (dim * 4) as u64);
+    vector_storage_bytes := mut vector_count * (32 + (dim * 4) as u64);
 
     # HNSW node storage (conservative estimate)
     # Each node: ~48B fixed + ~12B per neighbor * avg_neighbors
     # Avg neighbors ≈ M * (max_layer + 1) ≈ M * 2 for typical workloads
-    ~avg_neighbors = 32;
-    ~node_storage_bytes = vector_count * (48 + (12 * avg_neighbors));
+    avg_neighbors := mut 32;
+    node_storage_bytes := mut vector_count * (48 + (12 * avg_neighbors));
 
     # Total bytes
-    ~total_bytes = vector_storage_bytes + node_storage_bytes;
+    total_bytes := mut vector_storage_bytes + node_storage_bytes;
 
     # Convert to MB (with 20% overhead)
     ((total_bytes * 120 / 100) / (1024 * 1024)) as u32
@@ -572,7 +572,7 @@ F estimate_bulk_load_memory(dim: u32, vector_count: u64) -> u32 {
 
 #[test]
 F test_bulk_config_default() {
-    ~config = BulkLoadConfig.default();
+    config := mut BulkLoadConfig.default();
     assert_eq!(config.batch_size, 1000);
     assert_eq!(config.skip_wal, false);
     assert_eq!(config.progress_interval, 0);
@@ -581,7 +581,7 @@ F test_bulk_config_default() {
 
 #[test]
 F test_bulk_config_validation() {
-    ~config = BulkLoadConfig {
+    config := mut BulkLoadConfig {
         batch_size: 0,
         skip_wal: false,
         progress_interval: 0,
@@ -592,7 +592,7 @@ F test_bulk_config_validation() {
 
 #[test]
 F test_bulk_progress_percentage() {
-    ~progress = BulkLoadProgress.new(100);
+    progress := mut BulkLoadProgress.new(100);
     assert_eq!(progress.percentage(), 0.0);
 
     progress.set_inserted(50);
@@ -605,22 +605,22 @@ F test_bulk_progress_percentage() {
 #[test]
 F test_calculate_optimal_batch_size() {
     # For dim=128, memory budget=100MB
-    ~batch_size = calculate_optimal_batch_size(128, 100);
+    batch_size := mut calculate_optimal_batch_size(128, 100);
     assert!(batch_size >= 100);
     assert!(batch_size <= 10000);
 
     # Should increase with larger memory budget
-    ~batch_size_large = calculate_optimal_batch_size(128, 1000);
+    batch_size_large := mut calculate_optimal_batch_size(128, 1000);
     assert!(batch_size_large >= batch_size);
 }
 
 #[test]
 F test_estimate_bulk_load_memory() {
     # For 10000 vectors of dim=128
-    ~memory_mb = estimate_bulk_load_memory(128, 10000);
+    memory_mb := mut estimate_bulk_load_memory(128, 10000);
     assert!(memory_mb > 0);
 
     # Should scale with vector count
-    ~memory_mb_large = estimate_bulk_load_memory(128, 100000);
+    memory_mb_large := mut estimate_bulk_load_memory(128, 100000);
     assert!(memory_mb_large > memory_mb);
 }

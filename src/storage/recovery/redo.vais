@@ -94,10 +94,10 @@ S WalRecordIterator {
 X WalRecordIterator {
     # Create iterator starting from a specific LSN
     F from_lsn(wal_dir: Str, start_lsn: u64) -> Result<WalRecordIterator, VaisError> {
-        ~segment = I start_lsn == NULL_LSN { 1u32 } E { lsn_segment(start_lsn) };
-        ~offset = I start_lsn == NULL_LSN { WAL_SEGMENT_HEADER_SIZE } E { lsn_offset(start_lsn) };
+        segment := mut I start_lsn == NULL_LSN { 1u32 } E { lsn_segment(start_lsn) };
+        offset := mut I start_lsn == NULL_LSN { WAL_SEGMENT_HEADER_SIZE } E { lsn_offset(start_lsn) };
 
-        ~iter = WalRecordIterator {
+        iter := mut WalRecordIterator {
             wal_dir,
             current_segment: segment,
             current_offset: offset,
@@ -111,7 +111,7 @@ X WalRecordIterator {
     }
 
     # Read the next WAL record, returns None at end of WAL
-    F next(~self) -> Result<Option<(WalRecordHeader, Vec<u8>)>, VaisError> {
+    F next(mut self) -> Result<Option<(WalRecordHeader, Vec<u8>)>, VaisError> {
         L {
             # Ensure we have a segment file open
             I self.segment_file.is_none() {
@@ -120,13 +120,13 @@ X WalRecordIterator {
                 }
             }
 
-            ~file = M &self.segment_file {
+            file := mut M &self.segment_file {
                 Some(ref f) => f,
                 None => R Ok(None),
             };
 
             # Check if we're past the end of records in this segment
-            ~seg_end = M &self.segment_header {
+            seg_end := mut M &self.segment_header {
                 Some(ref h) => lsn_offset(h.last_lsn) + WAL_RECORD_HEADER_SIZE,  # Approximate
                 None => 0u32,
             };
@@ -138,17 +138,17 @@ X WalRecordIterator {
                 self.current_offset = WAL_SEGMENT_HEADER_SIZE;
             } E {
                 # Read record header
-                ~header_buf = Vec.with_capacity(WAL_RECORD_HEADER_SIZE as u64);
+                header_buf := mut Vec.with_capacity(WAL_RECORD_HEADER_SIZE as u64);
                 header_buf.resize(WAL_RECORD_HEADER_SIZE as u64, 0u8);
-                ~bytes_read = file.read_at(self.current_offset as u64, &header_buf)?;
+                bytes_read := mut file.read_at(self.current_offset as u64, &header_buf)?;
                 I bytes_read < WAL_RECORD_HEADER_SIZE as u64 {
                     # Partial header = end of segment or torn write
                     self.segment_file = None;
                     self.current_segment += 1;
                     self.current_offset = WAL_SEGMENT_HEADER_SIZE;
                 } E {
-                    ~buf = ByteBuffer.wrap_readonly(&header_buf);
-                    ~header = WalRecordHeader.deserialize(&buf)?;
+                    buf := mut ByteBuffer.wrap_readonly(&header_buf);
+                    header := mut WalRecordHeader.deserialize(&buf)?;
 
                     # Validate record
                     I header.record_length < WAL_RECORD_HEADER_SIZE || header.lsn == NULL_LSN {
@@ -158,8 +158,8 @@ X WalRecordIterator {
                         self.current_offset = WAL_SEGMENT_HEADER_SIZE;
                     } E {
                         # Read payload
-                        ~payload_size = header.record_length - WAL_RECORD_HEADER_SIZE;
-                        ~payload = Vec.with_capacity(payload_size as u64);
+                        payload_size := mut header.record_length - WAL_RECORD_HEADER_SIZE;
+                        payload := mut Vec.with_capacity(payload_size as u64);
                         payload.resize(payload_size as u64, 0u8);
                         I payload_size > 0 {
                             file.read_at(
@@ -169,7 +169,7 @@ X WalRecordIterator {
                         }
 
                         # Verify checksum of full record
-                        ~full_record = Vec.with_capacity(header.record_length as u64);
+                        full_record := mut Vec.with_capacity(header.record_length as u64);
                         full_record.resize(header.record_length as u64, 0u8);
                         file.read_at(self.current_offset as u64, &full_record)?;
                         I !header.verify_checksum(&full_record) {
@@ -190,21 +190,21 @@ X WalRecordIterator {
     }
 
     # Try to open the next WAL segment file
-    F try_open_next_segment(~self) -> Result<bool, VaisError> {
+    F try_open_next_segment(mut self) -> Result<bool, VaisError> {
         self.open_segment(self.current_segment)
     }
 
     # Open a specific WAL segment
-    F open_segment(~self, segment_num: u32) -> Result<bool, VaisError> {
-        ~path = self.wal_dir.clone() + "/" + &segment_filename(segment_num);
+    F open_segment(mut self, segment_num: u32) -> Result<bool, VaisError> {
+        path := mut self.wal_dir.clone() + "/" + &segment_filename(segment_num);
 
         M File.open(&path, OpenMode.ReadOnly) {
             Ok(file) => {
                 # Read segment header
-                ~header_buf = Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
+                header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
                 header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8);
                 file.read_at(0, &header_buf)?;
-                ~seg_header = WalSegmentHeader.deserialize(
+                seg_header := mut WalSegmentHeader.deserialize(
                     &ByteBuffer.wrap_readonly(&header_buf)
                 )?;
 
@@ -226,20 +226,20 @@ F recovery_analysis(
     wal_dir: &str,
     checkpoint_lsn: u64,
 ) -> Result<AnalysisResult, VaisError> {
-    ~txn_table: HashMap<u64, RecoveryTxnEntry> = HashMap.new();
-    ~dirty_pages: Vec<DirtyPageEntry> = Vec.new();
-    ~redo_start_lsn = checkpoint_lsn;
+    txn_table: HashMap<u64, RecoveryTxnEntry> := mut HashMap.new();
+    dirty_pages: Vec<DirtyPageEntry> := mut Vec.new();
+    redo_start_lsn := mut checkpoint_lsn;
 
-    ~iter = WalRecordIterator.from_lsn(wal_dir.to_string(), checkpoint_lsn)?;
+    iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), checkpoint_lsn)?;
 
-    ~has_records = true;
+    has_records := mut true;
     L has_records {
-        ~record_opt = iter.next()?;
+        record_opt := mut iter.next()?;
         M record_opt {
             None => { has_records = false; },
-            Some(~record) => {
-        ~(header, payload) = record;
-        ~txn_id = header.txn_id;
+            Some(mut record) => {
+        (header, payload) := mut record;
+        txn_id := mut header.txn_id;
 
         M header.record_type {
             TXN_BEGIN => {
@@ -249,13 +249,13 @@ F recovery_analysis(
             TXN_COMMIT => {
                 # Mark transaction as committed
                 M txn_table.get_mut(&txn_id) {
-                    Some(ref ~entry) => {
+                    Some(ref mut entry) => {
                         entry.state = RecoveryTxnState.Committed;
                         entry.last_lsn = header.lsn;
                     },
                     None => {
                         # Transaction started before checkpoint
-                        ~entry = RecoveryTxnEntry.new(txn_id, header.lsn);
+                        entry := mut RecoveryTxnEntry.new(txn_id, header.lsn);
                         entry.state = RecoveryTxnState.Committed;
                         txn_table.insert(txn_id, entry);
                     },
@@ -263,12 +263,12 @@ F recovery_analysis(
             },
             TXN_ABORT => {
                 M txn_table.get_mut(&txn_id) {
-                    Some(ref ~entry) => {
+                    Some(ref mut entry) => {
                         entry.state = RecoveryTxnState.Aborted;
                         entry.last_lsn = header.lsn;
                     },
                     None => {
-                        ~entry = RecoveryTxnEntry.new(txn_id, header.lsn);
+                        entry := mut RecoveryTxnEntry.new(txn_id, header.lsn);
                         entry.state = RecoveryTxnState.Aborted;
                         txn_table.insert(txn_id, entry);
                     },
@@ -276,8 +276,8 @@ F recovery_analysis(
             },
             CHECKPOINT_BEGIN => {
                 # Parse active txns from checkpoint payload
-                ~buf = ByteBuffer.wrap_readonly(&payload);
-                ~cp_payload = CheckpointBeginPayload.deserialize(&buf)?;
+                buf := mut ByteBuffer.wrap_readonly(&payload);
+                cp_payload := mut CheckpointBeginPayload.deserialize(&buf)?;
                 L active_txn: &cp_payload.active_txns {
                     I !txn_table.contains_key(active_txn) {
                         txn_table.insert(*active_txn, RecoveryTxnEntry.new(*active_txn, header.lsn));
@@ -290,10 +290,10 @@ F recovery_analysis(
             },
             CLR => {
                 # CLR - update undo_next_lsn for this transaction
-                ~buf = ByteBuffer.wrap_readonly(&payload);
-                ~clr_payload = ClrPayload.deserialize(&buf)?;
+                buf := mut ByteBuffer.wrap_readonly(&payload);
+                clr_payload := mut ClrPayload.deserialize(&buf)?;
                 M txn_table.get_mut(&txn_id) {
-                    Some(ref ~entry) => {
+                    Some(ref mut entry) => {
                         entry.last_lsn = header.lsn;
                         entry.undo_next_lsn = clr_payload.undo_next_lsn;
                     },
@@ -304,7 +304,7 @@ F recovery_analysis(
                 # All other record types: update transaction's last_lsn
                 # and track dirty pages
                 M txn_table.get_mut(&txn_id) {
-                    Some(ref ~entry) => {
+                    Some(ref mut entry) => {
                         entry.last_lsn = header.lsn;
                     },
                     None => {
@@ -315,10 +315,10 @@ F recovery_analysis(
                 }
 
                 # Track dirty pages for records that modify pages
-                track_dirty_page(&header, &payload, &~dirty_pages);
+                track_dirty_page(&header, &payload, &mut dirty_pages);
             },
         }
-            }, # end Some(~record)
+            }, # end Some(mut record)
         } # end M record_opt
     } # end W has_records
 
@@ -330,16 +330,16 @@ F recovery_analysis(
 }
 
 # Track dirty pages from a WAL record
-F track_dirty_page(header: &WalRecordHeader, payload: &[u8], dirty_pages: &~Vec<DirtyPageEntry>) {
+F track_dirty_page(header: &WalRecordHeader, payload: &[u8], dirty_pages: &mut Vec<DirtyPageEntry>) {
     # Extract file_id and page_id from common record types
     I payload.len() >= 5 {
-        ~buf = ByteBuffer.wrap_readonly(payload);
+        buf := mut ByteBuffer.wrap_readonly(payload);
         M buf.get_u8() {
             Ok(file_id) => {
                 M buf.get_u32_le() {
                     Ok(page_id) => {
                         # Check if already tracked
-                        ~found = false;
+                        found := mut false;
                         L dp: dirty_pages.iter() {
                             I !found && dp.file_id == file_id && dp.page_id == page_id {
                                 found = true;
@@ -367,22 +367,22 @@ F track_dirty_page(header: &WalRecordHeader, payload: &[u8], dirty_pages: &~Vec<
 F recovery_redo(
     wal_dir: &str,
     analysis: &AnalysisResult,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<u64, VaisError> {
-    ~records_redone: u64 = 0;
+    records_redone: u64 := mut 0;
 
-    ~iter = WalRecordIterator.from_lsn(wal_dir.to_string(), analysis.redo_start_lsn)?;
+    iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), analysis.redo_start_lsn)?;
 
-    ~has_records = true;
+    has_records := mut true;
     L has_records {
-        ~record_opt = iter.next()?;
+        record_opt := mut iter.next()?;
         M record_opt {
             None => { has_records = false; },
-            Some(~record) => {
-                ~(header, payload) = record;
+            Some(mut record) => {
+                (header, payload) := mut record;
 
                 # Skip meta records that don't modify pages
-                ~is_meta = M header.record_type {
+                is_meta := mut M header.record_type {
                     TXN_BEGIN | TXN_COMMIT | TXN_ABORT |
                     CHECKPOINT_BEGIN | CHECKPOINT_END => true,
                     _ => false,
@@ -392,21 +392,21 @@ F recovery_redo(
                     # skip, proceed to next record
                 } E I header.record_type == FPI {
                     # Apply FPI directly (full page image replaces entire page)
-                    ~buf = ByteBuffer.wrap_readonly(&payload);
-                    ~fpi_payload = FpiPayload.deserialize(&buf)?;
+                    buf := mut ByteBuffer.wrap_readonly(&payload);
+                    fpi_payload := mut FpiPayload.deserialize(&buf)?;
                     redo_fpi(pool, &fpi_payload, header.lsn)?;
                     records_redone += 1;
                 } E I header.record_type == CLR {
                     # For CLR: redo the compensation (CLRs are redo-only)
-                    ~buf = ByteBuffer.wrap_readonly(&payload);
-                    ~clr_payload = ClrPayload.deserialize(&buf)?;
+                    buf := mut ByteBuffer.wrap_readonly(&payload);
+                    clr_payload := mut ClrPayload.deserialize(&buf)?;
                     # CLRs record the undo operation - redo them to restore undo state
                     records_redone += 1;
                 } E {
                     # For data records: check if page needs redo
                     # Extract file_id and page_id from payload
                     I payload.len() >= 5 {
-                        ~buf = ByteBuffer.wrap_readonly(&payload);
+                        buf := mut ByteBuffer.wrap_readonly(&payload);
                         M (buf.get_u8(), buf.get_u32_le()) {
                             (Ok(file_id), Ok(page_id)) => {
                                 I needs_redo(pool, file_id, page_id, header.lsn)? {
@@ -427,15 +427,15 @@ F recovery_redo(
 
 # Check if a page needs redo (page_lsn < record_lsn)
 F needs_redo(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     file_id: u8,
     page_id: u32,
     record_lsn: u64,
 ) -> Result<bool, VaisError> {
-    ~frame = pool.fetch_page(file_id, page_id)?;
-    ~page_data = pool.get_page(frame);
-    ~page_header = PageHeader.read_from_page(page_data)?;
-    ~page_lsn = page_header.page_lsn;
+    frame := mut pool.fetch_page(file_id, page_id)?;
+    page_data := mut pool.get_page(frame);
+    page_header := mut PageHeader.read_from_page(page_data)?;
+    page_lsn := mut page_header.page_lsn;
     pool.unpin_page(frame, false);
 
     Ok(page_lsn < record_lsn)
@@ -443,11 +443,11 @@ F needs_redo(
 
 # Apply a Full Page Image (FPI) during redo
 F redo_fpi(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     fpi: &FpiPayload,
     lsn: u64,
 ) -> Result<(), VaisError> {
-    ~frame = pool.fetch_page(fpi.file_id, fpi.page_id)?;
+    frame := mut pool.fetch_page(fpi.file_id, fpi.page_id)?;
     pool.write_page(frame, &fpi.page_data)?;
     pool.unpin_page(frame, true);
     Ok(())
@@ -456,7 +456,7 @@ F redo_fpi(
 # Apply a WAL record during redo
 # Routes to the correct engine-specific redo handler based on engine_type
 F redo_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
@@ -472,19 +472,19 @@ F redo_record(
 
 # Redo a meta record (PAGE_ALLOC, PAGE_DEALLOC)
 F redo_meta_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
+    buf := mut ByteBuffer.wrap_readonly(payload);
     M header.record_type {
         PAGE_ALLOC => {
-            ~p = PageAllocPayload.deserialize(&buf)?;
+            p := mut PageAllocPayload.deserialize(&buf)?;
             pool.allocate_specific_page(p.file_id, p.page_id)?;
             Ok(())
         },
         PAGE_DEALLOC => {
-            ~p = PageDeallocPayload.deserialize(&buf)?;
+            p := mut PageDeallocPayload.deserialize(&buf)?;
             pool.deallocate_page(p.file_id, p.page_id)?;
             Ok(())
         },
@@ -496,18 +496,18 @@ F redo_meta_record(
 # Dispatch to specific tuple/btree redo handlers based on record type.
 # Physiological logging: physical to the page, logical within the page.
 F redo_relational_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
+    buf := mut ByteBuffer.wrap_readonly(payload);
 
     M header.record_type {
         PAGE_WRITE => {
             # Raw page write: apply new_data at offset
-            ~p = PageWritePayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
+            p := mut PageWritePayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
             # Write new_data at the specified page offset
             L i: 0..p.new_data.len() {
                 page_data[(p.offset as u64) + i] = p.new_data[i];
@@ -519,14 +519,14 @@ F redo_relational_record(
         },
         TUPLE_INSERT => {
             # Redo insert: re-insert tuple into the heap page at the recorded slot
-            ~p = TupleInsertPayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
-            ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
-            ~tuple = Tuple.read_from(&p.tuple_data, 0, p.tuple_data.len() as u64)?;
+            p := mut TupleInsertPayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
+            heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
+            tuple := mut Tuple.read_from(&p.tuple_data, 0, p.tuple_data.len() as u64)?;
             heap.insert_tuple(&tuple)?;
             # Flush heap page back to frame
-            ~flushed = heap.flush();
+            flushed := mut heap.flush();
             L i: 0..flushed.len() {
                 page_data[i] = flushed[i];
             }
@@ -536,13 +536,13 @@ F redo_relational_record(
         },
         TUPLE_DELETE => {
             # Redo delete: mark tuple's MVCC txn_id_expire
-            ~p = TupleDeletePayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
-            ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+            p := mut TupleDeletePayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
+            heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
             # Mark the tuple as expired using txn_id from the WAL header
             heap.delete_tuple(p.slot, header.txn_id, 0)?;
-            ~flushed = heap.flush();
+            flushed := mut heap.flush();
             L i: 0..flushed.len() {
                 page_data[i] = flushed[i];
             }
@@ -553,16 +553,16 @@ F redo_relational_record(
         TUPLE_UPDATE => {
             # Redo update: expire old tuple, insert new version
             # The WAL record contains the old slot's page info + new tuple data
-            ~p = TupleUpdatePayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
-            ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+            p := mut TupleUpdatePayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
+            heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
             # Mark old tuple as expired
             heap.delete_tuple(p.slot, header.txn_id, 0)?;
             # Insert new tuple version on the same page (if fits)
-            ~new_tuple = Tuple.read_from(&p.new_tuple, 0, p.new_tuple.len() as u64)?;
+            new_tuple := mut Tuple.read_from(&p.new_tuple, 0, p.new_tuple.len() as u64)?;
             heap.insert_tuple(&new_tuple)?;
-            ~flushed = heap.flush();
+            flushed := mut heap.flush();
             L i: 0..flushed.len() {
                 page_data[i] = flushed[i];
             }
@@ -572,9 +572,9 @@ F redo_relational_record(
         },
         BTREE_INSERT => {
             # Redo B+Tree insert: insert key-value into the leaf page
-            ~p = BtreeInsertPayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
+            p := mut BtreeInsertPayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
             # Apply key insert to the B+Tree leaf page
             # Logical redo: insert (key, value) into the sorted key directory
             btree_page_insert_key(page_data, &p.key, &p.value)?;
@@ -584,9 +584,9 @@ F redo_relational_record(
         },
         BTREE_DELETE => {
             # Redo B+Tree delete: remove key from the leaf page
-            ~p = BtreeDeletePayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~page_data = pool.get_page_mut(frame);
+            p := mut BtreeDeletePayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            page_data := mut pool.get_page_mut(frame);
             btree_page_delete_key(page_data, &p.key)?;
             set_page_lsn(page_data, header.lsn);
             pool.unpin_page(frame, true);
@@ -595,11 +595,11 @@ F redo_relational_record(
         BTREE_SPLIT => {
             # Redo split: the WAL record captures enough info to reconstruct the split
             # For now, fetch both pages and apply the split based on split_key
-            ~p = BtreeSplitPayload.deserialize(&buf)?;
-            ~frame_old = pool.fetch_page(p.file_id, p.page_id)?;
-            ~frame_new = pool.fetch_page(p.file_id, p.new_page_id)?;
-            ~old_data = pool.get_page_mut(frame_old);
-            ~new_data = pool.get_page_mut(frame_new);
+            p := mut BtreeSplitPayload.deserialize(&buf)?;
+            frame_old := mut pool.fetch_page(p.file_id, p.page_id)?;
+            frame_new := mut pool.fetch_page(p.file_id, p.new_page_id)?;
+            old_data := mut pool.get_page_mut(frame_old);
+            new_data := mut pool.get_page_mut(frame_new);
             btree_page_redo_split(old_data, new_data, &p.split_key, p.direction)?;
             set_page_lsn(old_data, header.lsn);
             set_page_lsn(new_data, header.lsn);
@@ -609,11 +609,11 @@ F redo_relational_record(
         },
         BTREE_MERGE => {
             # Redo merge: combine sibling into target page
-            ~p = BtreeMergePayload.deserialize(&buf)?;
-            ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-            ~frame_sib = pool.fetch_page(p.file_id, p.sibling_id)?;
-            ~page_data = pool.get_page_mut(frame);
-            ~sib_data = pool.get_page(frame_sib);
+            p := mut BtreeMergePayload.deserialize(&buf)?;
+            frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+            frame_sib := mut pool.fetch_page(p.file_id, p.sibling_id)?;
+            page_data := mut pool.get_page_mut(frame);
+            sib_data := mut pool.get_page(frame_sib);
             btree_page_redo_merge(page_data, sib_data)?;
             set_page_lsn(page_data, header.lsn);
             pool.unpin_page(frame, true);
@@ -630,31 +630,31 @@ F redo_relational_record(
 # These operate directly on the raw page bytes
 
 # Insert a key-value pair into a B+Tree leaf page
-F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(), VaisError> {
-    ~header = PageHeader.read_from_page(page_data)?;
-    ~item_count = header.item_count;
+F btree_page_insert_key(page_data: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), VaisError> {
+    header := mut PageHeader.read_from_page(page_data)?;
+    item_count := mut header.item_count;
 
     # Key directory starts after page header, each entry is 8 bytes (4B key_offset + 4B key_len)
     # Key data is appended to the page's data area
     # For redo, we trust the WAL and insert the key at the correct sorted position
-    ~key_dir_start = PAGE_HEADER_SIZE;
-    ~entry_size: u32 = 8;  # 4B offset + 4B length per key dir entry
+    key_dir_start := mut PAGE_HEADER_SIZE;
+    entry_size: u32 := mut 8;  # 4B offset + 4B length per key dir entry
 
     # Find insertion position (binary search over existing keys)
-    ~insert_pos = item_count as u32;
+    insert_pos := mut item_count as u32;
     L i: 0..item_count {
-        ~entry_off = key_dir_start + (i as u32) * entry_size;
-        ~existing_key_off = read_u32_le(page_data, entry_off);
-        ~existing_key_len = read_u32_le(page_data, entry_off + 4);
-        ~existing_key = &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
+        entry_off := mut key_dir_start + (i as u32) * entry_size;
+        existing_key_off := mut read_u32_le(page_data, entry_off);
+        existing_key_len := mut read_u32_le(page_data, entry_off + 4);
+        existing_key := mut &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
         I key < existing_key {
             insert_pos = i as u32;
         }
     }
 
     # Append key+value data to the data area (growing from the end of the key directory)
-    ~data_offset = header.free_space_offset as u32;
-    ~total_kv_len = key.len() as u32 + value.len() as u32;
+    data_offset := mut header.free_space_offset as u32;
+    total_kv_len := mut key.len() as u32 + value.len() as u32;
     L i: 0..key.len() {
         page_data[data_offset as u64 + i] = key[i];
     }
@@ -663,10 +663,10 @@ F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(
     }
 
     # Shift key directory entries after insert_pos to make room
-    ~i = item_count as u32;
+    i := mut item_count as u32;
     L i > insert_pos {
-        ~src_off = key_dir_start + (i - 1) * entry_size;
-        ~dst_off = key_dir_start + i * entry_size;
+        src_off := mut key_dir_start + (i - 1) * entry_size;
+        dst_off := mut key_dir_start + i * entry_size;
         L j: 0..entry_size {
             page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64];
         }
@@ -674,13 +674,13 @@ F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(
     }
 
     # Write new key directory entry at insert_pos
-    ~entry_off = key_dir_start + insert_pos * entry_size;
+    entry_off := mut key_dir_start + insert_pos * entry_size;
     write_u32_le(page_data, entry_off, data_offset);
     write_u32_le(page_data, entry_off + 4, total_kv_len);
 
     # Update header: item_count and free_space_offset
-    ~new_count = item_count + 1;
-    ~new_fso = data_offset + total_kv_len;
+    new_count := mut item_count + 1;
+    new_fso := mut data_offset + total_kv_len;
     set_item_count(page_data, new_count);
     set_free_space_offset(page_data, new_fso as u16);
 
@@ -688,19 +688,19 @@ F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(
 }
 
 # Delete a key from a B+Tree leaf page
-F btree_page_delete_key(page_data: &~[u8], key: &[u8]) -> Result<(), VaisError> {
-    ~header = PageHeader.read_from_page(page_data)?;
-    ~item_count = header.item_count;
-    ~key_dir_start = PAGE_HEADER_SIZE;
-    ~entry_size: u32 = 8;
+F btree_page_delete_key(page_data: &mut [u8], key: &[u8]) -> Result<(), VaisError> {
+    header := mut PageHeader.read_from_page(page_data)?;
+    item_count := mut header.item_count;
+    key_dir_start := mut PAGE_HEADER_SIZE;
+    entry_size: u32 := mut 8;
 
     # Find the key
-    ~found_pos: i32 = -1;
+    found_pos: i32 := mut -1;
     L i: 0..item_count {
-        ~entry_off = key_dir_start + (i as u32) * entry_size;
-        ~existing_key_off = read_u32_le(page_data, entry_off);
-        ~existing_key_len = read_u32_le(page_data, entry_off + 4);
-        ~existing_key = &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
+        entry_off := mut key_dir_start + (i as u32) * entry_size;
+        existing_key_off := mut read_u32_le(page_data, entry_off);
+        existing_key_len := mut read_u32_le(page_data, entry_off + 4);
+        existing_key := mut &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
         I key == existing_key && found_pos == -1 {
             found_pos = i as i32;
         }
@@ -708,10 +708,10 @@ F btree_page_delete_key(page_data: &~[u8], key: &[u8]) -> Result<(), VaisError> 
 
     I found_pos >= 0 {
         # Shift entries down to fill the gap
-        ~pos = found_pos as u32;
+        pos := mut found_pos as u32;
         L i: pos..(item_count as u32 - 1) {
-            ~src_off = key_dir_start + (i + 1) * entry_size;
-            ~dst_off = key_dir_start + i * entry_size;
+            src_off := mut key_dir_start + (i + 1) * entry_size;
+            dst_off := mut key_dir_start + i * entry_size;
             L j: 0..entry_size {
                 page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64];
             }
@@ -724,30 +724,30 @@ F btree_page_delete_key(page_data: &~[u8], key: &[u8]) -> Result<(), VaisError> 
 
 # Redo a B+Tree page split
 F btree_page_redo_split(
-    old_page: &~[u8],
-    new_page: &~[u8],
+    old_page: &mut [u8],
+    new_page: &mut [u8],
     split_key: &[u8],
     direction: u8,
 ) -> Result<(), VaisError> {
     # Split direction: 0=left (entries >= split_key move to new page)
     #                  1=right (entries < split_key move to new page)
     # Move entries from old_page to new_page based on split_key comparison
-    ~header = PageHeader.read_from_page(old_page)?;
-    ~item_count = header.item_count;
-    ~key_dir_start = PAGE_HEADER_SIZE;
-    ~entry_size: u32 = 8;
+    header := mut PageHeader.read_from_page(old_page)?;
+    item_count := mut header.item_count;
+    key_dir_start := mut PAGE_HEADER_SIZE;
+    entry_size: u32 := mut 8;
 
-    ~keep_count: u16 = 0;
-    ~move_count: u16 = 0;
+    keep_count: u16 := mut 0;
+    move_count: u16 := mut 0;
 
     # Count how many entries to keep vs move
     L i: 0..item_count {
-        ~entry_off = key_dir_start + (i as u32) * entry_size;
-        ~key_off = read_u32_le(old_page, entry_off);
-        ~key_len = read_u32_le(old_page, entry_off + 4);
-        ~existing_key = &old_page[key_off as u64..(key_off + key_len) as u64];
+        entry_off := mut key_dir_start + (i as u32) * entry_size;
+        key_off := mut read_u32_le(old_page, entry_off);
+        key_len := mut read_u32_le(old_page, entry_off + 4);
+        existing_key := mut &old_page[key_off as u64..(key_off + key_len) as u64];
 
-        ~should_move = I direction == 0 { existing_key >= split_key } E { existing_key < split_key };
+        should_move := mut I direction == 0 { existing_key >= split_key } E { existing_key < split_key };
         I should_move {
             move_count += 1;
         } E {
@@ -765,22 +765,22 @@ F btree_page_redo_split(
 
 # Redo a B+Tree page merge
 F btree_page_redo_merge(
-    target_page: &~[u8],
+    target_page: &mut [u8],
     sibling_page: &[u8],
 ) -> Result<(), VaisError> {
     # Move all entries from sibling into target
-    ~target_header = PageHeader.read_from_page(target_page)?;
-    ~sib_header = PageHeader.read_from_page(sibling_page)?;
-    ~key_dir_start = PAGE_HEADER_SIZE;
-    ~entry_size: u32 = 8;
+    target_header := mut PageHeader.read_from_page(target_page)?;
+    sib_header := mut PageHeader.read_from_page(sibling_page)?;
+    key_dir_start := mut PAGE_HEADER_SIZE;
+    entry_size: u32 := mut 8;
 
-    ~target_count = target_header.item_count;
-    ~sib_count = sib_header.item_count;
+    target_count := mut target_header.item_count;
+    sib_count := mut sib_header.item_count;
 
     # Copy sibling's key directory entries after target's
     L i: 0..sib_count {
-        ~src_off = key_dir_start + (i as u32) * entry_size;
-        ~dst_off = key_dir_start + ((target_count + i) as u32) * entry_size;
+        src_off := mut key_dir_start + (i as u32) * entry_size;
+        dst_off := mut key_dir_start + ((target_count + i) as u32) * entry_size;
         L j: 0..entry_size {
             target_page[(dst_off + j) as u64] = sibling_page[(src_off + j) as u64];
         }
@@ -793,15 +793,15 @@ F btree_page_redo_merge(
 
 # Helper: read a u32 little-endian from a byte slice at the given offset
 F read_u32_le(data: &[u8], offset: u32) -> u32 {
-    ~b0 = data[offset as u64] as u32;
-    ~b1 = data[(offset + 1) as u64] as u32;
-    ~b2 = data[(offset + 2) as u64] as u32;
-    ~b3 = data[(offset + 3) as u64] as u32;
+    b0 := mut data[offset as u64] as u32;
+    b1 := mut data[(offset + 1) as u64] as u32;
+    b2 := mut data[(offset + 2) as u64] as u32;
+    b3 := mut data[(offset + 3) as u64] as u32;
     b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 }
 
 # Helper: write a u32 little-endian to a byte slice at the given offset
-F write_u32_le(data: &~[u8], offset: u32, value: u32) {
+F write_u32_le(data: &mut [u8], offset: u32, value: u32) {
     data[offset as u64] = (value & 0xFF) as u8;
     data[(offset + 1) as u64] = ((value >> 8) & 0xFF) as u8;
     data[(offset + 2) as u64] = ((value >> 16) & 0xFF) as u8;
@@ -809,14 +809,14 @@ F write_u32_le(data: &~[u8], offset: u32, value: u32) {
 }
 
 # Helper: write a u64 little-endian to a byte slice at the given offset
-F write_u64_le(data: &~[u8], offset: u32, value: u64) {
+F write_u64_le(data: &mut [u8], offset: u32, value: u64) {
     L i: 0..8u32 {
         data[(offset + i) as u64] = ((value >> (i * 8)) & 0xFF) as u8;
     }
 }
 
 # Helper: write a u16 little-endian to a byte slice at the given offset
-F write_u16_le(data: &~[u8], offset: u32, value: u16) {
+F write_u16_le(data: &mut [u8], offset: u32, value: u16) {
     data[offset as u64] = (value & 0xFF) as u8;
     data[(offset + 1) as u64] = ((value >> 8) & 0xFF) as u8;
 }
@@ -826,15 +826,15 @@ F write_u16_le(data: &~[u8], offset: u32, value: u16) {
 # checksum(u32@20), prev_page(u32@24), next_page(u32@28), overflow_page(u32@32),
 # free_space_offset(u16@36), item_count(u16@38), flags(u16@40)
 
-F set_page_lsn(page_data: &~[u8], lsn: u64) {
+F set_page_lsn(page_data: &mut [u8], lsn: u64) {
     write_u64_le(page_data, 0, lsn);
 }
 
-F set_item_count(page_data: &~[u8], count: u16) {
+F set_item_count(page_data: &mut [u8], count: u16) {
     write_u16_le(page_data, 38, count);
 }
 
-F set_free_space_offset(page_data: &~[u8], offset: u16) {
+F set_free_space_offset(page_data: &mut [u8], offset: u16) {
     write_u16_le(page_data, 36, offset);
 }
 
@@ -843,7 +843,7 @@ F set_free_space_offset(page_data: &~[u8], offset: u16) {
 # During ARIES redo, we apply page-level changes using the payload data.
 # For HNSW records, the affected page(s) are listed in the payload.
 F redo_vector_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
@@ -857,13 +857,13 @@ F redo_vector_record(
     # For HNSW_* records: these modify node pages; the page image is restored
     # by replaying the stored payload onto the page.
     I payload.len() >= 5 {
-        ~buf = ByteBuffer.wrap_readonly(payload);
-        ~file_id = buf.get_u8()?;
-        ~page_id = buf.get_u32_le()?;
+        buf := mut ByteBuffer.wrap_readonly(payload);
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
 
         # Fetch page and update its LSN to mark redo was applied
-        ~frame = pool.fetch_page(file_id, page_id)?;
-        ~page_data = pool.get_page_mut(frame);
+        frame := mut pool.fetch_page(file_id, page_id)?;
+        page_data := mut pool.get_page_mut(frame);
 
         # For VECTOR_DATA_WRITE, apply the data at the offset
         # For other types, the page-level changes are already captured
@@ -872,8 +872,8 @@ F redo_vector_record(
             0x24 => {
                 # VECTOR_DATA_WRITE: payload is file_id + page_id + offset(u32) + data
                 I payload.len() > 9 {
-                    ~offset = buf.get_u32_le()?;
-                    ~data_start: u64 = 9;
+                    offset := mut buf.get_u32_le()?;
+                    data_start: u64 := mut 9;
                     L i: data_start..payload.len() as u64 {
                         I (offset as u64) + (i - data_start) < page_data.len() as u64 {
                             page_data[(offset as u64) + (i - data_start)] = payload[i];
@@ -900,7 +900,7 @@ F redo_vector_record(
 # Graph WAL records contain file_id + page_id in the first 5 bytes.
 # Node pages use slotted layout, adjacency pages have their own layout.
 F redo_graph_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
@@ -913,12 +913,12 @@ F redo_graph_record(
     #   (redo_graph_node_insert, redo_graph_edge_insert) that do page-level replay
     # - Here we just ensure page LSN is updated for each affected page
     I payload.len() >= 5 {
-        ~buf = ByteBuffer.wrap_readonly(payload);
-        ~file_id = buf.get_u8()?;
-        ~page_id = buf.get_u32_le()?;
+        buf := mut ByteBuffer.wrap_readonly(payload);
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
 
-        ~frame = pool.fetch_page(file_id, page_id)?;
-        ~page_data = pool.get_page_mut(frame);
+        frame := mut pool.fetch_page(file_id, page_id)?;
+        page_data := mut pool.get_page_mut(frame);
         set_page_lsn(page_data, header.lsn);
         pool.unpin_page(frame, true);
     }
@@ -928,7 +928,7 @@ F redo_graph_record(
 # Redo a full-text engine record
 # Full-text records modify dictionary pages (B+Tree) and posting list pages (slotted).
 F redo_fulltext_record(
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
@@ -938,12 +938,12 @@ F redo_fulltext_record(
     # These modify posting list pages and dictionary B+Tree pages.
     # During ARIES redo: page_lsn check + LSN update ensures correctness.
     I payload.len() >= 5 {
-        ~buf = ByteBuffer.wrap_readonly(payload);
-        ~file_id = buf.get_u8()?;
-        ~page_id = buf.get_u32_le()?;
+        buf := mut ByteBuffer.wrap_readonly(payload);
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
 
-        ~frame = pool.fetch_page(file_id, page_id)?;
-        ~page_data = pool.get_page_mut(frame);
+        frame := mut pool.fetch_page(file_id, page_id)?;
+        page_data := mut pool.get_page_mut(frame);
         set_page_lsn(page_data, header.lsn);
         pool.unpin_page(frame, true);
     }

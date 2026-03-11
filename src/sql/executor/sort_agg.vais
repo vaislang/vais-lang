@@ -42,12 +42,12 @@ X SortExecutor {
         }
     }
 
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         self.input.open()?;
 
         # Materialize all input rows
-        ~rows = Vec.new();
-        ~has_more = true;
+        rows := mut Vec.new();
+        has_more := mut true;
         L has_more {
             M self.input.next()? {
                 Option.Some(exec_row) => {
@@ -67,7 +67,7 @@ X SortExecutor {
         Result.Ok(())
     }
 
-    F next(~self) -> Result<Option<ExecutorRow>, VaisError> {
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         M &self.materialized {
             Option.None => {
                 Result.Err(VaisError.new("VAIS-E0105001", "SortExecutor not opened"))
@@ -76,7 +76,7 @@ X SortExecutor {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
                 } E {
-                    ~row = &rows[self.cursor];
+                    row := mut &rows[self.cursor];
                     self.cursor += 1;
                     self.stats.add_produced();
                     Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
@@ -85,7 +85,7 @@ X SortExecutor {
         }
     }
 
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         self.materialized = Option.None;
         self.cursor = 0;
         self.input.close()?;
@@ -100,23 +100,23 @@ X SortExecutor {
     F compare_rows(self, a: &Row, b: &Row) -> i32 {
         L item: &self.order_items {
             # Evaluate sort key for both rows
-            ~val_a = M eval_expr(&item.expr, a, &self.eval_ctx) {
+            val_a := mut M eval_expr(&item.expr, a, &self.eval_ctx) {
                 Result.Ok(v) => v,
                 Result.Err(_) => SqlValue.Null,  # Treat eval errors as NULL
             };
 
-            ~val_b = M eval_expr(&item.expr, b, &self.eval_ctx) {
+            val_b := mut M eval_expr(&item.expr, b, &self.eval_ctx) {
                 Result.Ok(v) => v,
                 Result.Err(_) => SqlValue.Null,
             };
 
             # Determine nulls_first (default: NULLS LAST for ASC, NULLS FIRST for DESC)
-            ~nulls_first = M item.nulls_first {
+            nulls_first := mut M item.nulls_first {
                 Option.Some(nf) => nf,
                 Option.None => !item.asc,
             };
 
-            ~cmp = order_by_compare(&val_a, &val_b, item.asc, Option.Some(nulls_first));
+            cmp := mut order_by_compare(&val_a, &val_b, item.asc, Option.Some(nulls_first));
             I cmp != 0 {
                 R cmp;
             }
@@ -145,7 +145,7 @@ S AggGroup {
 
 X AggGroup {
     F new(key_values: Vec<SqlValue>, agg_count: u64) -> AggGroup {
-        ~accumulators = Vec.with_capacity(agg_count);
+        accumulators := mut Vec.with_capacity(agg_count);
         L _: 0..agg_count {
             accumulators.push(AggAccumulator.Count { count: 0 });  # Default; overwritten by caller
         }
@@ -203,13 +203,13 @@ X AggregateExecutor {
         }
     }
 
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         self.input.open()?;
 
-        ~groups = HashMap.new();
+        groups := mut HashMap.new();
 
         # Initialize DISTINCT tracking for each aggregate if needed
-        ~distinct_sets: Vec<Option<HashSet<u64>>> = Vec.new();
+        distinct_sets: Vec<Option<HashSet<u64>>> := mut Vec.new();
         L spec: &self.agg_specs {
             I spec.is_distinct {
                 distinct_sets.push(Option.Some(HashSet.new()));
@@ -219,23 +219,23 @@ X AggregateExecutor {
         }
 
         # Process all input rows
-        ~has_more = true;
+        has_more := mut true;
         L has_more {
             M self.input.next()? {
                 Option.None => { has_more = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1);
-                    ~row = exec_row.get_row();
+                    row := mut exec_row.get_row();
 
                     # Evaluate group key
-                    ~group_key_values = Vec.new();
+                    group_key_values := mut Vec.new();
                     L expr: &self.group_exprs {
-                        ~val = eval_expr(expr, row, &self.eval_ctx)?;
+                        val := mut eval_expr(expr, row, &self.eval_ctx)?;
                         group_key_values.push(val);
                     }
 
                     # Hash group key
-                    ~hash = I group_key_values.is_empty() {
+                    hash := mut I group_key_values.is_empty() {
                         0  # No GROUP BY: single group
                     } E {
                         group_key_hash(&group_key_values)
@@ -245,28 +245,28 @@ X AggregateExecutor {
                     I !groups.contains_key(&hash) {
                         groups.insert(hash, AggGroup.new(group_key_values.clone(), self.agg_specs.len()));
                     }
-                    ~group = groups.get_mut(&hash)!;
+                    group := mut groups.get_mut(&hash)!;
 
                     # Update COUNT(*)
                     group.count_star += 1;
 
                     # Update each aggregate
                     L i: 0..self.agg_specs.len() {
-                        ~spec = &self.agg_specs[i];
+                        spec := mut &self.agg_specs[i];
 
                         # Evaluate aggregate argument
-                        ~arg_val = M &spec.arg_expr {
+                        arg_val := mut M &spec.arg_expr {
                             Expr.Star => SqlValue.IntVal { v: 1 },  # COUNT(*) uses dummy value
                             _ => eval_expr(&spec.arg_expr, row, &self.eval_ctx)?,
                         };
 
                         # Check DISTINCT
-                        ~should_skip = false;
+                        should_skip := mut false;
                         I spec.is_distinct {
-                            M &~distinct_sets[i] {
+                            M &mut distinct_sets[i] {
                                 Option.Some(set) => {
                                     # Hash the value for DISTINCT tracking
-                                    ~val_hash = group_key_hash(&[arg_val.clone()]);
+                                    val_hash := mut group_key_hash(&[arg_val.clone()]);
                                     I set.contains(&val_hash) {
                                         should_skip = true;  # Already seen this value
                                     } E {
@@ -291,7 +291,7 @@ X AggregateExecutor {
         Result.Ok(())
     }
 
-    F next(~self) -> Result<Option<ExecutorRow>, VaisError> {
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         # Lazy convert HashMap to Vec on first next() call
         I self.group_iter.is_none() {
             M &self.groups {
@@ -299,7 +299,7 @@ X AggregateExecutor {
                     R Result.Err(VaisError.new("VAIS-E0105002", "AggregateExecutor not opened"));
                 },
                 Option.Some(groups) => {
-                    ~group_vec = Vec.new();
+                    group_vec := mut Vec.new();
                     L (_, group): groups {
                         group_vec.push(group.clone());
                     }
@@ -316,11 +316,11 @@ X AggregateExecutor {
                         R Result.Ok(Option.None);
                     }
 
-                    ~group = &groups[self.cursor];
+                    group := mut &groups[self.cursor];
                     self.cursor += 1;
 
                     # Build result row: group_key_values + aggregate_results
-                    ~result_values = Vec.new();
+                    result_values := mut Vec.new();
 
                     # Add group key columns
                     L val: &group.key_values {
@@ -329,12 +329,12 @@ X AggregateExecutor {
 
                     # Add aggregate results
                     L i: 0..self.agg_specs.len() {
-                        ~spec = &self.agg_specs[i];
-                        ~agg_val = self.finalize_accumulator(group, i, &spec.func_name)?;
+                        spec := mut &self.agg_specs[i];
+                        agg_val := mut self.finalize_accumulator(group, i, &spec.func_name)?;
                         result_values.push(agg_val);
                     }
 
-                    ~result_row = Row.new(result_values);
+                    result_row := mut Row.new(result_values);
 
                     # Apply HAVING filter
                     M &self.having {
@@ -343,7 +343,7 @@ X AggregateExecutor {
                             R Result.Ok(Option.Some(ExecutorRow.virtual(result_row)));
                         },
                         Option.Some(having_expr) => {
-                            ~passed = M eval_expr(having_expr, &result_row, &self.eval_ctx)? {
+                            passed := mut M eval_expr(having_expr, &result_row, &self.eval_ctx)? {
                                 SqlValue.BoolVal { v: b } => b,
                                 _ => false,
                             };
@@ -360,7 +360,7 @@ X AggregateExecutor {
         }
     }
 
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         self.groups = Option.None;
         self.group_iter = Option.None;
         self.cursor = 0;
@@ -374,8 +374,8 @@ X AggregateExecutor {
 
     # Update an accumulator with a new value
     F update_accumulator(
-        ~self,
-        group: ~AggGroup,
+        mut self,
+        group: mut AggGroup,
         agg_idx: u64,
         func_name: &Str,
         val: &SqlValue,
@@ -384,7 +384,7 @@ X AggregateExecutor {
             "COUNT" => {
                 # COUNT: increment if non-NULL
                 I agg_count_value(val) {
-                    M &~group.accumulators[agg_idx] {
+                    M &mut group.accumulators[agg_idx] {
                         AggAccumulator.Count { count } => {
                             *count += 1;
                         },
@@ -395,50 +395,50 @@ X AggregateExecutor {
                 }
             },
             "SUM" => {
-                M &~group.accumulators[agg_idx] {
+                M &mut group.accumulators[agg_idx] {
                     AggAccumulator.Sum { acc } => {
-                        ~new_acc = agg_sum(acc, val)?;
+                        new_acc := mut agg_sum(acc, val)?;
                         *acc = new_acc;
                     },
                     _ => {
-                        ~new_acc = agg_sum(&Option.None, val)?;
+                        new_acc := mut agg_sum(&Option.None, val)?;
                         group.accumulators[agg_idx] = AggAccumulator.Sum { acc: new_acc };
                     },
                 }
             },
             "AVG" => {
-                M &~group.accumulators[agg_idx] {
+                M &mut group.accumulators[agg_idx] {
                     AggAccumulator.Avg { sum, count } => {
-                        ~result = agg_avg_accumulate(sum, count, val)?;
+                        result := mut agg_avg_accumulate(sum, count, val)?;
                         *sum = result.0;
                         *count = result.1;
                     },
                     _ => {
-                        ~result = agg_avg_accumulate(&Option.None, &0, val)?;
+                        result := mut agg_avg_accumulate(&Option.None, &0, val)?;
                         group.accumulators[agg_idx] = AggAccumulator.Avg { sum: result.0, count: result.1 };
                     },
                 }
             },
             "MIN" => {
-                M &~group.accumulators[agg_idx] {
+                M &mut group.accumulators[agg_idx] {
                     AggAccumulator.Min { acc } => {
-                        ~new_acc = agg_min(acc, val)?;
+                        new_acc := mut agg_min(acc, val)?;
                         *acc = new_acc;
                     },
                     _ => {
-                        ~new_acc = agg_min(&Option.None, val)?;
+                        new_acc := mut agg_min(&Option.None, val)?;
                         group.accumulators[agg_idx] = AggAccumulator.Min { acc: new_acc };
                     },
                 }
             },
             "MAX" => {
-                M &~group.accumulators[agg_idx] {
+                M &mut group.accumulators[agg_idx] {
                     AggAccumulator.Max { acc } => {
-                        ~new_acc = agg_max(acc, val)?;
+                        new_acc := mut agg_max(acc, val)?;
                         *acc = new_acc;
                     },
                     _ => {
-                        ~new_acc = agg_max(&Option.None, val)?;
+                        new_acc := mut agg_max(&Option.None, val)?;
                         group.accumulators[agg_idx] = AggAccumulator.Max { acc: new_acc };
                     },
                 }
@@ -532,13 +532,13 @@ X DistinctExecutor {
         }
     }
 
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         self.input.open()?;
         self.seen.clear();
         Result.Ok(())
     }
 
-    F next(~self) -> Result<Option<ExecutorRow>, VaisError> {
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         L {
             M self.input.next()? {
                 Option.None => {
@@ -548,12 +548,12 @@ X DistinctExecutor {
                     self.stats.add_scanned(1);
 
                     # Hash all row values
-                    ~row = exec_row.get_row();
-                    ~values: Vec<SqlValue> = Vec.new();
+                    row := mut exec_row.get_row();
+                    values: Vec<SqlValue> := mut Vec.new();
                     L i: 0..row.column_count() {
                         values.push(row.get(i).clone());
                     }
-                    ~hash = group_key_hash(&values);
+                    hash := mut group_key_hash(&values);
 
                     # Check if already seen
                     I !self.seen.contains(&hash) {
@@ -568,7 +568,7 @@ X DistinctExecutor {
         }
     }
 
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         self.seen.clear();
         self.input.close()?;
         Result.Ok(())

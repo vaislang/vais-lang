@@ -113,12 +113,12 @@ F execute_insert(
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
-    ~table_info = ctx.catalog.get_table(&insert.table_name)?;
-    ~columns = ctx.catalog.get_columns(table_info.table_id)?;
-    ~indexes = ctx.catalog.get_table_indexes(table_info.table_id)?;
+    table_info := mut ctx.catalog.get_table(&insert.table_name)?;
+    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
+    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
 
     # Build schema types array
-    ~schema = Vec.with_capacity(columns.len());
+    schema := mut Vec.with_capacity(columns.len());
     L col: &columns {
         schema.push(col.data_type);
     }
@@ -126,10 +126,10 @@ F execute_insert(
     # Determine column ordering for the INSERT
     # If columns are specified: map provided columns to table column positions
     # If not specified: values must M all columns in order
-    ~column_names: Vec<Str> = I insert.columns.len() > 0 {
+    column_names: Vec<Str> := mut I insert.columns.len() > 0 {
         insert.columns.clone()
     } E {
-        ~names = Vec.with_capacity(columns.len());
+        names := mut Vec.with_capacity(columns.len());
         L col: &columns {
             names.push(col.name.clone());
         }
@@ -137,15 +137,15 @@ F execute_insert(
     };
 
     # Validate column names exist in the table
-    ~column_indices = resolve_insert_columns(&column_names, &columns, &table_info.name)?;
+    column_indices := mut resolve_insert_columns(&column_names, &columns, &table_info.name)?;
 
     # Create constraint checker
-    ~checker = ConstraintChecker.new(table_info.clone(), columns.clone(), indexes.clone());
+    checker := mut ConstraintChecker.new(table_info.clone(), columns.clone(), indexes.clone());
 
     # Build evaluation context for expression evaluation
-    ~eval_ctx = EvalContext.from_columns(&table_info.name, columns.as_slice());
+    eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
 
-    ~rows_affected: u64 = 0;
+    rows_affected: u64 := mut 0;
 
     M &insert.source {
         InsertSource.Values { rows } => {
@@ -156,47 +156,47 @@ F execute_insert(
                 }
 
                 # Evaluate expressions to get SqlValues
-                ~values = Vec.with_capacity(row_exprs.len());
-                ~dummy_row = Row.null_row(0);
-                ~dummy_eval = EvalContext.new();
+                values := mut Vec.with_capacity(row_exprs.len());
+                dummy_row := mut Row.null_row(0);
+                dummy_eval := mut EvalContext.new();
                 L expr: row_exprs {
-                    ~val = eval_expr(expr, &dummy_row, &dummy_eval)?;
+                    val := mut eval_expr(expr, &dummy_row, &dummy_eval)?;
                     values.push(val);
                 }
 
                 # Build full row (reorder values to M table column order)
-                ~full_values = build_full_row_values(&values, &column_indices, columns.len());
+                full_values := mut build_full_row_values(&values, &column_indices, columns.len());
 
                 # Apply defaults for missing/NULL columns
-                ~row = checker.apply_defaults(full_values, column_names.as_slice())?;
+                row := mut checker.apply_defaults(full_values, column_names.as_slice())?;
 
                 # Validate all constraints
                 checker.validate_row(&row, ctx.pool)?;
 
                 # Encode row to bytes
-                ~row_bytes = row.encode(schema.as_slice());
+                row_bytes := mut row.encode(schema.as_slice());
 
                 # Create tuple with MVCC metadata
-                ~mvcc = MvccTupleMeta.new_insert(ctx.txn_id, ctx.cmd_id);
-                ~tuple = Tuple.new(mvcc, row_bytes);
+                mvcc := mut MvccTupleMeta.new_insert(ctx.txn_id, ctx.cmd_id);
+                tuple := mut Tuple.new(mvcc, row_bytes);
 
                 # WAL-first: find target page, write WAL, then insert
                 # We need page_id/slot_id for the WAL record, so insert first
                 # into buffer pool (dirty page), then immediately write WAL.
                 # The buffer pool guarantees the dirty page won't be flushed
                 # until the WAL record is persisted (WAL-before-flush invariant).
-                ~(page_id, slot_id) = insert_tuple_into_heap(
+                (page_id, slot_id) := mut insert_tuple_into_heap(
                     &table_info, &tuple, ctx,
                 )?;
 
                 # Write TUPLE_INSERT WAL record (before any buffer pool flush)
-                ~wal_payload = build_tuple_insert_wal(
+                wal_payload := mut build_tuple_insert_wal(
                     FILE_ID_DATA, page_id, slot_id, &tuple,
                 );
                 ctx.gcm.write_record(ctx.txn_id, TUPLE_INSERT, 0x01, &wal_payload)?;
 
                 # Insert into all indexes
-                ~tid = encode_tid(page_id, slot_id);
+                tid := mut encode_tid(page_id, slot_id);
                 insert_into_indexes(&row, tid, &indexes, &columns, ctx)?;
 
                 rows_affected += 1;
@@ -234,41 +234,41 @@ F execute_update(
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
-    ~table_info = ctx.catalog.get_table(&update.table_name)?;
-    ~columns = ctx.catalog.get_columns(table_info.table_id)?;
-    ~indexes = ctx.catalog.get_table_indexes(table_info.table_id)?;
+    table_info := mut ctx.catalog.get_table(&update.table_name)?;
+    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
+    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
 
     # Build schema
-    ~schema = Vec.with_capacity(columns.len());
+    schema := mut Vec.with_capacity(columns.len());
     L col: &columns {
         schema.push(col.data_type);
     }
 
     # Resolve assignment column indices
-    ~assignment_indices = Vec.with_capacity(update.assignments.len());
+    assignment_indices := mut Vec.with_capacity(update.assignments.len());
     L assign: &update.assignments {
-        ~col_idx = find_column_index(&assign.column, &columns, &table_info.name)?;
+        col_idx := mut find_column_index(&assign.column, &columns, &table_info.name)?;
         assignment_indices.push(col_idx);
     }
 
     # Build evaluation context
-    ~eval_ctx = EvalContext.from_columns(&table_info.name, columns.as_slice());
+    eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
 
     # Create constraint checker
-    ~checker = ConstraintChecker.new(table_info.clone(), columns.clone(), indexes.clone());
+    checker := mut ConstraintChecker.new(table_info.clone(), columns.clone(), indexes.clone());
 
     # Scan table for matching rows
     # Collect matching rows first, then update (to avoid concurrent modification)
-    ~matching_rows: Vec<(u32, u16, Row)> = Vec.new();
+    matching_rows: Vec<(u32, u16, Row)> := mut Vec.new();
 
-    ~scanner = TableScanExecutor.new(
+    scanner := mut TableScanExecutor.new(
         table_info.clone(),
         columns.clone(),
         update.where_clause.clone(),
     );
     scanner.open(ctx)?;
 
-    ~has_more = true;
+    has_more := mut true;
     L has_more {
         M scanner.next(ctx)? {
             Some(exec_row) => {
@@ -284,36 +284,36 @@ F execute_update(
 
     scanner.close();
 
-    ~rows_affected: u64 = 0;
+    rows_affected: u64 := mut 0;
 
     # Process each matching row
     L (old_page_id, old_slot_id, old_row): &matching_rows {
         # Build new row by applying assignments
-        ~new_values = Vec.with_capacity(columns.len());
+        new_values := mut Vec.with_capacity(columns.len());
         L i: 0..columns.len() {
             new_values.push(old_row.get(i).clone());
         }
 
         L j: 0..update.assignments.len() {
-            ~col_idx = assignment_indices[j];
-            ~new_val = eval_expr(&update.assignments[j].value, old_row, &eval_ctx)?;
+            col_idx := mut assignment_indices[j];
+            new_val := mut eval_expr(&update.assignments[j].value, old_row, &eval_ctx)?;
             new_values[col_idx] = new_val;
         }
 
-        ~new_row = Row.new(new_values);
+        new_row := mut Row.new(new_values);
 
         # Validate constraints on the new row
         checker.validate_row(&new_row, ctx.pool)?;
 
         # Encode new row
-        ~new_row_bytes = new_row.encode(schema.as_slice());
-        ~new_mvcc = MvccTupleMeta.new_insert(ctx.txn_id, ctx.cmd_id);
-        ~new_tuple = Tuple.new(new_mvcc, new_row_bytes);
+        new_row_bytes := mut new_row.encode(schema.as_slice());
+        new_mvcc := mut MvccTupleMeta.new_insert(ctx.txn_id, ctx.cmd_id);
+        new_tuple := mut Tuple.new(new_mvcc, new_row_bytes);
 
         # WAL-before-flush invariant: WAL record must be durable before page mutation.
         # Write TUPLE_UPDATE WAL record BEFORE modifying any pages.
-        ~old_tuple_bytes = old_row.encode(schema.as_slice());
-        ~wal_payload = build_tuple_update_wal(
+        old_tuple_bytes := mut old_row.encode(schema.as_slice());
+        wal_payload := mut build_tuple_update_wal(
             FILE_ID_DATA, *old_page_id, *old_slot_id,
             &old_tuple_bytes, &new_row_bytes,
         );
@@ -323,13 +323,13 @@ F execute_update(
         mark_tuple_expired(*old_page_id, *old_slot_id, ctx)?;
 
         # Step 2: Insert new tuple version
-        ~(new_page_id, new_slot_id) = insert_tuple_into_heap(
+        (new_page_id, new_slot_id) := mut insert_tuple_into_heap(
             &table_info, &new_tuple, ctx,
         )?;
 
         # Step 3: Update indexes
-        ~new_tid = encode_tid(new_page_id, new_slot_id);
-        ~old_tid = encode_tid(*old_page_id, *old_slot_id);
+        new_tid := mut encode_tid(new_page_id, new_slot_id);
+        old_tid := mut encode_tid(*old_page_id, *old_slot_id);
         update_indexes(
             old_row, &new_row, old_tid, new_tid,
             &indexes, &columns, ctx,
@@ -358,27 +358,27 @@ F execute_delete(
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
-    ~table_info = ctx.catalog.get_table(&delete.table_name)?;
-    ~columns = ctx.catalog.get_columns(table_info.table_id)?;
-    ~indexes = ctx.catalog.get_table_indexes(table_info.table_id)?;
+    table_info := mut ctx.catalog.get_table(&delete.table_name)?;
+    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
+    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
 
     # Build schema
-    ~schema = Vec.with_capacity(columns.len());
+    schema := mut Vec.with_capacity(columns.len());
     L col: &columns {
         schema.push(col.data_type);
     }
 
     # Scan table for matching rows
-    ~matching_rows: Vec<(u32, u16, Row)> = Vec.new();
+    matching_rows: Vec<(u32, u16, Row)> := mut Vec.new();
 
-    ~scanner = TableScanExecutor.new(
+    scanner := mut TableScanExecutor.new(
         table_info.clone(),
         columns.clone(),
         delete.where_clause.clone(),
     );
     scanner.open(ctx)?;
 
-    ~has_more = true;
+    has_more := mut true;
     L has_more {
         M scanner.next(ctx)? {
             Some(exec_row) => {
@@ -394,13 +394,13 @@ F execute_delete(
 
     scanner.close();
 
-    ~rows_affected: u64 = 0;
+    rows_affected: u64 := mut 0;
 
     # Process each matching row
     L (page_id, slot_id, row): &matching_rows {
         # WAL-first: write TUPLE_DELETE record
-        ~row_bytes = row.encode(schema.as_slice());
-        ~wal_payload = build_tuple_delete_wal(
+        row_bytes := mut row.encode(schema.as_slice());
+        wal_payload := mut build_tuple_delete_wal(
             FILE_ID_DATA, *page_id, *slot_id, &row_bytes,
         );
         ctx.gcm.write_record(ctx.txn_id, TUPLE_DELETE, 0x01, &wal_payload)?;
@@ -409,7 +409,7 @@ F execute_delete(
         mark_tuple_expired(*page_id, *slot_id, ctx)?;
 
         # Remove from all indexes
-        ~tid = encode_tid(*page_id, *slot_id);
+        tid := mut encode_tid(*page_id, *slot_id);
         delete_from_indexes(row, tid, &indexes, &columns, ctx)?;
 
         rows_affected += 1;
@@ -431,40 +431,40 @@ F insert_tuple_into_heap(
     tuple: &Tuple,
     ctx: &ExecContext,
 ) -> Result<(u32, u16), VaisError> {
-    ~tuple_size = tuple.on_page_size();
-    ~current_page_id = table_info.first_page_id;
+    tuple_size := mut tuple.on_page_size();
+    current_page_id := mut table_info.first_page_id;
 
     # Walk the heap page chain to find a page with space
     L current_page_id != 0 && current_page_id != NULL_PAGE {
-        ~frame_id = ctx.pool.fetch_page(FILE_ID_DATA, current_page_id)?;
-        ~page_data = ctx.pool.get_page(frame_id);
-        ~heap = HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
+        frame_id := mut ctx.pool.fetch_page(FILE_ID_DATA, current_page_id)?;
+        page_data := mut ctx.pool.get_page(frame_id);
+        heap := mut HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
 
         I heap.free_space_for_insert() >= tuple_size {
             # Found a page with space
-            ~slot_id = heap.insert_tuple(tuple)?;
-            ~flushed = heap.flush();
+            slot_id := mut heap.insert_tuple(tuple)?;
+            flushed := mut heap.flush();
             ctx.pool.write_page(frame_id, flushed)?;
             ctx.pool.unpin_page(frame_id, true);
             R Ok((current_page_id, slot_id));
         }
 
-        ~next = heap.get_header().next_page;
+        next := mut heap.get_header().next_page;
         ctx.pool.unpin_page(frame_id, false);
         current_page_id = next;
     }
 
     # No existing page has space — allocate a new page
-    ~new_page_id = ctx.pool.allocate_page(FILE_ID_DATA)?;
-    ~new_frame = ctx.pool.fetch_page(FILE_ID_DATA, new_page_id)?;
-    ~new_heap = HeapPage.new(new_page_id, ctx.pool.page_size);
+    new_page_id := mut ctx.pool.allocate_page(FILE_ID_DATA)?;
+    new_frame := mut ctx.pool.fetch_page(FILE_ID_DATA, new_page_id)?;
+    new_heap := mut HeapPage.new(new_page_id, ctx.pool.page_size);
 
-    ~slot_id = new_heap.insert_tuple(tuple)?;
+    slot_id := mut new_heap.insert_tuple(tuple)?;
 
     # Link new page to the end of the chain
     link_new_page(table_info.first_page_id, new_page_id, ctx)?;
 
-    ~flushed = new_heap.flush();
+    flushed := mut new_heap.flush();
     ctx.pool.write_page(new_frame, flushed)?;
     ctx.pool.unpin_page(new_frame, true);
 
@@ -484,18 +484,18 @@ F link_new_page(
     }
 
     # Walk to the last page in the chain
-    ~current = first_page_id;
+    current := mut first_page_id;
     L {
-        ~frame_id = ctx.pool.fetch_page(FILE_ID_DATA, current)?;
-        ~page_data = ctx.pool.get_page(frame_id);
-        ~heap = HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
-        ~next = heap.get_header().next_page;
+        frame_id := mut ctx.pool.fetch_page(FILE_ID_DATA, current)?;
+        page_data := mut ctx.pool.get_page(frame_id);
+        heap := mut HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
+        next := mut heap.get_header().next_page;
 
         I next == 0 || next == NULL_PAGE {
             # This is the last page — link the new page here
-            ~header = heap.get_header_mut();
+            header := mut heap.get_header_mut();
             header.next_page = new_page_id;
-            ~flushed = heap.flush();
+            flushed := mut heap.flush();
             ctx.pool.write_page(frame_id, flushed)?;
             ctx.pool.unpin_page(frame_id, true);
             R Ok(());
@@ -512,13 +512,13 @@ F mark_tuple_expired(
     slot_id: u16,
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
-    ~frame_id = ctx.pool.fetch_page(FILE_ID_DATA, page_id)?;
-    ~page_data = ctx.pool.get_page(frame_id);
-    ~heap = HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
+    frame_id := mut ctx.pool.fetch_page(FILE_ID_DATA, page_id)?;
+    page_data := mut ctx.pool.get_page(frame_id);
+    heap := mut HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
 
     heap.delete_tuple(slot_id, ctx.txn_id, ctx.cmd_id)?;
 
-    ~flushed = heap.flush();
+    flushed := mut heap.flush();
     ctx.pool.write_page(frame_id, flushed)?;
     ctx.pool.unpin_page(frame_id, true);
 
@@ -538,10 +538,10 @@ F insert_into_indexes(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     L idx: indexes {
-        ~col_indices = resolve_index_columns(&idx.columns, columns)?;
-        ~key = build_index_key_from_row(row, col_indices.as_slice());
+        col_indices := mut resolve_index_columns(&idx.columns, columns)?;
+        key := mut build_index_key_from_row(row, col_indices.as_slice());
 
-        ~tree = BTree {
+        tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
@@ -562,10 +562,10 @@ F delete_from_indexes(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     L idx: indexes {
-        ~col_indices = resolve_index_columns(&idx.columns, columns)?;
-        ~key = build_index_key_from_row(row, col_indices.as_slice());
+        col_indices := mut resolve_index_columns(&idx.columns, columns)?;
+        key := mut build_index_key_from_row(row, col_indices.as_slice());
 
-        ~tree = BTree {
+        tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
@@ -589,12 +589,12 @@ F update_indexes(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     L idx: indexes {
-        ~col_indices = resolve_index_columns(&idx.columns, columns)?;
+        col_indices := mut resolve_index_columns(&idx.columns, columns)?;
 
-        ~old_key = build_index_key_from_row(old_row, col_indices.as_slice());
-        ~new_key = build_index_key_from_row(new_row, col_indices.as_slice());
+        old_key := mut build_index_key_from_row(old_row, col_indices.as_slice());
+        new_key := mut build_index_key_from_row(new_row, col_indices.as_slice());
 
-        ~tree = BTree {
+        tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
@@ -626,10 +626,10 @@ F resolve_insert_columns(
     table_columns: &[ColumnInfo],
     table_name: &Str,
 ) -> Result<Vec<u64>, VaisError> {
-    ~indices = Vec.with_capacity(insert_columns.len());
+    indices := mut Vec.with_capacity(insert_columns.len());
 
     L col_name: insert_columns {
-        ~found = false;
+        found := mut false;
         L i: 0..table_columns.len() {
             I !found && &table_columns[i].name == col_name {
                 indices.push(i);
@@ -652,7 +652,7 @@ F build_full_row_values(
     column_indices: &[u64],
     total_columns: u64,
 ) -> Vec<SqlValue> {
-    ~full = Vec.with_capacity(total_columns);
+    full := mut Vec.with_capacity(total_columns);
     L _: 0..total_columns {
         full.push(SqlValue.Null);
     }
@@ -691,14 +691,14 @@ F build_tuple_insert_wal(
     slot: u16,
     tuple: &Tuple,
 ) -> Vec<u8> {
-    ~tuple_data = tuple.to_bytes();
-    ~payload = TupleInsertPayload {
+    tuple_data := mut tuple.to_bytes();
+    payload := mut TupleInsertPayload {
         file_id,
         page_id,
         slot,
         tuple_data,
     };
-    ~buf = ByteBuffer.new();
+    buf := mut ByteBuffer.new();
     payload.serialize(&buf);
     buf.to_vec()
 }
@@ -710,13 +710,13 @@ F build_tuple_delete_wal(
     slot: u16,
     old_tuple_data: &[u8],
 ) -> Vec<u8> {
-    ~payload = TupleDeletePayload {
+    payload := mut TupleDeletePayload {
         file_id,
         page_id,
         slot,
         old_tuple: old_tuple_data.to_vec(),
     };
-    ~buf = ByteBuffer.new();
+    buf := mut ByteBuffer.new();
     payload.serialize(&buf);
     buf.to_vec()
 }
@@ -729,14 +729,14 @@ F build_tuple_update_wal(
     old_tuple_data: &[u8],
     new_tuple_data: &[u8],
 ) -> Vec<u8> {
-    ~payload = TupleUpdatePayload {
+    payload := mut TupleUpdatePayload {
         file_id,
         page_id,
         slot,
         old_tuple: old_tuple_data.to_vec(),
         new_tuple: new_tuple_data.to_vec(),
     };
-    ~buf = ByteBuffer.new();
+    buf := mut ByteBuffer.new();
     payload.serialize(&buf);
     buf.to_vec()
 }

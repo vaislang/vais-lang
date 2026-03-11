@@ -43,7 +43,7 @@ X BufferPoolStats {
     }
 
     F hit_rate(self) -> f64 {
-        ~total = self.hits + self.misses;
+        total := mut self.hits + self.misses;
         I total == 0 { 1.0 }
         E { (self.hits as f64) / (total as f64) }
     }
@@ -52,9 +52,9 @@ X BufferPoolStats {
 X BufferPool {
     # Create a new buffer pool with given capacity (in pages)
     F new(page_manager: PageManager, capacity: u32) -> BufferPool {
-        ~page_size = page_manager.get_page_size();
-        ~frames = Vec.with_capacity(capacity as u64);
-        ~free_list = Vec.with_capacity(capacity as u64);
+        page_size := mut page_manager.get_page_size();
+        frames := mut Vec.with_capacity(capacity as u64);
+        free_list := mut Vec.with_capacity(capacity as u64);
 
         L i: 0..capacity {
             frames.push(BufferFrame.new(i, page_size));
@@ -78,18 +78,18 @@ X BufferPool {
 
     # Fetch a page into the buffer pool, returns frame_id
     # The page is pinned (pin_count = 1) on return
-    F fetch_page(~self, file_id: u8, page_id: u32) -> Result<u32, VaisError> {
+    F fetch_page(mut self, file_id: u8, page_id: u32) -> Result<u32, VaisError> {
         # Notify read-ahead tracker of this access
         self.readahead.notify_access(file_id, page_id);
 
-        ~key = make_page_key(file_id, page_id);
+        key := mut make_page_key(file_id, page_id);
 
         # Acquire pool lock for page table operations
-        ~guard = self.lock.lock();
+        guard := mut self.lock.lock();
 
         # Check if page is already in buffer pool
         I self.page_table.contains_key(&key) {
-            ~frame_id = *self.page_table.get(&key)!;
+            frame_id := mut *self.page_table.get(&key)!;
             self.frames[frame_id as u64].pin();
             self.stats.hits += 1;
             drop(guard);
@@ -99,27 +99,27 @@ X BufferPool {
         self.stats.misses += 1;
 
         # Need to load from disk - find a free frame
-        ~frame_id = self.get_free_frame()?;
+        frame_id := mut self.get_free_frame()?;
 
         drop(guard);
 
         # Read page from disk (outside lock to allow concurrent I/O)
-        ~page_data = self.page_manager.read_page(file_id, page_id)?;
+        page_data := mut self.page_manager.read_page(file_id, page_id)?;
 
-        ~guard2 = self.lock.lock();
+        guard2 := mut self.lock.lock();
 
         # Double-check nobody loaded this page while we were reading
         I self.page_table.contains_key(&key) {
             # Someone else loaded it - return our frame to free list
             self.free_list.push(frame_id);
-            ~existing_frame_id = *self.page_table.get(&key)!;
+            existing_frame_id := mut *self.page_table.get(&key)!;
             self.frames[existing_frame_id as u64].pin();
             drop(guard2);
             R Ok(existing_frame_id);
         }
 
         # Load page into frame
-        ~location = PageLocation.new(file_id, page_id);
+        location := mut PageLocation.new(file_id, page_id);
         self.frames[frame_id as u64].load(location, &page_data);
         self.page_table.insert(key, frame_id);
 
@@ -137,11 +137,11 @@ X BufferPool {
     }
 
     # Unpin a page (decrement pin count)
-    F unpin_page(~self, frame_id: u32, is_dirty: bool) {
+    F unpin_page(mut self, frame_id: u32, is_dirty: bool) {
         self.frames[frame_id as u64].unpin();
         I is_dirty {
             self.frames[frame_id as u64].mark_dirty();
-            ~frame = &self.frames[frame_id as u64];
+            frame := mut &self.frames[frame_id as u64];
             self.dirty_tracker.mark_dirty(
                 frame_id,
                 frame.location.clone(),
@@ -156,9 +156,9 @@ X BufferPool {
     }
 
     # Get mutable reference to a frame's page data (marks dirty)
-    F get_page_mut(~self, frame_id: u32) -> &~[u8] {
-        ~frame = &self.frames[frame_id as u64];
-        ~data = frame.get_data_mut();
+    F get_page_mut(mut self, frame_id: u32) -> &mut [u8] {
+        frame := mut &self.frames[frame_id as u64];
+        data := mut frame.get_data_mut();
         self.dirty_tracker.mark_dirty(
             frame_id,
             frame.location.clone(),
@@ -168,14 +168,14 @@ X BufferPool {
     }
 
     # Flush a specific dirty page to disk
-    F flush_page(~self, frame_id: u32) -> Result<(), VaisError> {
-        ~frame = &self.frames[frame_id as u64];
+    F flush_page(mut self, frame_id: u32) -> Result<(), VaisError> {
+        frame := mut &self.frames[frame_id as u64];
         I !frame.is_dirty() {
             R Ok(());
         }
 
         # Compute checksum and write
-        ~page_data = frame.data.clone();
+        page_data := mut frame.data.clone();
         PageHeader.update_checksum(&page_data);
 
         self.page_manager.write_page(
@@ -192,8 +192,8 @@ X BufferPool {
     }
 
     # Flush all dirty pages (for checkpoint)
-    F flush_all(~self) -> Result<(), VaisError> {
-        ~dirty_pages = self.dirty_tracker.get_dirty_pages();
+    F flush_all(mut self) -> Result<(), VaisError> {
+        dirty_pages := mut self.dirty_tracker.get_dirty_pages();
         L entry: &dirty_pages {
             self.flush_page(entry.frame_id)?;
         }
@@ -202,9 +202,9 @@ X BufferPool {
     }
 
     # Flush all dirty pages and return count (used by checkpoint)
-    F flush_all_dirty_pages(~self) -> Result<u32, VaisError> {
-        ~dirty_pages = self.dirty_tracker.get_dirty_pages();
-        ~count = dirty_pages.len() as u32;
+    F flush_all_dirty_pages(mut self) -> Result<u32, VaisError> {
+        dirty_pages := mut self.dirty_tracker.get_dirty_pages();
+        count := mut dirty_pages.len() as u32;
         L entry: &dirty_pages {
             self.flush_page(entry.frame_id)?;
         }
@@ -213,12 +213,12 @@ X BufferPool {
     }
 
     # Release a page from the buffer pool (unpin + evict if needed)
-    F release_page(~self, frame_id: u32) {
+    F release_page(mut self, frame_id: u32) {
         self.frames[frame_id as u64].unpin();
     }
 
     # Get a free frame (from free list or by eviction)
-    F get_free_frame(~self) -> Result<u32, VaisError> {
+    F get_free_frame(mut self) -> Result<u32, VaisError> {
         # Try free list first
         I !self.free_list.is_empty() {
             R Ok(self.free_list.pop()!);
@@ -233,8 +233,8 @@ X BufferPool {
                 }
 
                 # Remove from page table
-                ~victim = &self.frames[victim_id as u64];
-                ~key = make_page_key(victim.location.file_id, victim.location.page_id);
+                victim := mut &self.frames[victim_id as u64];
+                key := mut make_page_key(victim.location.file_id, victim.location.page_id);
                 self.page_table.remove(&key);
 
                 # Reset frame
@@ -270,7 +270,7 @@ X BufferPool {
     }
 
     # Set FPI flag on all loaded frames (called after checkpoint)
-    F set_all_needs_fpi(~self) {
+    F set_all_needs_fpi(mut self) {
         L frame: &self.frames {
             I !frame.is_empty() {
                 frame.set_needs_fpi(true);
@@ -284,29 +284,29 @@ X BufferPool {
     }
 
     # Clear FPI flag for a frame (after FPI has been written)
-    F clear_fpi(~self, frame_id: u32) {
+    F clear_fpi(mut self, frame_id: u32) {
         self.frames[frame_id as u64].set_needs_fpi(false);
     }
 
     # Prefetch pages asynchronously (best-effort, errors ignored)
-    F prefetch_pages(~self, file_id: u8, start_page: u32, count: u32) {
+    F prefetch_pages(mut self, file_id: u8, start_page: u32, count: u32) {
         L i: 0..count {
-            ~pg = start_page + i;
-            ~key = make_page_key(file_id, pg);
+            pg := mut start_page + i;
+            key := mut make_page_key(file_id, pg);
             # Skip if already in buffer pool
-            ~guard = self.lock.lock();
-            ~already_loaded = self.page_table.contains_key(&key);
+            guard := mut self.lock.lock();
+            already_loaded := mut self.page_table.contains_key(&key);
             drop(guard);
             I !already_loaded {
                 # Best-effort: silently ignore prefetch failures
                 M self.page_manager.read_page(file_id, pg) {
                     Ok(page_data) => {
-                        ~guard2 = self.lock.lock();
+                        guard2 := mut self.lock.lock();
                         # Recheck (race)
                         I !self.page_table.contains_key(&key) {
                             M self.get_free_frame() {
                                 Ok(fid) => {
-                                    ~loc = PageLocation.new(file_id, pg);
+                                    loc := mut PageLocation.new(file_id, pg);
                                     self.frames[fid as u64].load(loc, &page_data);
                                     self.page_table.insert(key, fid);
                                     # Prefetched pages start unpinned
@@ -328,7 +328,7 @@ X BufferPool {
     }
 
     # Get read-ahead prefetcher reference
-    F get_readahead(~self) -> &~ReadAhead {
+    F get_readahead(mut self) -> &mut ReadAhead {
         &self.readahead
     }
 }

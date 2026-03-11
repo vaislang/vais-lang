@@ -19,30 +19,30 @@ F leaf_needs_merge(leaf: &BTreeLeafNode) -> bool {
 # Merge two leaf nodes: move all entries from right into left
 # Caller must handle parent separator removal
 F merge_leaf_nodes(
-    left: &~BTreeLeafNode,
+    left: &mut BTreeLeafNode,
     right: &BTreeLeafNode,
     file_id: u8,
     page_size: u32,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<(), VaisError> {
     # Move all entries from right to left
     L i: 0..right.entry_count() as u64 {
-        ~key = right.get_key(i).to_vec();
-        ~tid = right.entries[i].tid;
+        key := mut right.get_key(i).to_vec();
+        tid := mut right.entries[i].tid;
         left.insert(&key, tid)?;
     }
 
     # Update leaf chain: left.next = right.next
-    ~right_next = right.next_leaf();
+    right_next := mut right.next_leaf();
     left.set_next_leaf(right_next);
 
     # Update the following leaf's prev pointer
     I right_next != NULL_PAGE {
-        ~next_frame = pool.fetch_page(file_id, right_next)?;
-        ~next_data = pool.get_page(next_frame);
-        ~next_leaf = BTreeLeafNode.from_page_data(next_data, page_size)?;
+        next_frame := mut pool.fetch_page(file_id, right_next)?;
+        next_data := mut pool.get_page(next_frame);
+        next_leaf := mut BTreeLeafNode.from_page_data(next_data, page_size)?;
         next_leaf.set_prev_leaf(left.header.page_id);
-        ~flushed = next_leaf.flush();
+        flushed := mut next_leaf.flush();
         pool.write_page(next_frame, flushed)?;
         pool.unpin_page(next_frame, true);
     }
@@ -53,7 +53,7 @@ F merge_leaf_nodes(
 # Merge two internal nodes: move all entries from right into left
 # The separator from parent must be included between the two sets of entries
 F merge_internal_nodes(
-    left: &~BTreeInternalNode,
+    left: &mut BTreeInternalNode,
     right: &BTreeInternalNode,
     parent_separator: &[u8],
 ) -> Result<(), VaisError> {
@@ -62,8 +62,8 @@ F merge_internal_nodes(
 
     # Move all entries from right to left
     L i: 0..right.entry_count() as u64 {
-        ~key = right.get_key(i).to_vec();
-        ~child = right.entries[i].child_page;
+        key := mut right.get_key(i).to_vec();
+        child := mut right.entries[i].child_page;
         left.insert_entry(&key, child)?;
     }
 
@@ -73,13 +73,13 @@ F merge_internal_nodes(
 # Redistribute entries from left sibling to right (underflowing) leaf
 # Returns the new separator key for the parent
 F redistribute_leaf_left_to_right(
-    left: &~BTreeLeafNode,
-    right: &~BTreeLeafNode,
+    left: &mut BTreeLeafNode,
+    right: &mut BTreeLeafNode,
 ) -> Result<Vec<u8>, VaisError> {
     # Calculate how many to move: aim for equal distribution
-    ~total = left.entry_count() + right.entry_count();
-    ~target_left = total / 2;
-    ~move_count = left.entry_count() - target_left;
+    total := mut left.entry_count() + right.entry_count();
+    target_left := mut total / 2;
+    move_count := mut left.entry_count() - target_left;
 
     I move_count == 0 {
         R Err(err_internal("Nothing to redistribute from left"));
@@ -87,18 +87,18 @@ F redistribute_leaf_left_to_right(
 
     # Move entries from end of left to beginning of right
     # We need to insert in order, so collect first
-    ~entries_to_move = Vec.new();
-    ~start = left.entry_count() as u64 - move_count as u64;
+    entries_to_move := mut Vec.new();
+    start := mut left.entry_count() as u64 - move_count as u64;
     L i: start..left.entry_count() as u64 {
-        ~key = left.get_key(i).to_vec();
-        ~tid = left.entries[i].tid;
+        key := mut left.get_key(i).to_vec();
+        tid := mut left.entries[i].tid;
         entries_to_move.push((key, tid));
     }
 
     # Remove from left
     L _: 0..move_count {
-        ~last_idx = (left.entry_count() - 1) as u64;
-        ~key = left.get_key(last_idx).to_vec();
+        last_idx := mut (left.entry_count() - 1) as u64;
+        key := mut left.get_key(last_idx).to_vec();
         left.delete(&key);
     }
 
@@ -108,19 +108,19 @@ F redistribute_leaf_left_to_right(
     }
 
     # New separator = first key of right
-    ~new_sep = right.get_key(0).to_vec();
+    new_sep := mut right.get_key(0).to_vec();
     Ok(new_sep)
 }
 
 # Redistribute entries from right sibling to left (underflowing) leaf
 # Returns the new separator key for the parent
 F redistribute_leaf_right_to_left(
-    left: &~BTreeLeafNode,
-    right: &~BTreeLeafNode,
+    left: &mut BTreeLeafNode,
+    right: &mut BTreeLeafNode,
 ) -> Result<Vec<u8>, VaisError> {
-    ~total = left.entry_count() + right.entry_count();
-    ~target_left = total / 2;
-    ~move_count = target_left - left.entry_count();
+    total := mut left.entry_count() + right.entry_count();
+    target_left := mut total / 2;
+    move_count := mut target_left - left.entry_count();
 
     I move_count == 0 {
         R Err(err_internal("Nothing to redistribute from right"));
@@ -128,30 +128,30 @@ F redistribute_leaf_right_to_left(
 
     # Move entries from beginning of right to end of left
     L _: 0..move_count {
-        ~key = right.get_key(0).to_vec();
-        ~tid = right.entries[0].tid;
+        key := mut right.get_key(0).to_vec();
+        tid := mut right.entries[0].tid;
         left.insert(&key, tid)?;
         right.delete(&key);
     }
 
     # New separator = first key of right (after entries were removed)
-    ~new_sep = right.get_key(0).to_vec();
+    new_sep := mut right.get_key(0).to_vec();
     Ok(new_sep)
 }
 
 # Redistribute entries between internal nodes
 # Returns the new separator key for the parent
 F redistribute_internal_left_to_right(
-    left: &~BTreeInternalNode,
-    right: &~BTreeInternalNode,
+    left: &mut BTreeInternalNode,
+    right: &mut BTreeInternalNode,
     parent_separator: &[u8],
 ) -> Result<Vec<u8>, VaisError> {
     # Move the parent separator and left's last child to right
     # Then the left's last key becomes the new parent separator
 
-    ~last_idx = (left.entry_count() - 1) as u64;
-    ~new_parent_sep = left.get_key(last_idx).to_vec();
-    ~moved_child = left.entries[last_idx].child_page;
+    last_idx := mut (left.entry_count() - 1) as u64;
+    new_parent_sep := mut left.get_key(last_idx).to_vec();
+    moved_child := mut left.entries[last_idx].child_page;
 
     # Remove from left
     left.entries.remove(last_idx);
@@ -159,7 +159,7 @@ F redistribute_internal_left_to_right(
 
     # Insert into right: parent_separator + moved_child becomes new entry
     # and right's leftmost_child shifts
-    ~old_leftmost = right.leftmost_child;
+    old_leftmost := mut right.leftmost_child;
     right.set_leftmost_child(moved_child);
     right.insert_entry(parent_separator, old_leftmost)?;
 
@@ -168,16 +168,16 @@ F redistribute_internal_left_to_right(
 
 # Redistribute entries from right internal sibling to left
 F redistribute_internal_right_to_left(
-    left: &~BTreeInternalNode,
-    right: &~BTreeInternalNode,
+    left: &mut BTreeInternalNode,
+    right: &mut BTreeInternalNode,
     parent_separator: &[u8],
 ) -> Result<Vec<u8>, VaisError> {
     # Move parent separator + right's leftmost_child to left
     left.insert_entry(parent_separator, right.leftmost_child)?;
 
     # Right's first key becomes new parent separator
-    ~new_parent_sep = right.get_key(0).to_vec();
-    ~new_leftmost = right.entries[0].child_page;
+    new_parent_sep := mut right.get_key(0).to_vec();
+    new_leftmost := mut right.entries[0].child_page;
 
     # Remove first entry from right, update leftmost_child
     right.entries.remove(0);
@@ -194,20 +194,20 @@ F can_merge_leaves(
     page_size: u32,
 ) -> bool {
     # Calculate total key data size + directory size
-    ~left_key_size: u32 = 0;
+    left_key_size: u32 := mut 0;
     L i: 0..left.entry_count() as u64 {
         left_key_size += left.entries[i].key_len as u32;
     }
 
-    ~right_key_size: u32 = 0;
+    right_key_size: u32 := mut 0;
     L i: 0..right.entry_count() as u64 {
         right_key_size += right.entries[i].key_len as u32;
     }
 
-    ~total_entries = left.entry_count() as u32 + right.entry_count() as u32;
-    ~total_dir_size = total_entries * 8;  # 8 bytes per leaf entry directory
-    ~total_key_size = left_key_size + right_key_size;
-    ~body_size = page_size - PAGE_HEADER_SIZE;
+    total_entries := mut left.entry_count() as u32 + right.entry_count() as u32;
+    total_dir_size := mut total_entries * 8;  # 8 bytes per leaf entry directory
+    total_key_size := mut left_key_size + right_key_size;
+    body_size := mut page_size - PAGE_HEADER_SIZE;
 
     total_dir_size + total_key_size < body_size
 }
@@ -219,21 +219,21 @@ F can_merge_internals(
     separator_len: u32,
     page_size: u32,
 ) -> bool {
-    ~left_key_size: u32 = 0;
+    left_key_size: u32 := mut 0;
     L i: 0..left.entry_count() as u64 {
         left_key_size += left.entries[i].key_len as u32;
     }
 
-    ~right_key_size: u32 = 0;
+    right_key_size: u32 := mut 0;
     L i: 0..right.entry_count() as u64 {
         right_key_size += right.entries[i].key_len as u32;
     }
 
     # +1 entry for the separator from parent, +4 for leftmost_child
-    ~total_entries = left.entry_count() as u32 + right.entry_count() as u32 + 1;
-    ~total_dir_size = total_entries * 8;  # 8 bytes per internal entry
-    ~total_key_size = left_key_size + right_key_size + separator_len;
-    ~body_size = page_size - PAGE_HEADER_SIZE - 4;  # 4 for leftmost_child
+    total_entries := mut left.entry_count() as u32 + right.entry_count() as u32 + 1;
+    total_dir_size := mut total_entries * 8;  # 8 bytes per internal entry
+    total_key_size := mut left_key_size + right_key_size + separator_len;
+    body_size := mut page_size - PAGE_HEADER_SIZE - 4;  # 4 for leftmost_child
 
     total_dir_size + total_key_size < body_size
 }

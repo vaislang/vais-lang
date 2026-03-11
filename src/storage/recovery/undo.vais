@@ -49,15 +49,15 @@ S UndoResult {
 F recovery_undo(
     wal_dir: &str,
     analysis: &AnalysisResult,
-    writer: &~WalWriter,
-    pool: &~BufferPool,
+    writer: &mut WalWriter,
+    pool: &mut BufferPool,
 ) -> Result<UndoResult, VaisError> {
-    ~txns_undone: u32 = 0;
-    ~records_undone: u64 = 0;
+    txns_undone: u32 := mut 0;
+    records_undone: u64 := mut 0;
 
     # Collect uncommitted (active) transactions sorted by last_lsn descending
     # Process in reverse LSN order to maximize efficiency
-    ~active_txns: Vec<(u64, u64)> = Vec.new();  # (txn_id, last_lsn)
+    active_txns: Vec<(u64, u64)> := mut Vec.new();  # (txn_id, last_lsn)
 
     L (txn_id, entry): &analysis.txn_table {
         M entry.state {
@@ -77,11 +77,11 @@ F recovery_undo(
 
     # Build a map of LSN -> WalRecordHeader+payload for quick lookup
     # In practice, we'd re-read from WAL segments, but we track undo progress per txn
-    ~undo_progress: HashMap<u64, u64> = HashMap.new();  # txn_id -> next_lsn_to_undo
+    undo_progress: HashMap<u64, u64> := mut HashMap.new();  # txn_id -> next_lsn_to_undo
 
     L &(txn_id, last_lsn): &active_txns {
         # Check if there's a CLR-based undo_next_lsn
-        ~start_lsn = M analysis.txn_table.get(&txn_id) {
+        start_lsn := mut M analysis.txn_table.get(&txn_id) {
             Some(entry) => {
                 I entry.undo_next_lsn != NULL_LSN {
                     entry.undo_next_lsn
@@ -98,7 +98,7 @@ F recovery_undo(
     L &(txn_id, _): &active_txns {
         M undo_progress.get(&txn_id) {
             Some(&current_lsn) => {
-                ~count = undo_single_transaction(
+                count := mut undo_single_transaction(
                     wal_dir, txn_id, current_lsn, writer, pool
                 )?;
 
@@ -106,8 +106,8 @@ F recovery_undo(
                 txns_undone += 1;
 
                 # Write TXN_ABORT for this transaction
-                ~abort_payload = TxnAbortPayload {};
-                ~buf = ByteBuffer.with_capacity(4);
+                abort_payload := mut TxnAbortPayload {};
+                buf := mut ByteBuffer.with_capacity(4);
                 abort_payload.serialize(&buf);
                 writer.write_record(txn_id, TXN_ABORT, ENGINE_META, buf.as_bytes())?;
             },
@@ -126,27 +126,27 @@ F undo_single_transaction(
     wal_dir: &str,
     txn_id: u64,
     start_lsn: u64,
-    writer: &~WalWriter,
-    pool: &~BufferPool,
+    writer: &mut WalWriter,
+    pool: &mut BufferPool,
 ) -> Result<u64, VaisError> {
-    ~records_undone: u64 = 0;
-    ~current_lsn = start_lsn;
+    records_undone: u64 := mut 0;
+    current_lsn := mut start_lsn;
 
     L current_lsn != NULL_LSN {
         # Read the WAL record at current_lsn
-        ~(header, payload) = read_record_at_lsn(wal_dir, current_lsn)?;
+        (header, payload) := mut read_record_at_lsn(wal_dir, current_lsn)?;
 
         # Skip CLR records (follow their undo_next_lsn instead)
         I header.record_type == CLR {
-            ~buf = ByteBuffer.wrap_readonly(&payload);
-            ~clr = ClrPayload.deserialize(&buf)?;
+            buf := mut ByteBuffer.wrap_readonly(&payload);
+            clr := mut ClrPayload.deserialize(&buf)?;
             current_lsn = clr.undo_next_lsn;
         } E {
             # Determine the next LSN to undo (prev_lsn of current record)
-            ~next_undo_lsn = header.prev_lsn;
+            next_undo_lsn := mut header.prev_lsn;
 
             # Apply undo for this record and write CLR
-            ~undone = undo_single_record(
+            undone := mut undo_single_record(
                 &header, &payload, txn_id, next_undo_lsn, writer, pool
             )?;
 
@@ -166,7 +166,7 @@ F read_record_at_lsn(
     wal_dir: &str,
     lsn: u64,
 ) -> Result<(WalRecordHeader, Vec<u8>), VaisError> {
-    ~iter = WalRecordIterator.from_lsn(wal_dir.to_string(), lsn)?;
+    iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), lsn)?;
     M iter.next()? {
         Some((header, payload)) => {
             I header.lsn == lsn {
@@ -186,11 +186,11 @@ F undo_single_record(
     payload: &[u8],
     txn_id: u64,
     undo_next_lsn: u64,
-    writer: &~WalWriter,
-    pool: &~BufferPool,
+    writer: &mut WalWriter,
+    pool: &mut BufferPool,
 ) -> Result<bool, VaisError> {
     # Extract page info from the record for CLR
-    ~(file_id, page_id) = extract_page_info(payload);
+    (file_id, page_id) := mut extract_page_info(payload);
 
     M header.record_type {
         TUPLE_INSERT => {
@@ -236,13 +236,13 @@ F undo_single_record(
     }
 
     # Write CLR (Compensation Log Record)
-    ~clr_payload = ClrPayload {
+    clr_payload := mut ClrPayload {
         original_record_type: header.record_type,
         undo_next_lsn,
         file_id,
         page_id,
     };
-    ~clr_buf = ByteBuffer.with_capacity(16);
+    clr_buf := mut ByteBuffer.with_capacity(16);
     clr_payload.serialize(&clr_buf);
     writer.write_record(txn_id, CLR, ENGINE_META, clr_buf.as_bytes())?;
 
@@ -252,7 +252,7 @@ F undo_single_record(
 # Extract file_id and page_id from a WAL record payload
 F extract_page_info(payload: &[u8]) -> (u8, u32) {
     I payload.len() >= 5 {
-        ~buf = ByteBuffer.wrap_readonly(payload);
+        buf := mut ByteBuffer.wrap_readonly(payload);
         M (buf.get_u8(), buf.get_u32_le()) {
             (Ok(fid), Ok(pid)) => (fid, pid),
             _ => (0, 0),
@@ -267,19 +267,19 @@ F extract_page_info(payload: &[u8]) -> (u8, u32) {
 
 # Undo TUPLE_INSERT: mark the inserted tuple's slot as dead (tombstone)
 # This effectively removes the tuple from the page so it won't be visible
-F undo_tuple_insert(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = TupleInsertPayload.deserialize(&buf)?;
+F undo_tuple_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut TupleInsertPayload.deserialize(&buf)?;
 
-    ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-    ~page_data = pool.get_page_mut(frame);
-    ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+    frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+    page_data := mut pool.get_page_mut(frame);
+    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
 
     # Mark the slot as dead to logically remove the inserted tuple
     heap.mark_slot_dead(p.slot)?;
 
     # Flush modified heap page back to frame
-    ~flushed = heap.flush();
+    flushed := mut heap.flush();
     L i: 0..flushed.len() {
         page_data[i] = flushed[i];
     }
@@ -290,23 +290,23 @@ F undo_tuple_insert(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
 
 # Undo TUPLE_DELETE: restore the deleted tuple by clearing its txn_id_expire
 # The old tuple data is stored in the WAL record for restoration
-F undo_tuple_delete(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = TupleDeletePayload.deserialize(&buf)?;
+F undo_tuple_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut TupleDeletePayload.deserialize(&buf)?;
 
-    ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-    ~page_data = pool.get_page_mut(frame);
-    ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+    frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+    page_data := mut pool.get_page_mut(frame);
+    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
 
     # Restore the tuple by clearing its expiration (set txn_id_expire = 0)
     # This makes the tuple visible again
-    ~mvcc = MvccTupleMeta.new_insert(0, 0);  # Will be overwritten
-    ~old_tuple = Tuple.read_from(&p.old_tuple, 0, p.old_tuple.len() as u64)?;
+    mvcc := mut MvccTupleMeta.new_insert(0, 0);  # Will be overwritten
+    old_tuple := mut Tuple.read_from(&p.old_tuple, 0, p.old_tuple.len() as u64)?;
     # The old_tuple contains the original MVCC metadata with txn_id_expire = 0
     # We need to reset the MVCC expire fields on the page
     heap.update_mvcc(p.slot, &old_tuple.mvcc)?;
 
-    ~flushed = heap.flush();
+    flushed := mut heap.flush();
     L i: 0..flushed.len() {
         page_data[i] = flushed[i];
     }
@@ -317,13 +317,13 @@ F undo_tuple_delete(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
 
 # Undo TUPLE_UPDATE: restore old tuple values
 # The WAL record contains both old and new tuple data
-F undo_tuple_update(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = TupleUpdatePayload.deserialize(&buf)?;
+F undo_tuple_update(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut TupleUpdatePayload.deserialize(&buf)?;
 
-    ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-    ~page_data = pool.get_page_mut(frame);
-    ~heap = HeapPage.from_page_data(page_data, pool.page_size)?;
+    frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+    page_data := mut pool.get_page_mut(frame);
+    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
 
     # Step 1: Remove the new version that was inserted during the UPDATE
     # The update added a new tuple version; we need to find and remove it
@@ -331,17 +331,17 @@ F undo_tuple_update(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
     # Undo: un-expire old tuple, remove new tuple
 
     # Restore old tuple's MVCC metadata (clear expiration)
-    ~old_tuple = Tuple.read_from(&p.old_tuple, 0, p.old_tuple.len() as u64)?;
+    old_tuple := mut Tuple.read_from(&p.old_tuple, 0, p.old_tuple.len() as u64)?;
     heap.update_mvcc(p.slot, &old_tuple.mvcc)?;
 
     # The new version tuple was inserted as the latest slot
     # Mark it as dead to remove it
-    ~last_slot = heap.item_count() - 1;
+    last_slot := mut heap.item_count() - 1;
     I last_slot > p.slot {
         heap.mark_slot_dead(last_slot)?;
     }
 
-    ~flushed = heap.flush();
+    flushed := mut heap.flush();
     L i: 0..flushed.len() {
         page_data[i] = flushed[i];
     }
@@ -351,12 +351,12 @@ F undo_tuple_update(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
 }
 
 # Undo BTREE_INSERT: remove the key that was inserted
-F undo_btree_insert(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = BtreeInsertPayload.deserialize(&buf)?;
+F undo_btree_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut BtreeInsertPayload.deserialize(&buf)?;
 
-    ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-    ~page_data = pool.get_page_mut(frame);
+    frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+    page_data := mut pool.get_page_mut(frame);
 
     # Remove the key from the B+Tree leaf page
     btree_page_delete_key(page_data, &p.key)?;
@@ -366,12 +366,12 @@ F undo_btree_insert(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
 }
 
 # Undo BTREE_DELETE: re-insert the deleted key
-F undo_btree_delete(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = BtreeDeletePayload.deserialize(&buf)?;
+F undo_btree_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut BtreeDeletePayload.deserialize(&buf)?;
 
-    ~frame = pool.fetch_page(p.file_id, p.page_id)?;
-    ~page_data = pool.get_page_mut(frame);
+    frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+    page_data := mut pool.get_page_mut(frame);
 
     # Re-insert the key-value pair
     btree_page_insert_key(page_data, &p.key, &p.old_value)?;
@@ -382,16 +382,16 @@ F undo_btree_delete(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError>
 
 # Undo BTREE_SPLIT: merge the split pages back together
 # This is the reverse of a split: move entries from new_page back to original
-F undo_btree_split(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = BtreeSplitPayload.deserialize(&buf)?;
+F undo_btree_split(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut BtreeSplitPayload.deserialize(&buf)?;
 
     # Read entries from new page and merge back into original
-    ~frame_old = pool.fetch_page(p.file_id, p.page_id)?;
-    ~frame_new = pool.fetch_page(p.file_id, p.new_page_id)?;
+    frame_old := mut pool.fetch_page(p.file_id, p.page_id)?;
+    frame_new := mut pool.fetch_page(p.file_id, p.new_page_id)?;
 
-    ~old_data = pool.get_page_mut(frame_old);
-    ~new_data = pool.get_page(frame_new);
+    old_data := mut pool.get_page_mut(frame_old);
+    new_data := mut pool.get_page(frame_new);
 
     # Merge new page entries back into old page
     btree_page_redo_merge(old_data, new_data)?;
@@ -407,31 +407,31 @@ F undo_btree_split(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> 
 
 # Undo BTREE_MERGE: re-split the merged page
 # This is the reverse of a merge: split entries back into two pages
-F undo_btree_merge(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~p = BtreeMergePayload.deserialize(&buf)?;
+F undo_btree_merge(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    p := mut BtreeMergePayload.deserialize(&buf)?;
 
     # Re-allocate the sibling page and split entries back
     pool.allocate_specific_page(p.file_id, p.sibling_id)?;
 
-    ~frame_main = pool.fetch_page(p.file_id, p.page_id)?;
-    ~frame_sib = pool.fetch_page(p.file_id, p.sibling_id)?;
+    frame_main := mut pool.fetch_page(p.file_id, p.page_id)?;
+    frame_sib := mut pool.fetch_page(p.file_id, p.sibling_id)?;
 
-    ~main_data = pool.get_page_mut(frame_main);
-    ~sib_data = pool.get_page_mut(frame_sib);
+    main_data := mut pool.get_page_mut(frame_main);
+    sib_data := mut pool.get_page_mut(frame_sib);
 
     # Split entries: move the second half back to sibling
-    ~header = PageHeader.read_from_page(main_data)?;
-    ~total_count = header.item_count;
-    ~keep_count = total_count / 2;
-    ~move_count = total_count - keep_count;
+    header := mut PageHeader.read_from_page(main_data)?;
+    total_count := mut header.item_count;
+    keep_count := mut total_count / 2;
+    move_count := mut total_count - keep_count;
 
     # Copy key directory entries from main to sibling
-    ~key_dir_start: u32 = 48;  # PAGE_HEADER_SIZE
-    ~entry_size: u32 = 8;
+    key_dir_start: u32 := mut 48;  # PAGE_HEADER_SIZE
+    entry_size: u32 := mut 8;
     L i: 0..move_count {
-        ~src_off = key_dir_start + ((keep_count + i) as u32) * entry_size;
-        ~dst_off = key_dir_start + (i as u32) * entry_size;
+        src_off := mut key_dir_start + ((keep_count + i) as u32) * entry_size;
+        dst_off := mut key_dir_start + (i as u32) * entry_size;
         L j: 0..entry_size {
             sib_data[(dst_off + j) as u64] = main_data[(src_off + j) as u64];
         }
@@ -451,25 +451,25 @@ F undo_btree_merge(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> 
 # these would be in a shared utility module
 
 # Insert a key-value pair into a B+Tree leaf page
-F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(), VaisError> {
-    ~header = PageHeader.read_from_page(page_data)?;
-    ~item_count = header.item_count;
-    ~key_dir_start: u32 = 48;  # PAGE_HEADER_SIZE
-    ~entry_size: u32 = 8;
+F btree_page_insert_key(page_data: &mut [u8], key: &[u8], value: &[u8]) -> Result<(), VaisError> {
+    header := mut PageHeader.read_from_page(page_data)?;
+    item_count := mut header.item_count;
+    key_dir_start: u32 := mut 48;  # PAGE_HEADER_SIZE
+    entry_size: u32 := mut 8;
 
-    ~insert_pos = item_count as u32;
+    insert_pos := mut item_count as u32;
     L i: 0..item_count {
-        ~entry_off = key_dir_start + (i as u32) * entry_size;
-        ~existing_key_off = read_u32_le(page_data, entry_off);
-        ~existing_key_len = read_u32_le(page_data, entry_off + 4);
-        ~existing_key = &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
+        entry_off := mut key_dir_start + (i as u32) * entry_size;
+        existing_key_off := mut read_u32_le(page_data, entry_off);
+        existing_key_len := mut read_u32_le(page_data, entry_off + 4);
+        existing_key := mut &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
         I key < existing_key {
             insert_pos = i as u32;
         }
     }
 
-    ~data_offset = header.free_space_offset as u32;
-    ~total_kv_len = key.len() as u32 + value.len() as u32;
+    data_offset := mut header.free_space_offset as u32;
+    total_kv_len := mut key.len() as u32 + value.len() as u32;
     L i: 0..key.len() {
         page_data[data_offset as u64 + i] = key[i];
     }
@@ -477,17 +477,17 @@ F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(
         page_data[(data_offset + key.len() as u32) as u64 + i] = value[i];
     }
 
-    ~i = item_count as u32;
+    i := mut item_count as u32;
     L i > insert_pos {
-        ~src_off = key_dir_start + (i - 1) * entry_size;
-        ~dst_off = key_dir_start + i * entry_size;
+        src_off := mut key_dir_start + (i - 1) * entry_size;
+        dst_off := mut key_dir_start + i * entry_size;
         L j: 0..entry_size {
             page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64];
         }
         i -= 1;
     }
 
-    ~entry_off = key_dir_start + insert_pos * entry_size;
+    entry_off := mut key_dir_start + insert_pos * entry_size;
     write_u32_le(page_data, entry_off, data_offset);
     write_u32_le(page_data, entry_off + 4, total_kv_len);
 
@@ -497,28 +497,28 @@ F btree_page_insert_key(page_data: &~[u8], key: &[u8], value: &[u8]) -> Result<(
 }
 
 # Delete a key from a B+Tree leaf page
-F btree_page_delete_key(page_data: &~[u8], key: &[u8]) -> Result<(), VaisError> {
-    ~header = PageHeader.read_from_page(page_data)?;
-    ~item_count = header.item_count;
-    ~key_dir_start: u32 = 48;
-    ~entry_size: u32 = 8;
+F btree_page_delete_key(page_data: &mut [u8], key: &[u8]) -> Result<(), VaisError> {
+    header := mut PageHeader.read_from_page(page_data)?;
+    item_count := mut header.item_count;
+    key_dir_start: u32 := mut 48;
+    entry_size: u32 := mut 8;
 
-    ~found_pos: i32 = -1;
+    found_pos: i32 := mut -1;
     L i: 0..item_count {
-        ~entry_off = key_dir_start + (i as u32) * entry_size;
-        ~existing_key_off = read_u32_le(page_data, entry_off);
-        ~existing_key_len = read_u32_le(page_data, entry_off + 4);
-        ~existing_key = &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
+        entry_off := mut key_dir_start + (i as u32) * entry_size;
+        existing_key_off := mut read_u32_le(page_data, entry_off);
+        existing_key_len := mut read_u32_le(page_data, entry_off + 4);
+        existing_key := mut &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64];
         I key == existing_key && found_pos == -1 {
             found_pos = i as i32;
         }
     }
 
     I found_pos >= 0 {
-        ~pos = found_pos as u32;
+        pos := mut found_pos as u32;
         L i: pos..(item_count as u32 - 1) {
-            ~src_off = key_dir_start + (i + 1) * entry_size;
-            ~dst_off = key_dir_start + i * entry_size;
+            src_off := mut key_dir_start + (i + 1) * entry_size;
+            dst_off := mut key_dir_start + i * entry_size;
             L j: 0..entry_size {
                 page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64];
             }
@@ -530,19 +530,19 @@ F btree_page_delete_key(page_data: &~[u8], key: &[u8]) -> Result<(), VaisError> 
 
 # Merge entries from sibling page into target page
 F btree_page_redo_merge(
-    target_page: &~[u8],
+    target_page: &mut [u8],
     sibling_page: &[u8],
 ) -> Result<(), VaisError> {
-    ~target_header = PageHeader.read_from_page(target_page)?;
-    ~sib_header = PageHeader.read_from_page(sibling_page)?;
-    ~key_dir_start: u32 = 48;
-    ~entry_size: u32 = 8;
-    ~target_count = target_header.item_count;
-    ~sib_count = sib_header.item_count;
+    target_header := mut PageHeader.read_from_page(target_page)?;
+    sib_header := mut PageHeader.read_from_page(sibling_page)?;
+    key_dir_start: u32 := mut 48;
+    entry_size: u32 := mut 8;
+    target_count := mut target_header.item_count;
+    sib_count := mut sib_header.item_count;
 
     L i: 0..sib_count {
-        ~src_off = key_dir_start + (i as u32) * entry_size;
-        ~dst_off = key_dir_start + ((target_count + i) as u32) * entry_size;
+        src_off := mut key_dir_start + (i as u32) * entry_size;
+        dst_off := mut key_dir_start + ((target_count + i) as u32) * entry_size;
         L j: 0..entry_size {
             target_page[(dst_off + j) as u64] = sibling_page[(src_off + j) as u64];
         }
@@ -553,15 +553,15 @@ F btree_page_redo_merge(
 
 # Helper: read a u32 little-endian from page data
 F read_u32_le(data: &[u8], offset: u32) -> u32 {
-    ~b0 = data[offset as u64] as u32;
-    ~b1 = data[(offset + 1) as u64] as u32;
-    ~b2 = data[(offset + 2) as u64] as u32;
-    ~b3 = data[(offset + 3) as u64] as u32;
+    b0 := mut data[offset as u64] as u32;
+    b1 := mut data[(offset + 1) as u64] as u32;
+    b2 := mut data[(offset + 2) as u64] as u32;
+    b3 := mut data[(offset + 3) as u64] as u32;
     b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 }
 
 # Helper: write a u32 little-endian to page data
-F write_u32_le(data: &~[u8], offset: u32, value: u32) {
+F write_u32_le(data: &mut [u8], offset: u32, value: u32) {
     data[offset as u64] = (value & 0xFF) as u8;
     data[(offset + 1) as u64] = ((value >> 8) & 0xFF) as u8;
     data[(offset + 2) as u64] = ((value >> 16) & 0xFF) as u8;
@@ -569,7 +569,7 @@ F write_u32_le(data: &~[u8], offset: u32, value: u32) {
 }
 
 # Helper: write a u16 little-endian to page data
-F write_u16_le(data: &~[u8], offset: u32, value: u16) {
+F write_u16_le(data: &mut [u8], offset: u32, value: u16) {
     data[offset as u64] = (value & 0xFF) as u8;
     data[(offset + 1) as u64] = ((value >> 8) & 0xFF) as u8;
 }
@@ -579,26 +579,26 @@ F write_u16_le(data: &~[u8], offset: u32, value: u16) {
 # prev_page(u32@24), next_page(u32@28), overflow_page(u32@32),
 # free_space_offset(u16@36), item_count(u16@38)
 
-F set_item_count(page_data: &~[u8], count: u16) {
+F set_item_count(page_data: &mut [u8], count: u16) {
     write_u16_le(page_data, 38, count);
 }
 
-F set_free_space_offset(page_data: &~[u8], offset: u16) {
+F set_free_space_offset(page_data: &mut [u8], offset: u16) {
     write_u16_le(page_data, 36, offset);
 }
 
-F undo_page_alloc(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~file_id = buf.get_u8()?;
-    ~page_id = buf.get_u32_le()?;
+F undo_page_alloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    file_id := mut buf.get_u8()?;
+    page_id := mut buf.get_u32_le()?;
     pool.deallocate_page(file_id, page_id)?;
     Ok(())
 }
 
-F undo_page_dealloc(pool: &~BufferPool, payload: &[u8]) -> Result<(), VaisError> {
-    ~buf = ByteBuffer.wrap_readonly(payload);
-    ~file_id = buf.get_u8()?;
-    ~page_id = buf.get_u32_le()?;
+F undo_page_dealloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+    buf := mut ByteBuffer.wrap_readonly(payload);
+    file_id := mut buf.get_u8()?;
+    page_id := mut buf.get_u32_le()?;
     pool.allocate_specific_page(file_id, page_id)?;
     Ok(())
 }

@@ -54,15 +54,15 @@ X UserManager {
     # Initialize with built-in system entries loaded from catalog
     # Called at engine startup after CatalogManager.load_from_disk()
     F load_from_catalog(catalog: &CatalogManager, config: &SecurityConfig) -> UserManager {
-        ~mgr = UserManager.new();
+        mgr := mut UserManager.new();
 
         # Load all user catalog entries and reconstruct UserInfo in-memory
-        ~cat_users = catalog.all_users();
-        ~i: u64 = 0;
+        cat_users := mut catalog.all_users();
+        i: u64 := mut 0;
         L i < cat_users.len() {
-            ~entry = cat_users[i];
+            entry := mut cat_users[i];
             # Reconstruct minimal UserInfo from catalog entry
-            ~info = UserInfo.new(
+            info := mut UserInfo.new(
                 entry.user_id,
                 entry.username.clone(),
                 "",            # password hash not stored in catalog (in security.vdb)
@@ -88,14 +88,14 @@ X UserManager {
     # Execute CREATE USER statement
     # Steps: validate -> hash password -> allocate ID -> write WAL -> update catalog -> cache
     F execute_create_user(
-        ~self,
+        mut self,
         stmt: &CreateUserStmt,
-        meta: &~SecurityMeta,
+        meta: &mut SecurityMeta,
         config: &SecurityConfig,
         session: &SessionContext,
-        catalog: &~CatalogManager,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
         cmd_id: u32,
     ) -> Result<u64, VaisError> {
@@ -116,24 +116,24 @@ X UserManager {
         validate_password(&stmt.password, config)?;
 
         # 5. Hash password with salt
-        ~salt = generate_salt(ARGON2_SALT_LENGTH);
-        ~password_hash = hash_password_sha256(&stmt.password, &salt);
+        salt := mut generate_salt(ARGON2_SALT_LENGTH);
+        password_hash := mut hash_password_sha256(&stmt.password, &salt);
 
         # 6. Allocate user ID
-        ~user_id = meta.alloc_user_id();
+        user_id := mut meta.alloc_user_id();
 
         # 7. Determine user properties from statement options
-        ~is_superuser = M &stmt.is_superuser {
+        is_superuser := mut M &stmt.is_superuser {
             Some(v) => *v,
             None => false,
         };
-        ~can_login = M &stmt.can_login {
+        can_login := mut M &stmt.can_login {
             Some(v) => *v,
             None => true,  # Users can login by default
         };
 
         # 8. Create UserInfo record
-        ~user_info = UserInfo.new(
+        user_info := mut UserInfo.new(
             user_id,
             stmt.username.clone(),
             password_hash.clone(),
@@ -154,9 +154,9 @@ X UserManager {
         };
 
         # 10. Grant initial roles (IN ROLE clause)
-        ~j: u64 = 0;
+        j: u64 := mut 0;
         L j < stmt.in_roles.len() {
-            ~role_name = &stmt.in_roles[j];
+            role_name := mut &stmt.in_roles[j];
             # Look up role ID from catalog
             M catalog.get_role(role_name) {
                 Some(role_entry) => {
@@ -173,11 +173,11 @@ X UserManager {
         user_info.add_role(PUBLIC_ROLE_ID)?;
 
         # 12. Write WAL record (WAL-first)
-        ~wal_payload = user_info.to_bytes();
+        wal_payload := mut user_info.to_bytes();
         gcm.write_record(txn_id, SECURITY_USER_CREATE, ENGINE_TAG_SECURITY, &wal_payload)?;
 
         # 13. Register in catalog (persistent B+Tree)
-        ~cat_entry = UserCatalogEntry.new(
+        cat_entry := mut UserCatalogEntry.new(
             user_id,
             stmt.username.clone(),
             is_superuser,
@@ -200,27 +200,27 @@ X UserManager {
     # Execute ALTER USER statement
     # Supports: SET PASSWORD, RENAME, SUPERUSER/NOSUPERUSER, LOGIN/NOLOGIN, LOCK/UNLOCK
     F execute_alter_user(
-        ~self,
+        mut self,
         stmt: &AlterUserStmt,
-        meta: &~SecurityMeta,
+        meta: &mut SecurityMeta,
         config: &SecurityConfig,
         session: &SessionContext,
-        catalog: &~CatalogManager,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
         cmd_id: u32,
     ) -> Result<(), VaisError> {
         # 1. Permission check: superusers can alter any user,
         #    non-superusers can only change their own password
-        ~is_self_alter = session.username == stmt.username;
+        is_self_alter := mut session.username == stmt.username;
         I !session.is_superuser && !is_self_alter {
             R Err(err_privilege_superuser_required());
         }
 
         # 2. Non-superuser can only SET PASSWORD on themselves
         I !session.is_superuser && is_self_alter {
-            ~has_non_password_changes = stmt.rename_to.is_some()
+            has_non_password_changes := mut stmt.rename_to.is_some()
                 || stmt.is_superuser.is_some()
                 || stmt.can_login.is_some()
                 || stmt.is_locked.is_some()
@@ -231,7 +231,7 @@ X UserManager {
         }
 
         # 3. Look up existing user
-        ~user_info = M self.users.get_mut(&stmt.username) {
+        user_info := mut M self.users.get_mut(&stmt.username) {
             Some(u) => u,
             None => { R Err(err_user_not_found(&stmt.username)); },
         };
@@ -240,8 +240,8 @@ X UserManager {
         M &stmt.password {
             Some(new_pw) => {
                 validate_password(new_pw, config)?;
-                ~salt = generate_salt(ARGON2_SALT_LENGTH);
-                ~hash = hash_password_sha256(new_pw, &salt);
+                salt := mut generate_salt(ARGON2_SALT_LENGTH);
+                hash := mut hash_password_sha256(new_pw, &salt);
                 user_info.password_hash = hash;
                 user_info.password_salt = salt;
                 user_info.password_changed_at = std/time.unix_timestamp();
@@ -286,7 +286,7 @@ X UserManager {
         user_info.updated_at = std/time.unix_timestamp();
 
         # 10. Write WAL record
-        ~wal_payload = user_info.to_bytes();
+        wal_payload := mut user_info.to_bytes();
         gcm.write_record(txn_id, SECURITY_USER_ALTER, ENGINE_TAG_SECURITY, &wal_payload)?;
 
         # 11. Handle RENAME TO (must update catalog + caches)
@@ -299,7 +299,7 @@ X UserManager {
 
                 # Update catalog: unregister old name, register new name
                 catalog.unregister_user(&stmt.username, pool, gcm, txn_id)?;
-                ~cat_entry = UserCatalogEntry.new(
+                cat_entry := mut UserCatalogEntry.new(
                     user_info.user_id,
                     new_name.clone(),
                     user_info.is_superuser,
@@ -309,14 +309,14 @@ X UserManager {
 
                 # Update in-memory: move from old key to new key
                 user_info.username = new_name.clone();
-                ~moved_info = self.users.remove(&stmt.username).unwrap();
+                moved_info := mut self.users.remove(&stmt.username).unwrap();
                 self.users_by_id.insert(moved_info.user_id, new_name.clone());
                 self.users.insert(new_name.clone(), moved_info);
             },
             None => {
                 # Update catalog entry in place (re-register with same name)
                 catalog.unregister_user(&stmt.username, pool, gcm, txn_id)?;
-                ~cat_entry = UserCatalogEntry.new(
+                cat_entry := mut UserCatalogEntry.new(
                     user_info.user_id,
                     stmt.username.clone(),
                     user_info.is_superuser,
@@ -335,15 +335,15 @@ X UserManager {
 
     # Execute DROP USER [IF EXISTS] [CASCADE]
     F execute_drop_user(
-        ~self,
+        mut self,
         username: &Str,
         if_exists: bool,
         cascade: bool,
-        meta: &~SecurityMeta,
+        meta: &mut SecurityMeta,
         session: &SessionContext,
-        catalog: &~CatalogManager,
-        pool: &~BufferPool,
-        gcm: &~GroupCommitManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
         cmd_id: u32,
     ) -> Result<(), VaisError> {
@@ -372,9 +372,9 @@ X UserManager {
         # Currently CASCADE allows unconditional drop
 
         # 4. Write WAL record
-        ~wal_buf = ByteBuffer.new(128);
+        wal_buf := mut ByteBuffer.new(128);
         wal_buf.put_string(username);
-        ~wal_bytes = wal_buf.to_vec();
+        wal_bytes := mut wal_buf.to_vec();
         gcm.write_record(txn_id, SECURITY_USER_DROP, ENGINE_TAG_SECURITY, &wal_bytes)?;
 
         # 5. Unregister from catalog
@@ -399,12 +399,12 @@ X UserManager {
     # Authenticate a user by username and password
     # Returns user_id on success, error on failure
     F authenticate(
-        ~self,
+        mut self,
         username: &Str,
         password: &Str,
         config: &SecurityConfig,
     ) -> Result<u64, VaisError> {
-        ~user_info = M self.users.get_mut(username) {
+        user_info := mut M self.users.get_mut(username) {
             Some(u) => u,
             None => { R Err(security/types.err_auth_failed(username)); },
         };
@@ -430,7 +430,7 @@ X UserManager {
         }
 
         # Verify password
-        ~computed_hash = hash_password_sha256(password, &user_info.password_salt);
+        computed_hash := mut hash_password_sha256(password, &user_info.password_salt);
         I computed_hash != user_info.password_hash {
             # Record failed attempt
             user_info.record_failed_login(config.max_failed_login_attempts);
@@ -449,12 +449,12 @@ X UserManager {
         client_addr: Str,
         database_name: Str,
     ) -> Result<SessionContext, VaisError> {
-        ~user_info = M self.users.get(username) {
+        user_info := mut M self.users.get(username) {
             Some(u) => u,
             None => { R Err(err_user_not_found(username)); },
         };
 
-        ~ctx = SessionContext.new(
+        ctx := mut SessionContext.new(
             user_info.user_id,
             user_info.username.clone(),
             user_info.is_superuser,
@@ -478,7 +478,7 @@ X UserManager {
     }
 
     # Get mutable user info
-    F get_user_mut(~self, username: &Str) -> Option<&~UserInfo> {
+    F get_user_mut(mut self, username: &Str) -> Option<&mut UserInfo> {
         self.users.get_mut(username)
     }
 
@@ -499,7 +499,7 @@ X UserManager {
 
     # List all active usernames
     F all_usernames(self) -> Vec<Str> {
-        ~names = Vec.new();
+        names := mut Vec.new();
         L key, _: &self.users {
             names.push(key.clone());
         }
@@ -508,11 +508,11 @@ X UserManager {
 
     # Add a role to a user (used by GrantManager for GRANT ROLE ... TO user)
     F add_role_to_user(
-        ~self,
+        mut self,
         username: &Str,
         role_id: u64,
     ) -> Result<(), VaisError> {
-        ~user_info = M self.users.get_mut(username) {
+        user_info := mut M self.users.get_mut(username) {
             Some(u) => u,
             None => { R Err(err_user_not_found(username)); },
         };
@@ -521,11 +521,11 @@ X UserManager {
 
     # Remove a role from a user
     F remove_role_from_user(
-        ~self,
+        mut self,
         username: &Str,
         role_id: u64,
     ) -> Result<bool, VaisError> {
-        ~user_info = M self.users.get_mut(username) {
+        user_info := mut M self.users.get_mut(username) {
             Some(u) => u,
             None => { R Err(err_user_not_found(username)); },
         };
@@ -540,24 +540,24 @@ X UserManager {
 # Generate a cryptographic salt using FNV-1a hash of timestamp + counter
 # (In production, use OS entropy source via C FFI)
 F generate_salt(length: u32) -> Vec<u8> {
-    ~salt = Vec.with_capacity(length as u64);
-    ~timestamp = std/time.unix_timestamp() as u64;
-    ~counter: u64 = 0;
-    ~remaining = length;
+    salt := mut Vec.with_capacity(length as u64);
+    timestamp := mut std/time.unix_timestamp() as u64;
+    counter: u64 := mut 0;
+    remaining := mut length;
     L remaining > 0 {
         # Generate 8 bytes per hash iteration
-        ~buf = ByteBuffer.new(24);
+        buf := mut ByteBuffer.new(24);
         buf.put_u64_le(timestamp);
         buf.put_u64_le(counter);
         buf.put_u64_le(remaining as u64);
-        ~hash = fnv1a_hash(buf.as_slice());
+        hash := mut fnv1a_hash(buf.as_slice());
 
         # Extract bytes from hash
-        ~hash_bytes = ByteBuffer.new(8);
+        hash_bytes := mut ByteBuffer.new(8);
         hash_bytes.put_u64_le(hash);
-        ~hb = hash_bytes.to_vec();
+        hb := mut hash_bytes.to_vec();
 
-        ~j: u32 = 0;
+        j: u32 := mut 0;
         L j < 8 && remaining > 0 {
             salt.push(hb[j as u64]);
             remaining = remaining - 1;
@@ -572,21 +572,21 @@ F generate_salt(length: u32) -> Vec<u8> {
 # (Placeholder: real argon2 requires C FFI)
 # Format: iterate FNV-1a 10000 times over (salt + password + iteration)
 F hash_password_sha256(password: &Str, salt: &Vec<u8>) -> Str {
-    ~pw_bytes = password.as_bytes();
+    pw_bytes := mut password.as_bytes();
 
     # Iterative hashing (key stretching)
-    ~hash: u64 = 0xcbf29ce484222325;  # FNV offset basis
-    ~iterations: u32 = 10000;
-    ~iter: u32 = 0;
+    hash: u64 := mut 0xcbf29ce484222325;  # FNV offset basis
+    iterations: u32 := mut 10000;
+    iter: u32 := mut 0;
     L iter < iterations {
         # Build input: salt + password + iteration counter
-        ~buf = ByteBuffer.new(salt.len() + pw_bytes.len() + 12);
-        ~s: u64 = 0;
+        buf := mut ByteBuffer.new(salt.len() + pw_bytes.len() + 12);
+        s: u64 := mut 0;
         L s < salt.len() {
             buf.put_u8(salt[s]);
             s = s + 1;
         }
-        ~p: u64 = 0;
+        p: u64 := mut 0;
         L p < pw_bytes.len() {
             buf.put_u8(pw_bytes[p]);
             p = p + 1;
@@ -604,17 +604,17 @@ F hash_password_sha256(password: &Str, salt: &Vec<u8>) -> Str {
 
 # Verify a password against a stored hash
 F verify_password(password: &Str, salt: &Vec<u8>, stored_hash: &Str) -> bool {
-    ~computed = hash_password_sha256(password, salt);
+    computed := mut hash_password_sha256(password, salt);
     computed == *stored_hash
 }
 
 # Convert u64 to 16-char hex string
 F u64_to_hex(value: u64) -> Str {
-    ~hex_chars = "0123456789abcdef";
-    ~result = Str.with_capacity(16);
-    ~shift: i32 = 60;
+    hex_chars := mut "0123456789abcdef";
+    result := mut Str.with_capacity(16);
+    shift: i32 := mut 60;
     L shift >= 0 {
-        ~nibble = ((value >> (shift as u32)) & 0x0F) as u8;
+        nibble := mut ((value >> (shift as u32)) & 0x0F) as u8;
         result.push_byte(hex_chars.as_bytes()[nibble as u64]);
         shift = shift - 4;
     }

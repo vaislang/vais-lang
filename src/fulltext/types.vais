@@ -155,7 +155,7 @@ X FullTextConfig {
     }
 
     # Serialize (24 bytes)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_f64_le(self.bm25_k1);
         buf.put_f64_le(self.bm25_b);
         buf.put_u32_le(self.max_token_length);
@@ -209,9 +209,9 @@ X FullTextMeta {
     }
 
     # Update average document length after insert/delete
-    F update_avg_doc_length(~self, doc_token_count: u64, is_insert: bool) {
+    F update_avg_doc_length(mut self, doc_token_count: u64, is_insert: bool) {
         I is_insert {
-            ~old_total = self.avg_doc_length * (self.total_docs as f64);
+            old_total := mut self.avg_doc_length * (self.total_docs as f64);
             self.total_docs += 1;
             self.total_tokens += doc_token_count;
             self.avg_doc_length = (old_total + doc_token_count as f64) / (self.total_docs as f64);
@@ -221,7 +221,7 @@ X FullTextMeta {
                 self.total_tokens = 0;
                 self.avg_doc_length = 0.0;
             } E {
-                ~old_total = self.avg_doc_length * (self.total_docs as f64);
+                old_total := mut self.avg_doc_length * (self.total_docs as f64);
                 self.total_docs -= 1;
                 self.total_tokens -= doc_token_count;
                 self.avg_doc_length = (old_total - doc_token_count as f64) / (self.total_docs as f64);
@@ -230,7 +230,7 @@ X FullTextMeta {
     }
 
     # Serialize to ByteBuffer
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u8(self.format_version);
         buf.put_u64_le(self.total_docs);
         buf.put_u64_le(self.total_terms);
@@ -243,7 +243,7 @@ X FullTextMeta {
 
     # Deserialize from ByteBuffer
     F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<FullTextMeta, VaisError> {
-        ~format_version = buf.get_u8()?;
+        format_version := mut buf.get_u8()?;
         Ok(FullTextMeta {
             format_version,
             total_docs: buf.get_u64_le()?,
@@ -297,13 +297,13 @@ X PostingEntry {
     # Serialize to ByteBuffer
     # Format: doc_id(8) + term_freq(4) + position_count(4) + positions(4 each)
     #         + txn_id_create(8) + txn_id_expire(8) + cmd_id(4) + expire_cmd_id(4)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u64_le(self.doc_id);
         buf.put_u32_le(self.term_freq);
         buf.put_u32_le(self.positions.len() as u32);
 
         # Positions
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.positions.len() {
             buf.put_u32_le(self.positions[i]);
             i += 1;
@@ -318,27 +318,27 @@ X PostingEntry {
 
     # Deserialize from ByteBuffer
     F deserialize(buf: &ByteBuffer) -> Result<PostingEntry, VaisError> {
-        ~doc_id = buf.get_u64_le()?;
-        ~term_freq = buf.get_u32_le()?;
-        ~position_count = buf.get_u32_le()? as u64;
+        doc_id := mut buf.get_u64_le()?;
+        term_freq := mut buf.get_u32_le()?;
+        position_count := mut buf.get_u32_le()? as u64;
 
         I position_count > MAX_POSITIONS_PER_ENTRY as u64 {
             R Err(err_fulltext_too_many_positions(position_count as u32));
         }
 
         # Positions
-        ~positions = Vec.with_capacity(position_count);
-        ~i: u64 = 0;
+        positions := mut Vec.with_capacity(position_count);
+        i: u64 := mut 0;
         L i < position_count {
             positions.push(buf.get_u32_le()?);
             i += 1;
         }
 
         # MVCC metadata
-        ~txn_id_create = buf.get_u64_le()?;
-        ~txn_id_expire = buf.get_u64_le()?;
-        ~cmd_id = buf.get_u32_le()?;
-        ~expire_cmd_id = buf.get_u32_le()?;
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
 
         Ok(PostingEntry {
             doc_id,
@@ -352,7 +352,7 @@ X PostingEntry {
     }
 
     # Mark as expired (soft delete)
-    F set_expired(~self, txn_id: u64, cmd_id: u32) {
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
         self.txn_id_expire = txn_id;
         self.expire_cmd_id = cmd_id;
     }
@@ -363,7 +363,7 @@ X PostingEntry {
     }
 
     # Clear expiration (rollback)
-    F clear_expired(~self) {
+    F clear_expired(mut self) {
         self.txn_id_expire = INVALID_TXN_ID;
         self.expire_cmd_id = 0;
     }
@@ -375,14 +375,14 @@ X PostingEntry {
 
     # Serialize to standalone byte vector (for WAL payload)
     F to_bytes(self) -> Vec<u8> {
-        ~buf = ByteBuffer.new(self.serialized_size() as u64);
+        buf := mut ByteBuffer.new(self.serialized_size() as u64);
         self.serialize(&buf);
         buf.to_vec()
     }
 
     # Deserialize from standalone byte vector (for WAL redo)
     F from_bytes(data: &[u8]) -> Result<PostingEntry, VaisError> {
-        ~buf = ByteBuffer.wrap_readonly(data);
+        buf := mut ByteBuffer.wrap_readonly(data);
         PostingEntry.deserialize(&buf)
     }
 }
@@ -410,7 +410,7 @@ X PostingPageHeader {
     }
 
     # Serialize (16 bytes)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u64_le(self.term_hash);
         buf.put_u16_le(self.entry_count);
         buf.put_u32_le(self.next_posting_page);
@@ -468,7 +468,7 @@ X DictEntry {
 
     # Serialize to ByteBuffer
     # Format: term_hash(8) + posting_head_page(4) + doc_freq(4) + total_term_freq(8) + term(var)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u64_le(self.term_hash);
         buf.put_u32_le(self.posting_head_page);
         buf.put_u32_le(self.doc_freq);
@@ -488,13 +488,13 @@ X DictEntry {
     }
 
     # Increment doc frequency
-    F inc_doc_freq(~self, term_freq: u32) {
+    F inc_doc_freq(mut self, term_freq: u32) {
         self.doc_freq += 1;
         self.total_term_freq += term_freq as u64;
     }
 
     # Decrement doc frequency
-    F dec_doc_freq(~self, term_freq: u32) {
+    F dec_doc_freq(mut self, term_freq: u32) {
         I self.doc_freq > 0 {
             self.doc_freq -= 1;
         }

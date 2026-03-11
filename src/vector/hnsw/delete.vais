@@ -114,8 +114,8 @@ F is_vector_visible(
 # Returns: Vec of layers affected (for potential neighbor cleanup)
 F hnsw_delete(
     node_id: u64,
-    ~meta: &~HnswMeta,
-    store: &~dyn NodeStore,
+    mut meta: &mut HnswMeta,
+    store: &mut dyn NodeStore,
     txn_id: u64,
     cmd_id: u32,
     file_id: u8,
@@ -129,8 +129,8 @@ F hnsw_delete(
         ));
     }
 
-    ~node_res = store.get_node_mut(node_id);
-    ~node = M node_res {
+    node_res := mut store.get_node_mut(node_id);
+    node := mut M node_res {
         Ok(n) => n,
         Err(e) => R Err(err_delete_failed(
             node_id,
@@ -153,8 +153,8 @@ F hnsw_delete(
     meta.delete_node();
 
     # Step 5: Collect affected layers for WAL record
-    ~layers_affected = Vec.with_capacity((node.max_layer + 1) as u64);
-    ~layer: u8 = 0;
+    layers_affected := mut Vec.with_capacity((node.max_layer + 1) as u64);
+    layer: u8 := mut 0;
     L layer <= node.max_layer {
         layers_affected.push(layer);
         layer = layer + 1;
@@ -163,7 +163,7 @@ F hnsw_delete(
     # Step 6: WAL-log the deletion
     # Note: Actual WAL write would be done by GroupCommitManager
     # Here we just prepare the payload
-    ~wal_payload = HnswDeleteNodePayload {
+    wal_payload := mut HnswDeleteNodePayload {
         node_id: node_id,
         layers_affected: layers_affected.clone(),
         file_id: file_id,
@@ -196,14 +196,14 @@ F calculate_oversample_factor(meta: &HnswMeta) -> f64 {
         R 2.0;
     }
 
-    ~invisible_ratio = (meta.total_deleted as f64) / (meta.total_nodes as f64);
+    invisible_ratio := mut (meta.total_deleted as f64) / (meta.total_nodes as f64);
 
     # Clamp invisible_ratio to prevent division by zero or overflow
     I invisible_ratio >= 0.95 {
         invisible_ratio = 0.95;
     }
 
-    ~adaptive_factor = 1.0 / (1.0 - invisible_ratio) * 1.5;
+    adaptive_factor := mut 1.0 / (1.0 - invisible_ratio) * 1.5;
 
     # Return max of base oversample (2.0) and adaptive factor
     I adaptive_factor > 2.0 {
@@ -248,23 +248,23 @@ F mvcc_filtered_search(
     clog: &Clog,
 ) -> Result<SearchResult, VaisError> {
     # Calculate initial oversample factor
-    ~oversample = calculate_oversample_factor(meta);
+    oversample := mut calculate_oversample_factor(meta);
 
     # Retry loop with adaptive oversampling
-    ~retry = 0;
-    ~max_retries = 3;
+    retry := mut 0;
+    max_retries := mut 3;
 
     L retry < max_retries {
         # Calculate actual k and ef for this attempt
-        ~actual_k = ((k as f64) * oversample).ceil() as u64;
-        ~actual_ef = I (actual_k as u32) > ef_search {
+        actual_k := mut ((k as f64) * oversample).ceil() as u64;
+        actual_ef := mut I (actual_k as u32) > ef_search {
             actual_k as u32
         } E {
             ef_search
         };
 
         # Perform HNSW search with oversampled k
-        ~search_result = knn_search(
+        search_result := mut knn_search(
             query,
             actual_k,
             actual_ef,
@@ -274,14 +274,14 @@ F mvcc_filtered_search(
         )?;
 
         # Filter results by MVCC visibility
-        ~visible_results = Vec.with_capacity(k);
-        ~idx: u64 = 0;
+        visible_results := mut Vec.with_capacity(k);
+        idx: u64 := mut 0;
         L idx < search_result.results.len() {
-            ~entry = &search_result.results[idx];
-            ~node_id = entry.node_id;
+            entry := mut &search_result.results[idx];
+            node_id := mut entry.node_id;
 
             # Get node and check visibility
-            ~node_res = store.get_node(node_id);
+            node_res := mut store.get_node(node_id);
             M node_res {
                 Ok(node) => {
                     # Check MVCC visibility
@@ -305,7 +305,7 @@ F mvcc_filtered_search(
                 visible_results.truncate(k);
             }
 
-            ~final_result = SearchResult.with_capacity(k);
+            final_result := mut SearchResult.with_capacity(k);
             final_result.results = visible_results;
             final_result.nodes_visited = search_result.nodes_visited;
             final_result.distance_computations = search_result.distance_computations;
@@ -323,14 +323,14 @@ F mvcc_filtered_search(
     # Caller should check result.results.len() < k
 
     # Perform final search with max oversample
-    ~actual_k_final = ((k as f64) * oversample).ceil() as u64;
-    ~actual_ef_final = I (actual_k_final as u32) > ef_search {
+    actual_k_final := mut ((k as f64) * oversample).ceil() as u64;
+    actual_ef_final := mut I (actual_k_final as u32) > ef_search {
         actual_k_final as u32
     } E {
         ef_search
     };
 
-    ~final_search = knn_search(
+    final_search := mut knn_search(
         query,
         actual_k_final,
         actual_ef_final,
@@ -340,13 +340,13 @@ F mvcc_filtered_search(
     )?;
 
     # Final visibility filter
-    ~final_visible = Vec.with_capacity(k);
-    ~final_idx: u64 = 0;
+    final_visible := mut Vec.with_capacity(k);
+    final_idx: u64 := mut 0;
     L final_idx < final_search.results.len() {
-        ~final_entry = &final_search.results[final_idx];
-        ~final_node_id = final_entry.node_id;
+        final_entry := mut &final_search.results[final_idx];
+        final_node_id := mut final_entry.node_id;
 
-        ~final_node_res = store.get_node(final_node_id);
+        final_node_res := mut store.get_node(final_node_id);
         M final_node_res {
             Ok(final_node) => {
                 I is_vector_visible(final_node, snapshot, clog) {
@@ -367,7 +367,7 @@ F mvcc_filtered_search(
         final_visible.truncate(k);
     }
 
-    ~result = SearchResult.with_capacity(k);
+    result := mut SearchResult.with_capacity(k);
     result.results = final_visible;
     result.nodes_visited = final_search.nodes_visited;
     result.distance_computations = final_search.distance_computations;
@@ -458,13 +458,13 @@ F scan_gc_candidates(
     low_water_mark: u64,
     clog: &Clog,
 ) -> Vec<u64> {
-    ~ready_nodes = Vec.new();
+    ready_nodes := mut Vec.new();
 
-    ~idx: u64 = 0;
+    idx: u64 := mut 0;
     L idx < node_ids.len() {
-        ~node_id = node_ids[idx];
+        node_id := mut node_ids[idx];
 
-        ~node_res = store.get_node(node_id);
+        node_res := mut store.get_node(node_id);
         M node_res {
             Ok(node) => {
                 I is_gc_ready(node, low_water_mark, clog) {
@@ -490,7 +490,7 @@ F scan_gc_candidates(
 #
 # T NodeStore {
 #     F get_node(self, node_id: u64) -> Result<&HnswNode, VaisError>;
-#     F get_node_mut(&~self, node_id: u64) -> Result<&~HnswNode, VaisError>;
+#     F get_node_mut(&mut self, node_id: u64) -> Result<&mut HnswNode, VaisError>;
 #     F get_vector(self, node_id: u64) -> Result<&[f32], VaisError>;
 # }
 #

@@ -23,12 +23,12 @@ L InsertResult =
 # Insert a key-TID pair into the B+Tree
 # Returns Ok(true) if inserted, Ok(false) if key already exists (duplicate)
 F btree_insert(
-    tree: &~BTree,
+    tree: &mut BTree,
     key: &[u8],
     tid: u32,
     txn_id: u64,
-    gcm: &~GroupCommitManager,
-    pool: &~BufferPool,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
 ) -> Result<bool, VaisError> {
     # Check for duplicate key first
     M tree.search(key, pool)? {
@@ -37,30 +37,30 @@ F btree_insert(
     }
 
     # Collect the path from root to leaf (for potential splits)
-    ~path = collect_insert_path(tree, key, pool)?;
+    path := mut collect_insert_path(tree, key, pool)?;
 
     # Insert into the leaf
-    ~leaf_info = &path[path.len() - 1];
-    ~leaf_frame = pool.fetch_page(tree.file_id, leaf_info.page_id)?;
-    ~page_data = pool.get_page(leaf_frame);
-    ~leaf = BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+    leaf_info := mut &path[path.len() - 1];
+    leaf_frame := mut pool.fetch_page(tree.file_id, leaf_info.page_id)?;
+    page_data := mut pool.get_page(leaf_frame);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
 
     # Acquire write latch on the leaf before modification
-    ~leaf_latch = LatchGuard.new_write(tree.get_latch_table(), leaf_info.page_id);
+    leaf_latch := mut LatchGuard.new_write(tree.get_latch_table(), leaf_info.page_id);
 
     I leaf.can_fit(key.len() as u32) {
         # Simple case: leaf has space
         # WAL-first: write WAL record before modifying page
-        ~tid_bytes = tid.to_le_bytes();
+        tid_bytes := mut tid.to_le_bytes();
         wal_btree_insert(gcm, txn_id, tree.file_id, leaf_info.page_id, key, &tid_bytes)?;
         # FPI: capture page image before first modification after checkpoint
         I pool.needs_fpi(leaf_frame) {
-            ~fpi_data = pool.get_page(leaf_frame);
+            fpi_data := mut pool.get_page(leaf_frame);
             write_fpi(gcm.writer(), txn_id, tree.file_id, leaf_info.page_id, fpi_data)?;
             pool.clear_fpi(leaf_frame);
         }
         leaf.insert(key, tid)?;
-        ~flushed = leaf.flush();
+        flushed := mut leaf.flush();
         pool.write_page(leaf_frame, flushed)?;
         leaf_latch.release();
         pool.unpin_page(leaf_frame, true);
@@ -70,7 +70,7 @@ F btree_insert(
 
     # Leaf is full, need to split
     # First do the split, then propagate separator up
-    ~split_result = split_leaf(tree, &leaf, key, tid, txn_id, gcm, leaf_frame, pool)?;
+    split_result := mut split_leaf(tree, &leaf, key, tid, txn_id, gcm, leaf_frame, pool)?;
 
     # Propagate split up through internal nodes
     M split_result {
@@ -97,23 +97,23 @@ S PathEntry {
 F collect_insert_path(
     tree: &BTree,
     key: &[u8],
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<Vec<PathEntry>, VaisError> {
-    ~path = Vec.with_capacity(tree.height as u64);
-    ~current_page = tree.root_page_id;
-    ~parent_guard: Option<LatchGuard> = None;
+    path := mut Vec.with_capacity(tree.height as u64);
+    current_page := mut tree.root_page_id;
+    parent_guard: Option<LatchGuard> := mut None;
 
     L level: 0..(tree.height - 1) {
         # Acquire read latch on current internal node
-        ~guard = LatchGuard.new_read(tree.get_latch_table(), current_page);
+        guard := mut LatchGuard.new_read(tree.get_latch_table(), current_page);
 
-        ~frame_id = pool.fetch_page(tree.file_id, current_page)?;
-        ~page_data = pool.get_page(frame_id);
-        ~internal = BTreeInternalNode.from_page_data(page_data, tree.page_size)?;
+        frame_id := mut pool.fetch_page(tree.file_id, current_page)?;
+        page_data := mut pool.get_page(frame_id);
+        internal := mut BTreeInternalNode.from_page_data(page_data, tree.page_size)?;
 
         # Find which child to descend to and record the child index
-        ~child_index = find_child_index(&internal, key);
-        ~next_page = I child_index == 0 {
+        child_index := mut find_child_index(&internal, key);
+        next_page := mut I child_index == 0 {
             internal.leftmost_child
         } E {
             internal.entries[child_index - 1].child_page
@@ -124,7 +124,7 @@ F collect_insert_path(
 
         # Release parent latch — child is safe once we descend
         M parent_guard {
-            Some(~pg) => { pg.release(); },
+            Some(mut pg) => { pg.release(); },
             None => {},
         }
 
@@ -134,7 +134,7 @@ F collect_insert_path(
 
     # Release the last internal node latch before latching the leaf
     M parent_guard {
-        Some(~pg) => { pg.release(); },
+        Some(mut pg) => { pg.release(); },
         None => {},
     }
 
@@ -146,12 +146,12 @@ F collect_insert_path(
 
 # Find the child index for descent (0 = leftmost_child, N = entries[N-1].child_page)
 F find_child_index(internal: &BTreeInternalNode, key: &[u8]) -> u64 {
-    ~lo: u64 = 0;
-    ~hi: u64 = internal.entries.len();
+    lo: u64 := mut 0;
+    hi: u64 := mut internal.entries.len();
 
     L lo < hi {
-        ~mid = lo + (hi - lo) / 2;
-        ~mid_key = internal.get_key(mid);
+        mid := mut lo + (hi - lo) / 2;
+        mid_key := mut internal.get_key(mid);
         M compare_keys(key, mid_key) {
             KeyCmp.Less => { hi = mid; },
             KeyCmp.Equal | KeyCmp.Greater => { lo = mid + 1; },
@@ -168,15 +168,15 @@ F split_leaf(
     key: &[u8],
     tid: u32,
     txn_id: u64,
-    gcm: &~GroupCommitManager,
+    gcm: &mut GroupCommitManager,
     leaf_frame: u32,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<InsertResult, VaisError> {
     # Find split point (median)
-    ~mid = leaf.median_index();
+    mid := mut leaf.median_index();
 
     # Allocate a new page for the right sibling
-    ~new_page_id = pool.allocate_page(tree.file_id)?;
+    new_page_id := mut pool.allocate_page(tree.file_id)?;
 
     # WAL-first: write PAGE_ALLOC + BTREE_SPLIT before modifying pages
     wal_btree_split(
@@ -184,19 +184,19 @@ F split_leaf(
         new_page_id, key, 1,  # direction=right
     )?;
 
-    ~new_frame = pool.fetch_page(tree.file_id, new_page_id)?;
+    new_frame := mut pool.fetch_page(tree.file_id, new_page_id)?;
 
     # Create the new leaf node
-    ~new_leaf = BTreeLeafNode.new(new_page_id, tree.page_size, false);
+    new_leaf := mut BTreeLeafNode.new(new_page_id, tree.page_size, false);
 
     # Determine where the new key goes (left or right of split point)
-    ~insert_pos = leaf.lower_bound(key);
-    ~goes_right = insert_pos >= mid;
+    insert_pos := mut leaf.lower_bound(key);
+    goes_right := mut insert_pos >= mid;
 
     # Move entries [mid..] to new leaf
     # Plus insert the new key at the right position
-    ~all_keys = Vec.new();
-    ~all_tids = Vec.new();
+    all_keys := mut Vec.new();
+    all_tids := mut Vec.new();
 
     L i: 0..leaf.entry_count() as u64 {
         I i == insert_pos {
@@ -212,11 +212,11 @@ F split_leaf(
     }
 
     # Split: left gets [0..mid], right gets [mid..]
-    ~total = all_keys.len();
-    ~split_at = total / 2;
+    total := mut all_keys.len();
+    split_at := mut total / 2;
 
     # Rebuild left leaf (reuse original)
-    ~left_leaf = BTreeLeafNode.new(leaf.header.page_id, tree.page_size, leaf.is_root());
+    left_leaf := mut BTreeLeafNode.new(leaf.header.page_id, tree.page_size, leaf.is_root());
     L i: 0..split_at {
         left_leaf.insert(&all_keys[i], all_tids[i])?;
     }
@@ -227,85 +227,85 @@ F split_leaf(
     }
 
     # Update leaf chain pointers
-    ~old_next = leaf.next_leaf();
+    old_next := mut leaf.next_leaf();
     left_leaf.set_next_leaf(new_page_id);
     new_leaf.set_prev_leaf(leaf.header.page_id);
     new_leaf.set_next_leaf(old_next);
 
     # Update the next leaf's prev pointer
     I old_next != NULL_PAGE {
-        ~next_frame = pool.fetch_page(tree.file_id, old_next)?;
+        next_frame := mut pool.fetch_page(tree.file_id, old_next)?;
         # FPI: next leaf is an existing page being modified
         I pool.needs_fpi(next_frame) {
-            ~fpi_data = pool.get_page(next_frame);
+            fpi_data := mut pool.get_page(next_frame);
             write_fpi(gcm.writer(), txn_id, tree.file_id, old_next, fpi_data)?;
             pool.clear_fpi(next_frame);
         }
-        ~next_data = pool.get_page(next_frame);
-        ~next_leaf = BTreeLeafNode.from_page_data(next_data, tree.page_size)?;
+        next_data := mut pool.get_page(next_frame);
+        next_leaf := mut BTreeLeafNode.from_page_data(next_data, tree.page_size)?;
         next_leaf.set_prev_leaf(new_page_id);
-        ~next_flushed = next_leaf.flush();
+        next_flushed := mut next_leaf.flush();
         pool.write_page(next_frame, next_flushed)?;
         pool.unpin_page(next_frame, true);
     }
 
     # FPI: original leaf page is being rewritten with left half
     I pool.needs_fpi(leaf_frame) {
-        ~fpi_data = pool.get_page(leaf_frame);
+        fpi_data := mut pool.get_page(leaf_frame);
         write_fpi(gcm.writer(), txn_id, tree.file_id, leaf.header.page_id, fpi_data)?;
         pool.clear_fpi(leaf_frame);
     }
 
     # Write both leaves
-    ~left_flushed = left_leaf.flush();
+    left_flushed := mut left_leaf.flush();
     pool.write_page(leaf_frame, left_flushed)?;
 
     # new_frame is a freshly allocated page — no FPI needed
-    ~new_flushed = new_leaf.flush();
+    new_flushed := mut new_leaf.flush();
     pool.write_page(new_frame, new_flushed)?;
     pool.unpin_page(new_frame, true);
 
     # Separator key = first key of right leaf
-    ~separator = all_keys[split_at].clone();
+    separator := mut all_keys[split_at].clone();
 
     Ok(InsertResult.NeedsSplit(separator, new_page_id))
 }
 
 # Propagate a split upward through the internal nodes
 F propagate_split(
-    tree: &~BTree,
+    tree: &mut BTree,
     path: &[PathEntry],
     separator: Vec<u8>,
     new_child_page: u32,
     txn_id: u64,
-    gcm: &~GroupCommitManager,
-    pool: &~BufferPool,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
 ) -> Result<(), VaisError> {
-    ~current_sep = separator;
-    ~current_child = new_child_page;
+    current_sep := mut separator;
+    current_child := mut new_child_page;
 
     # Walk up from the parent of the leaf (path[len-2]) to root
-    ~level = path.len() as i32 - 2;  # Start at parent of leaf
+    level := mut path.len() as i32 - 2;  # Start at parent of leaf
 
     L level >= 0 {
-        ~parent_info = &path[level as u64];
-        ~parent_frame = pool.fetch_page(tree.file_id, parent_info.page_id)?;
-        ~parent_data = pool.get_page(parent_frame);
-        ~internal = BTreeInternalNode.from_page_data(parent_data, tree.page_size)?;
+        parent_info := mut &path[level as u64];
+        parent_frame := mut pool.fetch_page(tree.file_id, parent_info.page_id)?;
+        parent_data := mut pool.get_page(parent_frame);
+        internal := mut BTreeInternalNode.from_page_data(parent_data, tree.page_size)?;
 
         # Acquire write latch on parent before modification
-        ~parent_latch = LatchGuard.new_write(tree.get_latch_table(), parent_info.page_id);
+        parent_latch := mut LatchGuard.new_write(tree.get_latch_table(), parent_info.page_id);
 
         I internal.can_fit(current_sep.len() as u32) {
             # Parent has space, insert separator
             # FPI: parent page being modified
             I pool.needs_fpi(parent_frame) {
-                ~fpi_data = pool.get_page(parent_frame);
+                fpi_data := mut pool.get_page(parent_frame);
                 write_fpi(gcm.writer(), txn_id, tree.file_id, parent_info.page_id, fpi_data)?;
                 pool.clear_fpi(parent_frame);
             }
             internal.insert_entry(&current_sep, current_child)?;
-            ~flushed = internal.flush();
+            flushed := mut internal.flush();
             pool.write_page(parent_frame, flushed)?;
             parent_latch.release();
             pool.unpin_page(parent_frame, true);
@@ -313,7 +313,7 @@ F propagate_split(
         }
 
         # Parent is full, need to split internal node
-        ~(new_sep, new_internal_page) = split_internal(
+        (new_sep, new_internal_page) := mut split_internal(
             tree, &internal, &current_sep, current_child, txn_id, gcm, parent_frame, pool
         )?;
         parent_latch.release();
@@ -338,20 +338,20 @@ F split_internal(
     new_key: &[u8],
     new_child: u32,
     txn_id: u64,
-    gcm: &~GroupCommitManager,
+    gcm: &mut GroupCommitManager,
     internal_frame: u32,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<(Vec<u8>, u32), VaisError> {
     # Collect all keys + the new key in sorted order
-    ~all_keys = Vec.new();
-    ~all_children = Vec.new();
+    all_keys := mut Vec.new();
+    all_children := mut Vec.new();
 
     # leftmost_child goes first
     all_children.push(internal.leftmost_child);
 
-    ~inserted = false;
+    inserted := mut false;
     L i: 0..internal.entry_count() as u64 {
-        ~entry_key = internal.get_key(i).to_vec();
+        entry_key := mut internal.get_key(i).to_vec();
         I !inserted && compare_keys(new_key, &entry_key) == KeyCmp.Less {
             all_keys.push(new_key.to_vec());
             all_children.push(new_child);
@@ -366,11 +366,11 @@ F split_internal(
     }
 
     # Split point: median key goes up, not into either node
-    ~mid = all_keys.len() / 2;
-    ~push_up_key = all_keys[mid].clone();
+    mid := mut all_keys.len() / 2;
+    push_up_key := mut all_keys[mid].clone();
 
     # Allocate new internal node
-    ~new_page_id = pool.allocate_page(tree.file_id)?;
+    new_page_id := mut pool.allocate_page(tree.file_id)?;
 
     # WAL-first: write PAGE_ALLOC + BTREE_SPLIT before modifying pages
     wal_btree_split(
@@ -378,17 +378,17 @@ F split_internal(
         new_page_id, &push_up_key, 1,
     )?;
 
-    ~new_frame = pool.fetch_page(tree.file_id, new_page_id)?;
+    new_frame := mut pool.fetch_page(tree.file_id, new_page_id)?;
 
     # Left internal: keys [0..mid], children [0..mid+1]
-    ~left = BTreeInternalNode.new(internal.header.page_id, tree.page_size, internal.is_root());
+    left := mut BTreeInternalNode.new(internal.header.page_id, tree.page_size, internal.is_root());
     left.set_leftmost_child(all_children[0]);
     L i: 0..mid {
         left.insert_entry(&all_keys[i], all_children[i + 1])?;
     }
 
     # Right internal: keys [mid+1..], children [mid+1..]
-    ~right = BTreeInternalNode.new(new_page_id, tree.page_size, false);
+    right := mut BTreeInternalNode.new(new_page_id, tree.page_size, false);
     right.set_leftmost_child(all_children[mid + 1]);
     L i: (mid + 1)..all_keys.len() {
         right.insert_entry(&all_keys[i], all_children[i + 1])?;
@@ -396,17 +396,17 @@ F split_internal(
 
     # FPI: original internal page is being rewritten with left half
     I pool.needs_fpi(internal_frame) {
-        ~fpi_data = pool.get_page(internal_frame);
+        fpi_data := mut pool.get_page(internal_frame);
         write_fpi(gcm.writer(), txn_id, tree.file_id, internal.header.page_id, fpi_data)?;
         pool.clear_fpi(internal_frame);
     }
 
     # Write both nodes
-    ~left_flushed = left.flush();
+    left_flushed := mut left.flush();
     pool.write_page(internal_frame, left_flushed)?;
 
     # new_frame is a freshly allocated page — no FPI needed
-    ~right_flushed = right.flush();
+    right_flushed := mut right.flush();
     pool.write_page(new_frame, right_flushed)?;
     pool.unpin_page(new_frame, true);
 
@@ -415,15 +415,15 @@ F split_internal(
 
 # Create a new root node when the old root splits
 F create_new_root(
-    tree: &~BTree,
+    tree: &mut BTree,
     separator: &[u8],
     left_child: u32,
     right_child: u32,
     txn_id: u64,
-    gcm: &~GroupCommitManager,
-    pool: &~BufferPool,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
 ) -> Result<(), VaisError> {
-    ~new_root_page = pool.allocate_page(tree.file_id)?;
+    new_root_page := mut pool.allocate_page(tree.file_id)?;
 
     # WAL-first: log the new root allocation
     wal_btree_split(
@@ -431,27 +431,27 @@ F create_new_root(
         new_root_page, separator, 1,
     )?;
 
-    ~new_root_frame = pool.fetch_page(tree.file_id, new_root_page)?;
+    new_root_frame := mut pool.fetch_page(tree.file_id, new_root_page)?;
 
-    ~root = BTreeInternalNode.new(new_root_page, tree.page_size, true);
+    root := mut BTreeInternalNode.new(new_root_page, tree.page_size, true);
     root.set_leftmost_child(left_child);
     root.insert_entry(separator, right_child)?;
 
-    ~flushed = root.flush();
+    flushed := mut root.flush();
     pool.write_page(new_root_frame, flushed)?;
     pool.unpin_page(new_root_frame, true);
 
     # Clear IS_ROOT flag on the old root node
-    ~old_root_frame = pool.fetch_page(tree.file_id, left_child)?;
+    old_root_frame := mut pool.fetch_page(tree.file_id, left_child)?;
     # FPI: old root page is being modified (flag change)
     I pool.needs_fpi(old_root_frame) {
-        ~fpi_data = pool.get_page(old_root_frame);
+        fpi_data := mut pool.get_page(old_root_frame);
         write_fpi(gcm.writer(), txn_id, tree.file_id, left_child, fpi_data)?;
         pool.clear_fpi(old_root_frame);
     }
-    ~old_root_data = pool.get_page(old_root_frame);
-    ~old_header = PageHeader.from_bytes(old_root_data)?;
-    ~old_flags = old_header.get_flags();
+    old_root_data := mut pool.get_page(old_root_frame);
+    old_header := mut PageHeader.from_bytes(old_root_data)?;
+    old_flags := mut old_header.get_flags();
     old_flags.set_root(false);
     old_header.set_flags(old_flags);
     old_header.serialize_into(old_root_data);

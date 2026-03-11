@@ -51,12 +51,12 @@ X BTree {
 
     # Search for a key, returns (page_id, slot_id) via TID or None
     # Read latch crabbing through internal nodes is handled by find_leaf()
-    F search(self, key: &[u8], pool: &~BufferPool) -> Result<Option<u32>, VaisError> {
-        ~leaf_frame = self.find_leaf(key, pool)?;
-        ~page_data = pool.get_page(leaf_frame);
-        ~leaf = BTreeLeafNode.from_page_data(page_data, self.page_size)?;
+    F search(self, key: &[u8], pool: &mut BufferPool) -> Result<Option<u32>, VaisError> {
+        leaf_frame := mut self.find_leaf(key, pool)?;
+        page_data := mut pool.get_page(leaf_frame);
+        leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
 
-        ~result = leaf.get_tid(key);
+        result := mut leaf.get_tid(key);
         pool.unpin_page(leaf_frame, false);
         Ok(result)
     }
@@ -67,26 +67,26 @@ X BTree {
     # Note: leaf read latch is acquired and immediately released — the buffer pin
     # provides logical protection for read-only callers. Write callers (insert/delete)
     # acquire their own write latch on the leaf independently.
-    F find_leaf(self, key: &[u8], pool: &~BufferPool) -> Result<u32, VaisError> {
-        ~current_page = self.root_page_id;
-        ~parent_guard: Option<LatchGuard> = None;
+    F find_leaf(self, key: &[u8], pool: &mut BufferPool) -> Result<u32, VaisError> {
+        current_page := mut self.root_page_id;
+        parent_guard: Option<LatchGuard> := mut None;
 
         L level: 0..(self.height - 1) {
             # Acquire read latch on current node
-            ~guard = LatchGuard.new_read(&self.latch_table, current_page);
+            guard := mut LatchGuard.new_read(&self.latch_table, current_page);
 
             # Load internal node
-            ~frame_id = pool.fetch_page(self.file_id, current_page)?;
-            ~page_data = pool.get_page(frame_id);
-            ~internal = BTreeInternalNode.from_page_data(page_data, self.page_size)?;
+            frame_id := mut pool.fetch_page(self.file_id, current_page)?;
+            page_data := mut pool.get_page(frame_id);
+            internal := mut BTreeInternalNode.from_page_data(page_data, self.page_size)?;
 
             # Find child to descend to
-            ~next_page = internal.find_child(key);
+            next_page := mut internal.find_child(key);
             pool.unpin_page(frame_id, false);
 
             # Release parent latch (if any) — child latch already held via next iteration
             M parent_guard {
-                Some(~pg) => { pg.release(); },
+                Some(mut pg) => { pg.release(); },
                 None => {},
             }
 
@@ -95,11 +95,11 @@ X BTree {
         }
 
         # Acquire read latch on the target leaf
-        ~leaf_guard = LatchGuard.new_read(&self.latch_table, current_page);
+        leaf_guard := mut LatchGuard.new_read(&self.latch_table, current_page);
 
         # Release the last internal node latch
         M parent_guard {
-            Some(~pg) => { pg.release(); },
+            Some(mut pg) => { pg.release(); },
             None => {},
         }
 
@@ -114,25 +114,25 @@ X BTree {
     # Range scan: find all entries with keys in [start_key, end_key]
     # Returns Vec<(key, tid)>
     # Uses latch crabbing on leaf chain: acquire next leaf latch before releasing current
-    F range_scan(self, start_key: &[u8], end_key: &[u8], pool: &~BufferPool) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
-        ~results = Vec.new();
+    F range_scan(self, start_key: &[u8], end_key: &[u8], pool: &mut BufferPool) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
+        results := mut Vec.new();
 
         # Find starting leaf (find_leaf handles internal node latch crabbing)
-        ~frame_id = self.find_leaf(start_key, pool)?;
-        ~page_data = pool.get_page(frame_id);
-        ~leaf = BTreeLeafNode.from_page_data(page_data, self.page_size)?;
-        ~current_page = leaf.header.page_id;
-        ~current_guard = LatchGuard.new_read(&self.latch_table, current_page);
+        frame_id := mut self.find_leaf(start_key, pool)?;
+        page_data := mut pool.get_page(frame_id);
+        leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
+        current_page := mut leaf.header.page_id;
+        current_guard := mut LatchGuard.new_read(&self.latch_table, current_page);
 
         # Find starting position within leaf
-        ~start_idx = leaf.lower_bound(start_key);
+        start_idx := mut leaf.lower_bound(start_key);
 
         # Scan current leaf from start position
-        ~i = start_idx;
-        ~has_next = true;
+        i := mut start_idx;
+        has_next := mut true;
         L has_next {
             L i < leaf.entry_count() as u64 {
-                ~key = leaf.get_key(i).to_vec();
+                key := mut leaf.get_key(i).to_vec();
                 I key_greater_than(&key, end_key) {
                     current_guard.release();
                     pool.unpin_page(frame_id, false);
@@ -143,7 +143,7 @@ X BTree {
             }
 
             # Follow next_page link with latch crabbing
-            ~next = leaf.next_leaf();
+            next := mut leaf.next_leaf();
 
             I next == NULL_PAGE {
                 current_guard.release();
@@ -151,7 +151,7 @@ X BTree {
                 has_next = false;
             } E {
                 # Acquire next leaf's read latch before releasing current
-                ~next_guard = LatchGuard.new_read(&self.latch_table, next);
+                next_guard := mut LatchGuard.new_read(&self.latch_table, next);
                 current_guard.release();
                 pool.unpin_page(frame_id, false);
 
@@ -175,14 +175,14 @@ X BTree {
     F get_entry_count(self) -> u64 { self.entry_count }
 
     # Update root after split
-    F set_root(~self, new_root_page: u32) {
+    F set_root(mut self, new_root_page: u32) {
         self.root_page_id = new_root_page;
         self.height += 1;
     }
 
     # Increment entry count
-    F inc_entries(~self) { self.entry_count += 1; }
-    F dec_entries(~self) { I self.entry_count > 0 { self.entry_count -= 1; } }
+    F inc_entries(mut self) { self.entry_count += 1; }
+    F dec_entries(mut self) { I self.entry_count > 0 { self.entry_count -= 1; } }
 }
 
 # Helper: check if a > b

@@ -148,7 +148,7 @@ X GraphEngine {
         bitmap: &FreelistBitmap,
         gcm: &GroupCommitManager,
     ) -> Result<GraphEngine, VaisError> {
-        ~page_size = config.page_size;
+        page_size := mut config.page_size;
 
         # Initialize metadata (empty graph)
         meta := GraphMeta.new(config.clone());
@@ -194,7 +194,7 @@ X GraphEngine {
     # ========================================================================
 
     ## Open engine: load meta page, edge type table, indexes
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         I self.is_open {
             R Ok(());
         }
@@ -219,19 +219,19 @@ X GraphEngine {
     }
 
     ## Close engine: flush dirty pages, release resources
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         I !self.is_open {
             R Ok(());
         }
 
         # Flush metadata page
-        ~meta_buf = ByteBuffer.new();
-        self.meta.serialize(&~meta_buf)?;
+        meta_buf := mut ByteBuffer.new();
+        self.meta.serialize(&mut meta_buf)?;
         self.pool.write_page(FILE_ID_GRAPH, 0, &meta_buf.to_vec())?;
 
         # Flush edge type table
-        ~edge_type_buf = ByteBuffer.new();
-        self.edge_type_table.serialize(&~edge_type_buf)?;
+        edge_type_buf := mut ByteBuffer.new();
+        self.edge_type_table.serialize(&mut edge_type_buf)?;
         self.pool.write_page(FILE_ID_GRAPH, 1, &edge_type_buf.to_vec())?;
 
         # Close indexes
@@ -252,7 +252,7 @@ X GraphEngine {
     ## Create node: WAL-log, write node page, update indexes
     ## Returns node_id (unique identifier for this node)
     F create_node(
-        ~self,
+        mut self,
         txn_id: u64,
         labels: &Vec<Str>,
         properties: &PropertyMap,
@@ -275,23 +275,23 @@ X GraphEngine {
 
         # 2. Resolve label strings to label IDs
         # NOTE: Using hash-based label IDs; full label registry deferred
-        ~label_ids = Vec.new();
+        label_ids := mut Vec.new();
         L label: labels {
             # Simple hash-based label ID (placeholder until proper label registry)
-            ~label_id = (label.len() % 65536) as u16;
+            label_id := mut (label.len() % 65536) as u16;
             label_ids.push(label_id);
         }
 
         # 3. Write node to storage
-        ~node = GraphNode.new(node_id, label_ids, txn_id, 0);
+        node := mut GraphNode.new(node_id, label_ids, txn_id, 0);
         (page_id, slot_index) := self.node_store.write_node(&node, txn_id)?;
 
         # 4. Update label indexes
-        ~li: u64 = 0;
+        li: u64 := mut 0;
         L li < label_ids.len() {
             self.label_index.insert_label(
                 node_id, label_ids[li], txn_id,
-                &~self.gcm, &~self.pool, self.allocator,
+                &mut self.gcm, &mut self.pool, self.allocator,
             )?;
             li += 1;
         }
@@ -309,7 +309,7 @@ X GraphEngine {
 
     ## Delete node: WAL-log, soft-delete node, expire all edges
     F delete_node(
-        ~self,
+        mut self,
         txn_id: u64,
         node_id: u64,
         cmd_id: u32,
@@ -321,7 +321,7 @@ X GraphEngine {
         }
 
         # Acquire node lock
-        ~lock_guard = self.lock_mgr.lock_node(node_id, txn_id)?;
+        lock_guard := mut self.lock_mgr.lock_node(node_id, txn_id)?;
 
         # 1. Get node to fetch labels and properties
         node := self.node_store.read_node(node_id)?;
@@ -333,19 +333,19 @@ X GraphEngine {
         self.node_store.delete_node(node_id, txn_id, cmd_id)?;
 
         # 4. Remove from label indexes
-        ~li: u64 = 0;
+        li: u64 := mut 0;
         L li < node.labels.len() {
             self.label_index.remove_label(
                 node_id, node.labels[li], txn_id,
-                &~self.gcm, &~self.pool,
+                &mut self.gcm, &mut self.pool,
             )?;
             li += 1;
         }
 
         # 5. Remove from property indexes (read properties from property page)
         I node.property_page != NULL_PAGE {
-            ~props = self.prop_store.read_properties(node.property_page)?;
-            ~pi: u64 = 0;
+            props := mut self.prop_store.read_properties(node.property_page)?;
+            pi: u64 := mut 0;
             L pi < props.entries.len() {
                 self.prop_index.remove_property(&props.entries[pi].key, node_id, true, txn_id)?;
                 pi += 1;
@@ -353,28 +353,28 @@ X GraphEngine {
         }
 
         # 6. Expire all outgoing edges
-        ~out_edges = self.get_neighbors(
+        out_edges := mut self.get_neighbors(
             node_id,
             node.out_adj_page,
             DIRECTION_OUTGOING,
             snapshot,
             clog,
         )?;
-        ~oi: u64 = 0;
+        oi: u64 := mut 0;
         L oi < out_edges.len() {
             self.delete_edge(txn_id, out_edges[oi].edge_id, node_id, out_edges[oi].target_node, cmd_id, snapshot, clog)?;
             oi += 1;
         }
 
         # 7. Expire all incoming edges
-        ~in_edges = self.get_neighbors(
+        in_edges := mut self.get_neighbors(
             node_id,
             node.in_adj_page,
             DIRECTION_INCOMING,
             snapshot,
             clog,
         )?;
-        ~ii: u64 = 0;
+        ii: u64 := mut 0;
         L ii < in_edges.len() {
             self.delete_edge(txn_id, in_edges[ii].edge_id, in_edges[ii].target_node, node_id, cmd_id, snapshot, clog)?;
             ii += 1;
@@ -407,7 +407,7 @@ X GraphEngine {
     ## Create edge: WAL-log, add to adjacency lists (bidirectional), write properties
     ## Returns edge_id (unique identifier for this edge)
     F create_edge(
-        ~self,
+        mut self,
         txn_id: u64,
         src: u64,
         dst: u64,
@@ -437,8 +437,8 @@ X GraphEngine {
         } E {
             (dst, src)
         };
-        ~lock1 = self.lock_mgr.lock_node(node1, txn_id)?;
-        ~lock2 = self.lock_mgr.lock_node(node2, txn_id)?;
+        lock1 := mut self.lock_mgr.lock_node(node1, txn_id)?;
+        lock2 := mut self.lock_mgr.lock_node(node2, txn_id)?;
 
         # 1. Get or create edge type ID
         edge_type_id := self.edge_type_table.get_or_create(edge_type)?;
@@ -459,18 +459,18 @@ X GraphEngine {
 
         # 4. Write edge properties
         # entity_type 1 = edge (0 = node)
-        ~prop_page_id = self.prop_store.write_properties(1, edge_id, properties, txn_id)?;
+        prop_page_id := mut self.prop_store.write_properties(1, edge_id, properties, txn_id)?;
 
         # 5. Add to src's outgoing adjacency list
-        ~out_entry = AdjEntry.new(dst, edge_id, edge_type_id, txn_id, 0);
+        out_entry := mut AdjEntry.new(dst, edge_id, edge_type_id, txn_id, 0);
         self.adj_mgr.add_edge(src_node.out_adj_page, out_entry, txn_id)?;
 
         # 6. Add to dst's incoming adjacency list
-        ~in_entry = AdjEntry.new(src, edge_id, edge_type_id, txn_id, 0);
+        in_entry := mut AdjEntry.new(src, edge_id, edge_type_id, txn_id, 0);
         self.adj_mgr.add_edge(dst_node.in_adj_page, in_entry, txn_id)?;
 
         # 7. Update property indexes (edge properties)
-        ~ei: u64 = 0;
+        ei: u64 := mut 0;
         L ei < properties.entries.len() {
             self.prop_index.insert_property(&properties.entries[ei].key, &properties.entries[ei].value, edge_id, false, txn_id)?;
             ei += 1;
@@ -484,7 +484,7 @@ X GraphEngine {
 
     ## Delete edge: WAL-log, expire in both adjacency lists
     F delete_edge(
-        ~self,
+        mut self,
         txn_id: u64,
         edge_id: u64,
         src: u64,
@@ -503,8 +503,8 @@ X GraphEngine {
         } E {
             (dst, src)
         };
-        ~lock1 = self.lock_mgr.lock_node(node1, txn_id)?;
-        ~lock2 = self.lock_mgr.lock_node(node2, txn_id)?;
+        lock1 := mut self.lock_mgr.lock_node(node1, txn_id)?;
+        lock2 := mut self.lock_mgr.lock_node(node2, txn_id)?;
 
         # 1. WAL-log edge deletion
         self.wal_mgr.log_edge_delete(edge_id, src, dst, txn_id, cmd_id)?;
@@ -585,13 +585,13 @@ X GraphEngine {
         }
 
         # Create BFS traversal
-        ~traversal = BfsTraversal.new(
+        traversal := mut BfsTraversal.new(
             self.pool, &self.node_store,
             snapshot.clone(), clog,
         );
 
         # Execute traversal
-        ~result = traversal.traverse(start, &self.adj_mgr, config)?;
+        result := mut traversal.traverse(start, &self.adj_mgr, config)?;
 
         Ok(result)
     }
@@ -621,13 +621,13 @@ X GraphEngine {
         }
 
         # Create shortest path finder
-        ~finder = ShortestPathFinder.new(
+        finder := mut ShortestPathFinder.new(
             self.pool, &self.node_store,
             snapshot.clone(), clog,
         );
 
         # Execute search
-        ~result = finder.find_shortest_path(start, end, &self.adj_mgr, config)?;
+        result := mut finder.find_shortest_path(start, end, &self.adj_mgr, config)?;
 
         Ok(result)
     }
@@ -648,10 +648,10 @@ X GraphEngine {
         }
 
         # Scan label index (takes label_id and pool)
-        node_ids := self.label_index.scan_by_label(label_id, &~self.pool)?;
+        node_ids := self.label_index.scan_by_label(label_id, &mut self.pool)?;
 
         # Filter visible nodes
-        ~visible = Vec.new();
+        visible := mut Vec.new();
         L node_id: node_ids {
             node := self.node_store.read_node(node_id)?;
             I is_node_visible(&node, snapshot, clog) {
@@ -678,7 +678,7 @@ X GraphEngine {
         node_ids := self.prop_index.lookup_by_property(key, value, true)?;
 
         # Filter visible nodes
-        ~visible = Vec.new();
+        visible := mut Vec.new();
         L node_id: node_ids {
             node := self.node_store.read_node(node_id)?;
             I is_node_visible(&node, snapshot, clog) {

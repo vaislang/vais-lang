@@ -54,7 +54,7 @@ X CowNeighborList {
 
     # Create new list with added neighbor (copy-on-write)
     F with_added(self, neighbor: HnswNeighbor, new_version: u64) -> CowNeighborList {
-        ~new_neighbors = Vec.with_capacity(self.neighbors.len() + 1);
+        new_neighbors := mut Vec.with_capacity(self.neighbors.len() + 1);
 
         # Copy existing neighbors
         L n: &self.neighbors {
@@ -69,7 +69,7 @@ X CowNeighborList {
 
     # Create new list with removed neighbor (copy-on-write)
     F with_removed(self, node_id: u64, new_version: u64) -> CowNeighborList {
-        ~new_neighbors = Vec.with_capacity(self.neighbors.len());
+        new_neighbors := mut Vec.with_capacity(self.neighbors.len());
 
         # Copy all neighbors except the one to remove
         L n: &self.neighbors {
@@ -88,7 +88,7 @@ X CowNeighborList {
 
     # Clone the neighbor vector for retirement
     F clone_neighbors(self) -> Vec<HnswNeighbor> {
-        ~cloned = Vec.with_capacity(self.neighbors.len());
+        cloned := mut Vec.with_capacity(self.neighbors.len());
         L n: &self.neighbors {
             cloned.push(*n);
         }
@@ -105,7 +105,7 @@ S CowNodeNeighbors {
 X CowNodeNeighbors {
     # Create new node neighbors with empty lists for all layers
     F new(node_id: u64, num_layers: u64) -> CowNodeNeighbors {
-        ~layers = Vec.with_capacity(num_layers);
+        layers := mut Vec.with_capacity(num_layers);
 
         L i: 0..num_layers {
             layers.push(CowNeighborList.new(Vec.new(), 0));
@@ -128,10 +128,10 @@ X CowNodeNeighbors {
     }
 
     # Update neighbor list for a specific layer (returns old list for retirement)
-    F update_layer(&~self, layer: u8, new_list: CowNeighborList) -> Option<Vec<HnswNeighbor>> {
+    F update_layer(&mut self, layer: u8, new_list: CowNeighborList) -> Option<Vec<HnswNeighbor>> {
         idx := layer as u64;
         I idx < self.layers.len() {
-            ~old_list = std.mem.replace(&~self.layers[idx], new_list);
+            old_list := mut std.mem.replace(&mut self.layers[idx], new_list);
             Some(old_list.clone_neighbors())
         } E {
             None
@@ -206,7 +206,7 @@ X EpochManager {
         epoch := self.current_epoch.load(std.sync.Ordering.Acquire);
         slot := (epoch % 3) as u64;
 
-        ~garbage = self.garbage[slot].lock()!;
+        garbage := mut self.garbage[slot].lock()!;
         garbage.push(old_list);
     }
 
@@ -228,7 +228,7 @@ X EpochManager {
             self.current_epoch.fetch_add(1, std.sync.Ordering.AcqRel);
 
             # Reclaim garbage from the now-reclaimable slot
-            ~garbage = self.garbage[reclaimable_slot].lock()!;
+            garbage := mut self.garbage[reclaimable_slot].lock()!;
             freed_count := garbage.len();
             garbage.clear();  # Vectors are dropped here
 
@@ -241,7 +241,7 @@ X EpochManager {
 
     # Get total number of arrays pending reclamation
     F pending_reclamation(self) -> u64 {
-        ~total = 0u64;
+        total := mut 0u64;
 
         L i: 0..3 {
             garbage := self.garbage[i].lock()!;
@@ -268,7 +268,7 @@ S EpochGuard<'a> {
 }
 
 I<'a> Drop for EpochGuard<'a> {
-    F drop(&~self) {
+    F drop(&mut self) {
         self.manager.unpin(self.epoch);
     }
 }
@@ -329,7 +329,7 @@ X CowNeighborStore {
         })?;
 
         # Clone neighbors for safe return
-        ~result = Vec.with_capacity(layer_list.len());
+        result := mut Vec.with_capacity(layer_list.len());
         L n: layer_list.get() {
             result.push(*n);
         }
@@ -346,7 +346,7 @@ X CowNeighborStore {
     ) -> Result<(), VaisError> {
         new_version := self.next_version();
 
-        ~neighbors = self.neighbors.lock()!;
+        neighbors := mut self.neighbors.lock()!;
 
         # Get or create node neighbors
         I !neighbors.contains_key(&node_id) {
@@ -367,9 +367,12 @@ X CowNeighborStore {
         new_list := CowNeighborList.new(new_neighbors, new_version);
 
         # Update layer and retire old list
-        I let Some(old_neighbors) = node_neighbors.update_layer(layer, new_list) {
-            # Retire old neighbor array to epoch manager
-            self.epoch_mgr.retire(old_neighbors);
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                # Retire old neighbor array to epoch manager
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
         }
 
         Ok(())
@@ -384,7 +387,7 @@ X CowNeighborStore {
     ) -> Result<(), VaisError> {
         new_version := self.next_version();
 
-        ~neighbors = self.neighbors.lock()!;
+        neighbors := mut self.neighbors.lock()!;
 
         # Get or create node neighbors
         I !neighbors.contains_key(&node_id) {
@@ -405,8 +408,11 @@ X CowNeighborStore {
         new_list := current_list.with_added(neighbor, new_version);
 
         # Update layer and retire old list
-        I let Some(old_neighbors) = node_neighbors.update_layer(layer, new_list) {
-            self.epoch_mgr.retire(old_neighbors);
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
         }
 
         Ok(())
@@ -421,7 +427,7 @@ X CowNeighborStore {
     ) -> Result<(), VaisError> {
         new_version := self.next_version();
 
-        ~neighbors = self.neighbors.lock()!;
+        neighbors := mut self.neighbors.lock()!;
 
         node_neighbors := neighbors.get_mut(&node_id).ok_or_else(|| {
             VaisError.new(
@@ -442,8 +448,11 @@ X CowNeighborStore {
         new_list := current_list.with_removed(neighbor_id, new_version);
 
         # Update layer and retire old list
-        I let Some(old_neighbors) = node_neighbors.update_layer(layer, new_list) {
-            self.epoch_mgr.retire(old_neighbors);
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
         }
 
         Ok(())

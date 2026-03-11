@@ -76,12 +76,12 @@ X WindowExecutor {
         }
     }
 
-    F open(~self) -> Result<(), VaisError> {
+    F open(mut self) -> Result<(), VaisError> {
         self.input.open()?;
 
         # Step 1: Materialize all input rows
-        ~input_rows = Vec.new();
-        ~has_more = true;
+        input_rows := mut Vec.new();
+        has_more := mut true;
         L has_more {
             M self.input.next()? {
                 Option.Some(exec_row) => {
@@ -93,11 +93,11 @@ X WindowExecutor {
         }
 
         # Step 2: Process each window function specification
-        ~augmented_rows = input_rows.clone();
+        augmented_rows := mut input_rows.clone();
 
         L spec: &self.window_specs {
             # Step 2a: Partition rows by partition key
-            ~partitions = self.partition_rows(&input_rows, &spec.partition_by)?;
+            partitions := mut self.partition_rows(&input_rows, &spec.partition_by)?;
 
             # Step 2b: Sort each partition by ORDER BY
             L partition: partitions.values_mut() {
@@ -105,7 +105,7 @@ X WindowExecutor {
             }
 
             # Step 2c: Compute window function values for each partition
-            ~window_values = self.compute_window_values(&partitions, spec)?;
+            window_values := mut self.compute_window_values(&partitions, spec)?;
 
             # Step 2d: Augment rows with computed window values
             augmented_rows = self.augment_rows_with_window_values(augmented_rows, &window_values);
@@ -118,7 +118,7 @@ X WindowExecutor {
         Result.Ok(())
     }
 
-    F next(~self) -> Result<Option<ExecutorRow>, VaisError> {
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         M &self.materialized {
             Option.None => {
                 Result.Err(VaisError.new("VAIS-E0106001", "WindowExecutor not opened"))
@@ -127,7 +127,7 @@ X WindowExecutor {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
                 } E {
-                    ~row = &rows[self.cursor];
+                    row := mut &rows[self.cursor];
                     self.cursor += 1;
                     self.stats.add_produced();
                     Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
@@ -136,7 +136,7 @@ X WindowExecutor {
         }
     }
 
-    F close(~self) -> Result<(), VaisError> {
+    F close(mut self) -> Result<(), VaisError> {
         self.materialized = Option.None;
         self.cursor = 0;
         self.input.close()?;
@@ -153,18 +153,18 @@ X WindowExecutor {
         rows: &Vec<Row>,
         partition_exprs: &Vec<Expr>,
     ) -> Result<HashMap<u64, Partition>, VaisError> {
-        ~partitions: HashMap<u64, Partition> = HashMap.new();
+        partitions: HashMap<u64, Partition> := mut HashMap.new();
 
         L row: rows {
             # Evaluate partition key
-            ~key_values = Vec.new();
+            key_values := mut Vec.new();
             L expr: partition_exprs {
-                ~val = eval_expr(expr, row, &self.eval_ctx)?;
+                val := mut eval_expr(expr, row, &self.eval_ctx)?;
                 key_values.push(val);
             }
 
             # Hash partition key (if empty, all rows go to same partition)
-            ~hash = I key_values.is_empty() {
+            hash := mut I key_values.is_empty() {
                 0  # No PARTITION BY: single partition
             } E {
                 group_key_hash(&key_values)
@@ -174,7 +174,7 @@ X WindowExecutor {
             I !partitions.contains_key(&hash) {
                 partitions.insert(hash, Partition.new(key_values.clone()));
             }
-            ~partition = partitions.get_mut(&hash)!;
+            partition := mut partitions.get_mut(&hash)!;
 
             # Add row to partition
             partition.rows.push(row.clone());
@@ -184,7 +184,7 @@ X WindowExecutor {
     }
 
     # Sort rows within a partition by ORDER BY clause
-    F sort_partition(self, order_items: &Vec<OrderByItem>, partition: ~Partition) {
+    F sort_partition(self, order_items: &Vec<OrderByItem>, partition: mut Partition) {
         I order_items.is_empty() {
             R;  # No ORDER BY, keep original order
         }
@@ -196,23 +196,23 @@ X WindowExecutor {
     F compare_rows(self, a: &Row, b: &Row, order_items: &Vec<OrderByItem>) -> i32 {
         L item: order_items {
             # Evaluate sort key for both rows
-            ~val_a = M eval_expr(&item.expr, a, &self.eval_ctx) {
+            val_a := mut M eval_expr(&item.expr, a, &self.eval_ctx) {
                 Result.Ok(v) => v,
                 Result.Err(_) => SqlValue.Null,  # Treat eval errors as NULL
             };
 
-            ~val_b = M eval_expr(&item.expr, b, &self.eval_ctx) {
+            val_b := mut M eval_expr(&item.expr, b, &self.eval_ctx) {
                 Result.Ok(v) => v,
                 Result.Err(_) => SqlValue.Null,
             };
 
             # Determine nulls_first (default: NULLS LAST for ASC, NULLS FIRST for DESC)
-            ~nulls_first = M item.nulls_first {
+            nulls_first := mut M item.nulls_first {
                 Option.Some(nf) => nf,
                 Option.None => !item.asc,
             };
 
-            ~cmp = order_by_compare(&val_a, &val_b, item.asc, Option.Some(nulls_first));
+            cmp := mut order_by_compare(&val_a, &val_b, item.asc, Option.Some(nulls_first));
             I cmp != 0 {
                 R cmp;
             }
@@ -228,10 +228,10 @@ X WindowExecutor {
         partitions: &HashMap<u64, Partition>,
         spec: &WindowSpec,
     ) -> Result<Vec<SqlValue>, VaisError> {
-        ~all_values = Vec.new();
+        all_values := mut Vec.new();
 
         L (_, partition): partitions {
-            ~partition_values = self.compute_partition_window_values(partition, spec)?;
+            partition_values := mut self.compute_partition_window_values(partition, spec)?;
             all_values.extend(partition_values);
         }
 
@@ -244,7 +244,7 @@ X WindowExecutor {
         partition: &Partition,
         spec: &WindowSpec,
     ) -> Result<Vec<SqlValue>, VaisError> {
-        ~values = Vec.with_capacity(partition.rows.len());
+        values := mut Vec.with_capacity(partition.rows.len());
 
         # Determine window function type
         M &spec.func_expr {
@@ -310,27 +310,27 @@ X WindowExecutor {
         spec: &WindowSpec,
         dense: bool,
     ) -> Result<Vec<SqlValue>, VaisError> {
-        ~values = Vec.with_capacity(partition.rows.len());
-        ~current_rank = 1i64;
-        ~dense_rank = 1i64;
-        ~prev_sort_key: Option<Vec<SqlValue>> = Option.None;
+        values := mut Vec.with_capacity(partition.rows.len());
+        current_rank := mut 1i64;
+        dense_rank := mut 1i64;
+        prev_sort_key: Option<Vec<SqlValue>> := mut Option.None;
 
         L i: 0..partition.rows.len() {
-            ~row = &partition.rows[i];
+            row := mut &partition.rows[i];
 
             # Evaluate ORDER BY expressions to get sort key
-            ~sort_key = Vec.new();
+            sort_key := mut Vec.new();
             L order_item: &spec.order_by {
-                ~val = eval_expr(&order_item.expr, row, &self.eval_ctx)?;
+                val := mut eval_expr(&order_item.expr, row, &self.eval_ctx)?;
                 sort_key.push(val);
             }
 
             # Check if sort key changed (tie detection)
-            ~is_tie = M &prev_sort_key {
+            is_tie := mut M &prev_sort_key {
                 Option.None => false,  # First row, no tie
                 Option.Some(prev_key) => {
                     # Compare all sort key values
-                    ~same = true;
+                    same := mut true;
                     L j: 0..sort_key.len() {
                         I same {
                             M sort_key[j].compare(&prev_key[j]) {
@@ -355,7 +355,7 @@ X WindowExecutor {
             }
 
             # Assign rank
-            ~rank_value = I dense { dense_rank } E { current_rank };
+            rank_value := mut I dense { dense_rank } E { current_rank };
             values.push(SqlValue.IntVal { v: rank_value });
 
             # Remember this sort key for next iteration
@@ -373,21 +373,21 @@ X WindowExecutor {
         func_name: &str,
         args: &Vec<Expr>,
     ) -> Result<Vec<SqlValue>, VaisError> {
-        ~values = Vec.with_capacity(partition.rows.len());
+        values := mut Vec.with_capacity(partition.rows.len());
 
         # For running aggregates, we accumulate values row-by-row
         # For partition-wide aggregates (no ORDER BY), compute once and reuse
-        ~has_order_by = !spec.order_by.is_empty();
+        has_order_by := mut !spec.order_by.is_empty();
 
         I has_order_by {
             # Running aggregate: accumulate as we go
             M func_name {
                 "SUM" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_sum(&acc, &arg_val)?;
-                        ~result = M &acc {
+                        result := mut M &acc {
                             Option.Some(v) => v.clone(),
                             Option.None => SqlValue.Null,
                         };
@@ -395,21 +395,21 @@ X WindowExecutor {
                     }
                 },
                 "AVG" => {
-                    ~sum: Option<SqlValue> = Option.None;
-                    ~count = 0u64;
+                    sum: Option<SqlValue> := mut Option.None;
+                    count := mut 0u64;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
-                        ~result_tuple = agg_avg_accumulate(&sum, &count, &arg_val)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        result_tuple := mut agg_avg_accumulate(&sum, &count, &arg_val)?;
                         sum = result_tuple.0;
                         count = result_tuple.1;
-                        ~avg = agg_avg_finalize(&sum, count)?;
+                        avg := mut agg_avg_finalize(&sum, count)?;
                         values.push(avg);
                     }
                 },
                 "COUNT" => {
-                    ~count = 0u64;
+                    count := mut 0u64;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         I agg_count_value(&arg_val) {
                             count += 1;
                         }
@@ -417,11 +417,11 @@ X WindowExecutor {
                     }
                 },
                 "MIN" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_min(&acc, &arg_val)?;
-                        ~result = M &acc {
+                        result := mut M &acc {
                             Option.Some(v) => v.clone(),
                             Option.None => SqlValue.Null,
                         };
@@ -429,11 +429,11 @@ X WindowExecutor {
                     }
                 },
                 "MAX" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_max(&acc, &arg_val)?;
-                        ~result = M &acc {
+                        result := mut M &acc {
                             Option.Some(v) => v.clone(),
                             Option.None => SqlValue.Null,
                         };
@@ -449,11 +449,11 @@ X WindowExecutor {
             }
         } E {
             # Partition-wide aggregate: compute once, replicate to all rows
-            ~final_value = M func_name {
+            final_value := mut M func_name {
                 "SUM" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_sum(&acc, &arg_val)?;
                     }
                     M acc {
@@ -462,20 +462,20 @@ X WindowExecutor {
                     }
                 },
                 "AVG" => {
-                    ~sum: Option<SqlValue> = Option.None;
-                    ~count = 0u64;
+                    sum: Option<SqlValue> := mut Option.None;
+                    count := mut 0u64;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
-                        ~result_tuple = agg_avg_accumulate(&sum, &count, &arg_val)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        result_tuple := mut agg_avg_accumulate(&sum, &count, &arg_val)?;
                         sum = result_tuple.0;
                         count = result_tuple.1;
                     }
                     agg_avg_finalize(&sum, count)?
                 },
                 "COUNT" => {
-                    ~count = 0u64;
+                    count := mut 0u64;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         I agg_count_value(&arg_val) {
                             count += 1;
                         }
@@ -483,9 +483,9 @@ X WindowExecutor {
                     SqlValue.IntVal { v: count as i64 }
                 },
                 "MIN" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_min(&acc, &arg_val)?;
                     }
                     M acc {
@@ -494,9 +494,9 @@ X WindowExecutor {
                     }
                 },
                 "MAX" => {
-                    ~acc: Option<SqlValue> = Option.None;
+                    acc: Option<SqlValue> := mut Option.None;
                     L row: &partition.rows {
-                        ~arg_val = self.eval_agg_arg(&args, row)?;
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
                         acc = agg_max(&acc, &arg_val)?;
                     }
                     M acc {
@@ -540,11 +540,11 @@ X WindowExecutor {
         rows: Vec<Row>,
         window_values: &Vec<SqlValue>,
     ) -> Vec<Row> {
-        ~augmented = Vec.with_capacity(rows.len());
+        augmented := mut Vec.with_capacity(rows.len());
 
         L i: 0..rows.len() {
-            ~row = &rows[i];
-            ~new_values = row.values.clone();
+            row := mut &rows[i];
+            new_values := mut row.values.clone();
             new_values.push(window_values[i].clone());
             augmented.push(Row.new(new_values));
         }

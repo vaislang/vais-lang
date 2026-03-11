@@ -208,9 +208,9 @@ X TableStats {
     # Extract statistics from TableInfo
     F from_table_info(info: &TableInfo) -> TableStats {
         # Use row_count_estimate from TableInfo
-        ~row_count = info.row_count_estimate;
-        ~page_count = I row_count == 0 { 1 } E { (row_count / 50) as u32 };  # Assume ~50 rows per page
-        ~avg_row_size = 200;  # Default estimate: 200 bytes per row
+        row_count := mut info.row_count_estimate;
+        page_count := mut I row_count == 0 { 1 } E { (row_count / 50) as u32 };  # Assume ~50 rows per page
+        avg_row_size := mut 200;  # Default estimate: 200 bytes per row
 
         TableStats {
             table_id: info.table_id,
@@ -245,14 +245,14 @@ F estimate_selectivity(expr: &Expr) -> f64 {
                 BinOp.Lt | BinOp.Le | BinOp.Gt | BinOp.Ge => SELECTIVITY_RANGE,
                 BinOp.And => {
                     # Multiply selectivities for AND (assuming independence)
-                    ~left_sel = estimate_selectivity(left);
-                    ~right_sel = estimate_selectivity(right);
+                    left_sel := mut estimate_selectivity(left);
+                    right_sel := mut estimate_selectivity(right);
                     left_sel * right_sel
                 },
                 BinOp.Or => {
                     # P(A OR B) = P(A) + P(B) - P(A)*P(B)
-                    ~left_sel = estimate_selectivity(left);
-                    ~right_sel = estimate_selectivity(right);
+                    left_sel := mut estimate_selectivity(left);
+                    right_sel := mut estimate_selectivity(right);
                     left_sel + right_sel - (left_sel * right_sel)
                 },
                 _ => SELECTIVITY_NO_STATS,
@@ -279,8 +279,8 @@ F estimate_selectivity(expr: &Expr) -> f64 {
 
         # IN list
         Expr.InList { list, negated, .. } => {
-            ~sel = SELECTIVITY_EQUALITY * (list.len() as f64);
-            ~sel = I sel > 1.0 { 1.0 } E { sel };
+            sel := mut SELECTIVITY_EQUALITY * (list.len() as f64);
+            sel := mut I sel > 1.0 { 1.0 } E { sel };
             I *negated { 1.0 - sel } E { sel }
         },
 
@@ -306,7 +306,7 @@ F estimate_selectivity(expr: &Expr) -> f64 {
 # Returns a PlanNode representing the root of the execution plan
 F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
     # Step 1: Plan the FROM clause (table scans and joins)
-    ~base_plan = M &query.from {
+    base_plan := mut M &query.from {
         Some(ref table_refs) => {
             plan_from_clause(table_refs, catalog)?
         },
@@ -317,7 +317,7 @@ F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, 
     };
 
     # Step 2: Apply WHERE clause (predicate pushdown already done in plan_from_clause)
-    ~filtered_plan = M &query.where_clause {
+    filtered_plan := mut M &query.where_clause {
         Some(ref predicate) => {
             # Try to push down to scans; if not possible, add Filter node
             plan_where(base_plan, predicate, catalog)?
@@ -326,36 +326,36 @@ F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, 
     };
 
     # Step 3: Apply GROUP BY and aggregates
-    ~grouped_plan = I query.group_by.len() > 0 || has_aggregates(&query.select_list) {
+    grouped_plan := mut I query.group_by.len() > 0 || has_aggregates(&query.select_list) {
         plan_aggregation(filtered_plan, &query.group_by, &query.select_list, &query.having, catalog)?
     } E {
         filtered_plan
     };
 
     # Step 4: Apply DISTINCT
-    ~distinct_plan = I query.distinct {
+    distinct_plan := mut I query.distinct {
         PlanNode.Distinct { input: Box.new(grouped_plan) }
     } E {
         grouped_plan
     };
 
     # Step 5: Apply ORDER BY
-    ~sorted_plan = I query.order_by.len() > 0 {
+    sorted_plan := mut I query.order_by.len() > 0 {
         plan_order_by(distinct_plan, &query.order_by)?
     } E {
         distinct_plan
     };
 
     # Step 6: Apply LIMIT/OFFSET
-    ~limited_plan = plan_limit(sorted_plan, &query.limit, &query.offset)?;
+    limited_plan := mut plan_limit(sorted_plan, &query.limit, &query.offset)?;
 
     # Step 7: Apply projection (SELECT list)
-    ~projected_plan = plan_projection(limited_plan, &query.select_list)?;
+    projected_plan := mut plan_projection(limited_plan, &query.select_list)?;
 
     # Step 8: Apply set operations (UNION, INTERSECT, EXCEPT)
-    ~final_plan = M &query.set_op {
+    final_plan := mut M &query.set_op {
         Some(ref set_op) => {
-            ~right_plan = build_plan(&set_op.right, catalog)?;
+            right_plan := mut build_plan(&set_op.right, catalog)?;
             plan_set_operation(projected_plan, right_plan, set_op)?
         },
         None => projected_plan,
@@ -375,11 +375,11 @@ F plan_from_clause(table_refs: &[TableRef], catalog: &CatalogManager) -> Result<
     }
 
     # Start with the first table
-    ~plan = plan_table_ref(&table_refs[0], catalog)?;
+    plan := mut plan_table_ref(&table_refs[0], catalog)?;
 
     # Process remaining tables as implicit cross joins or explicit joins
     L i: 1..table_refs.len() {
-        ~right_plan = plan_table_ref(&table_refs[i], catalog)?;
+        right_plan := mut plan_table_ref(&table_refs[i], catalog)?;
 
         # Implicit cross join (comma-separated tables in FROM clause)
         plan = PlanNode.NestedLoopJoin {
@@ -420,14 +420,14 @@ F plan_table_ref(table_ref: &TableRef, catalog: &CatalogManager) -> Result<PlanN
 
         TableRef.Subquery { query, alias } => {
             # Recursively build plan for subquery
-            ~subquery_plan = build_plan(query, catalog)?;
+            subquery_plan := mut build_plan(query, catalog)?;
             # Wrap in a logical "SubqueryScan" node (represented as the plan itself with alias)
             Ok(subquery_plan)
         },
 
         TableRef.CrossJoin { left, right } => {
-            ~left_plan = plan_table_ref(left, catalog)?;
-            ~right_plan = plan_table_ref(right, catalog)?;
+            left_plan := mut plan_table_ref(left, catalog)?;
+            right_plan := mut plan_table_ref(right, catalog)?;
             Ok(PlanNode.NestedLoopJoin {
                 left: Box.new(left_plan),
                 right: Box.new(right_plan),
@@ -465,11 +465,11 @@ F extract_table_name(table_ref: &TableRef) -> Option<Str> {
 
 # Plan a join (choose between nested loop join and hash join based on cost)
 F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
-    ~left_plan = plan_table_ref(&join.left, catalog)?;
-    ~right_plan = plan_table_ref(&join.right, catalog)?;
+    left_plan := mut plan_table_ref(&join.left, catalog)?;
+    right_plan := mut plan_table_ref(&join.right, catalog)?;
 
     # Extract join condition
-    ~condition = M &join.condition {
+    condition := mut M &join.condition {
         JoinCondition.On { expr } => Some(expr.clone()),
         JoinCondition.Using { columns } => {
             # Convert USING into explicit ON condition
@@ -478,13 +478,13 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
                 None
             } E {
                 # Extract table names for left and right sides to qualify columns
-                ~left_table = extract_table_name(&join.left);
-                ~right_table = extract_table_name(&join.right);
+                left_table := mut extract_table_name(&join.left);
+                right_table := mut extract_table_name(&join.right);
 
                 # Build conjunction of equality conditions
-                ~on_expr: Option<Expr> = None;
+                on_expr: Option<Expr> := mut None;
                 L col: columns {
-                    ~eq = Expr.BinaryOp {
+                    eq := mut Expr.BinaryOp {
                         left: Box.new(Expr.ColumnRef { table: left_table.clone(), column: col.clone() }),
                         op: BinOp.Eq,
                         right: Box.new(Expr.ColumnRef { table: right_table.clone(), column: col.clone() }),
@@ -509,21 +509,21 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
     };
 
     # Choose join algorithm based on cost estimation
-    ~left_cost = estimate_cost(&left_plan, catalog)?;
-    ~right_cost = estimate_cost(&right_plan, catalog)?;
+    left_cost := mut estimate_cost(&left_plan, catalog)?;
+    right_cost := mut estimate_cost(&right_plan, catalog)?;
 
     # Decision heuristic:
     # - If one side is small (< 1000 rows), use hash join with small side as build
     # - If join has equi-join predicates, prefer hash join
     # - Otherwise, use nested loop join
-    ~use_hash_join = false;
-    ~left_keys = Vec.new();
-    ~right_keys = Vec.new();
+    use_hash_join := mut false;
+    left_keys := mut Vec.new();
+    right_keys := mut Vec.new();
 
     # Check if condition has equi-join predicates (e.g., a.x = b.y)
     M &condition {
         Some(ref expr) => {
-            ~(found_equi, lk, rk) = extract_equi_join_keys(expr);
+            (found_equi, lk, rk) := mut extract_equi_join_keys(expr);
             I found_equi {
                 use_hash_join = true;
                 left_keys = lk;
@@ -570,19 +570,19 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
 # For example: a.x = b.y AND a.z = b.w → ([0, 1], [0, 1])
 # The actual column name resolution to physical indices happens at execution time
 F extract_equi_join_keys(expr: &Expr) -> (bool, Vec<u64>, Vec<u64>) {
-    ~left_keys = Vec.new();
-    ~right_keys = Vec.new();
+    left_keys := mut Vec.new();
+    right_keys := mut Vec.new();
 
     M expr {
         Expr.BinaryOp { left, op, right } => {
             M op {
                 BinOp.Eq => {
                     # Check if both sides are column references
-                    ~is_left_col = M left.as_ref() {
+                    is_left_col := mut M left.as_ref() {
                         Expr.ColumnRef { table, column } => true,
                         _ => false,
                     };
-                    ~is_right_col = M right.as_ref() {
+                    is_right_col := mut M right.as_ref() {
                         Expr.ColumnRef { table, column } => true,
                         _ => false,
                     };
@@ -597,16 +597,16 @@ F extract_equi_join_keys(expr: &Expr) -> (bool, Vec<u64>, Vec<u64>) {
                 },
                 BinOp.And => {
                     # Recursively extract from both sides
-                    ~(l_found, l_lk, l_rk) = extract_equi_join_keys(left);
-                    ~(r_found, r_lk, r_rk) = extract_equi_join_keys(right);
+                    (l_found, l_lk, l_rk) := mut extract_equi_join_keys(left);
+                    (r_found, r_lk, r_rk) := mut extract_equi_join_keys(right);
                     I l_found || r_found {
                         # Merge keys, adjusting ordinals
-                        ~offset = l_lk.len();
+                        offset := mut l_lk.len();
                         left_keys.extend(l_lk);
                         right_keys.extend(l_rk);
 
                         # Offset right-side keys
-                        ~i: u64 = 0;
+                        i: u64 := mut 0;
                         L i < r_lk.len() {
                             left_keys.push(r_lk[i] + offset);
                             i += 1;
@@ -640,7 +640,7 @@ F plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Res
             # Try to find an index that can satisfy this predicate
             M catalog.get_table(table) {
                 Some(table_info) => {
-                    ~indexes = catalog.get_indexes_for_table(table_info.table_id);
+                    indexes := mut catalog.get_indexes_for_table(table_info.table_id);
 
                     # Try to select an index for this predicate
                     M select_index(table, &indexes, predicate) {
@@ -712,7 +712,7 @@ F check_index_usable(index: &IndexInfo, predicate: &Expr) -> Option<(KeyRange, O
                             I index.columns.len() > 0 && column == &index.columns[0] {
                                 # This is an equality predicate on the index column
                                 # Build a point key range
-                                ~key_range = KeyRange.point(Vec.new());  # Simplified: empty key
+                                key_range := mut KeyRange.point(Vec.new());  # Simplified: empty key
                                 R Some((key_range, None));
                             }
                         },
@@ -725,7 +725,7 @@ F check_index_usable(index: &IndexInfo, predicate: &Expr) -> Option<(KeyRange, O
                         Expr.ColumnRef { table, column } => {
                             I index.columns.len() > 0 && column == &index.columns[0] {
                                 # Build a range key range
-                                ~key_range = KeyRange.all();  # Simplified
+                                key_range := mut KeyRange.all();  # Simplified
                                 R Some((key_range, None));
                             }
                         },
@@ -754,7 +754,7 @@ F plan_aggregation(
     catalog: &CatalogManager,
 ) -> Result<PlanNode, VaisError> {
     # Extract aggregate specs from SELECT list
-    ~aggregates = Vec.new();
+    aggregates := mut Vec.new();
     L item: select_list {
         M item {
             SelectItem.Expr { expr, alias } => {
@@ -782,7 +782,7 @@ F plan_aggregation(
 F extract_aggregate(expr: &Expr) -> Option<AggregateSpec> {
     M expr {
         Expr.FunctionCall { name, args, distinct } => {
-            ~upper = name.to_uppercase();
+            upper := mut name.to_uppercase();
             I upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" || upper == "MAX" {
                 I args.len() > 0 {
                     R Some(AggregateSpec {
@@ -833,7 +833,7 @@ F plan_order_by(input: PlanNode, order_by: &[OrderByItem]) -> Result<PlanNode, V
 # Plan LIMIT and OFFSET
 F plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> Result<PlanNode, VaisError> {
     # Extract constant integer values from limit/offset expressions
-    ~limit_val = M limit {
+    limit_val := mut M limit {
         Some(ref expr) => {
             M extract_constant_int(expr) {
                 Some(n) => Some(n as u64),
@@ -843,7 +843,7 @@ F plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> Re
         None => None,
     };
 
-    ~offset_val = M offset {
+    offset_val := mut M offset {
         Some(ref expr) => {
             M extract_constant_int(expr) {
                 Some(n) => Some(n as u64),
@@ -884,7 +884,7 @@ F extract_constant_int(expr: &Expr) -> Option<i64> {
 # Plan SELECT list projection
 F plan_projection(input: PlanNode, select_list: &[SelectItem]) -> Result<PlanNode, VaisError> {
     # Convert SELECT items to ProjectColumn specs
-    ~columns = Vec.new();
+    columns := mut Vec.new();
     L item: select_list {
         M item {
             SelectItem.AllColumns => {
@@ -941,18 +941,18 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
         PlanNode.SeqScan { table, filter, .. } => {
             M catalog.get_table(table) {
                 Some(table_info) => {
-                    ~stats = TableStats.from_table_info(table_info);
+                    stats := mut TableStats.from_table_info(table_info);
 
                     # I/O cost: read all pages
-                    ~io_cost = stats.page_count as f64;
+                    io_cost := mut stats.page_count as f64;
 
                     # CPU cost: compare every row against filter
-                    ~cpu_cost = stats.row_count as f64;
+                    cpu_cost := mut stats.row_count as f64;
 
                     # Row estimate: apply selectivity
-                    ~row_estimate = M filter {
+                    row_estimate := mut M filter {
                         Some(ref pred) => {
-                            ~sel = estimate_selectivity(pred);
+                            sel := mut estimate_selectivity(pred);
                             (stats.row_count as f64 * sel) as u64
                         },
                         None => stats.row_count,
@@ -967,21 +967,21 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
         PlanNode.IndexScan { table, index, key_range, residual } => {
             M catalog.get_table(table) {
                 Some(table_info) => {
-                    ~stats = TableStats.from_table_info(table_info);
+                    stats := mut TableStats.from_table_info(table_info);
 
                     # Index scan I/O cost: assume 10% of pages (estimate)
-                    ~io_cost = (stats.page_count as f64) * 0.1;
+                    io_cost := mut (stats.page_count as f64) * 0.1;
 
                     # CPU cost: fewer comparisons
-                    ~cpu_cost = (stats.row_count as f64) * 0.1;
+                    cpu_cost := mut (stats.row_count as f64) * 0.1;
 
                     # Row estimate: assume index is selective
-                    ~row_estimate = (stats.row_count as f64 * 0.1) as u64;
+                    row_estimate := mut (stats.row_count as f64 * 0.1) as u64;
 
                     # Apply residual filter selectivity
                     M residual {
                         Some(ref pred) => {
-                            ~sel = estimate_selectivity(pred);
+                            sel := mut estimate_selectivity(pred);
                             row_estimate = (row_estimate as f64 * sel) as u64;
                         },
                         None => {},
@@ -994,80 +994,80 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
         },
 
         PlanNode.Filter { input, predicate } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Filter adds CPU cost but no I/O
-            ~cpu_cost = input_cost.cpu_cost + (input_cost.row_estimate as f64);
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
 
             # Apply selectivity to row estimate
-            ~sel = estimate_selectivity(predicate);
-            ~row_estimate = (input_cost.row_estimate as f64 * sel) as u64;
+            sel := mut estimate_selectivity(predicate);
+            row_estimate := mut (input_cost.row_estimate as f64 * sel) as u64;
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
         },
 
         PlanNode.Project { input, columns } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Project adds minimal CPU cost
-            ~cpu_cost = input_cost.cpu_cost + (input_cost.row_estimate as f64 * 0.1);
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64 * 0.1);
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
         },
 
         PlanNode.NestedLoopJoin { left, right, condition, .. } => {
-            ~left_cost = estimate_cost(left, catalog)?;
-            ~right_cost = estimate_cost(right, catalog)?;
+            left_cost := mut estimate_cost(left, catalog)?;
+            right_cost := mut estimate_cost(right, catalog)?;
 
             # Nested loop: for each left row, scan all right rows
-            ~io_cost = left_cost.io_cost + (left_cost.row_estimate as f64) * right_cost.io_cost;
-            ~cpu_cost = left_cost.cpu_cost + (left_cost.row_estimate as f64) * right_cost.cpu_cost;
+            io_cost := mut left_cost.io_cost + (left_cost.row_estimate as f64) * right_cost.io_cost;
+            cpu_cost := mut left_cost.cpu_cost + (left_cost.row_estimate as f64) * right_cost.cpu_cost;
 
             # Output rows: apply join selectivity
-            ~join_sel = M condition {
+            join_sel := mut M condition {
                 Some(ref pred) => estimate_selectivity(pred),
                 None => 1.0,  # Cross join: all combinations
             };
-            ~row_estimate = ((left_cost.row_estimate as f64) * (right_cost.row_estimate as f64) * join_sel) as u64;
+            row_estimate := mut ((left_cost.row_estimate as f64) * (right_cost.row_estimate as f64) * join_sel) as u64;
 
             Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
         },
 
         PlanNode.HashJoin { build, probe, .. } => {
-            ~build_cost = estimate_cost(build, catalog)?;
-            ~probe_cost = estimate_cost(probe, catalog)?;
+            build_cost := mut estimate_cost(build, catalog)?;
+            probe_cost := mut estimate_cost(probe, catalog)?;
 
             # Hash join: scan build once, scan probe once
-            ~io_cost = build_cost.io_cost + probe_cost.io_cost;
+            io_cost := mut build_cost.io_cost + probe_cost.io_cost;
 
             # CPU cost: build hash table + probe
-            ~cpu_cost = build_cost.cpu_cost + probe_cost.cpu_cost +
+            cpu_cost := mut build_cost.cpu_cost + probe_cost.cpu_cost +
                         (build_cost.row_estimate as f64) + (probe_cost.row_estimate as f64);
 
             # Output rows: assume equi-join with selectivity 0.1
-            ~row_estimate = ((build_cost.row_estimate as f64) * (probe_cost.row_estimate as f64) * 0.1) as u64;
+            row_estimate := mut ((build_cost.row_estimate as f64) * (probe_cost.row_estimate as f64) * 0.1) as u64;
 
             Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
         },
 
         PlanNode.Sort { input, order_by } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Sort CPU cost: N log N comparisons
-            ~n = input_cost.row_estimate as f64;
-            ~cpu_cost = input_cost.cpu_cost + n * n.log2();
+            n := mut input_cost.row_estimate as f64;
+            cpu_cost := mut input_cost.cpu_cost + n * n.log2();
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
         },
 
         PlanNode.Aggregate { input, group_by, .. } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Aggregate CPU cost: hash-based aggregation
-            ~cpu_cost = input_cost.cpu_cost + (input_cost.row_estimate as f64);
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
 
             # Output rows: estimate number of groups
-            ~row_estimate = I group_by.len() > 0 {
+            row_estimate := mut I group_by.len() > 0 {
                 # Estimate distinct groups as sqrt(N) (heuristic)
                 ((input_cost.row_estimate as f64).sqrt()) as u64
             } E {
@@ -1079,10 +1079,10 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
         },
 
         PlanNode.Limit { input, limit, offset } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Limit reduces output rows
-            ~row_estimate = input_cost.row_estimate;
+            row_estimate := mut input_cost.row_estimate;
             M offset {
                 Some(off) => {
                     I row_estimate > *off {
@@ -1106,23 +1106,23 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
         },
 
         PlanNode.Distinct { input } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Distinct: hash-based deduplication
-            ~cpu_cost = input_cost.cpu_cost + (input_cost.row_estimate as f64);
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
 
             # Output rows: estimate as sqrt(N) distinct values
-            ~row_estimate = ((input_cost.row_estimate as f64).sqrt()) as u64;
+            row_estimate := mut ((input_cost.row_estimate as f64).sqrt()) as u64;
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
         },
 
         PlanNode.Window { input, .. } => {
-            ~input_cost = estimate_cost(input, catalog)?;
+            input_cost := mut estimate_cost(input, catalog)?;
 
             # Window functions: sort + scan
-            ~n = input_cost.row_estimate as f64;
-            ~cpu_cost = input_cost.cpu_cost + n * n.log2() + n;
+            n := mut input_cost.row_estimate as f64;
+            cpu_cost := mut input_cost.cpu_cost + n * n.log2() + n;
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
         },
@@ -1144,11 +1144,11 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
 
 # Format a plan node as a human-readable string for EXPLAIN output
 F format_plan(node: &PlanNode, indent: u64) -> Str {
-    ~prefix = "  ".repeat(indent);
+    prefix := mut "  ".repeat(indent);
 
     M node {
         PlanNode.SeqScan { table, alias, filter } => {
-            ~s = "{prefix}SeqScan on {table}";
+            s := mut "{prefix}SeqScan on {table}";
             M alias {
                 Some(ref a) => { s = "{s} as {a}"; },
                 None => {},
@@ -1161,7 +1161,7 @@ F format_plan(node: &PlanNode, indent: u64) -> Str {
         },
 
         PlanNode.IndexScan { table, index, residual, .. } => {
-            ~s = "{prefix}IndexScan on {table} using {index}";
+            s := mut "{prefix}IndexScan on {table} using {index}";
             M residual {
                 Some(ref r) => { s = "{s} (residual: <expr>)"; },
                 None => {},
@@ -1170,45 +1170,45 @@ F format_plan(node: &PlanNode, indent: u64) -> Str {
         },
 
         PlanNode.Filter { input, predicate } => {
-            ~s = "{prefix}Filter\n";
+            s := mut "{prefix}Filter\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },
 
         PlanNode.Project { input, columns } => {
-            ~s = "{prefix}Project ({columns.len()} columns)\n";
+            s := mut "{prefix}Project ({columns.len()} columns)\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },
 
         PlanNode.NestedLoopJoin { left, right, join_type, .. } => {
-            ~s = "{prefix}NestedLoopJoin ({join_type:?})\n";
+            s := mut "{prefix}NestedLoopJoin ({join_type:?})\n";
             s = "{s}{format_plan(left, indent + 1)}\n";
             s = "{s}{format_plan(right, indent + 1)}"
             s
         },
 
         PlanNode.HashJoin { build, probe, join_type, .. } => {
-            ~s = "{prefix}HashJoin ({join_type:?})\n";
+            s := mut "{prefix}HashJoin ({join_type:?})\n";
             s = "{s}{format_plan(build, indent + 1)}\n";
             s = "{s}{format_plan(probe, indent + 1)}"
             s
         },
 
         PlanNode.Sort { input, order_by } => {
-            ~s = "{prefix}Sort ({order_by.len()} keys)\n";
+            s := mut "{prefix}Sort ({order_by.len()} keys)\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },
 
         PlanNode.Aggregate { input, group_by, aggregates, .. } => {
-            ~s = "{prefix}Aggregate (groups: {group_by.len()}, aggs: {aggregates.len()})\n";
+            s := mut "{prefix}Aggregate (groups: {group_by.len()}, aggs: {aggregates.len()})\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },
 
         PlanNode.Limit { input, limit, offset } => {
-            ~s = "{prefix}Limit";
+            s := mut "{prefix}Limit";
             M limit {
                 Some(lim) => { s = "{s} {lim}"; },
                 None => {},
@@ -1222,13 +1222,13 @@ F format_plan(node: &PlanNode, indent: u64) -> Str {
         },
 
         PlanNode.Distinct { input } => {
-            ~s = "{prefix}Distinct\n";
+            s := mut "{prefix}Distinct\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },
 
         PlanNode.Window { input, window_specs } => {
-            ~s = "{prefix}Window ({window_specs.len()} specs)\n";
+            s := mut "{prefix}Window ({window_specs.len()} specs)\n";
             s = "{s}{format_plan(input, indent + 1)}"
             s
         },

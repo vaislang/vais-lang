@@ -185,33 +185,33 @@ F estimate_vector_scan_cost(
     params: &VectorScanParams,
     stats: &VectorIndexStats,
 ) -> HybridCost {
-    ~n = stats.vector_count as f64;
+    n := mut stats.vector_count as f64;
     I n <= 0.0 { n = 1.0; }
 
-    ~dim = stats.dimension as f64;
-    ~ef = I params.ef_search.is_some() {
+    dim := mut stats.dimension as f64;
+    ef := mut I params.ef_search.is_some() {
         params.ef_search! as f64
     } E {
         stats.ef_search_default as f64
     };
-    ~layers = stats.max_layer as f64;
+    layers := mut stats.max_layer as f64;
     I layers <= 0.0 { layers = (n.ln() / (stats.m as f64).ln()).ceil(); }
-    ~m = stats.m as f64;
+    m := mut stats.m as f64;
 
     # I/O cost: layer traversal + candidate page reads
     # Upper layers: few nodes, likely cached → HNSW_LAYER_IO_FACTOR per layer
     # Bottom layer: ef_search candidate pages
-    ~io_layers = layers * HNSW_LAYER_IO_FACTOR;
-    ~io_candidates = ef * HNSW_PAGE_READ_IO * 0.3;  # Many candidates share pages
-    ~io_cost = io_layers + io_candidates;
+    io_layers := mut layers * HNSW_LAYER_IO_FACTOR;
+    io_candidates := mut ef * HNSW_PAGE_READ_IO * 0.3;  # Many candidates share pages
+    io_cost := mut io_layers + io_candidates;
 
     # CPU cost: distance computations
     # Per layer: M distance comps × dim
     # Bottom layer: ef_search × M distance comps × dim
-    ~cpu_upper = layers * m * dim * HNSW_DISTANCE_CPU_FACTOR;
-    ~cpu_bottom = ef * m * dim * HNSW_DISTANCE_CPU_FACTOR;
-    ~cpu_neighbor = ef * m * HNSW_NEIGHBOR_VISIT_CPU;
-    ~cpu_cost = cpu_upper + cpu_bottom + cpu_neighbor;
+    cpu_upper := mut layers * m * dim * HNSW_DISTANCE_CPU_FACTOR;
+    cpu_bottom := mut ef * m * dim * HNSW_DISTANCE_CPU_FACTOR;
+    cpu_neighbor := mut ef * m * HNSW_NEIGHBOR_VISIT_CPU;
+    cpu_cost := mut cpu_upper + cpu_bottom + cpu_neighbor;
 
     # Quantization reduces CPU cost
     I stats.is_quantized {
@@ -220,16 +220,16 @@ F estimate_vector_scan_cost(
 
     # Pre-filter adds I/O I present (bitmap scan of filter column)
     I params.pre_filter.is_some() {
-        ~sel = estimate_selectivity(params.pre_filter.as_ref()!);
+        sel := mut estimate_selectivity(params.pre_filter.as_ref()!);
         io_cost += n * 0.01 * sel;  # Bitmap scan cost
         cpu_cost += n * sel * 0.01;  # Filter eval cost
     }
 
     # Output: top_k rows
-    ~row_estimate = params.top_k as u64;
+    row_estimate := mut params.top_k as u64;
 
     # Memory: top_k × (dim × 4 bytes + overhead)
-    ~mem = row_estimate * (stats.dimension as u64 * 4 + 64);
+    mem := mut row_estimate * (stats.dimension as u64 * 4 + 64);
 
     HybridCost {
         total_io_cost: io_cost,
@@ -262,10 +262,10 @@ F estimate_graph_traverse_cost(
     params: &GraphTraverseNodeParams,
     stats: &GraphStats,
 ) -> HybridCost {
-    ~depth = params.max_depth as f64;
+    depth := mut params.max_depth as f64;
     I depth <= 0.0 { depth = 3.0; }  # Default max depth for cost estimation
 
-    ~avg_degree = I params.direction == 2 {
+    avg_degree := mut I params.direction == 2 {
         # BOTH: consider both in and out degrees
         stats.avg_out_degree + stats.avg_in_degree
     } E I params.direction == 1 {
@@ -275,38 +275,38 @@ F estimate_graph_traverse_cost(
     };
 
     # Edge type filter reduces effective degree
-    ~effective_degree = avg_degree;
+    effective_degree := mut avg_degree;
     I params.edge_type_filter.is_some() {
-        ~filter_types = params.edge_type_filter.as_ref()!.len() as f64;
-        ~total_types = stats.edge_type_count as f64;
+        filter_types := mut params.edge_type_filter.as_ref()!.len() as f64;
+        total_types := mut stats.edge_type_count as f64;
         I total_types > 0.0 {
             effective_degree = avg_degree * (filter_types / total_types);
         }
     }
 
     # Estimated nodes visited: geometric series sum 1 + d + d^2 + ... + d^depth
-    ~nodes_visited = I effective_degree <= 1.0 {
+    nodes_visited := mut I effective_degree <= 1.0 {
         depth + 1.0
     } E {
         (effective_degree.powf(depth + 1.0) - 1.0) / (effective_degree - 1.0)
     };
 
     # Cap at total node count
-    ~max_nodes = stats.node_count as f64;
+    max_nodes := mut stats.node_count as f64;
     I max_nodes > 0.0 && nodes_visited > max_nodes {
         nodes_visited = max_nodes;
     }
 
     # I/O cost: node page reads + adjacency page reads
-    ~io_node = nodes_visited * GRAPH_NODE_READ_IO * 0.5;  # Many nodes share pages
-    ~io_adj = nodes_visited * GRAPH_ADJ_READ_IO;
-    ~io_cost = io_node + io_adj;
+    io_node := mut nodes_visited * GRAPH_NODE_READ_IO * 0.5;  # Many nodes share pages
+    io_adj := mut nodes_visited * GRAPH_ADJ_READ_IO;
+    io_cost := mut io_node + io_adj;
 
     # CPU cost: edge filter + visibility per visited edge
-    ~edges_checked = nodes_visited * effective_degree;
-    ~cpu_filter = edges_checked * GRAPH_EDGE_FILTER_CPU;
-    ~cpu_visibility = edges_checked * GRAPH_VISIBILITY_CPU;
-    ~cpu_cost = cpu_filter + cpu_visibility;
+    edges_checked := mut nodes_visited * effective_degree;
+    cpu_filter := mut edges_checked * GRAPH_EDGE_FILTER_CPU;
+    cpu_visibility := mut edges_checked * GRAPH_VISIBILITY_CPU;
+    cpu_cost := mut cpu_filter + cpu_visibility;
 
     # Property reads I filter present
     I params.filter.is_some() {
@@ -314,8 +314,8 @@ F estimate_graph_traverse_cost(
         cpu_cost += nodes_visited * 0.1;  # Filter eval per node
     }
 
-    ~row_estimate = nodes_visited as u64;
-    ~mem = row_estimate * 64;  # Per-node: node_id + depth + path overhead
+    row_estimate := mut nodes_visited as u64;
+    mem := mut row_estimate * 64;  # Per-node: node_id + depth + path overhead
 
     HybridCost {
         total_io_cost: io_cost,
@@ -350,28 +350,28 @@ F estimate_fulltext_scan_cost(
     stats: &FullTextStats,
 ) -> HybridCost {
     # Estimate query terms (rough: 1 term per 5 chars average)
-    ~estimated_terms = 3u64;  # Default assumption: 3 query terms
+    estimated_terms := mut 3u64;  # Default assumption: 3 query terms
 
-    ~doc_count = stats.document_count as f64;
+    doc_count := mut stats.document_count as f64;
     I doc_count <= 0.0 { doc_count = 1.0; }
 
-    ~avg_posting = stats.avg_posting_length as f64;
-    ~dict_size = stats.dictionary_size as f64;
+    avg_posting := mut stats.avg_posting_length as f64;
+    dict_size := mut stats.dictionary_size as f64;
     I dict_size <= 0.0 { dict_size = 1.0; }
 
     # I/O cost: dictionary lookups + posting page reads
-    ~dict_depth = (dict_size.ln() / 100.0f64.ln()).ceil();  # B+Tree depth (fanout ~100)
-    ~io_dict = estimated_terms as f64 * dict_depth * FT_DICT_LOOKUP_IO;
-    ~posting_pages = (avg_posting as f64 * 40.0 / 8192.0).ceil();  # 40B per PostingEntry, 8KB page
-    ~io_posting = estimated_terms as f64 * posting_pages * FT_POSTING_PAGE_IO;
-    ~io_cost = io_dict + io_posting;
+    dict_depth := mut (dict_size.ln() / 100.0f64.ln()).ceil();  # B+Tree depth (fanout ~100)
+    io_dict := mut estimated_terms as f64 * dict_depth * FT_DICT_LOOKUP_IO;
+    posting_pages := mut (avg_posting as f64 * 40.0 / 8192.0).ceil();  # 40B per PostingEntry, 8KB page
+    io_posting := mut estimated_terms as f64 * posting_pages * FT_POSTING_PAGE_IO;
+    io_cost := mut io_dict + io_posting;
 
     # CPU cost: tokenization + BM25 scoring + visibility
-    ~cpu_tokenize = FT_TOKENIZE_CPU;
-    ~total_postings = estimated_terms as f64 * avg_posting;
-    ~cpu_score = total_postings * FT_BM25_SCORE_CPU;
-    ~cpu_visibility = total_postings * FT_VISIBILITY_CPU;
-    ~cpu_cost = cpu_tokenize + cpu_score + cpu_visibility;
+    cpu_tokenize := mut FT_TOKENIZE_CPU;
+    total_postings := mut estimated_terms as f64 * avg_posting;
+    cpu_score := mut total_postings * FT_BM25_SCORE_CPU;
+    cpu_visibility := mut total_postings * FT_VISIBILITY_CPU;
+    cpu_cost := mut cpu_tokenize + cpu_score + cpu_visibility;
 
     # Phrase search adds position checking cost
     M params.search_mode {
@@ -384,8 +384,8 @@ F estimate_fulltext_scan_cost(
         _ => {}
     }
 
-    ~row_estimate = params.top_k as u64;
-    ~mem = row_estimate * 48;  # doc_id + score + table_id + row_tid + overhead
+    row_estimate := mut params.top_k as u64;
+    mem := mut row_estimate * 48;  # doc_id + score + table_id + row_tid + overhead
 
     HybridCost {
         total_io_cost: io_cost,
@@ -418,28 +418,28 @@ F estimate_fusion_cost(
     method: &FusionMethod,
     top_k: u32,
 ) -> HybridCost {
-    ~left_rows = left_cost.row_estimate as f64;
-    ~right_rows = right_cost.row_estimate as f64;
-    ~total_rows = left_rows + right_rows;
+    left_rows := mut left_cost.row_estimate as f64;
+    right_rows := mut right_cost.row_estimate as f64;
+    total_rows := mut left_rows + right_rows;
 
     # I/O: sum of children (fusion itself is in-memory)
-    ~io_cost = left_cost.total_io_cost + right_cost.total_io_cost;
+    io_cost := mut left_cost.total_io_cost + right_cost.total_io_cost;
 
     # CPU: normalization + merge + method-specific
-    ~cpu_normalize = total_rows * FUSION_NORMALIZE_CPU;
-    ~cpu_merge = total_rows * FUSION_MERGE_CPU;
-    ~cpu_method = M method {
+    cpu_normalize := mut total_rows * FUSION_NORMALIZE_CPU;
+    cpu_merge := mut total_rows * FUSION_MERGE_CPU;
+    cpu_method := mut M method {
         FusionMethod.WeightedSum { .. } => total_rows * FUSION_NORMALIZE_CPU,
         FusionMethod.ReciprocalRankFusion { .. } => total_rows * FUSION_RRF_CPU,
     };
-    ~cpu_cost = left_cost.total_cpu_cost + right_cost.total_cpu_cost +
+    cpu_cost := mut left_cost.total_cpu_cost + right_cost.total_cpu_cost +
                 cpu_normalize + cpu_merge + cpu_method;
 
-    ~row_estimate = top_k as u64;
-    ~mem = left_cost.total_memory_bytes + right_cost.total_memory_bytes +
+    row_estimate := mut top_k as u64;
+    mem := mut left_cost.total_memory_bytes + right_cost.total_memory_bytes +
            (total_rows as u64 * 24);  # Merge buffer: doc_id + score + rank
 
-    ~result = left_cost.add(right_cost);
+    result := mut left_cost.add(right_cost);
     result.total_io_cost = io_cost;
     result.total_cpu_cost = cpu_cost;
     result.total_memory_bytes = mem;
@@ -452,25 +452,25 @@ F estimate_cross_engine_join_cost(
     left_cost: &HybridCost,
     right_cost: &HybridCost,
 ) -> HybridCost {
-    ~left_rows = left_cost.row_estimate as f64;
-    ~right_rows = right_cost.row_estimate as f64;
+    left_rows := mut left_cost.row_estimate as f64;
+    right_rows := mut right_cost.row_estimate as f64;
 
     # Hash join: build on smaller side, probe with larger
-    ~build_rows = I left_rows < right_rows { left_rows } E { right_rows };
-    ~probe_rows = I left_rows < right_rows { right_rows } E { left_rows };
+    build_rows := mut I left_rows < right_rows { left_rows } E { right_rows };
+    probe_rows := mut I left_rows < right_rows { right_rows } E { left_rows };
 
-    ~io_cost = left_cost.total_io_cost + right_cost.total_io_cost;
-    ~cpu_build = build_rows * CROSS_JOIN_HASH_BUILD_CPU;
-    ~cpu_probe = probe_rows * CROSS_JOIN_PROBE_CPU;
-    ~cpu_cost = left_cost.total_cpu_cost + right_cost.total_cpu_cost + cpu_build + cpu_probe;
+    io_cost := mut left_cost.total_io_cost + right_cost.total_io_cost;
+    cpu_build := mut build_rows * CROSS_JOIN_HASH_BUILD_CPU;
+    cpu_probe := mut probe_rows * CROSS_JOIN_PROBE_CPU;
+    cpu_cost := mut left_cost.total_cpu_cost + right_cost.total_cpu_cost + cpu_build + cpu_probe;
 
     # Output cardinality: min of left/right (assuming PK-FK join)
-    ~row_estimate = I left_rows < right_rows { left_cost.row_estimate } E { right_cost.row_estimate };
+    row_estimate := mut I left_rows < right_rows { left_cost.row_estimate } E { right_cost.row_estimate };
 
-    ~mem = left_cost.total_memory_bytes + right_cost.total_memory_bytes +
+    mem := mut left_cost.total_memory_bytes + right_cost.total_memory_bytes +
            (build_rows as u64 * 128);  # Hash table overhead
 
-    ~result = left_cost.add(right_cost);
+    result := mut left_cost.add(right_cost);
     result.total_io_cost = io_cost;
     result.total_cpu_cost = cpu_cost;
     result.total_memory_bytes = mem;
@@ -487,35 +487,35 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         HybridPlanNode.FullTextScan { cost, .. } => cost.clone(),
 
         HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
-            ~left_cost = estimate_hybrid_cost(left);
-            ~right_cost = estimate_hybrid_cost(right);
+            left_cost := mut estimate_hybrid_cost(left);
+            right_cost := mut estimate_hybrid_cost(right);
             estimate_fusion_cost(&left_cost, &right_cost, method, *top_k)
         },
 
         HybridPlanNode.CrossEngineJoin { left, right, .. } => {
-            ~left_cost = estimate_hybrid_cost(left);
-            ~right_cost = estimate_hybrid_cost(right);
+            left_cost := mut estimate_hybrid_cost(left);
+            right_cost := mut estimate_hybrid_cost(right);
             estimate_cross_engine_join_cost(&left_cost, &right_cost)
         },
 
         HybridPlanNode.HybridFilter { input, predicate, .. } => {
-            ~child_cost = estimate_hybrid_cost(input);
-            ~sel = estimate_selectivity(predicate);
-            ~cpu_filter = child_cost.row_estimate as f64 * 0.01;
+            child_cost := mut estimate_hybrid_cost(input);
+            sel := mut estimate_selectivity(predicate);
+            cpu_filter := mut child_cost.row_estimate as f64 * 0.01;
             child_cost.total_cpu_cost += cpu_filter;
             child_cost.row_estimate = (child_cost.row_estimate as f64 * sel) as u64;
             child_cost
         },
 
         HybridPlanNode.HybridProject { input, .. } => {
-            ~child_cost = estimate_hybrid_cost(input);
+            child_cost := mut estimate_hybrid_cost(input);
             child_cost.total_cpu_cost += child_cost.row_estimate as f64 * 0.001;
             child_cost
         },
 
         HybridPlanNode.HybridSort { input, .. } => {
-            ~child_cost = estimate_hybrid_cost(input);
-            ~n = child_cost.row_estimate as f64;
+            child_cost := mut estimate_hybrid_cost(input);
+            n := mut child_cost.row_estimate as f64;
             I n > 1.0 {
                 child_cost.total_cpu_cost += n * n.log2() * 0.01;
             }
@@ -524,9 +524,9 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         },
 
         HybridPlanNode.HybridLimit { input, limit, .. } => {
-            ~child_cost = estimate_hybrid_cost(input);
+            child_cost := mut estimate_hybrid_cost(input);
             I limit.is_some() {
-                ~lim = limit!;
+                lim := mut limit!;
                 I lim < child_cost.row_estimate {
                     child_cost.row_estimate = lim;
                 }
@@ -535,11 +535,11 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         },
 
         HybridPlanNode.HybridAggregate { input, group_by, .. } => {
-            ~child_cost = estimate_hybrid_cost(input);
-            ~n = child_cost.row_estimate as f64;
+            child_cost := mut estimate_hybrid_cost(input);
+            n := mut child_cost.row_estimate as f64;
             child_cost.total_cpu_cost += n * 0.05;  # Hashing + aggregation per row
             # Cardinality after GROUP BY: rough estimate
-            ~groups = I group_by.len() == 0 { 1u64 } E { (n * 0.1) as u64 };
+            groups := mut I group_by.len() == 0 { 1u64 } E { (n * 0.1) as u64 };
             I groups < 1 { groups = 1; }
             child_cost.row_estimate = groups;
             child_cost.total_memory_bytes += groups * 128;  # Hash table for groups
@@ -561,8 +561,8 @@ F is_cheaper(a: &HybridCost, b: &HybridCost) -> bool {
 # Compare with bias toward lower memory usage (for memory-constrained environments)
 F is_cheaper_memory_aware(a: &HybridCost, b: &HybridCost, memory_budget: u64) -> bool {
     # If one plan fits in budget and the other doesn't, prefer the one that fits
-    ~a_fits = a.total_memory_bytes <= memory_budget;
-    ~b_fits = b.total_memory_bytes <= memory_budget;
+    a_fits := mut a.total_memory_bytes <= memory_budget;
+    b_fits := mut b.total_memory_bytes <= memory_budget;
 
     I a_fits && !b_fits {
         R true;

@@ -20,7 +20,7 @@ S OverflowPointer {
 
 X OverflowPointer {
     # Serialize overflow pointer (8 bytes)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u32_le(self.overflow_page_id);
         buf.put_u32_le(self.overflow_total_len);
     }
@@ -54,14 +54,14 @@ X OverflowPage {
     # Write overflow page to full page buffer
     F write_to_page(
         self,
-        page_data: &~[u8],
+        page_data: &mut [u8],
         page_id: u32,
         next_page: u32,
         page_lsn: u64,
         txn_id: u64
     ) {
         # Write page header
-        ~header = PageHeader.new(page_id, PAGE_TYPE_OVERFLOW, ENGINE_TAG_COMMON);
+        header := mut PageHeader.new(page_id, PAGE_TYPE_OVERFLOW, ENGINE_TAG_COMMON);
         header.page_lsn = page_lsn;
         header.txn_id = txn_id;
         header.next_page = next_page;
@@ -81,7 +81,7 @@ X OverflowPage {
 
     # Read overflow page from full page buffer
     F read_from_page(page_data: &[u8], page_size: u32) -> Result<OverflowPage, VaisError> {
-        ~header = PageHeader.read_from_page(page_data)?;
+        header := mut PageHeader.read_from_page(page_data)?;
 
         # Verify this is an overflow page
         I header.page_type != PAGE_TYPE_OVERFLOW {
@@ -89,8 +89,8 @@ X OverflowPage {
         }
 
         # Read data after header
-        ~data_len = (header.free_space_offset as u32 - PAGE_HEADER_SIZE) as u64;
-        ~data = Vec.with_capacity(data_len);
+        data_len := mut (header.free_space_offset as u32 - PAGE_HEADER_SIZE) as u64;
+        data := mut Vec.with_capacity(data_len);
 
         L i: 0..data_len {
             data.push(page_data[PAGE_HEADER_SIZE as u64 + i]);
@@ -106,48 +106,48 @@ F write_overflow_data(
     data: &[u8],
     page_size: u32,
     file_id: u8,
-    allocator: &~PageAllocator,
-    bitmap: &~FreelistBitmap,
+    allocator: &mut PageAllocator,
+    bitmap: &mut FreelistBitmap,
     page_lsn: u64,
     txn_id: u64,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<u32, VaisError> {
-    ~max_per_page = max_data_per_page(page_size) as u64;
-    ~num_pages = (data.len() + max_per_page - 1) / max_per_page;
+    max_per_page := mut max_data_per_page(page_size) as u64;
+    num_pages := mut (data.len() + max_per_page - 1) / max_per_page;
 
     I num_pages == 0 {
         R Err(err_internal("Cannot create overflow chain with zero data"));
     }
 
     # Allocate all needed pages upfront
-    ~page_ids = allocator.allocate_bulk(file_id, num_pages as u32, bitmap)?;
+    page_ids := mut allocator.allocate_bulk(file_id, num_pages as u32, bitmap)?;
 
     I page_ids.len() < num_pages {
         R Err(err_internal("Could not allocate enough overflow pages"));
     }
 
-    ~first_page_id = page_ids[0];
+    first_page_id := mut page_ids[0];
 
     # Write each overflow page via buffer pool
     L i: 0..num_pages {
-        ~start_offset = i * max_per_page;
-        ~end_offset = (start_offset + max_per_page).min(data.len());
-        ~chunk_data = Vec.with_capacity(end_offset - start_offset);
+        start_offset := mut i * max_per_page;
+        end_offset := mut (start_offset + max_per_page).min(data.len());
+        chunk_data := mut Vec.with_capacity(end_offset - start_offset);
         L j: start_offset..end_offset {
             chunk_data.push(data[j]);
         }
 
-        ~page_id = page_ids[i];
-        ~next_page = I i + 1 < num_pages {
+        page_id := mut page_ids[i];
+        next_page := mut I i + 1 < num_pages {
             page_ids[i + 1]
         } E {
             NULL_PAGE  # Last page in chain
         };
 
         # Fetch page frame from buffer pool, write overflow data, mark dirty
-        ~frame_id = pool.fetch_page(file_id, page_id)?;
-        ~page_buf = pool.get_page_mut(frame_id);
-        ~overflow_page = OverflowPage.new(chunk_data);
+        frame_id := mut pool.fetch_page(file_id, page_id)?;
+        page_buf := mut pool.get_page_mut(frame_id);
+        overflow_page := mut OverflowPage.new(chunk_data);
         overflow_page.write_to_page(page_buf, page_id, next_page, page_lsn, txn_id);
         pool.unpin_page(frame_id, true);
     }
@@ -162,12 +162,12 @@ F read_overflow_data(
     file_id: u8,
     page_size: u32,
     expected_total_len: u32,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<Vec<u8>, VaisError> {
-    ~result = Vec.with_capacity(expected_total_len as u64);
-    ~current_page_id = first_page_id;
-    ~max_iterations = 1000;  # Safety limit to prevent infinite loops
-    ~iteration = 0u32;
+    result := mut Vec.with_capacity(expected_total_len as u64);
+    current_page_id := mut first_page_id;
+    max_iterations := mut 1000;  # Safety limit to prevent infinite loops
+    iteration := mut 0u32;
 
     L current_page_id != NULL_PAGE {
         I iteration >= max_iterations {
@@ -176,14 +176,14 @@ F read_overflow_data(
         iteration += 1;
 
         # Read page via buffer pool
-        ~frame_id = pool.fetch_page(file_id, current_page_id)?;
-        ~page_data = pool.get_page(frame_id);
+        frame_id := mut pool.fetch_page(file_id, current_page_id)?;
+        page_data := mut pool.get_page(frame_id);
 
         # Parse overflow page body
-        ~overflow_page = OverflowPage.read_from_page(page_data, page_size)?;
+        overflow_page := mut OverflowPage.read_from_page(page_data, page_size)?;
 
         # Read next_page pointer from page header
-        ~header = PageHeader.read_from_page(page_data)?;
+        header := mut PageHeader.read_from_page(page_data)?;
 
         # Append data from this page
         L k: 0..overflow_page.data.len() {
@@ -212,15 +212,15 @@ F read_overflow_data(
 F free_overflow_chain(
     first_page_id: u32,
     file_id: u8,
-    allocator: &~PageAllocator,
-    bitmap: &~FreelistBitmap,
+    allocator: &mut PageAllocator,
+    bitmap: &mut FreelistBitmap,
     page_size: u32,
-    pool: &~BufferPool,
+    pool: &mut BufferPool,
 ) -> Result<(), VaisError> {
-    ~current_page_id = first_page_id;
-    ~max_iterations = 1000;  # Safety limit
-    ~iteration = 0u32;
-    ~pages_to_free = Vec.new();
+    current_page_id := mut first_page_id;
+    max_iterations := mut 1000;  # Safety limit
+    iteration := mut 0u32;
+    pages_to_free := mut Vec.new();
 
     # Collect all page IDs in chain by reading next_page pointers
     L current_page_id != NULL_PAGE {
@@ -232,20 +232,20 @@ F free_overflow_chain(
         pages_to_free.push(current_page_id);
 
         # Read next_page from page header via buffer pool
-        ~frame_id = pool.fetch_page(file_id, current_page_id)?;
-        ~page_data = pool.get_page(frame_id);
-        ~header = PageHeader.read_from_page(page_data)?;
+        frame_id := mut pool.fetch_page(file_id, current_page_id)?;
+        page_data := mut pool.get_page(frame_id);
+        header := mut PageHeader.read_from_page(page_data)?;
         current_page_id = header.next_page;
         pool.unpin_page(frame_id, false);
     }
 
     # Zero out page data and deallocate all pages
     L i: 0..pages_to_free.len() {
-        ~page_id = pages_to_free[i];
+        page_id := mut pages_to_free[i];
 
         # Zero out the page data via buffer pool
-        ~frame_id = pool.fetch_page(file_id, page_id)?;
-        ~page_buf = pool.get_page_mut(frame_id);
+        frame_id := mut pool.fetch_page(file_id, page_id)?;
+        page_buf := mut pool.get_page_mut(frame_id);
         L j: 0..page_size as u64 {
             page_buf[j] = 0;
         }
@@ -260,7 +260,7 @@ F free_overflow_chain(
 
 # Calculate how many overflow pages are needed for data of given size
 F overflow_pages_needed(data_len: u32, page_size: u32) -> u32 {
-    ~max_per_page = max_data_per_page(page_size);
+    max_per_page := mut max_data_per_page(page_size);
     (data_len + max_per_page - 1) / max_per_page
 }
 
@@ -278,6 +278,6 @@ F inline_threshold(page_size: u32) -> u32 {
 # Split data into inline portion and overflow portion
 # Returns (inline_data, overflow_data)
 F split_for_overflow(data: &[u8], inline_size: u32) -> (&[u8], &[u8]) {
-    ~inline_end = (inline_size as u64).min(data.len());
+    inline_end := mut (inline_size as u64).min(data.len());
     (&data[0..inline_end], &data[inline_end..])
 }

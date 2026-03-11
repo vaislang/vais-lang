@@ -46,7 +46,7 @@ X AdjPageHeader {
     }
 
     # Serialize (16 bytes)
-    F serialize(self, buf: &~ByteBuffer) {
+    F serialize(self, buf: &mut ByteBuffer) {
         buf.put_u64_le(self.node_id);
         buf.put_u8(self.direction);
         buf.put_u16_le(self.entry_count);
@@ -90,17 +90,17 @@ X AdjPage {
 
     # Load from page buffer
     F load(page_id: u32, page_data: &[u8], page_size: u32) -> Result<AdjPage, VaisError> {
-        ~header = PageHeader.read_from_page(page_data)?;
+        header := mut PageHeader.read_from_page(page_data)?;
         I header.page_type != PAGE_TYPE_GRAPH_ADJ {
             R Err(err_graph_adj_corrupt(page_id));
         }
 
-        ~buf = ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
-        ~adj_header = AdjPageHeader.deserialize(&buf)?;
+        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
+        adj_header := mut AdjPageHeader.deserialize(&buf)?;
 
         # Read entries
-        ~entries = Vec.with_capacity(adj_header.entry_count as u64);
-        ~i: u64 = 0;
+        entries := mut Vec.with_capacity(adj_header.entry_count as u64);
+        i: u64 := mut 0;
         L i < adj_header.entry_count as u64 {
             entries.push(AdjEntry.deserialize(&buf)?);
             i += 1;
@@ -116,7 +116,7 @@ X AdjPage {
 
     # Maximum entries that fit in one page
     F max_entries(page_size: u32) -> u16 {
-        ~available = page_size - PAGE_HEADER_SIZE - ADJ_PAGE_HEADER_SIZE;
+        available := mut page_size - PAGE_HEADER_SIZE - ADJ_PAGE_HEADER_SIZE;
         (available / ADJ_ENTRY_SIZE) as u16
     }
 
@@ -126,7 +126,7 @@ X AdjPage {
     }
 
     # Add entry to page
-    F add_entry(~self, entry: AdjEntry) -> Result<(), VaisError> {
+    F add_entry(mut self, entry: AdjEntry) -> Result<(), VaisError> {
         I !self.has_space() {
             R Err(err_graph_page_full(self.page_id));
         }
@@ -137,7 +137,7 @@ X AdjPage {
 
     # Find entry by edge_id
     F find_entry(self, edge_id: u64) -> Option<u64> {
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.entries.len() {
             I self.entries[i].edge_id == edge_id {
                 R Some(i);
@@ -149,7 +149,7 @@ X AdjPage {
 
     # Find entry by target_node and edge_type
     F find_entry_by_target(self, target_node: u64, edge_type: u16) -> Option<u64> {
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.entries.len() {
             I self.entries[i].target_node == target_node && self.entries[i].edge_type == edge_type {
                 R Some(i);
@@ -161,8 +161,8 @@ X AdjPage {
 
     # Get all active entries (not expired)
     F active_entries(self) -> Vec<&AdjEntry> {
-        ~result = Vec.new();
-        ~i: u64 = 0;
+        result := mut Vec.new();
+        i: u64 := mut 0;
         L i < self.entries.len() {
             I self.entries[i].is_active() {
                 result.push(&self.entries[i]);
@@ -174,10 +174,10 @@ X AdjPage {
 
     # Write page to buffer
     F write_to_buffer(self, page_lsn: u64, txn_id: u64) -> Vec<u8> {
-        ~out = vec![0u8; self.page_size as u64];
+        out := mut vec![0u8; self.page_size as u64];
 
         # Page header
-        ~header = PageHeader.new(self.page_id, PAGE_TYPE_GRAPH_ADJ, ENGINE_TAG_GRAPH);
+        header := mut PageHeader.new(self.page_id, PAGE_TYPE_GRAPH_ADJ, ENGINE_TAG_GRAPH);
         header.page_lsn = page_lsn;
         header.txn_id = txn_id;
         header.item_count = self.adj_header.entry_count;
@@ -185,12 +185,12 @@ X AdjPage {
         header.write_to_page(&out);
 
         # Adj page header
-        ~buf = ByteBuffer.wrap(&out);
+        buf := mut ByteBuffer.wrap(&out);
         buf.set_position(PAGE_HEADER_SIZE as u64);
         self.adj_header.serialize(&buf);
 
         # Entries
-        ~i: u64 = 0;
+        i: u64 := mut 0;
         L i < self.entries.len() {
             self.entries[i].serialize(&buf);
             i += 1;
@@ -225,19 +225,19 @@ X AdjacencyManager {
 
     # Create a new adjacency list page for a node (returns page_id)
     F create_adj_page(
-        ~self,
+        mut self,
         node_id: u64,
         direction: u8,
         txn_id: u64
     ) -> Result<u32, VaisError> {
-        ~page_id = self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
-        ~adj_page = AdjPage.new(page_id, node_id, direction, self.page_size);
+        page_id := mut self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
+        adj_page := mut AdjPage.new(page_id, node_id, direction, self.page_size);
 
         # Write to buffer pool
-        ~page_buffer = adj_page.write_to_buffer(0, txn_id);
-        ~frame_id = self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        ~frame_data = self.pool.get_page_mut(frame_id);
-        ~i: u64 = 0;
+        page_buffer := mut adj_page.write_to_buffer(0, txn_id);
+        frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
+        frame_data := mut self.pool.get_page_mut(frame_id);
+        i: u64 := mut 0;
         L i < page_buffer.len() {
             frame_data[i] = page_buffer[i];
             i += 1;
@@ -250,29 +250,29 @@ X AdjacencyManager {
     # Add an edge entry to a node's adjacency list
     # Handles page-full by allocating a new page and chaining
     F add_edge(
-        ~self,
+        mut self,
         adj_page_id: u32,
         entry: AdjEntry,
         txn_id: u64
     ) -> Result<u32, VaisError> {
         # Load current page
-        ~frame_id = self.pool.fetch_page(FILE_ID_GRAPH, adj_page_id)?;
-        ~page_data = self.pool.get_page(frame_id);
-        ~adj_page = AdjPage.load(adj_page_id, page_data, self.page_size)?;
+        frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, adj_page_id)?;
+        page_data := mut self.pool.get_page(frame_id);
+        adj_page := mut AdjPage.load(adj_page_id, page_data, self.page_size)?;
         self.pool.unpin_page(frame_id, false);
 
         # Walk chain to find page with space
-        ~current_page = adj_page;
+        current_page := mut adj_page;
         L {
             I current_page.has_space() {
                 # Add to this page
                 current_page.add_entry(entry)?;
 
                 # Write back
-                ~write_buf = current_page.write_to_buffer(0, txn_id);
-                ~wframe = self.pool.fetch_page(FILE_ID_GRAPH, current_page.page_id)?;
-                ~wdata = self.pool.get_page_mut(wframe);
-                ~j: u64 = 0;
+                write_buf := mut current_page.write_to_buffer(0, txn_id);
+                wframe := mut self.pool.fetch_page(FILE_ID_GRAPH, current_page.page_id)?;
+                wdata := mut self.pool.get_page_mut(wframe);
+                j: u64 := mut 0;
                 L j < write_buf.len() {
                     wdata[j] = write_buf[j];
                     j += 1;
@@ -285,8 +285,8 @@ X AdjacencyManager {
             # Check if there's a next page
             I current_page.adj_header.next_adj_page == NULL_PAGE {
                 # Need to allocate new page
-                ~new_page_id = self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
-                ~new_page = AdjPage.new(
+                new_page_id := mut self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
+                new_page := mut AdjPage.new(
                     new_page_id,
                     current_page.adj_header.node_id,
                     current_page.adj_header.direction,
@@ -298,20 +298,20 @@ X AdjacencyManager {
                 current_page.adj_header.next_adj_page = new_page_id;
 
                 # Write both pages
-                ~cur_buf = current_page.write_to_buffer(0, txn_id);
-                ~cf = self.pool.fetch_page(FILE_ID_GRAPH, current_page.page_id)?;
-                ~cd = self.pool.get_page_mut(cf);
-                ~k: u64 = 0;
+                cur_buf := mut current_page.write_to_buffer(0, txn_id);
+                cf := mut self.pool.fetch_page(FILE_ID_GRAPH, current_page.page_id)?;
+                cd := mut self.pool.get_page_mut(cf);
+                k: u64 := mut 0;
                 L k < cur_buf.len() {
                     cd[k] = cur_buf[k];
                     k += 1;
                 }
                 self.pool.unpin_page(cf, true);
 
-                ~new_buf = new_page.write_to_buffer(0, txn_id);
-                ~nf = self.pool.fetch_page(FILE_ID_GRAPH, new_page_id)?;
-                ~nd = self.pool.get_page_mut(nf);
-                ~m: u64 = 0;
+                new_buf := mut new_page.write_to_buffer(0, txn_id);
+                nf := mut self.pool.fetch_page(FILE_ID_GRAPH, new_page_id)?;
+                nd := mut self.pool.get_page_mut(nf);
+                m: u64 := mut 0;
                 L m < new_buf.len() {
                     nd[m] = new_buf[m];
                     m += 1;
@@ -322,9 +322,9 @@ X AdjacencyManager {
             }
 
             # Move to next page
-            ~next_id = current_page.adj_header.next_adj_page;
-            ~nframe = self.pool.fetch_page(FILE_ID_GRAPH, next_id)?;
-            ~ndata = self.pool.get_page(nframe);
+            next_id := mut current_page.adj_header.next_adj_page;
+            nframe := mut self.pool.fetch_page(FILE_ID_GRAPH, next_id)?;
+            ndata := mut self.pool.get_page(nframe);
             current_page = AdjPage.load(next_id, ndata, self.page_size)?;
             self.pool.unpin_page(nframe, false);
         }
@@ -336,17 +336,17 @@ X AdjacencyManager {
             R Ok(Vec.new());
         }
 
-        ~result = Vec.new();
-        ~current_page_id = adj_page_id;
+        result := mut Vec.new();
+        current_page_id := mut adj_page_id;
 
         L current_page_id != NULL_PAGE {
-            ~frame_id = self.pool.fetch_page(FILE_ID_GRAPH, current_page_id)?;
-            ~page_data = self.pool.get_page(frame_id);
-            ~adj_page = AdjPage.load(current_page_id, page_data, self.page_size)?;
+            frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, current_page_id)?;
+            page_data := mut self.pool.get_page(frame_id);
+            adj_page := mut AdjPage.load(current_page_id, page_data, self.page_size)?;
             self.pool.unpin_page(frame_id, false);
 
             # Copy entries
-            ~i: u64 = 0;
+            i: u64 := mut 0;
             L i < adj_page.entries.len() {
                 result.push(adj_page.entries[i]);
                 i += 1;
@@ -360,7 +360,7 @@ X AdjacencyManager {
 
     # Mark an edge as expired in the adjacency list
     F expire_edge(
-        ~self,
+        mut self,
         adj_page_id: u32,
         edge_id: u64,
         txn_id: u64,
@@ -370,12 +370,12 @@ X AdjacencyManager {
             R Ok(false);
         }
 
-        ~current_page_id = adj_page_id;
+        current_page_id := mut adj_page_id;
 
         L current_page_id != NULL_PAGE {
-            ~frame_id = self.pool.fetch_page(FILE_ID_GRAPH, current_page_id)?;
-            ~page_data = self.pool.get_page_mut(frame_id);
-            ~adj_page = AdjPage.load(current_page_id, page_data, self.page_size)?;
+            frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, current_page_id)?;
+            page_data := mut self.pool.get_page_mut(frame_id);
+            adj_page := mut AdjPage.load(current_page_id, page_data, self.page_size)?;
 
             M adj_page.find_entry(edge_id) {
                 Some(idx) => {
@@ -383,8 +383,8 @@ X AdjacencyManager {
                     adj_page.entries[idx].set_expired(txn_id, cmd_id);
 
                     # Write back
-                    ~write_buf = adj_page.write_to_buffer(0, txn_id);
-                    ~j: u64 = 0;
+                    write_buf := mut adj_page.write_to_buffer(0, txn_id);
+                    j: u64 := mut 0;
                     L j < write_buf.len() {
                         page_data[j] = write_buf[j];
                         j += 1;
@@ -393,7 +393,7 @@ X AdjacencyManager {
                     R Ok(true);
                 },
                 None => {
-                    ~next_id = adj_page.adj_header.next_adj_page;
+                    next_id := mut adj_page.adj_header.next_adj_page;
                     self.pool.unpin_page(frame_id, false);
                     current_page_id = next_id;
                 },

@@ -55,7 +55,7 @@ S ClogPage {
 
 X ClogPage {
     F new(page_body_size: u32) -> ClogPage {
-        ~data = Vec.with_capacity(page_body_size as u64);
+        data := mut Vec.with_capacity(page_body_size as u64);
         data.resize(page_body_size as u64, 0u8);
         ClogPage { data }
     }
@@ -71,19 +71,19 @@ X ClogPage {
 
     # Get status of a transaction within this page
     F get_status(self, txn_id: u64, txns_per_page: u64) -> TxnStatus {
-        ~local_id = txn_id % txns_per_page;
-        ~byte_offset = (local_id / 4) as u64;
-        ~bit_offset = ((local_id % 4) * 2) as u8;
-        ~bits = (self.data[byte_offset] >> bit_offset) & 0b11;
+        local_id := mut txn_id % txns_per_page;
+        byte_offset := mut (local_id / 4) as u64;
+        bit_offset := mut ((local_id % 4) * 2) as u8;
+        bits := mut (self.data[byte_offset] >> bit_offset) & 0b11;
         TxnStatus.from_u8(bits)
     }
 
     # Set status of a transaction within this page
-    F set_status(~self, txn_id: u64, txns_per_page: u64, status: TxnStatus) {
-        ~local_id = txn_id % txns_per_page;
-        ~byte_offset = (local_id / 4) as u64;
-        ~bit_offset = ((local_id % 4) * 2) as u8;
-        ~mask = !(0b11u8 << bit_offset);
+    F set_status(mut self, txn_id: u64, txns_per_page: u64, status: TxnStatus) {
+        local_id := mut txn_id % txns_per_page;
+        byte_offset := mut (local_id / 4) as u64;
+        bit_offset := mut ((local_id % 4) * 2) as u8;
+        mask := mut !(0b11u8 << bit_offset);
         self.data[byte_offset] = (self.data[byte_offset] & mask) | (status.to_u8() << bit_offset);
     }
 }
@@ -101,8 +101,8 @@ S Clog {
 X Clog {
     # Create a new CLOG manager
     F new(page_size: u32, cache_pages: u32) -> Clog {
-        ~txns_per_page = ClogPage.txns_per_page(page_size);
-        ~cache = Vec.with_capacity(cache_pages as u64);
+        txns_per_page := mut ClogPage.txns_per_page(page_size);
+        cache := mut Vec.with_capacity(cache_pages as u64);
         L _: 0..cache_pages {
             cache.push(ClogPage.new(page_size - PAGE_HEADER_SIZE));
         }
@@ -121,17 +121,17 @@ X Clog {
     # On cache miss, extends the cache window to include the requested page.
     # Previous behavior returned InProgress on miss, which caused committed txns
     # to appear uncommitted — a critical MVCC visibility bug.
-    F get_status(~self, txn_id: u64) -> TxnStatus {
-        ~page_num = (txn_id / self.txns_per_page) as u32;
+    F get_status(mut self, txn_id: u64) -> TxnStatus {
+        page_num := mut (txn_id / self.txns_per_page) as u32;
 
-        ~guard = self.lock.lock();
+        guard := mut self.lock.lock();
 
         # Ensure page is in cache (extends window on miss)
         self.ensure_page_cached(page_num);
 
         M self.page_to_cache_index(page_num) {
             Some(idx) => {
-                ~status = self.cache[idx].get_status(txn_id, self.txns_per_page);
+                status := mut self.cache[idx].get_status(txn_id, self.txns_per_page);
                 drop(guard);
                 status
             },
@@ -144,10 +144,10 @@ X Clog {
     }
 
     # Set transaction status
-    F set_status(~self, txn_id: u64, status: TxnStatus) {
-        ~page_num = (txn_id / self.txns_per_page) as u32;
+    F set_status(mut self, txn_id: u64, status: TxnStatus) {
+        page_num := mut (txn_id / self.txns_per_page) as u32;
 
-        ~guard = self.lock.lock();
+        guard := mut self.lock.lock();
 
         # Ensure page is in cache, extending if needed
         self.ensure_page_cached(page_num);
@@ -163,12 +163,12 @@ X Clog {
     }
 
     # Check if a transaction is committed
-    F is_committed(~self, txn_id: u64) -> bool {
+    F is_committed(mut self, txn_id: u64) -> bool {
         self.get_status(txn_id).is_committed()
     }
 
     # Check if a transaction is aborted
-    F is_aborted(~self, txn_id: u64) -> bool {
+    F is_aborted(mut self, txn_id: u64) -> bool {
         self.get_status(txn_id).is_aborted()
     }
 
@@ -183,14 +183,14 @@ X Clog {
     }
 
     # Ensure a page is represented in the cache
-    F ensure_page_cached(~self, page_num: u32) {
+    F ensure_page_cached(mut self, page_num: u32) {
         I self.page_to_cache_index(page_num).is_none() {
             # Slide cache window to include this page
             I page_num >= self.cache_base_page + self.cache_size {
-                ~new_base = page_num - self.cache_size + 1;
+                new_base := mut page_num - self.cache_size + 1;
                 I new_base > self.cache_base_page {
                     # Shift cache: drop old pages, add new ones
-                    ~shift = (new_base - self.cache_base_page) as u64;
+                    shift := mut (new_base - self.cache_base_page) as u64;
                     L _: 0..shift.min(self.cache.len()) {
                         self.cache.remove(0);
                         self.cache.push(ClogPage.new(self.page_size - PAGE_HEADER_SIZE));
@@ -202,13 +202,13 @@ X Clog {
     }
 
     # Load CLOG pages from raw data (used during recovery)
-    F load_pages(~self, base_page: u32, pages_data: Vec<Vec<u8>>) {
-        ~guard = self.lock.lock();
+    F load_pages(mut self, base_page: u32, pages_data: Vec<Vec<u8>>) {
+        guard := mut self.lock.lock();
         self.cache_base_page = base_page;
         self.cache.clear();
         L page_data: &pages_data {
             # Skip page header (48 bytes), use rest as CLOG data
-            ~body = page_data[PAGE_HEADER_SIZE as u64..].to_vec();
+            body := mut page_data[PAGE_HEADER_SIZE as u64..].to_vec();
             self.cache.push(ClogPage.from_bytes(&body));
         }
         self.cache_size = self.cache.len() as u32;
@@ -217,7 +217,7 @@ X Clog {
 
     # Get serialized CLOG pages (for checkpoint)
     F get_pages(self) -> Vec<&[u8]> {
-        ~result = Vec.new();
+        result := mut Vec.new();
         L page: &self.cache {
             result.push(&page.data);
         }

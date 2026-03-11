@@ -105,13 +105,13 @@ F execute_alter_table(
     ctx: &ExecContext,
 ) -> Result<AlterResult, VaisError> {
     # Look up table metadata
-    ~table_info = M ctx.catalog.get_table(&alter.table_name) {
+    table_info := mut M ctx.catalog.get_table(&alter.table_name) {
         Some(info) => info.clone(),
         None => { R Err(err_table_not_found_alter(alter.table_name.clone())); },
     };
 
-    ~columns = ctx.catalog.get_columns(table_info.table_id);
-    ~col_vec = Vec.with_capacity(columns.len());
+    columns := mut ctx.catalog.get_columns(table_info.table_id);
+    col_vec := mut Vec.with_capacity(columns.len());
     L col: &columns {
         col_vec.push(col.clone());
     }
@@ -172,23 +172,23 @@ F alter_add_column(
     }
 
     # Determine the next column_index (append to the end)
-    ~next_index = columns.len() as u16;
+    next_index := mut columns.len() as u16;
 
     # Schema version for this new column
     # For simplicity, we use column_index as schema_version proxy in this minimal implementation
     # In production, table would have a schema_version field that increments on each schema change
-    ~added_at_version = next_index as u32;
+    added_at_version := mut next_index as u32;
 
     # Convert default_value Expr to SqlValue for storage
     # For now, we store default as a string representation in ColumnInfo.default_value
     # A full implementation would evaluate the Expr and store the SqlValue
-    ~default_str = M &column_def.default_value {
+    default_str := mut M &column_def.default_value {
         Some(_) => Some("DEFAULT_EXPR".to_string()),  # FUTURE(sql/executor): Evaluate default expression
         None => None,
     };
 
     # Create the new ColumnInfo
-    ~new_col = ColumnInfo {
+    new_col := mut ColumnInfo {
         table_id: table_info.table_id,
         column_index: next_index,
         name: column_def.name.clone(),
@@ -199,17 +199,17 @@ F alter_add_column(
     };
 
     # Serialize the new column to bytes
-    ~col_buf = ByteBuffer.with_capacity(128);
+    col_buf := mut ByteBuffer.with_capacity(128);
     new_col.serialize(&col_buf);
-    ~col_bytes = col_buf.to_vec();
+    col_bytes := mut col_buf.to_vec();
 
     # Build catalog key for this column
-    ~col_catalog_key = new_col.to_catalog_key();
+    col_catalog_key := mut new_col.to_catalog_key();
 
     # Insert into catalog B+Tree (via CatalogManager internal helper)
     # Note: CatalogManager.insert_catalog_entry is private, so we'll use a simpler approach:
     # Write a SCHEMA_CHANGE WAL record and update the catalog directly
-    ~wal_payload = build_add_column_wal(
+    wal_payload := mut build_add_column_wal(
         table_info.table_id,
         &column_def.name,
         &column_def.data_type,
@@ -241,8 +241,8 @@ F alter_drop_column(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     # Validate: column must exist
-    ~found = false;
-    ~col_info: Option<ColumnInfo> = None;
+    found := mut false;
+    col_info: Option<ColumnInfo> := mut None;
     L col: columns {
         I !found && &col.name == column_name {
             found = true;
@@ -254,7 +254,7 @@ F alter_drop_column(
         R Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()));
     }
 
-    ~col = col_info!;
+    col := mut col_info!;
 
     # Validate: cannot drop primary key column
     I col.is_primary_key {
@@ -262,7 +262,7 @@ F alter_drop_column(
     }
 
     # Write SCHEMA_CHANGE WAL record to log the drop
-    ~wal_payload = build_drop_column_wal(table_info.table_id, column_name);
+    wal_payload := mut build_drop_column_wal(table_info.table_id, column_name);
     ctx.gcm.write_record(ctx.txn_id, SCHEMA_CHANGE, 0x02, &wal_payload)?;
 
     # Mark column as invisible in catalog
@@ -287,7 +287,7 @@ F alter_rename_column(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     # Validate: old column must exist
-    ~found_old = false;
+    found_old := mut false;
     L col: columns {
         I &col.name == old_name {
             found_old = true;
@@ -303,7 +303,7 @@ F alter_rename_column(
     }
 
     # Write SCHEMA_CHANGE WAL record
-    ~wal_payload = build_rename_column_wal(table_info.table_id, old_name, new_name);
+    wal_payload := mut build_rename_column_wal(table_info.table_id, old_name, new_name);
     ctx.gcm.write_record(ctx.txn_id, SCHEMA_CHANGE, 0x03, &wal_payload)?;
 
     # Update catalog: rename ColumnInfo.name
@@ -329,8 +329,8 @@ F alter_column_type(
     ctx: &ExecContext,
 ) -> Result<(), VaisError> {
     # Validate: column must exist
-    ~found = false;
-    ~old_type: Option<SqlType> = None;
+    found := mut false;
+    old_type: Option<SqlType> := mut None;
     L col: columns {
         I !found && &col.name == column_name {
             found = true;
@@ -342,7 +342,7 @@ F alter_column_type(
         R Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()));
     }
 
-    ~old = old_type!;
+    old := mut old_type!;
 
     # Validate: types must be compatible
     I !old.is_compatible(new_type) {
@@ -354,7 +354,7 @@ F alter_column_type(
     }
 
     # Write SCHEMA_CHANGE WAL record
-    ~wal_payload = build_alter_type_wal(table_info.table_id, column_name, new_type);
+    wal_payload := mut build_alter_type_wal(table_info.table_id, column_name, new_type);
     ctx.gcm.write_record(ctx.txn_id, SCHEMA_CHANGE, 0x04, &wal_payload)?;
 
     # Update catalog: change ColumnInfo.data_type
@@ -375,7 +375,7 @@ F build_add_column_wal(
     data_type: &SqlType,
     nullable: bool,
 ) -> Vec<u8> {
-    ~buf = ByteBuffer.with_capacity(64);
+    buf := mut ByteBuffer.with_capacity(64);
     buf.put_u32_le(table_id);
     write_string(&buf, column_name);
     data_type.serialize(&buf);
@@ -389,7 +389,7 @@ F build_drop_column_wal(
     table_id: u32,
     column_name: &Str,
 ) -> Vec<u8> {
-    ~buf = ByteBuffer.with_capacity(32);
+    buf := mut ByteBuffer.with_capacity(32);
     buf.put_u32_le(table_id);
     write_string(&buf, column_name);
     buf.to_vec()
@@ -402,7 +402,7 @@ F build_rename_column_wal(
     old_name: &Str,
     new_name: &Str,
 ) -> Vec<u8> {
-    ~buf = ByteBuffer.with_capacity(64);
+    buf := mut ByteBuffer.with_capacity(64);
     buf.put_u32_le(table_id);
     write_string(&buf, old_name);
     write_string(&buf, new_name);
@@ -416,7 +416,7 @@ F build_alter_type_wal(
     column_name: &Str,
     new_type: &SqlType,
 ) -> Vec<u8> {
-    ~buf = ByteBuffer.with_capacity(64);
+    buf := mut ByteBuffer.with_capacity(64);
     buf.put_u32_le(table_id);
     write_string(&buf, column_name);
     new_type.serialize(&buf);

@@ -27,7 +27,7 @@ F err_analyze_failed(reason: Str) -> VaisError {
 
 # Analyze a SelectQuery to detect which engines are involved
 F analyze_query(query: &SelectQuery) -> Result<QueryProfile, VaisError> {
-    ~profile = QueryProfile.new();
+    profile := mut QueryProfile.new();
 
     # Walk all parts of the query
     analyze_select_query(query, &profile)?;
@@ -39,7 +39,7 @@ F analyze_query(query: &SelectQuery) -> Result<QueryProfile, VaisError> {
 # SelectQuery Analysis
 # ============================================================================
 
-F analyze_select_query(query: &SelectQuery, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Result<(), VaisError> {
     # 1. Analyze CTEs (WITH clause)
     L cte: &query.ctes {
         analyze_cte(cte, profile)?;
@@ -115,7 +115,7 @@ F analyze_select_query(query: &SelectQuery, profile: &~QueryProfile) -> Result<(
 # CTE Analysis
 # ============================================================================
 
-F analyze_cte(cte: &Cte, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_cte(cte: &Cte, profile: &mut QueryProfile) -> Result<(), VaisError> {
     analyze_select_query(&cte.query, profile)
 }
 
@@ -123,7 +123,7 @@ F analyze_cte(cte: &Cte, profile: &~QueryProfile) -> Result<(), VaisError> {
 # SELECT Item Analysis
 # ============================================================================
 
-F analyze_select_item(item: &SelectItem, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_select_item(item: &SelectItem, profile: &mut QueryProfile) -> Result<(), VaisError> {
     M item {
         SelectItem.AllColumns => {
             # SELECT * — no engine functions here
@@ -143,7 +143,7 @@ F analyze_select_item(item: &SelectItem, profile: &~QueryProfile) -> Result<(), 
 # TableRef Analysis
 # ============================================================================
 
-F analyze_table_ref(table_ref: &TableRef, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_table_ref(table_ref: &TableRef, profile: &mut QueryProfile) -> Result<(), VaisError> {
     M table_ref {
         TableRef.Table { name, .. } => {
             # Regular table reference
@@ -172,7 +172,7 @@ F analyze_table_ref(table_ref: &TableRef, profile: &~QueryProfile) -> Result<(),
     }
 }
 
-F analyze_join_clause(join: &JoinClause, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_join_clause(join: &JoinClause, profile: &mut QueryProfile) -> Result<(), VaisError> {
     analyze_table_ref(&join.left, profile)?;
     analyze_table_ref(&join.right, profile)?;
 
@@ -198,7 +198,7 @@ U sql/parser/ast.{JoinCondition};
 # Expression Analysis — Recursive Walker
 # ============================================================================
 
-F analyze_expr(expr: &Expr, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError> {
     M expr {
         Expr.Literal { .. } => {
             # No engine functions
@@ -307,9 +307,9 @@ F analyze_expr(expr: &Expr, profile: &~QueryProfile) -> Result<(), VaisError> {
 # Function Call Detection — Identify Engine Functions
 # ============================================================================
 
-F analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &~QueryProfile) -> Result<(), VaisError> {
+F analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     # Normalize function name to uppercase for case-insensitive matching
-    ~upper_name = name.to_uppercase();
+    upper_name := mut name.to_uppercase();
 
     M upper_name.as_str() {
         "VECTOR_SEARCH" => {
@@ -339,7 +339,7 @@ F analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &~QueryProfile) -
 # ============================================================================
 
 # VECTOR_SEARCH(table, column, query_vector, top_k [, ef_search])
-F extract_vector_search_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Result<(), VaisError> {
+F extract_vector_search_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() < 4 || args.len() > 5 {
         R Err(err_analyze_failed(
             "VECTOR_SEARCH requires 4-5 arguments: (table, column, query_vector, top_k [, ef_search])"
@@ -347,25 +347,25 @@ F extract_vector_search_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Res
     }
 
     # Extract table_name (arg 0 must be string literal)
-    ~table_name = extract_string_literal(&args[0])?;
+    table_name := mut extract_string_literal(&args[0])?;
 
     # Extract column_name (arg 1 must be string literal)
-    ~column_name = extract_string_literal(&args[1])?;
+    column_name := mut extract_string_literal(&args[1])?;
 
     # query_vector_expr (arg 2 can be any expression)
-    ~query_vector_expr = args[2].clone();
+    query_vector_expr := mut args[2].clone();
 
     # Extract top_k (arg 3 must be integer literal)
-    ~top_k = extract_integer_literal(&args[3])?;
+    top_k := mut extract_integer_literal(&args[3])?;
 
     # Extract optional ef_search (arg 4)
-    ~ef_search: Option<u32> = None;
+    ef_search: Option<u32> := mut None;
     I args.len() == 5 {
         ef_search = Some(extract_integer_literal(&args[4])?);
     }
 
     # Build VectorScanParams
-    ~params = VectorScanParams.new(table_name, column_name, query_vector_expr, top_k);
+    params := mut VectorScanParams.new(table_name, column_name, query_vector_expr, top_k);
     I ef_search.is_some() {
         params = params.with_ef_search(ef_search!);
     }
@@ -379,7 +379,7 @@ F extract_vector_search_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Res
 # ============================================================================
 
 # GRAPH_TRAVERSE(start_node_id, max_depth [, direction] [, edge_types] [, return_paths] [, use_dfs])
-F extract_graph_traverse_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Result<(), VaisError> {
+F extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() < 2 || args.len() > 6 {
         R Err(err_analyze_failed(
             "GRAPH_TRAVERSE requires 2-6 arguments: (start_node_id, max_depth [, direction] [, edge_types] [, return_paths] [, use_dfs])"
@@ -387,37 +387,37 @@ F extract_graph_traverse_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Re
     }
 
     # start_node_expr (arg 0 can be any expression)
-    ~start_node_expr = args[0].clone();
+    start_node_expr := mut args[0].clone();
 
     # Extract max_depth (arg 1 must be integer literal)
-    ~max_depth = extract_integer_literal(&args[1])?;
+    max_depth := mut extract_integer_literal(&args[1])?;
 
     # Extract optional direction (arg 2, default OUTGOING)
-    ~direction: u8 = DIRECTION_OUTGOING;
+    direction: u8 := mut DIRECTION_OUTGOING;
     I args.len() >= 3 {
         direction = extract_direction(&args[2])?;
     }
 
     # Extract optional edge_types (arg 3)
-    ~edge_type_filter: Option<Vec<Str>> = None;
+    edge_type_filter: Option<Vec<Str>> := mut None;
     I args.len() >= 4 {
         edge_type_filter = Some(extract_string_array(&args[3])?);
     }
 
     # Extract optional return_paths (arg 4, default false)
-    ~return_paths = false;
+    return_paths := mut false;
     I args.len() >= 5 {
         return_paths = extract_boolean_literal(&args[4])?;
     }
 
     # Extract optional use_dfs (arg 5, default false)
-    ~use_dfs = false;
+    use_dfs := mut false;
     I args.len() >= 6 {
         use_dfs = extract_boolean_literal(&args[5])?;
     }
 
     # Build GraphTraverseNodeParams
-    ~params = GraphTraverseNodeParams.new(start_node_expr, max_depth);
+    params := mut GraphTraverseNodeParams.new(start_node_expr, max_depth);
     params = params.with_direction(direction);
     I edge_type_filter.is_some() {
         params = params.with_edge_filter(edge_type_filter!);
@@ -438,7 +438,7 @@ F extract_graph_traverse_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Re
 # ============================================================================
 
 # FULLTEXT_MATCH(table, column, query_text, top_k)
-F extract_fulltext_match_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Result<(), VaisError> {
+F extract_fulltext_match_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() != 4 {
         R Err(err_analyze_failed(
             "FULLTEXT_MATCH requires 4 arguments: (table, column, query_text, top_k)"
@@ -446,19 +446,19 @@ F extract_fulltext_match_params(args: &Vec<Expr>, profile: &~QueryProfile) -> Re
     }
 
     # Extract table_name (arg 0 must be string literal)
-    ~table_name = extract_string_literal(&args[0])?;
+    table_name := mut extract_string_literal(&args[0])?;
 
     # Extract column_name (arg 1 must be string literal)
-    ~column_name = extract_string_literal(&args[1])?;
+    column_name := mut extract_string_literal(&args[1])?;
 
     # query_text_expr (arg 2 can be any expression)
-    ~query_text_expr = args[2].clone();
+    query_text_expr := mut args[2].clone();
 
     # Extract top_k (arg 3 must be integer literal)
-    ~top_k = extract_integer_literal(&args[3])?;
+    top_k := mut extract_integer_literal(&args[3])?;
 
     # Build FullTextScanParams
-    ~params = FullTextScanParams.new(table_name, column_name, query_text_expr, top_k);
+    params := mut FullTextScanParams.new(table_name, column_name, query_text_expr, top_k);
 
     profile.fulltext_calls.push(params);
     Ok(())
@@ -522,8 +522,8 @@ F extract_boolean_literal(expr: &Expr) -> Result<bool, VaisError> {
 
 # Extract direction from expression (string literal: "OUTGOING", "INCOMING", "BOTH")
 F extract_direction(expr: &Expr) -> Result<u8, VaisError> {
-    ~dir_str = extract_string_literal(expr)?;
-    ~upper_dir = dir_str.to_uppercase();
+    dir_str := mut extract_string_literal(expr)?;
+    upper_dir := mut dir_str.to_uppercase();
 
     M upper_dir.as_str() {
         "OUTGOING" => Ok(DIRECTION_OUTGOING),
@@ -546,9 +546,9 @@ F extract_string_array(expr: &Expr) -> Result<Vec<Str>, VaisError> {
                 SqlValue.StringVal { v: ref s } => {
                     # Comma-separated string → split into array
                     I s.contains(',') {
-                        ~result: Vec<Str> = Vec.new();
+                        result: Vec<Str> := mut Vec.new();
                         L part: s.split(',') {
-                            ~trimmed = part.trim().to_string();
+                            trimmed := mut part.trim().to_string();
                             I trimmed.len() > 0 {
                                 result.push(trimmed);
                             }
@@ -556,7 +556,7 @@ F extract_string_array(expr: &Expr) -> Result<Vec<Str>, VaisError> {
                         Ok(result)
                     } E {
                         # Single string → single-element array
-                        ~result: Vec<Str> = Vec.new();
+                        result: Vec<Str> := mut Vec.new();
                         result.push(s.clone());
                         Ok(result)
                     }

@@ -45,7 +45,7 @@ src/
 ## Coding Conventions
 
 - Follow Vais standard style (single-char keywords: `F`, `S`, `I`, `L`, `M`, etc.)
-- Use `~` for mutable bindings
+- Use `mut` for mutable bindings (e.g., `x := mut 0;`, `F method(mut self, ...)`, `&mut Type`)
 - Use `|>` pipe operator for data transformations
 - All public APIs must have doc comments
 - Error handling: use `Result<T, E>` with `?` operator

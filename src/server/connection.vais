@@ -31,7 +31,7 @@ X ConnectionIdGen {
         }
     }
 
-    F next(~self) -> u64 {
+    F next(mut self) -> u64 {
         self.next_id.fetch_add(1, Ordering.Relaxed)
     }
 }
@@ -73,21 +73,21 @@ X Connection {
         }
     }
 
-    F with_application_name(~self, name: Str) -> Connection {
+    F with_application_name(mut self, name: Str) -> Connection {
         self.application_name = name;
         self
     }
 
-    F with_timestamp(~self, ts: u64) -> Connection {
+    F with_timestamp(mut self, ts: u64) -> Connection {
         self.created_at = ts;
         self.last_active_at = ts;
         self
     }
 
     # State transitions
-    F set_state(~self, new_state: ConnectionState) -> Result<(), VaisError> {
+    F set_state(mut self, new_state: ConnectionState) -> Result<(), VaisError> {
         # Validate transition
-        ~valid = false;
+        valid := mut false;
 
         M &self.state {
             ConnectionState.New => {
@@ -169,22 +169,22 @@ X Connection {
     }
 
     # Transaction management
-    F begin_transaction(~self, txn_id: u64) {
+    F begin_transaction(mut self, txn_id: u64) {
         self.txn_state = TransactionState.InBlock;
         self.current_txn_id = Some(txn_id);
     }
 
-    F commit_transaction(~self) {
+    F commit_transaction(mut self) {
         self.txn_state = TransactionState.Idle;
         self.current_txn_id = None;
     }
 
-    F rollback_transaction(~self) {
+    F rollback_transaction(mut self) {
         self.txn_state = TransactionState.Idle;
         self.current_txn_id = None;
     }
 
-    F mark_txn_failed(~self) {
+    F mark_txn_failed(mut self) {
         self.txn_state = TransactionState.Failed;
     }
 
@@ -197,7 +197,7 @@ X Connection {
     }
 
     # Prepared statement management
-    F add_prepared_stmt(~self, stmt: PreparedStmtInfo) {
+    F add_prepared_stmt(mut self, stmt: PreparedStmtInfo) {
         self.prepared_stmts.insert(stmt.name.clone(), stmt);
     }
 
@@ -208,7 +208,7 @@ X Connection {
         }
     }
 
-    F remove_prepared_stmt(~self, name: &Str) -> Result<(), VaisError> {
+    F remove_prepared_stmt(mut self, name: &Str) -> Result<(), VaisError> {
         M self.prepared_stmts.remove(name) {
             Some(_) => Ok(()),
             None => Err(err_prepared_stmt_not_found(name.clone())),
@@ -220,7 +220,7 @@ X Connection {
     }
 
     # Portal management
-    F add_portal(~self, portal: PortalInfo) {
+    F add_portal(mut self, portal: PortalInfo) {
         self.portals.insert(portal.name.clone(), portal);
     }
 
@@ -231,7 +231,7 @@ X Connection {
         }
     }
 
-    F remove_portal(~self, name: &Str) -> Result<(), VaisError> {
+    F remove_portal(mut self, name: &Str) -> Result<(), VaisError> {
         M self.portals.remove(name) {
             Some(_) => Ok(()),
             None => Err(err_portal_not_found(name.clone())),
@@ -239,7 +239,7 @@ X Connection {
     }
 
     # Clear all portals (done on Sync)
-    F clear_portals(~self) {
+    F clear_portals(mut self) {
         self.portals.clear();
     }
 
@@ -248,12 +248,12 @@ X Connection {
         &self.session_config
     }
 
-    F get_session_config_mut(~self) -> &~SessionConfig {
+    F get_session_config_mut(mut self) -> &mut SessionConfig {
         &self.session_config
     }
 
     # Activity tracking
-    F touch(~self, timestamp: u64) {
+    F touch(mut self, timestamp: u64) {
         self.last_active_at = timestamp;
     }
 
@@ -321,17 +321,17 @@ X ConnectionPool {
 
     # Create a new connection and add it to the pool.
     # Returns the connection ID, or error if max connections exceeded.
-    F create_connection(~self, user: Str, database: Str, timestamp: u64) -> Result<u64, VaisError> {
-        ~current = self.active_count.load(Ordering.Relaxed);
+    F create_connection(mut self, user: Str, database: Str, timestamp: u64) -> Result<u64, VaisError> {
+        current := mut self.active_count.load(Ordering.Relaxed);
         I current >= self.max_connections as u64 {
             R Err(err_max_connections(self.max_connections));
         }
 
-        ~id = self.id_gen.next();
-        ~conn = Connection.new(id, user, database);
+        id := mut self.id_gen.next();
+        conn := mut Connection.new(id, user, database);
         conn = conn.with_timestamp(timestamp);
 
-        ~guard = self.connections.lock();
+        guard := mut self.connections.lock();
         guard.insert(id, conn);
         self.active_count.fetch_add(1, Ordering.Relaxed);
 
@@ -339,9 +339,9 @@ X ConnectionPool {
     }
 
     # Remove a connection from the pool
-    F remove_connection(~self, conn_id: u64) -> Option<Connection> {
-        ~guard = self.connections.lock();
-        ~removed = guard.remove(&conn_id);
+    F remove_connection(mut self, conn_id: u64) -> Option<Connection> {
+        guard := mut self.connections.lock();
+        removed := mut guard.remove(&conn_id);
         I removed.is_some() {
             self.active_count.fetch_sub(1, Ordering.Relaxed);
         }
@@ -361,11 +361,11 @@ X ConnectionPool {
     # Execute a function with a locked reference to a connection.
     # Returns error if connection not found.
     F with_connection<T>(
-        ~self,
+        mut self,
         conn_id: u64,
-        f: F(&~Connection) -> T,
+        f: F(&mut Connection) -> T,
     ) -> Result<T, VaisError> {
-        ~guard = self.connections.lock();
+        guard := mut self.connections.lock();
         M guard.get_mut(&conn_id) {
             Some(conn) => Ok(f(conn)),
             None => Err(err_connection_closed()),
@@ -378,7 +378,7 @@ X ConnectionPool {
         conn_id: u64,
         f: F(&Connection) -> T,
     ) -> Result<T, VaisError> {
-        ~guard = self.connections.lock();
+        guard := mut self.connections.lock();
         M guard.get(&conn_id) {
             Some(conn) => Ok(f(conn)),
             None => Err(err_connection_closed()),
@@ -387,8 +387,8 @@ X ConnectionPool {
 
     # Get connection IDs for monitoring
     F connection_ids(self) -> Vec<u64> {
-        ~guard = self.connections.lock();
-        ~ids = Vec.new();
+        guard := mut self.connections.lock();
+        ids := mut Vec.new();
         L entry: guard.iter() {
             ids.push(*entry.0);
         }
@@ -397,12 +397,12 @@ X ConnectionPool {
 
     # Find idle connections exceeding timeout (for cleanup)
     F find_idle_connections(self, now: u64, idle_timeout_sec: u32) -> Vec<u64> {
-        ~guard = self.connections.lock();
-        ~idle_ids = Vec.new();
-        ~timeout = idle_timeout_sec as u64;
+        guard := mut self.connections.lock();
+        idle_ids := mut Vec.new();
+        timeout := mut idle_timeout_sec as u64;
 
         L entry: guard.iter() {
-            ~conn = entry.1;
+            conn := mut entry.1;
             I conn.idle_duration(now) > timeout {
                 # Only close connections that are idle (not mid-query/transaction)
                 M conn.get_state() {
