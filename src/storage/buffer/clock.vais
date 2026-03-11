@@ -18,39 +18,49 @@ X ClockReplacer {
         }
     }
 
-    # Find a frame to evict using clock algorithm
+    # Find a frame to evict using clock algorithm (single-pass)
     # Returns frame_id of victim, or None if all frames are pinned
     F find_victim(~self, frames: &~Vec<BufferFrame>) -> Option<u32> {
-        # Two passes: first pass clears reference bits, second pass finds victim
+        # Single pass: clear reference bits on the fly, evict immediately when bit is 0
         ~scanned: u32 = 0;
-        ~max_scans = self.capacity * 2;  # At most 2 full rotations
+        ~found = false;
+        ~victim: u32 = 0;
 
-        L scanned < max_scans {
+        L !found && scanned < self.capacity {
             ~frame = &frames[self.hand as u64];
 
             I frame.is_evictable() {
                 I !frame.clock_ref {
-                    # Found victim: evictable and reference bit cleared
-                    ~victim = self.hand;
-                    self.advance();
-                    R Some(victim);
+                    # Found victim: evictable with reference bit already 0
+                    victim = self.hand;
+                    found = true;
                 } E {
-                    # Clear reference bit (second chance)
+                    # Clear reference bit (second chance) and move on
                     frames[self.hand as u64].clock_ref = false;
                 }
             }
 
-            self.advance();
+            I !found {
+                self.advance();
+            }
             scanned += 1;
+        }
+
+        I found {
+            self.advance();
+            R Some(victim);
         }
 
         # All frames are pinned - no eviction possible
         None
     }
 
-    # Advance clock hand
+    # Advance clock hand (branch-based, avoids modulo)
     F advance(~self) {
-        self.hand = (self.hand + 1) % self.capacity;
+        self.hand = self.hand + 1;
+        I self.hand >= self.capacity {
+            self.hand = 0;
+        }
     }
 
     # Reset the replacer (e.g., after pool resize)

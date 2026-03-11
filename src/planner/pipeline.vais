@@ -27,6 +27,7 @@ U planner/types.{
 U vector/search.{VectorSearchParams, VectorSearchExecutor, VectorSearchRow};
 U graph/query/traverse_fn.{GraphTraverseParams, GraphTraverseResult, TraverseRow};
 U fulltext/search/match_fn.{FullTextMatchExecutor, FullTextMatchResult};
+U std/hashmap.HashMap;
 
 # ============================================================================
 # Error Codes: EE=00 (common/planner), CC=09 (executor)
@@ -124,7 +125,8 @@ F fuse_scored_results(
     }
 }
 
-# Weighted sum fusion: normalize both sets, combine by doc_id M # Uses HashMap-based O(N+M) approach instead of O(N*M) nested loops
+# Weighted sum fusion: normalize both sets, combine by doc_id
+# Uses HashMap-based O(N+M) approach instead of O(N*M) nested loops
 F fuse_weighted_sum(
     left: &Vec<ScoredResult>,
     right: &Vec<ScoredResult>,
@@ -135,33 +137,26 @@ F fuse_weighted_sum(
     ~norm_left = normalize_scores(left);
     ~norm_right = normalize_scores(right);
 
-    # Build hash map from right results: row_key → (index, score)
-    # Key = (page_id, slot_id) packed as u64
-    ~right_map: Vec<(u64, u64, f64)> = Vec.new();
+    # Build HashMap from right results: row_key (as String) → (index, score)
+    # Key = row_hash_key() packed as u64 converted to String for HashMap compatibility
+    ~right_map: HashMap<(u64, f64)> = HashMap.new();
     L i: 0..norm_right.len() {
         ~key = row_hash_key(&norm_right[i].row);
-        right_map.push((key, i, norm_right[i].score));
-    }
-
-    # Track which right rows were matched
-    ~right_matched: Vec<bool> = Vec.with_capacity(norm_right.len());
-    L _: 0..norm_right.len() {
-        right_matched.push(false);
+        right_map.insert(key.to_string(), (i, norm_right[i].score));
     }
 
     ~combined: Vec<ScoredResult> = Vec.new();
 
-    # Process left rows: look up matching right score via hash
+    # Process left rows: O(1) lookup in right_map
     L lr: norm_left.iter() {
         ~left_key = row_hash_key(&lr.row);
         ~right_score = 0.0;
-        ~found_match = false;
-        L (rk, ri, rs): right_map.iter() {
-            I !found_match && *rk == left_key && rows_match(&lr.row, &norm_right[*ri].row) {
-                right_score = *rs;
-                right_matched[*ri] = true;
-                found_match = true;
-            }
+        M right_map.get(&left_key.to_string()) {
+            Option.Some(entry) => {
+                right_score = entry.1;
+                right_map.remove(&left_key.to_string());
+            },
+            Option.None => {},
         }
         combined.push(ScoredResult {
             row: lr.row.clone(),
@@ -170,15 +165,13 @@ F fuse_weighted_sum(
         });
     }
 
-    # Add unmatched right rows
-    L i: 0..norm_right.len() {
-        I !right_matched[i] {
-            combined.push(ScoredResult {
-                row: norm_right[i].row.clone(),
-                score: weight_b * norm_right[i].score,
-                source_engine: EngineType.Hybrid,
-            });
-        }
+    # Remaining entries in right_map are unmatched right rows
+    L (key, (idx, score)): right_map.iter() {
+        combined.push(ScoredResult {
+            row: norm_right[*idx].row.clone(),
+            score: weight_b * *score,
+            source_engine: EngineType.Hybrid,
+        });
     }
 
     # Sort by score descending
@@ -202,34 +195,27 @@ F fuse_rrf(
 ) -> Vec<ScoredResult> {
     # RRF score = Σ 1/(k + rank_i) across all result lists
 
-    # Build hash map from right results: row_key → (index, rank)
-    ~right_map: Vec<(u64, u64, u64)> = Vec.new();
+    # Build HashMap from right results: row_key (as String) → (index, rank)
+    ~right_map: HashMap<(u64, u64)> = HashMap.new();
     L j: 0..right.len() {
         ~key = row_hash_key(&right[j].row);
-        right_map.push((key, j, j));  # j is the rank
-    }
-
-    # Track which right rows were matched
-    ~right_matched: Vec<bool> = Vec.with_capacity(right.len());
-    L _: 0..right.len() {
-        right_matched.push(false);
+        right_map.insert(key.to_string(), (j, j));  # value = (index, rank)
     }
 
     ~combined: Vec<ScoredResult> = Vec.new();
 
-    # Process left results with rank-based scores
+    # Process left results with rank-based scores; O(1) lookup per left row
     L i: 0..left.len() {
         ~rrf_score = 1.0 / (k as f64 + i as f64 + 1.0);
 
-        # Look up matching right row via hash
         ~left_key = row_hash_key(&left[i].row);
-        ~found_match = false;
-        L (rk, ri, rank): right_map.iter() {
-            I !found_match && *rk == left_key && rows_match(&left[i].row, &right[*ri].row) {
-                rrf_score += 1.0 / (k as f64 + *rank as f64 + 1.0);
-                right_matched[*ri] = true;
-                found_match = true;
-            }
+        M right_map.get(&left_key.to_string()) {
+            Option.Some(entry) => {
+                ~rank = entry.1;
+                rrf_score += 1.0 / (k as f64 + rank as f64 + 1.0);
+                right_map.remove(&left_key.to_string());
+            },
+            Option.None => {},
         }
 
         combined.push(ScoredResult {
@@ -239,16 +225,14 @@ F fuse_rrf(
         });
     }
 
-    # Add unmatched right-only results
-    L j: 0..right.len() {
-        I !right_matched[j] {
-            ~rrf_score = 1.0 / (k as f64 + j as f64 + 1.0);
-            combined.push(ScoredResult {
-                row: right[j].row.clone(),
-                score: rrf_score,
-                source_engine: EngineType.Hybrid,
-            });
-        }
+    # Remaining entries in right_map are unmatched right-only rows
+    L (key, (idx, rank)): right_map.iter() {
+        ~rrf_score = 1.0 / (k as f64 + *rank as f64 + 1.0);
+        combined.push(ScoredResult {
+            row: right[*idx].row.clone(),
+            score: rrf_score,
+            source_engine: EngineType.Hybrid,
+        });
     }
 
     combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std.cmp.Ordering.Equal));

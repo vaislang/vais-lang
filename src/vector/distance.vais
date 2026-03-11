@@ -17,6 +17,14 @@ U std/math.{sqrt};
 U storage/error.{VaisError};
 
 # ============================================================================
+# Module-Level Constants
+# ============================================================================
+
+# Epsilon used for near-zero magnitude checks to avoid division by zero.
+# Applied in cosine distance and vector normalization.
+C EPSILON: f32 = 0.00000001;
+
+# ============================================================================
 # Distance Metric Enum
 # ============================================================================
 
@@ -103,10 +111,9 @@ F cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     }
 
     # Add epsilon to avoid division by zero
-    ~ epsilon: f32 = 1e-8;
     ~ magnitude = sqrt(norm_a) * sqrt(norm_b);
 
-    I magnitude < epsilon {
+    I magnitude < EPSILON {
         # Zero magnitude vector - return max distance
         R 2.0;
     }
@@ -211,15 +218,77 @@ X DistanceComputer {
         Ok(distance)
     }
 
-    # Compute distance with SIMD optimization (if available)
-    # Falls back to scalar implementation if SIMD not supported
+    # Compute distance with SIMD optimization (if available).
+    # Dispatches to platform-specific SIMD FFI (NEON on ARM, AVX2 on x86-64)
+    # when the vector length is >= 4. Falls back to scalar for shorter vectors.
     F compute_simd(self, a: &[f32], b: &[f32]) -> Result<f32, VaisError> {
-        # Validate dimensions
+        # Validate dimensions first (shared with compute())
         validate_dimensions(a, b)?;
 
-        # FUTURE(simd): Runtime CPU feature detection and SIMD dispatch via C FFI
-        # Currently using scalar implementation
-        self.compute(a, b)
+        ~ len = a.len();
+
+        # Only use SIMD when there are enough elements for a meaningful gain.
+        # Vectors shorter than 4 elements use the scalar path directly.
+        I len < 4 {
+            R self.compute(a, b);
+        }
+
+        # Obtain raw pointers for FFI calls.
+        ~ ptr_a = a.as_ptr();
+        ~ ptr_b = b.as_ptr();
+        ~ dim   = len as u32;
+
+        # Dispatch: prefer NEON on ARM targets, AVX2 on x86-64 targets.
+        # The correct extern symbol is selected at link time via platform flags.
+        ~ distance: f32 = M self.metric {
+            DistanceMetric.Cosine => {
+                # ARM NEON path
+                #[cfg(target_arch = "aarch64")]
+                {
+                    simd_cosine_neon_f32(ptr_a, ptr_b, dim)
+                }
+                # x86-64 AVX2 path
+                #[cfg(target_arch = "x86_64")]
+                {
+                    simd_cosine_avx2_f32(ptr_a, ptr_b, dim)
+                }
+                # Fallback for any other architecture
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                {
+                    cosine_distance_scalar(a, b)
+                }
+            },
+            DistanceMetric.L2 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    simd_l2_neon_f32(ptr_a, ptr_b, dim)
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    simd_l2_avx2_f32(ptr_a, ptr_b, dim)
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                {
+                    l2_distance_scalar(a, b)
+                }
+            },
+            DistanceMetric.DotProduct => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    simd_dot_neon_f32(ptr_a, ptr_b, dim)
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    simd_dot_avx2_f32(ptr_a, ptr_b, dim)
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                {
+                    dot_product_scalar(a, b)
+                }
+            },
+        };
+
+        Ok(distance)
     }
 
     # Get the distance metric type
@@ -232,8 +301,11 @@ X DistanceComputer {
 # Utility Functions
 # ============================================================================
 
-# Normalize a vector to unit length
-# Returns a new vector with magnitude 1.0
+# Normalize a vector to unit length, returning a new allocation.
+# Returns a new vector with magnitude 1.0.
+#
+# NOTE: Prefer `normalize_vector_inplace()` when mutation is acceptable.
+# It avoids an extra heap allocation and is more cache-friendly.
 F normalize_vector(v: &[f32]) -> Result<Vec<f32>, VaisError> {
     I v.len() == 0 {
         R Err(err_invalid_dimension(0));
@@ -249,9 +321,8 @@ F normalize_vector(v: &[f32]) -> Result<Vec<f32>, VaisError> {
     }
 
     ~ magnitude = sqrt(sum_sq);
-    ~ epsilon: f32 = 1e-8;
 
-    I magnitude < epsilon {
+    I magnitude < EPSILON {
         R Err(err_zero_magnitude());
     }
 
@@ -282,9 +353,8 @@ F normalize_vector_inplace(v: &~[f32]) -> Result<(), VaisError> {
     }
 
     ~ magnitude = sqrt(sum_sq);
-    ~ epsilon: f32 = 1e-8;
 
-    I magnitude < epsilon {
+    I magnitude < EPSILON {
         R Err(err_zero_magnitude());
     }
 

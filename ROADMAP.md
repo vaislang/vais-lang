@@ -56,19 +56,25 @@ VaisDB solves the fundamental problem of RAG and AI agent systems: **4 databases
 | 12 | Benchmarks | ✅ Complete | 4/4 (100%) |
 | 13 | Documentation | ✅ Complete | 3/3 (100%) |
 | 14 | Code Quality | ✅ Complete | 3/3 (100%) |
-| 15 | Commit & Performance | 🔄 In Progress | 0/6 (0%) |
+| 15 | Commit & Performance | ✅ Complete | 6/6 (100%) |
 
 ---
 
 ## Phase 15: Commit & Performance Optimization (2026-03-11)
 모드: 자동진행
-- [ ] 1. 커밋 정리 — W→L 키워드 변경 145파일 커밋 (Opus 직접)
-- [ ] 2. HNSW MinHeap/MaxHeap O(n)→O(log n) 최적화 (impl-sonnet) [blockedBy: 1]
-- [ ] 3. Pipeline fusion O(n*m)→O(n+m) HashMap 기반 변경 (impl-sonnet) [blockedBy: 1]
-- [ ] 4. Distance SIMD stub 활성화 (impl-sonnet) [blockedBy: 1]
-- [ ] 5. BM25 IDF 캐싱 + ln() 최적화 (impl-sonnet) [blockedBy: 1]
-- [ ] 6. Clock eviction 단일 pass 최적화 (impl-sonnet) [blockedBy: 1]
-진행률: 0/6 (0%)
+- [x] 1. 커밋 정리 — W→L 키워드 변경 145파일 커밋 (Opus 직접) ✅
+  변경: 146 files (L→C 상수, ~var→var := 가변 바인딩 등 Vais 키워드 일관성 수정)
+- [x] 2. HNSW MinHeap/MaxHeap O(n)→O(log n) 최적화 (impl-sonnet) ✅
+  변경: src/vector/hnsw/search.vais (sorted Vec insert→binary heap sift_up/sift_down)
+- [x] 3. Pipeline fusion O(n*m)→O(n+m) HashMap 기반 변경 (impl-sonnet) ✅
+  변경: src/planner/pipeline.vais (Vec 순회→HashMap O(1) lookup, right_matched 제거)
+- [x] 4. Distance SIMD stub 활성화 (impl-sonnet) ✅
+  변경: src/vector/distance.vais (SIMD FFI 호출 활성화, EPSILON 상수화, NEON/AVX2 분기)
+- [x] 5. BM25 IDF 캐싱 + ln() 최적화 (impl-sonnet) ✅
+  변경: src/fulltext/search/bm25.vais (IDF HashMap 캐싱, ln_fast() 256-entry lookup table, score_batch())
+- [x] 6. Clock eviction 단일 pass 최적화 (impl-sonnet) ✅
+  변경: src/storage/buffer/clock.vais (2-pass→single-pass, modulo→if-then 분기)
+진행률: 6/6 (100%)
 
 ---
 
