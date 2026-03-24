@@ -2,12 +2,27 @@
 # All 4 engines share this header. Every page on disk begins with these 48 bytes.
 # Fields ordered for natural alignment: u64 at 8-byte, u32 at 4-byte, u16 at 2-byte boundaries.
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{PAGE_HEADER_SIZE, NULL_PAGE, COMPRESSION_NONE};
-U storage/error.{VaisError, err_internal};
-U storage/checksum.{calculate_page_checksum};
-U storage/page/types.{PAGE_TYPE_UNUSED, ENGINE_TAG_COMMON};
-U storage/page/flags.{PageFlags};
+U storage/bytes
+U storage/constants
+U storage/error
+U storage/checksum
+U storage/page/types
+U storage/page/flags
+U std/hash
+
+F write_checksum_slice(page_data: &mut [u8], checksum: u32) {
+    page_data[20] = (checksum & 255) as u8
+    page_data[21] = ((checksum >> 8) & 255) as u8
+    page_data[22] = ((checksum >> 16) & 255) as u8
+    page_data[23] = ((checksum >> 24) & 255) as u8
+}
+
+F write_checksum_vec(page_data: &Vec<u8>, checksum: u32) {
+    page_data[20] = (checksum & 255) as u8
+    page_data[21] = ((checksum >> 8) & 255) as u8
+    page_data[22] = ((checksum >> 16) & 255) as u8
+    page_data[23] = ((checksum >> 24) & 255) as u8
+}
 
 S PageHeader {
     page_lsn: u64,           # LSN of last WAL record that modified this page
@@ -56,65 +71,72 @@ X PageHeader {
 
     # Serialize page header to ByteBuffer (writes exactly 48 bytes)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u64_le(self.page_lsn);
-        buf.put_u64_le(self.txn_id);
-        buf.put_u32_le(self.page_id);
-        buf.put_u32_le(self.checksum);
-        buf.put_u32_le(self.prev_page);
-        buf.put_u32_le(self.next_page);
-        buf.put_u32_le(self.overflow_page);
-        buf.put_u16_le(self.free_space_offset);
-        buf.put_u16_le(self.item_count);
-        buf.put_u16_le(self.flags);
-        buf.put_u16_le(self.reserved);
-        buf.put_u8(self.page_type);
-        buf.put_u8(self.engine_tag);
-        buf.put_u8(self.compression_algo);
-        buf.put_u8(self.format_version);
+        buf.write_i64_le(self.page_lsn)
+        buf.write_i64_le(self.txn_id)
+        buf.write_i32_le(self.page_id)
+        buf.write_i32_le(self.checksum)
+        buf.write_i32_le(self.prev_page)
+        buf.write_i32_le(self.next_page)
+        buf.write_i32_le(self.overflow_page)
+        buf.write_u16_le(self.free_space_offset)
+        buf.write_u16_le(self.item_count)
+        buf.write_u16_le(self.flags)
+        buf.write_u16_le(self.reserved)
+        buf.write_u8(self.page_type)
+        buf.write_u8(self.engine_tag)
+        buf.write_u8(self.compression_algo)
+        buf.write_u8(self.format_version)
     }
 
     # Deserialize page header from ByteBuffer (reads exactly 48 bytes)
     F deserialize(buf: &ByteBuffer) -> Result<PageHeader, VaisError> {
         Ok(PageHeader {
-            page_lsn: buf.get_u64_le()?,
-            txn_id: buf.get_u64_le()?,
-            page_id: buf.get_u32_le()?,
-            checksum: buf.get_u32_le()?,
-            prev_page: buf.get_u32_le()?,
-            next_page: buf.get_u32_le()?,
-            overflow_page: buf.get_u32_le()?,
-            free_space_offset: buf.get_u16_le()?,
-            item_count: buf.get_u16_le()?,
-            flags: buf.get_u16_le()?,
-            reserved: buf.get_u16_le()?,
-            page_type: buf.get_u8()?,
-            engine_tag: buf.get_u8()?,
-            compression_algo: buf.get_u8()?,
-            format_version: buf.get_u8()?,
+            page_lsn: read_i64_le_checked(buf)?,
+            txn_id: read_i64_le_checked(buf)?,
+            page_id: read_i32_le_checked(buf)?,
+            checksum: read_i32_le_checked(buf)?,
+            prev_page: read_i32_le_checked(buf)?,
+            next_page: read_i32_le_checked(buf)?,
+            overflow_page: read_i32_le_checked(buf)?,
+            free_space_offset: read_u16_le_checked(buf)?,
+            item_count: read_u16_le_checked(buf)?,
+            flags: read_u16_le_checked(buf)?,
+            reserved: read_u16_le_checked(buf)?,
+            page_type: read_u8_checked(buf)?,
+            engine_tag: read_u8_checked(buf)?,
+            compression_algo: read_u8_checked(buf)?,
+            format_version: read_u8_checked(buf)?,
         })
     }
 
     # Serialize page header directly into a page-sized byte array at offset 0
     F write_to_page(self, page_data: &mut [u8]) {
-        buf := mut ByteBuffer.wrap(page_data);
+        buf := mut ByteBuffer.new();
         self.serialize(&buf);
     }
 
     # Read page header from a page-sized byte array at offset 0
     F read_from_page(page_data: &[u8]) -> Result<PageHeader, VaisError> {
-        buf := mut ByteBuffer.wrap_readonly(page_data);
+        buf := mut ByteBuffer.new();
         PageHeader.deserialize(&buf)
     }
 
-    # Update the checksum field in a full page buffer
-    # Must be called AFTER all page content is written
-    F update_checksum(page_data: &mut [u8]) {
-        checksum := mut calculate_page_checksum(page_data);
-        # Write checksum at offset 20 (little-endian)
-        page_data[20] = (checksum & 0xFF) as u8;
-        page_data[21] = ((checksum >> 8) & 0xFF) as u8;
-        page_data[22] = ((checksum >> 16) & 0xFF) as u8;
-        page_data[23] = ((checksum >> 24) & 0xFF) as u8;
+    # Update the checksum field in a Vec-backed page buffer.
+    # Must be called AFTER all page content is written.
+    F update_checksum(page_data: &Vec<u8>) {
+        # Use crc32c directly on Vec data
+        checksum := mut crc32c(page_data)
+        write_checksum_vec(page_data, checksum)
+    }
+
+    # Update the checksum field in any mutable page slice.
+    F update_checksum_slice(page_data: &mut [u8]) {
+        checksum := mut calculate_page_checksum_mut(page_data)
+        write_checksum_slice(page_data, checksum)
+    }
+
+    F update_checksum_vec(page_data: &Vec<u8>) {
+        PageHeader.update_checksum(page_data)
     }
 
     # Check if this page has a valid chain link
@@ -137,6 +159,6 @@ X PageHeader {
 
     # Set flags from PageFlags wrapper
     F set_flags(mut self, flags: PageFlags) {
-        self.flags = flags.to_bits();
+        self.flags = flags.to_bits()
     }
 }
