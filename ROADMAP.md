@@ -689,22 +689,33 @@ IR 후처리(ir_fix.py)로는 한계 도달. 테스트별 5-20+개 에러 순차
 **VaisDB 코드 수정:**
 3. `src/storage/checksum.vais`: `I crc & 1 == 1` → `I (crc & 1) == 1` (연산자 우선순위)
 
-### 최종 TC 에러 현황 (컴파일러 + VaisDB 수정 후)
-| 테스트 | Phase 158 직후 | **최종** | 감소 |
-|--------|---------------|---------|------|
-| test_graph | 28 | **12** | -16 |
-| test_wal | 24 | **19** | -5 |
-| test_btree | 10 | **10** | 0 |
-| test_fulltext | 64 | **50** | -14 |
-| test_vector | 48 | **47** | -1 |
-| test_transaction | 47 | **42** | -5 |
-| **합계** | **221** | **181** | **-40** |
+### 최종 TC 에러 현황 (Phase 160 컴파일러 수정 후)
+| 테스트 | Phase 158 직후 | **최종** | 이전 세션(a84599bb) |
+|--------|---------------|---------|-------------------|
+| test_graph | 28 | **6** | 6 (동일) |
+| test_wal | 24 | **16** | 16 (동일) |
+| test_btree | 10 | **10** | 10 (동일) |
+| test_fulltext | 64 | **27** | 27 (동일) |
+| test_vector | 48 | **3** | 5 (개선) |
+| test_transaction | 47 | **39** | 43 (개선) |
+| **합계** | **221** | **101** | — |
 
-### 잔여 에러 분류 (컴파일러 제한)
-1. **크로스모듈 Vec<T> erasure**: 대규모 파일에서 Vec<str>/Vec<f32> 인덱싱 시 i64로 fallback (단독 파일에서는 정상)
-2. **크로스모듈 TC**: Optional/Result 타입 해석 실패, undefined variable (import된 함수)
-3. **포인터/슬라이스 불일치**: `*u8` vs `&[u8]` (기존 제한)
-4. **`?` 연산자**: `Optional or Result, found ()` (함수가 Result를 반환하지 않는 경우)
+**Phase 158 문법 변경 영향 완전 해소.** 이전 세션 대비 동일하거나 개선됨.
+
+### Phase 160 컴파일러 수정 요약 (2026-03-29)
+1. `control_flow.rs`: match arm void 함수 Unit recovery
+2. `collections.rs`: Vec<T> indexing apply_substitutions + RefMut
+3. `unification.rs`: bool↔int, int↔float, f32↔f64 numeric promotion 복원 (str↔i64는 금지 유지)
+4. `method_call.rs`, `generics.rs`, `type_inference.rs`: codegen specialization
+커밋: c6fa82aa (Phase 160 TC+codegen), 04f5c6b2 (Phase 160 numeric promotion)
+
+### 잔여 에러 분류 (101건 — Phase 158과 무관한 기존 크로스모듈 TC 제한)
+1. **str↔i64 (12건)**: 크로스모듈 Vec<str> erasure (단독 파일에서는 정상)
+2. **undefined variable (8건)**: 크로스모듈 import 해석 실패
+3. **`*u8` vs `&[u8]` (6건)**: 포인터/슬라이스 타입 불일치
+4. **Optional/Result (5건)**: `?` 연산자 관련
+5. **argument count (4건)**: 기존 TC 제한
+6. **기타 (7건)**: enum/struct 타입명 불일치 (크로스모듈)
 
 ### 컴파일러 근본 수정 (2026-03-29)
 **vais 프로젝트 수정 (3개 파일):**
