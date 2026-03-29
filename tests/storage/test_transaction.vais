@@ -4,163 +4,191 @@
 #         CLOG status tracking, transaction timeout
 
 U std/test.{assert_eq, assert_ne, assert_true, assert_false, describe, it};
+U std/result
 
 U storage/constants.{INVALID_TXN_ID, NULL_UNDO_PTR};
-U storage/txn/visibility.{is_visible, is_committed, is_aborted};
-U storage/txn/snapshot.{Snapshot};
+U storage/txn/visibility.{is_visible, is_aborted_fast};
+U storage/txn/snapshot.{TxnSnapshot, IsolationLevel};
 U storage/txn/clog.{Clog, TxnStatus};
 U storage/txn/att.{ActiveTransactionTable, TxnState};
 U storage/txn/conflict.{ConflictDetector};
 U storage/txn/deadlock.{WaitForGraph};
-U storage/txn/undo_entry.{UndoEntry, UndoType};
+U storage/txn/undo_entry.{UndoEntry};
 U storage/page/mvcc.{MvccTupleMeta};
+U storage/constants.{UNDO_INSERT, UNDO_UPDATE, UNDO_DELETE};
 
 describe("MVCC Visibility - 10 Scenarios") {
     # Scenario 1: Transaction sees its own uncommitted insert
     it("Scenario 1: own uncommitted insert is visible") {
-        tuple := mut MvccTupleMeta.new(100, 0);  # Created by txn 100, not expired
-        snapshot := mut Snapshot.new(100, vec![100], 99);  # txn 100 is the reader
+        tuple := mut MvccTupleMeta.new_insert(100, 0);  # Created by txn 100, not expired
+        active1 := mut Vec.with_capacity(1);
+        active1.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active1);  # txn 100 is the reader
 
         # txn 100 can see its own insert (Case 1)
         clog := mut Clog.new(4096, 4);
         clog.set_status(100, TxnStatus.InProgress);
 
-        assert_true(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_true(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 2: Transaction cannot see another's uncommitted insert
     it("Scenario 2: other's uncommitted insert is not visible") {
-        tuple := mut MvccTupleMeta.new(101, 0);  # Created by txn 101
-        snapshot := mut Snapshot.new(100, vec![100, 101], 99);
+        tuple := mut MvccTupleMeta.new_insert(101, 0);  # Created by txn 101
+        active2 := mut Vec.with_capacity(2);
+        active2.push(100u64);
+        active2.push(101u64);
+        snapshot := mut TxnSnapshot.new(100, active2);
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(101, TxnStatus.InProgress);
 
         # txn 100 cannot see txn 101's uncommitted insert
-        assert_false(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 3: Transaction sees a committed insert from before snapshot
     it("Scenario 3: committed insert from before snapshot is visible") {
-        tuple := mut MvccTupleMeta.new(90, 0);  # Created by txn 90
+        tuple := mut MvccTupleMeta.new_insert(90, 0);  # Created by txn 90
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(90, TxnStatus.Committed);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active3 := mut Vec.with_capacity(1);
+        active3.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active3);
 
-        assert_true(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_true(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 4: Transaction cannot see a committed insert from after snapshot
     it("Scenario 4: committed insert after snapshot is not visible") {
-        tuple := mut MvccTupleMeta.new(105, 0);  # Created by txn 105 (after snapshot)
+        tuple := mut MvccTupleMeta.new_insert(105, 0);  # Created by txn 105 (after snapshot)
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(105, TxnStatus.Committed);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active4 := mut Vec.with_capacity(1);
+        active4.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active4);
 
         # txn 105 > snapshot boundary → not visible
-        assert_false(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 5: Deleted tuple is not visible to same transaction
     it("Scenario 5: own delete makes tuple invisible") {
-        tuple := mut MvccTupleMeta.new(90, 0);
-        tuple.set_expire(100, 0);  # Expired by txn 100
+        tuple := mut MvccTupleMeta.new_insert(90, 0);
+        tuple.set_expired(100, 0);  # Expired by txn 100
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(90, TxnStatus.Committed);
         clog.set_status(100, TxnStatus.InProgress);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active5 := mut Vec.with_capacity(1);
+        active5.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active5);
 
         # txn 100 deleted this tuple → not visible (Case 3 with own txn)
-        assert_false(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 6: Deleted by another committed txn before snapshot
     it("Scenario 6: deleted by committed txn before snapshot") {
-        tuple := mut MvccTupleMeta.new(80, 0);
-        tuple.set_expire(85, 0);
+        tuple := mut MvccTupleMeta.new_insert(80, 0);
+        tuple.set_expired(85, 0);
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(80, TxnStatus.Committed);
         clog.set_status(85, TxnStatus.Committed);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active6 := mut Vec.with_capacity(1);
+        active6.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active6);
 
         # Both create and expire are committed before snapshot → not visible (expired)
-        assert_false(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 7: Deleted by uncommitted txn → still visible
     it("Scenario 7: deleted by uncommitted txn is still visible") {
-        tuple := mut MvccTupleMeta.new(80, 0);
-        tuple.set_expire(101, 0);  # Expired by txn 101 (uncommitted)
+        tuple := mut MvccTupleMeta.new_insert(80, 0);
+        tuple.set_expired(101, 0);  # Expired by txn 101 (uncommitted)
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(80, TxnStatus.Committed);
         clog.set_status(101, TxnStatus.InProgress);
 
-        snapshot := mut Snapshot.new(100, vec![100, 101], 99);
+        active7 := mut Vec.with_capacity(2);
+        active7.push(100u64);
+        active7.push(101u64);
+        snapshot := mut TxnSnapshot.new(100, active7);
 
         # txn 101 hasn't committed → tuple still visible to txn 100
-        assert_true(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        assert_true(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 8: Aborted transaction's insert is not visible
     it("Scenario 8: aborted insert is not visible (fast-path)") {
-        tuple := mut MvccTupleMeta.new(95, 0);
+        tuple := mut MvccTupleMeta.new_insert(95, 0);
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(95, TxnStatus.Aborted);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active8 := mut Vec.with_capacity(1);
+        active8.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active8);
 
-        # is_aborted fast-path: aborted txn's tuples never visible
-        assert_true(is_aborted(95, &clog));
-        assert_false(is_visible(&tuple, 100, 0, &snapshot, &clog));
+        # is_aborted_fast fast-path: aborted txn's tuples never visible
+        assert_true(is_aborted_fast(95, &clog));
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot, &clog));
     }
 
     # Scenario 9: Command ID visibility within same transaction
     it("Scenario 9: cmd_id ordering within transaction") {
-        tuple := mut MvccTupleMeta.new(100, 0);
+        tuple := mut MvccTupleMeta.new_insert(100, 0);
         tuple.cmd_id = 5;  # Created at command 5
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(100, TxnStatus.InProgress);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active9 := mut Vec.with_capacity(1);
+        active9.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active9);
 
         # Command 10 sees tuple created at command 5
-        assert_true(is_visible(&tuple, 100, 10, &snapshot, &clog));
+        snapshot10 := mut TxnSnapshot.new(100, vec![100u64]);
+        snapshot10.current_cmd_id = 10;
+        assert_true(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot10, &clog));
 
         # Command 3 does NOT see tuple created at command 5
-        assert_false(is_visible(&tuple, 100, 3, &snapshot, &clog));
+        snapshot3 := mut TxnSnapshot.new(100, vec![100u64]);
+        snapshot3.current_cmd_id = 3;
+        assert_false(is_visible(tuple.txn_id_create, tuple.txn_id_expire, tuple.cmd_id, tuple.expire_cmd_id, &snapshot3, &clog));
     }
 
     # Scenario 10: Concurrent updates with snapshot isolation
     it("Scenario 10: snapshot isolation consistency") {
         # txn 100 takes snapshot, then txn 101 updates and commits
-        tuple_v1 := mut MvccTupleMeta.new(80, 0);
-        tuple_v1.set_expire(101, 0);  # Expired by txn 101
+        tuple_v1 := mut MvccTupleMeta.new_insert(80, 0);
+        tuple_v1.set_expired(101, 0);  # Expired by txn 101
 
-        tuple_v2 := mut MvccTupleMeta.new(101, 0);  # New version by txn 101
+        tuple_v2 := mut MvccTupleMeta.new_insert(101, 0);  # New version by txn 101
 
         clog := mut Clog.new(4096, 4);
         clog.set_status(80, TxnStatus.Committed);
         clog.set_status(101, TxnStatus.Committed);
 
-        snapshot := mut Snapshot.new(100, vec![100], 99);
+        active10 := mut Vec.with_capacity(1);
+        active10.push(100u64);
+        snapshot := mut TxnSnapshot.new(100, active10);
 
         # txn 100's snapshot was taken before txn 101 committed
         # v1 is still visible (101 committed after snapshot)
-        assert_true(is_visible(&tuple_v1, 100, 0, &snapshot, &clog));
+        assert_true(is_visible(tuple_v1.txn_id_create, tuple_v1.txn_id_expire, tuple_v1.cmd_id, tuple_v1.expire_cmd_id, &snapshot, &clog));
 
         # v2 is NOT visible (created by txn 101 which is after snapshot)
-        assert_false(is_visible(&tuple_v2, 100, 0, &snapshot, &clog));
+        assert_false(is_visible(tuple_v2.txn_id_create, tuple_v2.txn_id_expire, tuple_v2.cmd_id, tuple_v2.expire_cmd_id, &snapshot, &clog));
     }
 }
 
@@ -194,7 +222,7 @@ describe("Conflict Detection") {
     it("should allow first writer") {
         detector := mut ConflictDetector.new();
 
-        result := mut detector.check_and_lock(100, 1, 10, 0);
+        result := mut detector.check_and_lock(1u8, 10u32, 0u16, 100u64);
         assert_true(result.is_ok());
     }
 
@@ -202,21 +230,21 @@ describe("Conflict Detection") {
         detector := mut ConflictDetector.new();
 
         # txn 100 locks row
-        detector.check_and_lock(100, 1, 10, 0)!;
+        detector.check_and_lock(1u8, 10u32, 0u16, 100u64)!;
 
         # txn 101 tries same row → conflict
-        result := mut detector.check_and_lock(101, 1, 10, 0);
+        result := mut detector.check_and_lock(1u8, 10u32, 0u16, 101u64);
         assert_true(result.is_err());
     }
 
     it("should release locks on commit/abort") {
         detector := mut ConflictDetector.new();
 
-        detector.check_and_lock(100, 1, 10, 0)!;
+        detector.check_and_lock(1u8, 10u32, 0u16, 100u64)!;
         detector.release_locks(100);
 
         # Now txn 101 can lock the same row
-        result := mut detector.check_and_lock(101, 1, 10, 0);
+        result := mut detector.check_and_lock(1u8, 10u32, 0u16, 101u64);
         assert_true(result.is_ok());
     }
 }
@@ -258,27 +286,33 @@ describe("Deadlock Detection") {
 
 describe("Undo Entry") {
     it("should serialize and deserialize round-trip") {
-        entry := mut UndoEntry.for_insert(100, 1, 10, 5);
-        buf := mut Vec.with_capacity(64);
-        buf.resize(64, 0u8);
-        bb := mut ByteBuffer.wrap(&buf);
-        entry.serialize(&bb);
+        entry := mut UndoEntry.new_insert(100, 0, 1u8, 10u32, 5u16);
+        buf := mut ByteBuffer.with_capacity(64);
+        entry.serialize(&mut buf);
 
-        read_bb := mut ByteBuffer.wrap_readonly(&buf);
-        restored := mut UndoEntry.deserialize(&read_bb)!;
+        buf.seek(0);
+        restored := mut UndoEntry.deserialize(&buf)!;
         assert_eq(restored.txn_id, 100);
-        assert_eq(restored.undo_type, UndoType.Insert);
+        assert_eq(restored.entry_type, UNDO_INSERT);
         assert_eq(restored.file_id, 1);
         assert_eq(restored.page_id, 10);
         assert_eq(restored.slot_id, 5);
     }
 
     it("should carry old data for update operations") {
-        old_data := mut [1u8, 2, 3, 4, 5, 6, 7, 8];
-        entry := mut UndoEntry.for_update(100, 1, 10, 5, &old_data);
+        old_data := mut Vec.with_capacity(8);
+        old_data.push(1u8);
+        old_data.push(2u8);
+        old_data.push(3u8);
+        old_data.push(4u8);
+        old_data.push(5u8);
+        old_data.push(6u8);
+        old_data.push(7u8);
+        old_data.push(8u8);
+        entry := mut UndoEntry.new_update(100, 0, 1u8, 10u32, 5u16, old_data);
 
-        assert_eq(entry.undo_type, UndoType.Update);
-        assert_eq(&entry.old_data, &old_data);
+        assert_eq(entry.entry_type, UNDO_UPDATE);
+        assert_eq(entry.data_len, 8);
     }
 }
 
@@ -286,32 +320,41 @@ describe("Active Transaction Table") {
     it("should register and retrieve transactions") {
         att := mut ActiveTransactionTable.new();
 
-        att.register(100, 0);
-        entry := mut att.get(100)!;
-        assert_eq(entry.txn_id, 100);
-
-        M entry.state {
-            TxnState.Active => {},
-            _ => panic!("Expected Active state"),
+        att.register(100, IsolationLevel.SnapshotIsolation);
+        entry := mut att.get(100);
+        M entry {
+            Some(e) => {
+                assert_eq(e.txn_id, 100);
+                M e.state {
+                    TxnState.Active => {},
+                    _ => assert_true(false),
+                }
+            },
+            None => assert_true(false),
         }
     }
 
     it("should track state transitions") {
         att := mut ActiveTransactionTable.new();
-        att.register(100, 0);
+        att.register(100, IsolationLevel.SnapshotIsolation);
 
         att.set_state(100, TxnState.Committing);
-        entry := mut att.get(100)!;
-        M entry.state {
-            TxnState.Committing => {},
-            _ => panic!("Expected Committing state"),
+        entry2 := mut att.get(100);
+        M entry2 {
+            Some(e) => {
+                M e.state {
+                    TxnState.Committing => {},
+                    _ => assert_true(false),
+                }
+            },
+            None => assert_true(false),
         }
     }
 
     it("should find timed-out transactions") {
         att := mut ActiveTransactionTable.new();
-        att.register(100, 0);
-        att.register(101, 0);
+        att.register(100, IsolationLevel.SnapshotIsolation);
+        att.register(101, IsolationLevel.SnapshotIsolation);
 
         # Simulate time passing (set old start_time)
         # In real implementation, start_time would be checked against current time
