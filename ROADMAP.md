@@ -657,7 +657,21 @@ IR 후처리(ir_fix.py)로는 한계 도달. 테스트별 5-20+개 에러 순차
 | test_transaction | 47 | 39 | **24** |
 | **합계** | **221** | **101** | **86** |
 
-**VaisDB 코드 수정으로 해결 가능한 부분 완료.** 잔여 86건은 컴파일러 크로스모듈 TC 제한 (vais Phase 161).
+**VaisDB 코드 수정으로 해결 가능한 부분 완료.**
+
+### Phase 161 컴파일러 수정 검증 (2026-03-30)
+vais 컴파일러 Phase 161 (크로스모듈 TC suppress) + Phase 160-A numeric promotion 재적용:
+| 테스트 | Phase 160-A 후 | **Phase 161 후** |
+|--------|---------------|-----------------|
+| test_graph | 6 | **0** ✅ |
+| test_wal | 17 | **2** |
+| test_btree | 9 | **3** |
+| test_fulltext | 27 | **12** |
+| test_vector | 3 | **0** ✅ |
+| test_transaction | 24 | **2** |
+| **합계** | **86** | **19** |
+
+**221→19 (91% 감소).** test_graph, test_vector TC 에러 0건 달성.
 
 ---
 
