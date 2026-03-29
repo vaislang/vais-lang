@@ -16,7 +16,7 @@ U storage/wal/record_types.{
     ClrPayload, PageAllocPayload, FpiPayload,
     ISOLATION_READ_COMMITTED, ISOLATION_SERIALIZABLE,
 };
-U storage/wal/lsn.{LsnAllocator, NULL_LSN, lsn_segment, lsn_offset, lsn_compare, lsn_advance};
+U storage/wal/lsn.{LsnAllocator, LsnAllocation, NULL_LSN, lsn_segment, lsn_offset, lsn_compare, lsn_advance};
 U storage/wal/buffer.{WalBuffer};
 U storage/checksum.{calculate_wal_checksum, verify_wal_checksum};
 
@@ -47,12 +47,17 @@ describe("WAL Record Header") {
     }
 
     it("should verify checksum over full record") {
-        record := mut Vec.with_capacity(56);
-        record.resize(56, 0u8);
-
-        buf := mut ByteBuffer.wrap(&record);
+        buf := mut ByteBuffer.with_capacity(56);
         header := mut WalRecordHeader.new(1, 1, 0, TXN_BEGIN, ENGINE_META, 56);
         header.serialize(&buf);
+        # Pad to 56 bytes
+        i := mut buf.len()
+        L i < 56 {
+            buf.write_u8(0)
+            i += 1
+        }
+
+        record := mut buf.to_vec()
 
         # Compute checksum with field zeroed
         checksum := mut calculate_wal_checksum(&record);
@@ -61,11 +66,11 @@ describe("WAL Record Header") {
         record[38] = ((checksum >> 16) & 0xFF) as u8;
         record[39] = ((checksum >> 24) & 0xFF) as u8;
 
-        assert_true(verify_wal_checksum(&record));
+        assert_true(verify_wal_checksum(&record) as i64);
 
         # Corrupt payload → checksum fails
         record[50] = 0xFF;
-        assert_false(verify_wal_checksum(&record));
+        assert_false(verify_wal_checksum(&record) as i64);
     }
 }
 
@@ -94,34 +99,34 @@ describe("LSN Allocator") {
     it("should allocate monotonically increasing LSNs") {
         alloc := mut LsnAllocator.new(1024 * 1024);  # 1MB segments
 
-        (lsn1, _) := mut alloc.allocate(100);
-        (lsn2, _) := mut alloc.allocate(100);
-        (lsn3, _) := mut alloc.allocate(100);
+        a1 := mut alloc.allocate(100);
+        a2 := mut alloc.allocate(100);
+        a3 := mut alloc.allocate(100);
 
-        assert_true(lsn_compare(lsn1, lsn2) < 0);
-        assert_true(lsn_compare(lsn2, lsn3) < 0);
+        assert_true((lsn_compare(a1.lsn, a2.lsn) < 0) as i64);
+        assert_true((lsn_compare(a2.lsn, a3.lsn) < 0) as i64);
     }
 
     it("should trigger new segment when full") {
         alloc := mut LsnAllocator.new(200);  # Tiny segment for testing
 
-        (lsn1, new_seg1) := mut alloc.allocate(100);
-        assert_false(new_seg1);
+        a1 := mut alloc.allocate(100);
+        assert_false(a1.needs_new_segment as i64);
 
-        (lsn2, new_seg2) := mut alloc.allocate(150);  # Exceeds 200
-        assert_true(new_seg2);
+        a2 := mut alloc.allocate(150);  # Exceeds 200
+        assert_true(a2.needs_new_segment as i64);
 
-        assert_ne(lsn_segment(lsn1), lsn_segment(lsn2));
+        assert_ne(lsn_segment(a1.lsn), lsn_segment(a2.lsn));
     }
 
     it("should resume from last known LSN") {
         alloc := mut LsnAllocator.new(1024 * 1024);
-        (lsn1, _) := mut alloc.allocate(100);
+        a1 := mut alloc.allocate(100);
 
         # Simulate crash recovery: resume from lsn1
-        resumed := mut LsnAllocator.resume(lsn1, 1024 * 1024);
-        (lsn2, _) := mut resumed.allocate(100);
-        assert_true(lsn_compare(lsn2, lsn1) > 0);
+        resumed := mut LsnAllocator.resume(a1.lsn, 1024 * 1024);
+        a2 := mut resumed.allocate(100);
+        assert_true((lsn_compare(a2.lsn, a1.lsn) > 0) as i64);
     }
 }
 
@@ -158,7 +163,7 @@ describe("WAL Record Type Payloads") {
         buf := mut ByteBuffer.with_capacity(8);
         original.serialize(&buf);
 
-        read_buf := mut ByteBuffer.wrap_readonly(buf.as_bytes());
+        read_buf := mut ByteBuffer.from_buf(&buf);
         restored := mut TxnBeginPayload.deserialize(&read_buf)!;
         assert_eq(restored.isolation_level, ISOLATION_SERIALIZABLE);
     }
@@ -170,7 +175,7 @@ describe("WAL Record Type Payloads") {
         buf := mut ByteBuffer.with_capacity(32);
         original.serialize(&buf);
 
-        read_buf := mut ByteBuffer.wrap_readonly(buf.as_bytes());
+        read_buf := mut ByteBuffer.from_buf(&buf);
         restored := mut CheckpointBeginPayload.deserialize(&read_buf)!;
         assert_eq(restored.active_txns.len(), 3);
         assert_eq(restored.active_txns[0], 100);
@@ -188,7 +193,7 @@ describe("WAL Record Type Payloads") {
         buf := mut ByteBuffer.with_capacity(16);
         original.serialize(&buf);
 
-        read_buf := mut ByteBuffer.wrap_readonly(buf.as_bytes());
+        read_buf := mut ByteBuffer.from_buf(&buf);
         restored := mut ClrPayload.deserialize(&read_buf)!;
         assert_eq(restored.original_record_type, TUPLE_INSERT);
         assert_eq(restored.undo_next_lsn, 500);
