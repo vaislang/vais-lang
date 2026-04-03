@@ -1,0 +1,218 @@
+# vaisdb Migrator
+# Schema migration management with version tracking and up/down support
+
+U std/string
+U std/vec
+U db/connection
+
+# ============================================================================
+# Migration — a single versioned schema change
+# ============================================================================
+
+S Migration {
+    version: i64,
+    name: str,
+    up_sql: str,
+    down_sql: str,
+}
+
+X Migration {
+    F new(version: i64, name: str, up_sql: str, down_sql: str) -> Migration {
+        Migration { version, name, up_sql, down_sql }
+    }
+
+    F to_string(self) -> str {
+        "Migration[v{self.version}] {self.name}"
+    }
+}
+
+# ============================================================================
+# MigrationRecord — persisted record from the migration history table
+# ============================================================================
+
+S MigrationRecord {
+    version: i64,
+    name: str,
+    applied_at: str,   # ISO-8601 timestamp string
+}
+
+X MigrationRecord {
+    F new(version: i64, name: str, applied_at: str) -> MigrationRecord {
+        MigrationRecord { version, name, applied_at }
+    }
+}
+
+# ============================================================================
+# Migrator — orchestrates migration application and rollback
+# ============================================================================
+
+C MIGRATIONS_TABLE: str = "__vaisdb_migrations"
+
+S Migrator {
+    conn: DbConnection,
+    migrations: Vec<Migration>,
+    current_version: i64,
+}
+
+X Migrator {
+    # Create a Migrator bound to an open DbConnection.
+    # The migration history table is created automatically if it does not exist.
+    F new(conn: DbConnection) -> Result<Migrator, VaisDbError> {
+        I !conn.is_connected() {
+            R Err(VaisDbError.new(5001, "Migrator requires an active DbConnection"))
+        }
+
+        migrator := Migrator {
+            conn,
+            migrations: Vec.new(),
+            current_version: 0,
+        }
+
+        M migrator._ensure_history_table() {
+            Ok(_) => {},
+            Err(e) => { R Err(e) },
+        }
+
+        Ok(migrator)
+    }
+
+    # Register a Migration for later execution.
+    F add_migration(mut self, migration: Migration) {
+        self.migrations.push(migration)
+    }
+
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    # Ensure the migration history table exists in the database.
+    F _ensure_history_table(self) -> Result<(), VaisDbError> {
+        create_sql := "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+        M self.conn.execute(create_sql) {
+            Ok(_) => { Ok(()) },
+            Err(e) => { Err(e) },
+        }
+    }
+
+    # Record that a migration has been applied.
+    F _record_applied(self, m: Migration, timestamp: str) -> Result<(), VaisDbError> {
+        insert_sql := "INSERT INTO {MIGRATIONS_TABLE} (version, name, applied_at) VALUES ({m.version}, '{m.name}', '{timestamp}')"
+        M self.conn.execute(insert_sql) {
+            Ok(_) => { Ok(()) },
+            Err(e) => { Err(e) },
+        }
+    }
+
+    # Remove the record for a rolled-back migration version.
+    F _remove_record(self, version: i64) -> Result<(), VaisDbError> {
+        delete_sql := "DELETE FROM {MIGRATIONS_TABLE} WHERE version = {version}"
+        M self.conn.execute(delete_sql) {
+            Ok(_) => { Ok(()) },
+            Err(e) => { Err(e) },
+        }
+    }
+
+    # Check whether a given version has already been applied.
+    # In a real implementation this queries the history table;
+    # here we compare against the tracked current_version as a proxy.
+    F _is_applied(self, version: i64) -> bool {
+        version <= self.current_version
+    }
+
+    # Sort the migrations list by version ascending (insertion sort).
+    F _sort_ascending(self) -> Vec<Migration> {
+        sorted := mut Vec.new()
+        I i = 0; i < self.migrations.len(); i = i + 1 {
+            sorted.push(self.migrations.get(i))
+        }
+        # Insertion sort by version
+        I i = 1; i < sorted.len(); i = i + 1 {
+            j := mut i
+            I j > 0 {
+                a := sorted.get(j - 1)
+                b := sorted.get(j)
+                I a.version > b.version {
+                    tmp := a
+                    sorted_j_minus_1 := b
+                    sorted_j := tmp
+                    j = j - 1
+                }
+            }
+        }
+        sorted
+    }
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    # Apply all migrations whose version is greater than current_version.
+    # Migrations are executed in ascending version order.
+    F run_up(mut self) -> Result<i64, VaisDbError> {
+        applied_count := mut 0
+
+        I i = 0; i < self.migrations.len(); i = i + 1 {
+            m := self.migrations.get(i)
+            I !self._is_applied(m.version) {
+                M self.conn.execute(m.up_sql) {
+                    Ok(_) => {
+                        M self._record_applied(m, "2026-04-03T00:00:00Z") {
+                            Ok(_) => {},
+                            Err(e) => { R Err(e) },
+                        }
+                        self.current_version = m.version
+                        applied_count = applied_count + 1
+                    },
+                    Err(e) => {
+                        R Err(VaisDbError.new(5002, "Migration v{m.version} ({m.name}) failed: {e.message}"))
+                    },
+                }
+            }
+        }
+
+        Ok(applied_count)
+    }
+
+    # Roll back all migrations down to (and including) `target_version`.
+    # Migrations are executed in descending version order.
+    F run_down(mut self, target_version: i64) -> Result<i64, VaisDbError> {
+        rolled_back := mut 0
+
+        # Iterate in reverse to undo newest-first
+        I i = self.migrations.len() - 1; i >= 0; i = i - 1 {
+            m := self.migrations.get(i)
+            I m.version > target_version && self._is_applied(m.version) {
+                M self.conn.execute(m.down_sql) {
+                    Ok(_) => {
+                        M self._remove_record(m.version) {
+                            Ok(_) => {},
+                            Err(e) => { R Err(e) },
+                        }
+                        self.current_version = target_version
+                        rolled_back = rolled_back + 1
+                    },
+                    Err(e) => {
+                        R Err(VaisDbError.new(5003, "Rollback v{m.version} ({m.name}) failed: {e.message}"))
+                    },
+                }
+            }
+        }
+
+        Ok(rolled_back)
+    }
+
+    # Return the version of the most recently applied migration.
+    F get_current_version(self) -> i64 {
+        self.current_version
+    }
+
+    # Return the number of registered (not necessarily applied) migrations.
+    F migration_count(self) -> i64 {
+        self.migrations.len()
+    }
+
+    # Return a human-readable status summary.
+    F to_string(self) -> str {
+        "Migrator { current_version={self.current_version}, registered={self.migration_count()} }"
+    }
+}

@@ -1,0 +1,274 @@
+# vaisdb Model Definition
+# DDL generation for standard tables, VectorField, and GraphEdge special types
+
+U std/string
+U std/vec
+
+# ============================================================================
+# FieldKind — classifies the column for DDL generation
+# ============================================================================
+
+E FieldKind {
+    Standard,       # Ordinary column (type provided verbatim)
+    Vector,         # VECTOR(dimensions) type for ANN index support
+    GraphEdge,      # GRAPH_EDGE type for adjacency-list edges
+}
+
+# ============================================================================
+# Field — column descriptor
+# ============================================================================
+
+S Field {
+    name: str,
+    field_type: str,         # SQL type string, e.g. "TEXT", "INTEGER", "REAL"
+    nullable: i64,           # 0 = NOT NULL, 1 = nullable
+    primary_key: i64,        # 0 = false, 1 = true
+    default_value: str,      # Empty string = no default
+    kind: FieldKind,
+}
+
+X Field {
+    # Standard column
+    F new(name: str, field_type: str) -> Field {
+        Field {
+            name,
+            field_type,
+            nullable: 1,
+            primary_key: 0,
+            default_value: "",
+            kind: FieldKind.Standard,
+        }
+    }
+
+    # Primary key shorthand
+    F primary_key(name: str, field_type: str) -> Field {
+        Field {
+            name,
+            field_type,
+            nullable: 0,
+            primary_key: 1,
+            default_value: "",
+            kind: FieldKind.Standard,
+        }
+    }
+
+    # NOT NULL column
+    F not_null(name: str, field_type: str) -> Field {
+        Field {
+            name,
+            field_type,
+            nullable: 0,
+            primary_key: 0,
+            default_value: "",
+            kind: FieldKind.Standard,
+        }
+    }
+
+    # Column with a default value
+    F with_default(name: str, field_type: str, default_value: str) -> Field {
+        Field {
+            name,
+            field_type,
+            nullable: 1,
+            primary_key: 0,
+            default_value,
+            kind: FieldKind.Standard,
+        }
+    }
+
+    # VectorField — stores a dense float vector with the given dimensionality
+    F vector(name: str, dimensions: i64) -> Field {
+        Field {
+            name,
+            field_type: "VECTOR({dimensions})",
+            nullable: 0,
+            primary_key: 0,
+            default_value: "",
+            kind: FieldKind.Vector,
+        }
+    }
+
+    # GraphEdge field — stores an adjacency relationship
+    F graph_edge(name: str) -> Field {
+        Field {
+            name,
+            field_type: "GRAPH_EDGE",
+            nullable: 0,
+            primary_key: 0,
+            default_value: "",
+            kind: FieldKind.GraphEdge,
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # DDL rendering
+    # -------------------------------------------------------------------------
+
+    F to_column_def(self) -> str {
+        def := mut "  {self.name} {self.field_type}"
+
+        I self.primary_key == 1 {
+            def = def + " PRIMARY KEY"
+        }
+
+        I self.nullable == 0 && self.primary_key == 0 {
+            def = def + " NOT NULL"
+        }
+
+        I self.default_value != "" {
+            def = def + " DEFAULT {self.default_value}"
+        }
+
+        # Append a vaisdb-specific index hint for special field kinds
+        M self.kind {
+            FieldKind.Vector    => { def = def + " INDEX HNSW" },
+            FieldKind.GraphEdge => { def = def + " INDEX ADJACENCY" },
+            FieldKind.Standard  => {},
+        }
+
+        def
+    }
+}
+
+# ============================================================================
+# VectorField — convenience wrapper that surfaces vector metadata
+# ============================================================================
+
+S VectorField {
+    field: Field,
+    dimensions: i64,
+}
+
+X VectorField {
+    F new(name: str, dimensions: i64) -> VectorField {
+        VectorField {
+            field: Field.vector(name, dimensions),
+            dimensions,
+        }
+    }
+
+    F to_column_def(self) -> str {
+        self.field.to_column_def()
+    }
+}
+
+# ============================================================================
+# GraphEdge — convenience wrapper for edge columns
+# ============================================================================
+
+S GraphEdge {
+    field: Field,
+    target_table: str,   # Referenced table (for documentation; not enforced as FK)
+}
+
+X GraphEdge {
+    F new(name: str, target_table: str) -> GraphEdge {
+        GraphEdge {
+            field: Field.graph_edge(name),
+            target_table,
+        }
+    }
+
+    F to_column_def(self) -> str {
+        self.field.to_column_def()
+    }
+}
+
+# ============================================================================
+# ModelDef — full table schema definition
+# ============================================================================
+
+S ModelDef {
+    table_name: str,
+    fields: Vec<Field>,
+}
+
+X ModelDef {
+    F new(table_name: str) -> ModelDef {
+        ModelDef {
+            table_name,
+            fields: Vec.new(),
+        }
+    }
+
+    # Add a field to the model
+    F add_field(mut self, field: Field) {
+        self.fields.push(field)
+    }
+
+    # Add a VectorField to the model
+    F add_vector_field(mut self, vf: VectorField) {
+        self.fields.push(vf.field)
+    }
+
+    # Add a GraphEdge field to the model
+    F add_graph_edge(mut self, ge: GraphEdge) {
+        self.fields.push(ge.field)
+    }
+
+    # -------------------------------------------------------------------------
+    # DDL generation
+    # -------------------------------------------------------------------------
+
+    # Generate a CREATE TABLE statement for this model.
+    F create_table_sql(self) -> str {
+        I self.fields.len() == 0 {
+            R "CREATE TABLE {self.table_name} ()"
+        }
+
+        sql := mut "CREATE TABLE {self.table_name} (\n"
+
+        I i = 0; i < self.fields.len(); i = i + 1 {
+            field := self.fields.get(i)
+            sql = sql + field.to_column_def()
+            I i < self.fields.len() - 1 {
+                sql = sql + ","
+            }
+            sql = sql + "\n"
+        }
+
+        sql = sql + ")"
+        sql
+    }
+
+    # Generate a CREATE TABLE IF NOT EXISTS statement.
+    F create_table_if_not_exists_sql(self) -> str {
+        I self.fields.len() == 0 {
+            R "CREATE TABLE IF NOT EXISTS {self.table_name} ()"
+        }
+
+        sql := mut "CREATE TABLE IF NOT EXISTS {self.table_name} (\n"
+
+        I i = 0; i < self.fields.len(); i = i + 1 {
+            field := self.fields.get(i)
+            sql = sql + field.to_column_def()
+            I i < self.fields.len() - 1 {
+                sql = sql + ","
+            }
+            sql = sql + "\n"
+        }
+
+        sql = sql + ")"
+        sql
+    }
+
+    # Generate a DROP TABLE statement.
+    F drop_table_sql(self) -> str {
+        "DROP TABLE {self.table_name}"
+    }
+
+    # Generate a DROP TABLE IF EXISTS statement.
+    F drop_table_if_exists_sql(self) -> str {
+        "DROP TABLE IF EXISTS {self.table_name}"
+    }
+
+    # Return the number of defined fields.
+    F field_count(self) -> i64 {
+        self.fields.len()
+    }
+
+    # Return a human-readable summary.
+    F to_string(self) -> str {
+        "ModelDef[{self.table_name}] fields={self.field_count()}"
+    }
+}

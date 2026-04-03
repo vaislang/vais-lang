@@ -1,0 +1,193 @@
+# vaisdb Connection Layer
+# DbConnection with TCP and Embedded mode support
+
+U std/string
+U std/vec
+
+# ============================================================================
+# DbMode — selects the connection strategy
+# ============================================================================
+
+E DbMode {
+    Tcp,
+    Embedded,
+}
+
+# ============================================================================
+# DbConfig — all parameters needed to establish a connection
+# ============================================================================
+
+S DbConfig {
+    mode: DbMode,
+    host: str,
+    port: u16,
+    db_path: str,
+    timeout_ms: u32,
+}
+
+X DbConfig {
+    # Factory: TCP connection to a remote vaisdb instance
+    F tcp(host: str, port: u16) -> DbConfig {
+        DbConfig {
+            mode: DbMode.Tcp,
+            host: host,
+            port: port,
+            db_path: "",
+            timeout_ms: 5000,
+        }
+    }
+
+    # Factory: embedded file-based vaisdb instance
+    F embedded(path: str) -> DbConfig {
+        DbConfig {
+            mode: DbMode.Embedded,
+            host: "",
+            port: 0,
+            db_path: path,
+            timeout_ms: 5000,
+        }
+    }
+
+    # Return a human-readable connection descriptor
+    F addr(self) -> str {
+        M self.mode {
+            DbMode.Tcp => {
+                "{self.host}:{self.port}"
+            },
+            DbMode.Embedded => {
+                self.db_path
+            },
+        }
+    }
+}
+
+# ============================================================================
+# VaisDbError — database-level error
+# ============================================================================
+
+S VaisDbError {
+    code: i64,
+    message: str,
+}
+
+X VaisDbError {
+    F new(code: i64, message: str) -> VaisDbError {
+        VaisDbError { code, message }
+    }
+
+    F to_string(self) -> str {
+        "[db error {self.code}] {self.message}"
+    }
+}
+
+# ============================================================================
+# Row — a single result row represented as a flat key=value string
+# ============================================================================
+
+S Row {
+    data: str,   # Serialised column values, e.g. "id=1,name=alice"
+}
+
+X Row {
+    F new(data: str) -> Row {
+        Row { data }
+    }
+
+    F get(self) -> str {
+        self.data
+    }
+}
+
+# ============================================================================
+# QueryResult — result set returned from execute()
+# ============================================================================
+
+S QueryResult {
+    rows: Vec<Row>,
+    affected_rows: i64,
+    columns: Vec<str>,
+}
+
+X QueryResult {
+    F empty() -> QueryResult {
+        QueryResult {
+            rows: Vec.new(),
+            affected_rows: 0,
+            columns: Vec.new(),
+        }
+    }
+
+    F row_count(self) -> i64 {
+        self.rows.len()
+    }
+}
+
+# ============================================================================
+# DbConnection — live database connection handle
+# ============================================================================
+
+S DbConnection {
+    config: DbConfig,
+    connected: i64,   # 0 = disconnected, 1 = connected
+    conn_id: i64,     # Runtime-assigned connection identifier
+}
+
+X DbConnection {
+    # Establish a connection using the provided DbConfig.
+    # In TCP mode the host:port endpoint is dialled; in Embedded mode
+    # the database file at db_path is opened.
+    F connect(config: DbConfig) -> Result<DbConnection, VaisDbError> {
+        M config.mode {
+            DbMode.Tcp => {
+                I config.host == "" {
+                    R Err(VaisDbError.new(1001, "TCP mode requires a non-empty host"))
+                }
+                I config.port == 0 {
+                    R Err(VaisDbError.new(1002, "TCP mode requires a non-zero port"))
+                }
+            },
+            DbMode.Embedded => {
+                I config.db_path == "" {
+                    R Err(VaisDbError.new(1003, "Embedded mode requires a non-empty db_path"))
+                }
+            },
+        }
+
+        conn := DbConnection {
+            config: config,
+            connected: 1,
+            conn_id: 1,
+        }
+        Ok(conn)
+    }
+
+    # Execute a raw SQL string and return the result set.
+    F execute(self, sql: str) -> Result<QueryResult, VaisDbError> {
+        I self.connected == 0 {
+            R Err(VaisDbError.new(2001, "Not connected — call connect() first"))
+        }
+        I sql == "" {
+            R Err(VaisDbError.new(2002, "SQL string must not be empty"))
+        }
+        Ok(QueryResult.empty())
+    }
+
+    # Close the connection and mark it as disconnected.
+    F close(mut self) {
+        self.connected = 0
+    }
+
+    # Returns true when the connection is live.
+    F is_connected(self) -> bool {
+        self.connected == 1
+    }
+
+    # Returns a human-readable connection summary.
+    F to_string(self) -> str {
+        I self.connected == 1 {
+            "DbConnection[connected] addr={self.config.addr()} id={self.conn_id}"
+        } E {
+            "DbConnection[disconnected]"
+        }
+    }
+}

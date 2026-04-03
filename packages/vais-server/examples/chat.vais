@@ -1,0 +1,143 @@
+# chat.vais — WebSocket chat server example
+#
+# Demonstrates:
+#   - WsServer + RoomManager setup
+#   - /ws/chat WebSocket endpoint
+#   - join / leave / broadcast message handling
+
+U core/app
+U core/config
+U core/context
+U ws/server
+U ws/room
+U ws/message
+
+C PORT:      u16 = 8080
+C CHAT_ROOM: str = "general"
+
+# ============================================================================
+# ChatServer — combines WsServer + RoomManager
+# ============================================================================
+
+S ChatServer {
+    ws:    WsServer,
+    rooms: RoomManager,
+}
+
+X ChatServer {
+    F new() -> ChatServer {
+        ChatServer {
+            ws:    WsServer.default(),
+            rooms: RoomManager.new(),
+        }
+    }
+
+    # Called when a new WebSocket connection arrives at /ws/chat.
+    # Upgrades the HTTP request and adds the client to the general room.
+    F on_connect(mut self, remote_addr: str) -> Result<i64, VaisServerError> {
+        M self.ws.upgrade_request(remote_addr) {
+            Ok(conn) => {
+                conn_id := conn.conn_id
+                # Ensure the general chat room exists
+                I !self.rooms.room_exists(CHAT_ROOM) {
+                    self.rooms.create_room(CHAT_ROOM)
+                }
+                room := mut self.rooms.get_room(CHAT_ROOM)
+                room.join(conn_id)
+                println("[chat] client {conn_id} connected from {remote_addr}")
+                Ok(conn_id)
+            },
+            Err(e) => { Err(e) },
+        }
+    }
+
+    # Dispatch an incoming message from conn_id.
+    # Supported payload prefixes:
+    #   "join:<room>"  — join a named room
+    #   "leave:<room>" — leave a named room
+    #   anything else  — broadcast to the general room
+    F on_message(mut self, conn_id: i64, msg: WsMessage) {
+        payload := msg.data
+        plen    := str_len(payload)
+
+        I plen > 5 && str_slice(payload, 0, 5) == "join:" {
+            room_name := str_slice(payload, 5, plen)
+            I !self.rooms.room_exists(room_name) {
+                self.rooms.create_room(room_name)
+            }
+            room := mut self.rooms.get_room(room_name)
+            room.join(conn_id)
+            println("[chat] client {conn_id} joined room '{room_name}'")
+            R
+        }
+
+        I plen > 6 && str_slice(payload, 0, 6) == "leave:" {
+            room_name := str_slice(payload, 6, plen)
+            room      := mut self.rooms.get_room(room_name)
+            room.leave(conn_id)
+            println("[chat] client {conn_id} left room '{room_name}'")
+            R
+        }
+
+        # Default: broadcast to general room
+        room      := self.rooms.get_room(CHAT_ROOM)
+        broadcast_msg := WsMessage.text("[{conn_id}]: " + payload)
+        count := room.broadcast(broadcast_msg)
+        println("[chat] broadcast from {conn_id} to {count} members")
+    }
+
+    # Called when a connection closes.
+    F on_disconnect(mut self, conn_id: i64) {
+        self.ws.remove_connection(conn_id)
+        # Remove from all rooms
+        room := mut self.rooms.get_room(CHAT_ROOM)
+        room.leave(conn_id)
+        println("[chat] client {conn_id} disconnected")
+    }
+}
+
+# ============================================================================
+# HTTP handler for WebSocket upgrade
+# ============================================================================
+
+F handle_ws_chat(ctx: Context) -> Response {
+    # The runtime performs the actual upgrade; this handler signals intent.
+    # Returning a 101 response body signals the upgrade to the HTTP server.
+    ctx.text(101, "WebSocket upgrade requested for /ws/chat")
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+
+    # Register the WebSocket upgrade endpoint
+    app.ws("/ws/chat", "handle_ws_chat")
+
+    # Initialise the chat server (used by the runtime dispatcher)
+    chat := mut ChatServer.new()
+    chat.rooms.create_room(CHAT_ROOM)
+
+    println("WebSocket chat server starting on :{PORT}")
+    println("  Endpoint: ws://0.0.0.0:{PORT}/ws/chat")
+    println("  Default room: {CHAT_ROOM}")
+
+    M app.listen(":{PORT}") {
+        Ok(_) => {},
+        Err(e) => {
+            println("Server error: {e.message}")
+            R 1
+        },
+    }
+    0
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str

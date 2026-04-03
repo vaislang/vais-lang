@@ -1,0 +1,220 @@
+# test_tree.vais — Unit tests for RadixTree (insert + match, :param, *wildcard)
+
+U router/tree
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+F test_tree_static_exact() -> i64 {
+    tree := mut RadixTree.new()
+    tree.insert("/", 1)
+    tree.insert("/users", 2)
+    tree.insert("/users/profile", 3)
+
+    r1 := tree.match_path("/")
+    r2 := tree.match_path("/users")
+    r3 := tree.match_path("/users/profile")
+
+    M r1 {
+        None => { println("FAIL test_tree_static_exact: / not matched"); R 1 },
+        Some(m) => {
+            I m.handler_id != 1 {
+                println("FAIL test_tree_static_exact: / handler expected 1, got {m.handler_id}")
+                R 1
+            }
+        },
+    }
+    M r2 {
+        None => { println("FAIL test_tree_static_exact: /users not matched"); R 1 },
+        Some(m) => {
+            I m.handler_id != 2 {
+                println("FAIL test_tree_static_exact: /users handler expected 2, got {m.handler_id}")
+                R 1
+            }
+        },
+    }
+    M r3 {
+        None => { println("FAIL test_tree_static_exact: /users/profile not matched"); R 1 },
+        Some(m) => {
+            I m.handler_id != 3 {
+                println("FAIL test_tree_static_exact: /users/profile handler expected 3, got {m.handler_id}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_tree_static_exact")
+    0
+}
+
+F test_tree_param_match() -> i64 {
+    tree := mut RadixTree.new()
+    tree.insert("/users/:id", 10)
+
+    result := tree.match_path("/users/42")
+    M result {
+        None => {
+            println("FAIL test_tree_param_match: /users/42 not matched")
+            R 1
+        },
+        Some(m) => {
+            I m.handler_id != 10 {
+                println("FAIL test_tree_param_match: expected handler_id=10, got {m.handler_id}")
+                R 1
+            }
+            I m.params.len() != 1 {
+                println("FAIL test_tree_param_match: expected 1 param, got {m.params.len()}")
+                R 1
+            }
+            p := m.params.get(0)
+            I p.key != "id" {
+                println("FAIL test_tree_param_match: expected param key=id, got {p.key}")
+                R 1
+            }
+            I p.value != "42" {
+                println("FAIL test_tree_param_match: expected param value=42, got {p.value}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_tree_param_match")
+    0
+}
+
+F test_tree_wildcard_match() -> i64 {
+    tree := mut RadixTree.new()
+    tree.insert("/files/*path", 20)
+
+    result := tree.match_path("/files/docs/readme.md")
+    M result {
+        None => {
+            println("FAIL test_tree_wildcard_match: /files/docs/readme.md not matched")
+            R 1
+        },
+        Some(m) => {
+            I m.handler_id != 20 {
+                println("FAIL test_tree_wildcard_match: expected handler_id=20, got {m.handler_id}")
+                R 1
+            }
+            I m.params.len() != 1 {
+                println("FAIL test_tree_wildcard_match: expected 1 param, got {m.params.len()}")
+                R 1
+            }
+            p := m.params.get(0)
+            I p.key != "path" {
+                println("FAIL test_tree_wildcard_match: expected key=path, got {p.key}")
+                R 1
+            }
+            # Value should be "docs/readme.md"
+            I p.value != "docs/readme.md" {
+                println("FAIL test_tree_wildcard_match: expected value=docs/readme.md, got {p.value}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_tree_wildcard_match")
+    0
+}
+
+F test_tree_no_match() -> i64 {
+    tree := mut RadixTree.new()
+    tree.insert("/users", 1)
+
+    result := tree.match_path("/posts")
+    M result {
+        Some(_) => {
+            println("FAIL test_tree_no_match: /posts should not match")
+            R 1
+        },
+        None => {},
+    }
+
+    println("PASS test_tree_no_match")
+    0
+}
+
+F test_tree_static_priority_over_param() -> i64 {
+    # Static segments should be preferred over param segments
+    tree := mut RadixTree.new()
+    tree.insert("/users/:id",     10)
+    tree.insert("/users/profile", 20)
+
+    # /users/profile should match the static route (handler 20)
+    profile_result := tree.match_path("/users/profile")
+    M profile_result {
+        None => {
+            println("FAIL test_tree_static_priority_over_param: /users/profile not matched")
+            R 1
+        },
+        Some(m) => {
+            I m.handler_id != 20 {
+                println("FAIL test_tree_static_priority_over_param: expected 20 (static), got {m.handler_id}")
+                R 1
+            }
+        },
+    }
+
+    # /users/99 should match the param route (handler 10)
+    param_result := tree.match_path("/users/99")
+    M param_result {
+        None => {
+            println("FAIL test_tree_static_priority_over_param: /users/99 not matched")
+            R 1
+        },
+        Some(m) => {
+            I m.handler_id != 10 {
+                println("FAIL test_tree_static_priority_over_param: expected 10 (param), got {m.handler_id}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_tree_static_priority_over_param")
+    0
+}
+
+F test_split_segments_helper() -> i64 {
+    segs := split_segments("/api/v1/users")
+    I segs.len() != 3 {
+        println("FAIL test_split_segments_helper: expected 3 segments, got {segs.len()}")
+        R 1
+    }
+    I segs.get(0) != "api" {
+        println("FAIL test_split_segments_helper: seg[0] expected api, got {segs.get(0)}")
+        R 1
+    }
+    I segs.get(1) != "v1" {
+        println("FAIL test_split_segments_helper: seg[1] expected v1, got {segs.get(1)}")
+        R 1
+    }
+    I segs.get(2) != "users" {
+        println("FAIL test_split_segments_helper: seg[2] expected users, got {segs.get(2)}")
+        R 1
+    }
+    println("PASS test_split_segments_helper")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    failures := mut 0
+    failures += test_tree_static_exact()
+    failures += test_tree_param_match()
+    failures += test_tree_wildcard_match()
+    failures += test_tree_no_match()
+    failures += test_tree_static_priority_over_param()
+    failures += test_split_segments_helper()
+
+    I failures > 0 {
+        println("FAILED: {failures} test(s) failed")
+        R 1
+    }
+    println("ALL TESTS PASSED (test_tree)")
+    0
+}

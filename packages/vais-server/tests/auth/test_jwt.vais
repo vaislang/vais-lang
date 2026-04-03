@@ -1,0 +1,225 @@
+# test_jwt.vais — Unit tests for JWT token generation and verification
+
+U auth/jwt
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+F test_jwt_generate_access_token() -> i64 {
+    roles := Vec.new()
+    roles.push("user")
+
+    config := JwtConfig.new("test-secret", "test-issuer")
+    claims := JwtClaims.new("user-42", "test-issuer", 9999999999, 1000000000, roles)
+
+    result := generate_access_token(claims, config)
+    M result {
+        Err(e) => {
+            println("FAIL test_jwt_generate_access_token: unexpected error: {e.message}")
+            R 1
+        },
+        Ok(token) => {
+            I token.token == "" {
+                println("FAIL test_jwt_generate_access_token: token string is empty")
+                R 1
+            }
+            I token.expires_at != 9999999999 {
+                println("FAIL test_jwt_generate_access_token: unexpected expires_at")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_jwt_generate_access_token")
+    0
+}
+
+F test_jwt_empty_secret_fails() -> i64 {
+    roles  := Vec.new()
+    config := JwtConfig {
+        secret:                "",
+        issuer:                "test",
+        access_token_ttl_sec:  3600,
+        refresh_token_ttl_sec: 604800,
+    }
+    claims := JwtClaims.new("u1", "test", 9999999999, 0, roles)
+
+    result := generate_access_token(claims, config)
+    M result {
+        Ok(_) => {
+            println("FAIL test_jwt_empty_secret_fails: should have returned error for empty secret")
+            R 1
+        },
+        Err(e) => {
+            I e.code != 500 {
+                println("FAIL test_jwt_empty_secret_fails: expected code=500, got {e.code}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_jwt_empty_secret_fails")
+    0
+}
+
+F test_jwt_claims_encode_decode() -> i64 {
+    roles := Vec.new()
+    roles.push("admin")
+    roles.push("user")
+
+    claims := JwtClaims.new("alice", "my-app", 2000000000, 1000000000, roles)
+    encoded := claims.encode()
+
+    I encoded == "" {
+        println("FAIL test_jwt_claims_encode_decode: encoded string is empty")
+        R 1
+    }
+
+    # Decode and verify
+    decoded_result := jwt_decode_claims(encoded)
+    M decoded_result {
+        Err(e) => {
+            println("FAIL test_jwt_claims_encode_decode: decode error: {e.message}")
+            R 1
+        },
+        Ok(decoded) => {
+            I decoded.sub != "alice" {
+                println("FAIL test_jwt_claims_encode_decode: sub mismatch: {decoded.sub}")
+                R 1
+            }
+            I decoded.iss != "my-app" {
+                println("FAIL test_jwt_claims_encode_decode: iss mismatch: {decoded.iss}")
+                R 1
+            }
+            I decoded.exp != 2000000000 {
+                println("FAIL test_jwt_claims_encode_decode: exp mismatch")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_jwt_claims_encode_decode")
+    0
+}
+
+F test_jwt_verify_invalid_signature() -> i64 {
+    config := JwtConfig.new("secret-a", "issuer")
+
+    # Build a token signed with secret-a
+    roles  := Vec.new()
+    claims := JwtClaims.new("u1", "issuer", 9999999999, 0, roles)
+    gen_result := generate_access_token(claims, config)
+
+    M gen_result {
+        Err(e) => {
+            println("FAIL test_jwt_verify_invalid_signature: generate error: {e.message}")
+            R 1
+        },
+        Ok(good_token) => {
+            # Verify with wrong secret — should fail
+            wrong_config := JwtConfig.new("wrong-secret", "issuer")
+            verify_result := verify_token(good_token.token, wrong_config)
+            M verify_result {
+                Ok(_) => {
+                    println("FAIL test_jwt_verify_invalid_signature: expected verification to fail")
+                    R 1
+                },
+                Err(e) => {
+                    I e.code != 401 {
+                        println("FAIL test_jwt_verify_invalid_signature: expected code=401, got {e.code}")
+                        R 1
+                    }
+                },
+            }
+        },
+    }
+
+    println("PASS test_jwt_verify_invalid_signature")
+    0
+}
+
+F test_jwt_verify_empty_token() -> i64 {
+    config := JwtConfig.default()
+    result := verify_token("", config)
+    M result {
+        Ok(_) => {
+            println("FAIL test_jwt_verify_empty_token: should fail for empty token")
+            R 1
+        },
+        Err(e) => {
+            I e.code != 401 {
+                println("FAIL test_jwt_verify_empty_token: expected code=401, got {e.code}")
+                R 1
+            }
+        },
+    }
+    println("PASS test_jwt_verify_empty_token")
+    0
+}
+
+F test_jwt_token_pair() -> i64 {
+    roles := Vec.new()
+    roles.push("user")
+    config := JwtConfig.new("pair-secret", "pair-issuer")
+
+    result := generate_token_pair("user-1", roles, config)
+    M result {
+        Err(e) => {
+            println("FAIL test_jwt_token_pair: unexpected error: {e.message}")
+            R 1
+        },
+        Ok(pair) => {
+            I pair.access.token == "" {
+                println("FAIL test_jwt_token_pair: access token is empty")
+                R 1
+            }
+            I pair.refresh.token == "" {
+                println("FAIL test_jwt_token_pair: refresh token is empty")
+                R 1
+            }
+            I pair.access.token == pair.refresh.token {
+                println("FAIL test_jwt_token_pair: access and refresh tokens should differ")
+                R 1
+            }
+        },
+    }
+    println("PASS test_jwt_token_pair")
+    0
+}
+
+F test_jwt_default_config() -> i64 {
+    cfg := JwtConfig.default()
+    I cfg.secret == "" {
+        println("FAIL test_jwt_default_config: secret should not be empty")
+        R 1
+    }
+    I cfg.access_token_ttl_sec != 3600 {
+        println("FAIL test_jwt_default_config: expected access_token_ttl_sec=3600")
+        R 1
+    }
+    println("PASS test_jwt_default_config")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    failures := mut 0
+    failures += test_jwt_generate_access_token()
+    failures += test_jwt_empty_secret_fails()
+    failures += test_jwt_claims_encode_decode()
+    failures += test_jwt_verify_invalid_signature()
+    failures += test_jwt_verify_empty_token()
+    failures += test_jwt_token_pair()
+    failures += test_jwt_default_config()
+
+    I failures > 0 {
+        println("FAILED: {failures} test(s) failed")
+        R 1
+    }
+    println("ALL TESTS PASSED (test_jwt)")
+    0
+}

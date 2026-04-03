@@ -1,0 +1,110 @@
+name: Docs Site CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/kit/docs/site/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "packages/kit/docs/site/**"
+
+defaults:
+  run:
+    working-directory: packages/kit/docs/site
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: Run SEO tests
+        run: pnpm vitest run tests/seo.test.ts
+
+      - name: Build docs site
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-dist
+          path: packages/kit/docs/site/.vaisx/output
+          retention-days: 7
+
+  deploy-vercel:
+    name: Deploy to Vercel
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://vaisx.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docs-dist
+          path: packages/kit/docs/site/.vaisx/output
+
+      - name: Deploy to Vercel (Production)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: packages/kit/docs/site
+          vercel-args: "--prod"
+
+  preview-vercel:
+    name: PR Preview (Vercel)
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docs-dist
+          path: packages/kit/docs/site/.vaisx/output
+
+      - name: Deploy Preview to Vercel
+        id: vercel-preview
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: packages/kit/docs/site
+
+      - name: Comment PR with preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const previewUrl = '${{ steps.vercel-preview.outputs.preview-url }}';
+            const body = `## 문서 사이트 미리보기\n\n배포 완료: ${previewUrl}\n\n_이 댓글은 자동으로 생성되었습니다._`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

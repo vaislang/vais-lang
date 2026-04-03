@@ -1,0 +1,242 @@
+# Input Validation Utilities
+# Provides format checkers and a fluent Validator builder.
+
+U std/string
+U std/vec
+
+# ============================================================================
+# ValidationResult — outcome of a Validator.validate() call
+# ============================================================================
+
+S ValidationResult {
+    valid:  bool,
+    errors: Vec<str>,
+}
+
+X ValidationResult {
+    F ok() -> ValidationResult {
+        ValidationResult {
+            valid:  true,
+            errors: Vec.new(),
+        }
+    }
+
+    F fail(errors: Vec<str>) -> ValidationResult {
+        ValidationResult {
+            valid:  false,
+            errors: errors,
+        }
+    }
+
+    F is_valid(self) -> bool {
+        self.valid
+    }
+
+    F error_count(self) -> i64 {
+        self.errors.len()
+    }
+
+    F first_error(self) -> str {
+        I self.errors.len() == 0 {
+            R ""
+        }
+        self.errors.get(0)
+    }
+}
+
+# ============================================================================
+# Format checkers — pure functions
+# ============================================================================
+
+# is_email: must contain '@' and at least one '.' after the '@'.
+F is_email(s: str) -> bool {
+    slen := str_len(s)
+    I slen < 3 { R false }
+    at_idx := val_find_char(s, "@", 0, slen)
+    I at_idx < 0 { R false }
+    # '@' must not be first or last
+    I at_idx == 0 || at_idx == slen - 1 { R false }
+    # must have a '.' after '@'
+    dot_idx := val_find_char(s, ".", at_idx + 1, slen)
+    I dot_idx < 0 { R false }
+    # '.' must not be the very last character
+    I dot_idx == slen - 1 { R false }
+    true
+}
+
+# is_url: must start with "http://" or "https://".
+F is_url(s: str) -> bool {
+    slen := str_len(s)
+    I slen < 7 { R false }
+    I val_starts_with(s, "http://", slen)  { R true }
+    I val_starts_with(s, "https://", slen) { R true }
+    false
+}
+
+# is_numeric: every character must be an ASCII digit (0–9).
+F is_numeric(s: str) -> bool {
+    slen := str_len(s)
+    I slen == 0 { R false }
+    val_all_digits(s, slen, 0)
+}
+
+F val_all_digits(s: str, slen: i64, i: i64) -> bool {
+    I i >= slen { R true }
+    code := str_char_code(s, i)
+    I code < 48 || code > 57 { R false }
+    val_all_digits(s, slen, i + 1)
+}
+
+# min_length: string length >= min.
+F min_length(s: str, min: i64) -> bool {
+    str_len(s) >= min
+}
+
+# max_length: string length <= max.
+F max_length(s: str, max: i64) -> bool {
+    str_len(s) <= max
+}
+
+# ============================================================================
+# RuleEntry — a single validation rule stored inside Validator
+# ============================================================================
+
+E RuleKind {
+    Email,
+    Url,
+    Numeric,
+    MinLength,
+    MaxLength,
+    Required,
+}
+
+S RuleEntry {
+    kind:    RuleKind,
+    param:   i64,    # Used by MinLength / MaxLength
+    message: str,    # Custom error message
+}
+
+X RuleEntry {
+    F new(kind: RuleKind, param: i64, message: str) -> RuleEntry {
+        RuleEntry { kind, param, message }
+    }
+}
+
+# ============================================================================
+# Validator — fluent builder for field validation
+# ============================================================================
+
+S Validator {
+    field_name: str,
+    rules:      Vec<RuleEntry>,
+}
+
+X Validator {
+    F new(field_name: str) -> Validator {
+        Validator {
+            field_name: field_name,
+            rules:      Vec.new(),
+        }
+    }
+
+    # Chain: value must be a valid e-mail address
+    F email(mut self) -> Validator {
+        entry := RuleEntry.new(RuleKind.Email, 0, "must be a valid email address")
+        self.rules.push(entry)
+        self
+    }
+
+    # Chain: value must be a valid URL (http/https)
+    F url(mut self) -> Validator {
+        entry := RuleEntry.new(RuleKind.Url, 0, "must be a valid URL (http:// or https://)")
+        self.rules.push(entry)
+        self
+    }
+
+    # Chain: value must contain only digits
+    F numeric(mut self) -> Validator {
+        entry := RuleEntry.new(RuleKind.Numeric, 0, "must be numeric")
+        self.rules.push(entry)
+        self
+    }
+
+    # Chain: value length must be >= min
+    F min_len(mut self, min: i64) -> Validator {
+        msg := "must be at least {min} characters"
+        entry := RuleEntry.new(RuleKind.MinLength, min, msg)
+        self.rules.push(entry)
+        self
+    }
+
+    # Chain: value length must be <= max
+    F max_len(mut self, max: i64) -> Validator {
+        msg := "must be at most {max} characters"
+        entry := RuleEntry.new(RuleKind.MaxLength, max, msg)
+        self.rules.push(entry)
+        self
+    }
+
+    # Chain: value must not be empty
+    F required(mut self) -> Validator {
+        entry := RuleEntry.new(RuleKind.Required, 0, "is required")
+        self.rules.push(entry)
+        self
+    }
+
+    # Run all rules against `value`. Returns a ValidationResult.
+    F validate(self, value: str) -> ValidationResult {
+        errors := mut Vec.new()
+        I i = 0; i < self.rules.len(); i = i + 1 {
+            rule := self.rules.get(i)
+            passed := M rule.kind {
+                RuleKind.Email     => { is_email(value) },
+                RuleKind.Url       => { is_url(value) },
+                RuleKind.Numeric   => { is_numeric(value) },
+                RuleKind.MinLength => { min_length(value, rule.param) },
+                RuleKind.MaxLength => { max_length(value, rule.param) },
+                RuleKind.Required  => { str_len(value) > 0 },
+            }
+            I !passed {
+                errors.push(self.field_name + " " + rule.message)
+            }
+        }
+        I errors.len() == 0 {
+            ValidationResult.ok()
+        } E {
+            ValidationResult.fail(errors)
+        }
+    }
+}
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+# Find the first occurrence of a single-character string ch in s[start..end).
+# Returns index or -1 if not found.
+F val_find_char(s: str, ch: str, start: i64, end: i64) -> i64 {
+    I start >= end { R -1 }
+    I str_char_at(s, start) == ch { R start }
+    val_find_char(s, ch, start + 1, end)
+}
+
+# Returns true if s starts with prefix.
+F val_starts_with(s: str, prefix: str, slen: i64) -> bool {
+    plen := str_len(prefix)
+    I plen > slen { R false }
+    val_prefix_match(s, prefix, plen, 0)
+}
+
+F val_prefix_match(s: str, prefix: str, plen: i64, i: i64) -> bool {
+    I i >= plen { R true }
+    I str_char_at(s, i) != str_char_at(prefix, i) { R false }
+    val_prefix_match(s, prefix, plen, i + 1)
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_char_at(s: str, i: i64) -> str
+X F str_char_code(s: str, i: i64) -> i64

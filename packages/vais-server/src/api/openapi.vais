@@ -1,0 +1,487 @@
+# OpenAPI 3.0 Spec Generator
+# Builds an OpenAPI 3.0.0 JSON specification from registered route metadata.
+
+U std/string
+U std/vec
+U src/router/router
+U src/router/route
+
+# ============================================================================
+# Parameter location
+# ============================================================================
+
+E ParamLocation {
+    Query,
+    Path,
+    Header,
+    Cookie,
+}
+
+F param_location_to_str(loc: ParamLocation) -> str {
+    M loc {
+        ParamLocation.Query  => { "query" },
+        ParamLocation.Path   => { "path" },
+        ParamLocation.Header => { "header" },
+        ParamLocation.Cookie => { "cookie" },
+    }
+}
+
+# ============================================================================
+# API Parameter descriptor
+# ============================================================================
+
+S ApiParameter {
+    name:       str,
+    location:   ParamLocation,
+    required:   i64,   # 1 = required, 0 = optional
+    param_type: str,   # JSON Schema type: "string", "integer", "boolean", …
+    description: str,
+}
+
+X ApiParameter {
+    F new(name: str, location: ParamLocation, required: i64, param_type: str) -> ApiParameter {
+        ApiParameter {
+            name:        name,
+            location:    location,
+            required:    required,
+            param_type:  param_type,
+            description: "",
+        }
+    }
+
+    # Serialise to OpenAPI parameter object JSON.
+    F to_json(self) -> str {
+        loc_str  := param_location_to_str(self.location)
+        req_str  := I self.required == 1 { "true" } E { "false" }
+        result   := "{\"name\": \"" + self.name + "\""
+                  + ", \"in\": \"" + loc_str + "\""
+                  + ", \"required\": " + req_str
+                  + ", \"schema\": {\"type\": \"" + self.param_type + "\"}"
+        I self.description != "" {
+            result = result + ", \"description\": \"" + self.description + "\""
+        }
+        result + "}"
+    }
+}
+
+# ============================================================================
+# Request body
+# ============================================================================
+
+S ApiRequestBody {
+    content_type: str,   # e.g. "application/json"
+    schema_ref:   str,   # e.g. "#/components/schemas/UserInput" or inline JSON
+    required:     i64,
+}
+
+X ApiRequestBody {
+    F json_ref(schema_ref: str) -> ApiRequestBody {
+        ApiRequestBody {
+            content_type: "application/json",
+            schema_ref:   schema_ref,
+            required:     1,
+        }
+    }
+
+    F to_json(self) -> str {
+        req_str := I self.required == 1 { "true" } E { "false" }
+        "{\"required\": " + req_str
+            + ", \"content\": {\"" + self.content_type + "\": {\"schema\": {"
+            + "\"$ref\": \"" + self.schema_ref + "\"}}}}"
+    }
+}
+
+# ============================================================================
+# Response descriptor
+# ============================================================================
+
+S ApiResponseEntry {
+    status_code:  str,   # "200", "201", "default", …
+    description:  str,
+    content_type: str,   # may be "" for bodyless responses
+    schema_ref:   str,   # may be "" for bodyless responses
+}
+
+X ApiResponseEntry {
+    F new(status_code: str, description: str) -> ApiResponseEntry {
+        ApiResponseEntry {
+            status_code:  status_code,
+            description:  description,
+            content_type: "",
+            schema_ref:   "",
+        }
+    }
+
+    F with_json(status_code: str, description: str, schema_ref: str) -> ApiResponseEntry {
+        ApiResponseEntry {
+            status_code:  status_code,
+            description:  description,
+            content_type: "application/json",
+            schema_ref:   schema_ref,
+        }
+    }
+
+    F to_json(self) -> str {
+        inner := "\"description\": \"" + self.description + "\""
+        I self.content_type != "" && self.schema_ref != "" {
+            inner = inner + ", \"content\": {\"" + self.content_type
+                  + "\": {\"schema\": {\"$ref\": \"" + self.schema_ref + "\"}}}"
+        }
+        "{" + inner + "}"
+    }
+}
+
+# ============================================================================
+# Path / Operation descriptor
+# ============================================================================
+
+S ApiPath {
+    path:         str,
+    method:       str,   # "get", "post", "put", "delete", "patch", …
+    summary:      str,
+    description:  str,
+    operation_id: str,
+    parameters:   Vec<ApiParameter>,
+    request_body: str,   # serialised JSON of ApiRequestBody or ""
+    responses:    Vec<ApiResponseEntry>,
+    tags:         Vec<str>,
+}
+
+X ApiPath {
+    F new(path: str, method: str, summary: str) -> ApiPath {
+        ApiPath {
+            path:         path,
+            method:       method,
+            summary:      summary,
+            description:  "",
+            operation_id: "",
+            parameters:   Vec.new(),
+            request_body: "",
+            responses:    Vec.new(),
+            tags:         Vec.new(),
+        }
+    }
+
+    F add_parameter(mut self, param: ApiParameter) {
+        self.parameters.push(param)
+    }
+
+    F add_response(mut self, response: ApiResponseEntry) {
+        self.responses.push(response)
+    }
+
+    F add_tag(mut self, tag: str) {
+        self.tags.push(tag)
+    }
+
+    F set_request_body(mut self, body: ApiRequestBody) {
+        self.request_body = body.to_json()
+    }
+
+    # Serialise the operation object JSON (the value under the HTTP method key).
+    F operation_to_json(self) -> str {
+        result := mut "{"
+        I self.summary != "" {
+            result = result + "\"summary\": \"" + self.summary + "\""
+        }
+        I self.description != "" {
+            result = result + ", \"description\": \"" + self.description + "\""
+        }
+        I self.operation_id != "" {
+            result = result + ", \"operationId\": \"" + self.operation_id + "\""
+        }
+
+        # tags
+        I self.tags.len() > 0 {
+            tags_json := vec_str_to_json_array(self.tags)
+            result = result + ", \"tags\": " + tags_json
+        }
+
+        # parameters
+        I self.parameters.len() > 0 {
+            params_json := mut "["
+            i := mut 0
+            L i < self.parameters.len() {
+                I i > 0 { params_json = params_json + ", " }
+                params_json = params_json + self.parameters.get(i).to_json()
+                i += 1
+            }
+            params_json = params_json + "]"
+            result = result + ", \"parameters\": " + params_json
+        }
+
+        # requestBody
+        I self.request_body != "" {
+            result = result + ", \"requestBody\": " + self.request_body
+        }
+
+        # responses
+        result = result + ", \"responses\": {"
+        I self.responses.len() == 0 {
+            result = result + "\"200\": {\"description\": \"OK\"}"
+        } E {
+            i := mut 0
+            L i < self.responses.len() {
+                I i > 0 { result = result + ", " }
+                r := self.responses.get(i)
+                result = result + "\"" + r.status_code + "\": " + r.to_json()
+                i += 1
+            }
+        }
+        result = result + "}}"
+        result
+    }
+}
+
+# ============================================================================
+# Top-level API Spec
+# ============================================================================
+
+S ApiSpec {
+    title:       str,
+    version:     str,
+    description: str,
+    paths:       Vec<ApiPath>,
+    servers:     Vec<str>,   # base URL strings
+}
+
+X ApiSpec {
+    F new(title: str, version: str, description: str) -> ApiSpec {
+        ApiSpec {
+            title:       title,
+            version:     version,
+            description: description,
+            paths:       Vec.new(),
+            servers:     Vec.new(),
+        }
+    }
+
+    F add_path(mut self, api_path: ApiPath) {
+        self.paths.push(api_path)
+    }
+
+    F add_server(mut self, url: str) {
+        self.servers.push(url)
+    }
+
+    # Serialise the full OpenAPI 3.0 spec to a JSON string.
+    F to_json(self) -> str {
+        result := mut "{"
+        result = result + "\"openapi\": \"3.0.0\""
+        result = result + ", \"info\": {"
+        result = result + "\"title\": \"" + self.title + "\""
+        result = result + ", \"version\": \"" + self.version + "\""
+        I self.description != "" {
+            result = result + ", \"description\": \"" + self.description + "\""
+        }
+        result = result + "}"
+
+        # servers
+        I self.servers.len() > 0 {
+            result = result + ", \"servers\": ["
+            i := mut 0
+            L i < self.servers.len() {
+                I i > 0 { result = result + ", " }
+                result = result + "{\"url\": \"" + self.servers.get(i) + "\"}"
+                i += 1
+            }
+            result = result + "]"
+        }
+
+        # paths — group by path string, then by method
+        result = result + ", \"paths\": " + build_paths_json(self.paths)
+        result = result + "}"
+        result
+    }
+}
+
+# ============================================================================
+# generate_spec — main entry point
+# ============================================================================
+
+# Generate an OpenAPI JSON spec string from a collection of ApiPath objects.
+# This is the standalone entry point when routes are pre-converted to ApiPath.
+F generate_spec(routes: Vec<ApiPath>) -> str {
+    spec := ApiSpec.new("API", "1.0.0", "")
+    i := mut 0
+    L i < routes.len() {
+        spec.add_path(routes.get(i))
+        i += 1
+    }
+    spec.to_json()
+}
+
+# Derive a minimal ApiSpec from a Router by reflecting its registered routes.
+# summary, parameters, and responses are auto-populated with sensible defaults.
+F generate_spec_from_router(router: Router, title: str, version: str) -> str {
+    spec := ApiSpec.new(title, version, "")
+    method_names := ["get", "post", "put", "delete", "patch", "head", "options"]
+
+    i := mut 0
+    L i < router.routes.len() {
+        entry := router.routes.get(i)
+        method_str := method_names.get(entry.method())
+        path_str   := entry.path()
+        summary    := method_str + " " + path_str
+
+        api_path := mut ApiPath.new(path_str, method_str, summary)
+
+        # Auto-generate path parameters from "{param}" or ":param" segments.
+        path_params := extract_path_params(path_str)
+        j := mut 0
+        L j < path_params.len() {
+            param_name := path_params.get(j)
+            param := ApiParameter.new(
+                param_name,
+                ParamLocation.Path,
+                1,
+                "string"
+            )
+            api_path.add_parameter(param)
+            j += 1
+        }
+
+        # Default responses
+        ok_resp := ApiResponseEntry.new("200", "OK")
+        api_path.add_response(ok_resp)
+
+        spec.add_path(api_path)
+        i += 1
+    }
+
+    spec.to_json()
+}
+
+# ============================================================================
+# Path grouping helpers
+# ============================================================================
+
+# Build the "paths" JSON object.  Multiple operations under the same path
+# are folded into the same path object.
+F build_paths_json(paths: Vec<ApiPath>) -> str {
+    I paths.len() == 0 { R "{}" }
+
+    # Collect distinct path strings in insertion order.
+    distinct := Vec.new()
+    i := mut 0
+    L i < paths.len() {
+        p := paths.get(i)
+        I vec_str_contains(distinct, p.path) == 0 {
+            distinct.push(p.path)
+        }
+        i += 1
+    }
+
+    result := mut "{"
+    di := mut 0
+    L di < distinct.len() {
+        I di > 0 { result = result + ", " }
+        path_str := distinct.get(di)
+        result = result + "\"" + path_str + "\": {"
+        first_method := mut 1
+        j := mut 0
+        L j < paths.len() {
+            ap := paths.get(j)
+            I ap.path == path_str {
+                I first_method == 0 { result = result + ", " }
+                result = result + "\"" + ap.method + "\": " + ap.operation_to_json()
+                first_method = 0
+            }
+            j += 1
+        }
+        result = result + "}"
+        di += 1
+    }
+
+    result + "}"
+}
+
+# ============================================================================
+# Path param extraction
+# ============================================================================
+
+# Extract parameter names from a path template.
+# Supports both ":name" (Express-style) and "{name}" (OpenAPI-style).
+F extract_path_params(path: str) -> Vec<str> {
+    params := Vec.new()
+    extract_path_params_rec(path, params, 0)
+}
+
+F extract_path_params_rec(path: str, params: Vec<str>, i: i64) -> Vec<str> {
+    c := str_char_at(path, i)
+    I c == 0 { R params }
+
+    # ':' = 58, '{' = 123
+    I c == 58 {
+        name := read_path_param_name(path, i + 1)
+        I name != "" { params.push(name) }
+        R extract_path_params_rec(path, params, i + str_len(name) + 1)
+    }
+    I c == 123 {
+        name := read_path_param_brace(path, i + 1)
+        I name != "" { params.push(name) }
+        R extract_path_params_rec(path, params, i + str_len(name) + 2)
+    }
+    extract_path_params_rec(path, params, i + 1)
+}
+
+# Read a colon-style param name (chars until '/' or end).
+F read_path_param_name(path: str, start: i64) -> str {
+    end := read_until_slash(path, start)
+    str_slice(path, start, end)
+}
+
+F read_until_slash(path: str, i: i64) -> i64 {
+    c := str_char_at(path, i)
+    I c == 0  { R i }
+    I c == 47 { R i }   # 47 = '/'
+    read_until_slash(path, i + 1)
+}
+
+# Read a brace-style param name (chars until '}').
+F read_path_param_brace(path: str, start: i64) -> str {
+    end := read_until_close_brace(path, start)
+    str_slice(path, start, end)
+}
+
+F read_until_close_brace(path: str, i: i64) -> i64 {
+    c := str_char_at(path, i)
+    I c == 0   { R i }
+    I c == 125 { R i }   # 125 = '}'
+    read_until_close_brace(path, i + 1)
+}
+
+# ============================================================================
+# Vec<str> helpers
+# ============================================================================
+
+F vec_str_contains(v: Vec<str>, s: str) -> i64 {
+    vec_str_contains_rec(v, s, 0)
+}
+
+F vec_str_contains_rec(v: Vec<str>, s: str, i: i64) -> i64 {
+    I i >= v.len() { R 0 }
+    I v.get(i) == s { R 1 }
+    vec_str_contains_rec(v, s, i + 1)
+}
+
+F vec_str_to_json_array(v: Vec<str>) -> str {
+    I v.len() == 0 { R "[]" }
+    result := mut "["
+    i := mut 0
+    L i < v.len() {
+        I i > 0 { result = result + ", " }
+        result = result + "\"" + v.get(i) + "\""
+        i += 1
+    }
+    result + "]"
+}
+
+# ============================================================================
+# External helpers
+# ============================================================================
+
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F i64_to_str(n: i64) -> str

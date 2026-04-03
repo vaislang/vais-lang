@@ -1,0 +1,307 @@
+# gRPC Server
+# Provides service/method registration, request dispatch, and Protobuf
+# message encode/decode interface.  HTTP/2 framing is marked FUTURE.
+
+U std/string
+U std/vec
+U std/option
+
+# ============================================================================
+# Protobuf Message interface
+# ============================================================================
+
+# Every message type that participates in gRPC must implement these two
+# operations.  The host runtime maps message_type_id to a concrete codec.
+
+S ProtobufMessage {
+    message_type_id: i64,   # opaque type tag registered by the host
+    raw_bytes:       str,   # wire-format bytes represented as a string
+    decoded_json:    str,   # JSON representation after decode (may be "")
+}
+
+X ProtobufMessage {
+    F new(message_type_id: i64) -> ProtobufMessage {
+        ProtobufMessage {
+            message_type_id: message_type_id,
+            raw_bytes:       "",
+            decoded_json:    "",
+        }
+    }
+
+    # Encode: populate raw_bytes from decoded_json via the host codec.
+    # Returns 1 on success, 0 on error.
+    F encode(mut self) -> i64 {
+        result := proto_encode(self.message_type_id, self.decoded_json)
+        I result == "" { R 0 }
+        self.raw_bytes = result
+        1
+    }
+
+    # Decode: populate decoded_json from raw_bytes via the host codec.
+    # Returns 1 on success, 0 on error.
+    F decode(mut self) -> i64 {
+        result := proto_decode(self.message_type_id, self.raw_bytes)
+        I result == "" { R 0 }
+        self.decoded_json = result
+        1
+    }
+}
+
+# Host-provided codec hooks.
+X F proto_encode(type_id: i64, json: str) -> str
+X F proto_decode(type_id: i64, bytes: str) -> str
+
+# ============================================================================
+# gRPC Method descriptor
+# ============================================================================
+
+S GrpcMethod {
+    name:         str,
+    input_type:   str,   # Protobuf message type name, e.g. "HelloRequest"
+    output_type:  str,   # Protobuf message type name, e.g. "HelloReply"
+    is_streaming: i64,   # 1 = server-streaming or bidirectional; 0 = unary
+    handler_id:   i64,   # opaque handler reference
+}
+
+X GrpcMethod {
+    F new(name: str, input_type: str, output_type: str, is_streaming: i64, handler_id: i64) -> GrpcMethod {
+        GrpcMethod {
+            name:         name,
+            input_type:   input_type,
+            output_type:  output_type,
+            is_streaming: is_streaming,
+            handler_id:   handler_id,
+        }
+    }
+
+    F unary(name: str, input_type: str, output_type: str, handler_id: i64) -> GrpcMethod {
+        GrpcMethod.new(name, input_type, output_type, 0, handler_id)
+    }
+
+    F streaming(name: str, input_type: str, output_type: str, handler_id: i64) -> GrpcMethod {
+        GrpcMethod.new(name, input_type, output_type, 1, handler_id)
+    }
+}
+
+# ============================================================================
+# gRPC Service descriptor
+# ============================================================================
+
+S GrpcService {
+    name:    str,
+    methods: Vec<GrpcMethod>,
+}
+
+X GrpcService {
+    F new(name: str) -> GrpcService {
+        GrpcService {
+            name:    name,
+            methods: Vec.new(),
+        }
+    }
+
+    F add_method(mut self, method: GrpcMethod) {
+        self.methods.push(method)
+    }
+
+    # Look up a method by name; returns the handler_id or -1 if not found.
+    F find_method(self, method_name: str) -> i64 {
+        find_grpc_method(self.methods, method_name)
+    }
+}
+
+F find_grpc_method(methods: Vec<GrpcMethod>, name: str) -> i64 {
+    find_grpc_method_rec(methods, name, 0)
+}
+
+F find_grpc_method_rec(methods: Vec<GrpcMethod>, name: str, i: i64) -> i64 {
+    I i >= methods.len() { R 0 - 1 }
+    m := methods.get(i)
+    I m.name == name { R m.handler_id }
+    find_grpc_method_rec(methods, name, i + 1)
+}
+
+# ============================================================================
+# gRPC Request / Response
+# ============================================================================
+
+S GrpcRequest {
+    service_name: str,
+    method_name:  str,
+    message:      ProtobufMessage,
+    metadata:     str,   # key:value pairs as a JSON string (may be "{}")
+}
+
+X GrpcRequest {
+    F new(service_name: str, method_name: str, message: ProtobufMessage) -> GrpcRequest {
+        GrpcRequest {
+            service_name: service_name,
+            method_name:  method_name,
+            message:      message,
+            metadata:     "{}",
+        }
+    }
+}
+
+S GrpcStatus {
+    code:    i64,   # gRPC status code (0 = OK)
+    message: str,
+}
+
+X GrpcStatus {
+    F ok() -> GrpcStatus {
+        GrpcStatus { code: 0, message: "OK" }
+    }
+
+    F not_found(msg: str) -> GrpcStatus {
+        GrpcStatus { code: 5, message: msg }
+    }
+
+    F unimplemented(msg: str) -> GrpcStatus {
+        GrpcStatus { code: 12, message: msg }
+    }
+
+    F internal(msg: str) -> GrpcStatus {
+        GrpcStatus { code: 13, message: msg }
+    }
+
+    F is_ok(self) -> i64 {
+        I self.code == 0 { 1 } E { 0 }
+    }
+}
+
+S GrpcResponse {
+    message: ProtobufMessage,
+    status:  GrpcStatus,
+    trailer_metadata: str,   # JSON string (may be "{}")
+}
+
+X GrpcResponse {
+    F success(message: ProtobufMessage) -> GrpcResponse {
+        GrpcResponse {
+            message:          message,
+            status:           GrpcStatus.ok(),
+            trailer_metadata: "{}",
+        }
+    }
+
+    F error(status: GrpcStatus) -> GrpcResponse {
+        GrpcResponse {
+            message:          ProtobufMessage.new(0),
+            status:           status,
+            trailer_metadata: "{}",
+        }
+    }
+}
+
+# ============================================================================
+# HTTP/2 Framing — FUTURE
+# ============================================================================
+# HTTP/2 framing support is deferred to a future implementation phase.
+# The structures below document the intended interface.
+
+# FUTURE: Http2Frame will represent a raw HTTP/2 DATA or HEADERS frame.
+# S Http2Frame {
+#     stream_id: i64,
+#     frame_type: i64,   # 0=DATA, 1=HEADERS, 4=SETTINGS, ...
+#     flags: i64,
+#     payload: str,
+# }
+
+# FUTURE: GrpcFramer will wrap a ProtobufMessage in the 5-byte gRPC frame
+# prefix (1 byte compressed-flag + 4 bytes message-length big-endian).
+# F grpc_frame_message(msg: ProtobufMessage) -> str { ... }
+# F grpc_unframe_message(frame: str) -> ProtobufMessage { ... }
+
+# ============================================================================
+# gRPC Server
+# ============================================================================
+
+S GrpcServer {
+    services: Vec<GrpcService>,
+    port:     i64,
+}
+
+X GrpcServer {
+    F new(port: i64) -> GrpcServer {
+        GrpcServer {
+            services: Vec.new(),
+            port:     port,
+        }
+    }
+
+    # Register a service descriptor.
+    F register_service(mut self, service: GrpcService) {
+        self.services.push(service)
+    }
+
+    # Dispatch an incoming GrpcRequest:
+    # 1. Locate the service by name.
+    # 2. Locate the method within the service.
+    # 3. Decode the request message.
+    # 4. Invoke the host handler and return a GrpcResponse.
+    F handle_request(self, request: GrpcRequest) -> GrpcResponse {
+        service_idx := find_service_index(self.services, request.service_name)
+        I service_idx < 0 {
+            status := GrpcStatus.not_found("Service not found: " + request.service_name)
+            R GrpcResponse.error(status)
+        }
+
+        service := self.services.get(service_idx)
+        handler_id := service.find_method(request.method_name)
+        I handler_id < 0 {
+            status := GrpcStatus.not_found("Method not found: " + request.method_name)
+            R GrpcResponse.error(status)
+        }
+
+        # Decode inbound message.
+        msg := mut request.message
+        decode_ok := msg.decode()
+        I decode_ok == 0 {
+            status := GrpcStatus.internal("Failed to decode request message")
+            R GrpcResponse.error(status)
+        }
+
+        # Dispatch to host handler; host returns JSON for the response message.
+        resp_json := grpc_invoke_handler(handler_id, msg.decoded_json, request.metadata)
+        I resp_json == "" {
+            status := GrpcStatus.internal("Handler returned empty response")
+            R GrpcResponse.error(status)
+        }
+
+        # Build a response ProtobufMessage with the JSON payload.
+        resp_msg := mut ProtobufMessage.new(msg.message_type_id)
+        resp_msg.decoded_json = resp_json
+        encode_ok := resp_msg.encode()
+        I encode_ok == 0 {
+            status := GrpcStatus.internal("Failed to encode response message")
+            R GrpcResponse.error(status)
+        }
+
+        GrpcResponse.success(resp_msg)
+    }
+}
+
+# Find the index of a service by name; returns -1 if not found.
+F find_service_index(services: Vec<GrpcService>, name: str) -> i64 {
+    find_service_index_rec(services, name, 0)
+}
+
+F find_service_index_rec(services: Vec<GrpcService>, name: str, i: i64) -> i64 {
+    I i >= services.len() { R 0 - 1 }
+    svc := services.get(i)
+    I svc.name == name { R i }
+    find_service_index_rec(services, name, i + 1)
+}
+
+# Host-provided handler invocation.
+X F grpc_invoke_handler(handler_id: i64, request_json: str, metadata: str) -> str
+
+# ============================================================================
+# External helpers
+# ============================================================================
+
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F i64_to_str(n: i64) -> str

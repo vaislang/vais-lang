@@ -1,0 +1,266 @@
+# OAuth 2.0 Authorization Code Flow
+# Supports Google, GitHub, and custom providers.
+# get_authorization_url → redirect user → exchange_code → OAuthToken
+
+U std/string
+U std/vec
+
+# ============================================================================
+# OAuthProvider — supported identity providers
+# ============================================================================
+
+E OAuthProvider {
+    Google,
+    Github,
+    Custom,
+}
+
+# ============================================================================
+# OAuthConfig — per-provider registration parameters
+# ============================================================================
+
+S OAuthConfig {
+    provider:      OAuthProvider,
+    client_id:     str,
+    client_secret: str,
+    redirect_uri:  str,
+    authorize_url: str,
+    token_url:     str,
+    scopes:        Vec<str>,
+}
+
+X OAuthConfig {
+    # Google OAuth 2.0 defaults
+    F google(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+        scopes := Vec.new()
+        scopes.push("openid")
+        scopes.push("email")
+        scopes.push("profile")
+
+        OAuthConfig {
+            provider:      OAuthProvider.Google,
+            client_id,
+            client_secret,
+            redirect_uri,
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
+            token_url:     "https://oauth2.googleapis.com/token",
+            scopes,
+        }
+    }
+
+    # GitHub OAuth 2.0 defaults
+    F github(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+        scopes := Vec.new()
+        scopes.push("read:user")
+        scopes.push("user:email")
+
+        OAuthConfig {
+            provider:      OAuthProvider.Github,
+            client_id,
+            client_secret,
+            redirect_uri,
+            authorize_url: "https://github.com/login/oauth/authorize",
+            token_url:     "https://github.com/login/oauth/access_token",
+            scopes,
+        }
+    }
+
+    # Custom provider
+    F custom(client_id: str, client_secret: str, redirect_uri: str,
+             authorize_url: str, token_url: str) -> OAuthConfig {
+        OAuthConfig {
+            provider:      OAuthProvider.Custom,
+            client_id,
+            client_secret,
+            redirect_uri,
+            authorize_url,
+            token_url,
+            scopes: Vec.new(),
+        }
+    }
+}
+
+# ============================================================================
+# OAuthToken — token response from the provider's token endpoint
+# ============================================================================
+
+S OAuthToken {
+    access_token:  str,
+    token_type:    str,
+    expires_in:    i64,
+    refresh_token: str,
+    scope:         str,
+}
+
+X OAuthToken {
+    F new(access_token: str, token_type: str, expires_in: i64,
+          refresh_token: str, scope: str) -> OAuthToken {
+        OAuthToken { access_token, token_type, expires_in, refresh_token, scope }
+    }
+
+    # Check if this token carries a refresh token
+    F has_refresh(self) -> bool {
+        self.refresh_token != ""
+    }
+}
+
+# ============================================================================
+# OAuthStateParam — CSRF protection state included in the authorization URL
+# ============================================================================
+
+S OAuthStateParam {
+    value: str,
+}
+
+X OAuthStateParam {
+    # Generate a random-looking state value from the current timestamp.
+    # FUTURE: replace with cryptographic random bytes.
+    F generate() -> OAuthStateParam {
+        t     := current_time_ms()
+        state := "state_" + i64_to_str(t)
+        OAuthStateParam { value: state }
+    }
+
+    F from(value: str) -> OAuthStateParam {
+        OAuthStateParam { value }
+    }
+}
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Build the URL to which the user should be redirected to begin OAuth.
+# A CSRF state parameter is automatically appended.
+F get_authorization_url(config: OAuthConfig) -> str {
+    state      := OAuthStateParam.generate()
+    scope_str  := oauth_join_scopes(config.scopes, 0, "")
+
+    url := config.authorize_url
+         + "?client_id="     + config.client_id
+         + "&redirect_uri="  + config.redirect_uri
+         + "&response_type=code"
+         + "&state="         + state.value
+
+    I scope_str != "" {
+        url + "&scope=" + scope_str
+    } E {
+        url
+    }
+}
+
+# Build the authorization URL with an explicit state value (useful for tests
+# or when the caller manages state externally).
+F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
+    scope_str := oauth_join_scopes(config.scopes, 0, "")
+
+    url := config.authorize_url
+         + "?client_id="     + config.client_id
+         + "&redirect_uri="  + config.redirect_uri
+         + "&response_type=code"
+         + "&state="         + state
+
+    I scope_str != "" {
+        url + "&scope=" + scope_str
+    } E {
+        url
+    }
+}
+
+# Exchange an authorization code for an OAuthToken.
+# In production this would issue an HTTP POST to config.token_url.
+# FUTURE(std/http_client): perform the real network request.
+F exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
+    I code == "" {
+        R Err(VaisError.new(400, "Authorization code is empty"))
+    }
+    I config.client_id == "" {
+        R Err(VaisError.new(500, "OAuth client_id is not configured"))
+    }
+    I config.client_secret == "" {
+        R Err(VaisError.new(500, "OAuth client_secret is not configured"))
+    }
+
+    # Simulate a successful token exchange.
+    # A real implementation posts:
+    #   grant_type=authorization_code&code=<code>&redirect_uri=<uri>
+    #   &client_id=<id>&client_secret=<secret>
+    # and parses the JSON response.
+    now        := current_time_ms()
+    mock_token := "at_" + code + "_" + i64_to_str(now)
+
+    token := OAuthToken.new(
+        mock_token,
+        "Bearer",
+        3600,
+        "rt_" + mock_token,
+        oauth_join_scopes(config.scopes, 0, ""),
+    )
+
+    Ok(token)
+}
+
+# Validate that a state parameter returned by the provider matches the expected value.
+F validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
+    I returned == "" {
+        R Err(VaisError.new(400, "Missing OAuth state parameter"))
+    }
+    I returned != expected {
+        R Err(VaisError.new(400, "OAuth state mismatch — possible CSRF attack"))
+    }
+    Ok(true)
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Join Vec<str> scopes with space separator (OAuth convention).
+F oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
+    I i >= scopes.len() { R acc }
+    s := scopes.get(i)
+    I acc == "" {
+        oauth_join_scopes(scopes, i + 1, s)
+    } E {
+        oauth_join_scopes(scopes, i + 1, acc + " " + s)
+    }
+}
+
+# ============================================================================
+# Numeric utilities
+# ============================================================================
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch    := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F current_time_ms() -> i64

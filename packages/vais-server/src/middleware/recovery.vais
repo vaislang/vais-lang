@@ -1,0 +1,180 @@
+# Recovery Middleware
+# Catches panics / errors that occur during handler execution and returns
+# a 500 Internal Server Error response instead of crashing the server.
+# Also logs the error details.
+
+U std/string
+U core/context
+U middleware/pipeline
+
+# ============================================================================
+# RecoveryConfig
+# ============================================================================
+
+S RecoveryConfig {
+    log_errors:      bool,   # Whether to log error details (default: true)
+    include_message: bool,   # Include error message in response body (dev only)
+}
+
+X RecoveryConfig {
+    F default() -> RecoveryConfig {
+        RecoveryConfig {
+            log_errors:      true,
+            include_message: false,
+        }
+    }
+
+    # Dev config — includes error messages in the response body for debugging
+    F dev() -> RecoveryConfig {
+        RecoveryConfig {
+            log_errors:      true,
+            include_message: true,
+        }
+    }
+}
+
+# ============================================================================
+# RecoveryMiddleware
+# ============================================================================
+
+S RecoveryMiddleware {
+    config: RecoveryConfig,
+}
+
+X RecoveryMiddleware {
+    F new(config: RecoveryConfig) -> RecoveryMiddleware {
+        RecoveryMiddleware { config: config }
+    }
+
+    F default() -> RecoveryMiddleware {
+        RecoveryMiddleware.new(RecoveryConfig.default())
+    }
+
+    # -------------------------------------------------------------------------
+    # before — mark the context so after() knows recovery is active
+    # -------------------------------------------------------------------------
+    F before(self, ctx: Context) -> BeforeResult {
+        # Signal that recovery wrapping is enabled for this request
+        updated := ctx.set_state("recovery=active")
+        BeforeResult.next()
+    }
+
+    # -------------------------------------------------------------------------
+    # after — inspect response for error markers; wrap 5xx in a safe body
+    #
+    # The Vais runtime signals a handler panic by setting response.status = 0
+    # (sentinel) or by propagating a special error marker in response.body
+    # prefixed with "PANIC:". Recovery normalises both into a clean 500.
+    # -------------------------------------------------------------------------
+    F after(self, ctx: Context, response: Response) -> Response {
+        is_panic   := recovery_is_panic(response)
+        is_zero    := response.status == 0
+
+        I is_panic || is_zero {
+            error_detail := recovery_extract_error(response)
+
+            I self.config.log_errors {
+                println("[ERROR] [{ctx.method}] {ctx.path} - handler panic: {error_detail}")
+            }
+
+            body := recovery_build_body(self.config, error_detail)
+
+            R Response {
+                status:       500,
+                body:         body,
+                content_type: "application/json; charset=utf-8",
+                headers:      "",
+                redirect_url: "",
+            }
+        }
+
+        # Non-panic 5xx: log if configured but do not alter the response
+        I response.status >= 500 && self.config.log_errors {
+            u16_str := u16_to_str(response.status)
+            println("[ERROR] [{ctx.method}] {ctx.path} - handler returned {u16_str}")
+        }
+
+        response
+    }
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# A response signals a panic when body starts with "PANIC:"
+F recovery_is_panic(response: Response) -> bool {
+    recovery_str_starts_with(response.body, "PANIC:", 0)
+}
+
+F recovery_str_starts_with(s: str, prefix: str, i: i64) -> bool {
+    c := str_char_at(prefix, i)
+    I c == 0 { R true }
+    sc := str_char_at(s, i)
+    I sc != c { R false }
+    recovery_str_starts_with(s, prefix, i + 1)
+}
+
+# Extract the error detail string from the response body
+F recovery_extract_error(response: Response) -> str {
+    I recovery_is_panic(response) {
+        # Strip the "PANIC:" prefix
+        prefix_len := str_len("PANIC:")
+        body_len   := str_len(response.body)
+        I body_len > prefix_len {
+            str_slice(response.body, prefix_len, body_len)
+        } E {
+            "unknown panic"
+        }
+    } E {
+        "internal server error"
+    }
+}
+
+# Build the response body (JSON-ish)
+F recovery_build_body(config: RecoveryConfig, detail: str) -> str {
+    I config.include_message {
+        "{\"error\": \"Internal Server Error\", \"detail\": \"{detail}\"}"
+    } E {
+        "{\"error\": \"Internal Server Error\"}"
+    }
+}
+
+# u16 -> str (for status code logging)
+F u16_to_str(n: u16) -> str {
+    i64_to_str(n)
+}
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+# External string helpers
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str

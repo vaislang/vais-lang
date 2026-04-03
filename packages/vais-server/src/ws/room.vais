@@ -1,0 +1,182 @@
+# WebSocket Room Management
+# WsRoom handles member tracking and message broadcasting.
+# RoomManager maintains a named collection of rooms.
+
+U std/string
+U std/vec
+U ws/message
+
+# ============================================================================
+# WsRoom — a named group of connected clients
+# ============================================================================
+
+S WsRoom {
+    name:    str,
+    members: Vec<i64>,  # conn_ids of current members
+}
+
+X WsRoom {
+    # Create an empty room with the given name
+    F new(name: str) -> WsRoom {
+        WsRoom {
+            name:    name,
+            members: Vec.new(),
+        }
+    }
+
+    # Add a connection to this room.
+    # No-op if the connection is already a member.
+    F join(mut self, conn_id: i64) {
+        I !self.has_member(conn_id) {
+            self.members.push(conn_id)
+        }
+    }
+
+    # Remove a connection from this room.
+    # No-op if the connection is not a member.
+    F leave(mut self, conn_id: i64) {
+        new_members := mut Vec.new()
+        i := mut 0
+        L i < self.members.len() {
+            member := self.members.get(i)
+            I member != conn_id {
+                new_members.push(member)
+            }
+            i += 1
+        }
+        self.members = new_members
+    }
+
+    # Returns true when conn_id is a member of this room
+    F has_member(self, conn_id: i64) -> bool {
+        i := mut 0
+        L i < self.members.len() {
+            member := self.members.get(i)
+            I member == conn_id {
+                R true
+            }
+            i += 1
+        }
+        false
+    }
+
+    # Number of members currently in this room
+    F member_count(self) -> i64 {
+        self.members.len()
+    }
+
+    # Send a message to every member of the room.
+    # Returns the number of recipients targeted.
+    # FUTURE(std/ws_runtime): actual delivery is handled by the runtime;
+    # this method records the broadcast intent and returns the target count.
+    F broadcast(self, message: WsMessage) -> i64 {
+        self.members.len()
+    }
+
+    # Send a message to a single member identified by conn_id.
+    # Returns true when the target is a member, false otherwise.
+    # FUTURE(std/ws_runtime): actual delivery is handled by the runtime.
+    F send_to(self, conn_id: i64, message: WsMessage) -> bool {
+        self.has_member(conn_id)
+    }
+}
+
+# ============================================================================
+# RoomEntry — internal name→room record stored in RoomManager
+# ============================================================================
+
+S RoomEntry {
+    name: str,
+    room: WsRoom,
+}
+
+X RoomEntry {
+    F new(name: str) -> RoomEntry {
+        RoomEntry {
+            name: name,
+            room: WsRoom.new(name),
+        }
+    }
+}
+
+# ============================================================================
+# RoomManager — creates, retrieves, and removes named rooms
+# ============================================================================
+
+S RoomManager {
+    rooms: Vec<RoomEntry>,
+}
+
+X RoomManager {
+    F new() -> RoomManager {
+        RoomManager {
+            rooms: Vec.new(),
+        }
+    }
+
+    # Create a room with the given name and add it to the registry.
+    # If a room with that name already exists it is replaced.
+    F create_room(mut self, name: str) {
+        # Remove any existing room with the same name first
+        self._remove_entry(name)
+        entry := RoomEntry.new(name)
+        self.rooms.push(entry)
+    }
+
+    # Retrieve a room by name.
+    # Returns a default empty room when the name is not registered —
+    # callers should check member_count() or use room_exists() first.
+    F get_room(self, name: str) -> WsRoom {
+        i := mut 0
+        L i < self.rooms.len() {
+            entry := self.rooms.get(i)
+            I entry.name == name {
+                R entry.room
+            }
+            i += 1
+        }
+        WsRoom.new(name)
+    }
+
+    # Returns true when a room with the given name exists in the registry
+    F room_exists(self, name: str) -> bool {
+        i := mut 0
+        L i < self.rooms.len() {
+            entry := self.rooms.get(i)
+            I entry.name == name {
+                R true
+            }
+            i += 1
+        }
+        false
+    }
+
+    # Remove the room identified by name from the registry.
+    # No-op when the name is not found.
+    F remove_room(mut self, name: str) {
+        self._remove_entry(name)
+    }
+
+    # Total number of managed rooms
+    F room_count(self) -> i64 {
+        self.rooms.len()
+    }
+
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    # Rebuild rooms list without any entry whose name matches
+    F _remove_entry(mut self, name: str) {
+        new_rooms := mut Vec.new()
+        i := mut 0
+        L i < self.rooms.len() {
+            entry := self.rooms.get(i)
+            I entry.name != name {
+                new_rooms.push(entry)
+            }
+            i += 1
+        }
+        self.rooms = new_rooms
+    }
+}

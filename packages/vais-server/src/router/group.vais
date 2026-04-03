@@ -1,0 +1,107 @@
+U std/string
+U std/vec
+U router/router
+U router/route
+
+# RouteGroup: a named prefix + shared middleware applied to all routes in the group
+S RouteGroup {
+    prefix: str,
+    middleware_ids: Vec<i64>,
+    router: Router,
+}
+
+X RouteGroup {
+    # Create a new group bound to the given router and prefix
+    F new(router: Router, prefix: str) -> RouteGroup {
+        RouteGroup {
+            prefix: prefix,
+            middleware_ids: Vec.new(),
+            router: router,
+        }
+    }
+
+    # Create a new group with pre-attached middleware
+    F with_middleware(router: Router, prefix: str, middleware_ids: Vec<i64>) -> RouteGroup {
+        RouteGroup {
+            prefix: prefix,
+            middleware_ids: middleware_ids,
+            router: router,
+        }
+    }
+
+    # Add a middleware to every route registered through this group
+    F use_middleware(mut self, middleware_id: i64) {
+        self.middleware_ids.push(middleware_id)
+    }
+
+    # Combine group prefix with a route-level path
+    # Rules:
+    #   prefix="/api/v1"  path="/users"   -> "/api/v1/users"
+    #   prefix="/api/v1"  path=""          -> "/api/v1"
+    #   prefix=""         path="/users"   -> "/users"
+    F _full_path(self, path: str) -> str {
+        I self.prefix.len() == 0 {
+            R path
+        }
+        I path.len() == 0 {
+            R self.prefix
+        }
+        # Avoid double slash
+        prefix_ends_slash := self.prefix.ends_with("/")
+        path_starts_slash := path.starts_with("/")
+        I prefix_ends_slash && path_starts_slash {
+            # e.g. "/api/" + "/users" -> "/api/users"
+            R self.prefix + path.slice(1, path.len())
+        }
+        I !prefix_ends_slash && !path_starts_slash {
+            # e.g. "/api" + "users" -> "/api/users"
+            R self.prefix + "/" + path
+        }
+        # Exactly one slash at the join point — just concatenate
+        self.prefix + path
+    }
+
+    # Copy middleware_ids so the router entry has its own copy
+    F _copy_middleware(self) -> Vec<i64> {
+        copy := Vec.new()
+        I i = 0; i < self.middleware_ids.len(); i = i + 1 {
+            copy.push(self.middleware_ids.get(i))
+        }
+        copy
+    }
+
+    # Register a route under this group
+    F add(mut self, method: i64, path: str, handler_id: i64) {
+        full := self._full_path(path)
+        mw := self._copy_middleware()
+        self.router.add_with_middleware(method, full, handler_id, mw)
+    }
+
+    # Convenience methods — mirror Router's interface
+    F get(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_GET, path, handler_id)
+    }
+
+    F post(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_POST, path, handler_id)
+    }
+
+    F put(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_PUT, path, handler_id)
+    }
+
+    F delete(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_DELETE, path, handler_id)
+    }
+
+    F patch(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_PATCH, path, handler_id)
+    }
+
+    # Create a nested sub-group: inherits this group's prefix + middleware
+    F group(self, sub_prefix: str) -> RouteGroup {
+        combined := self._full_path(sub_prefix)
+        mw := self._copy_middleware()
+        RouteGroup.with_middleware(self.router, combined, mw)
+    }
+}

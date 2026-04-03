@@ -1,0 +1,168 @@
+# vais-server App
+# Central application object: registers routes/middleware, starts the server
+
+U std/string
+U std/vec
+U core/config
+U core/error
+U core/context
+
+# ============================================================================
+# Handler type alias
+#   Every route handler is a function: F(ctx: Context) -> Response
+# ============================================================================
+
+# ============================================================================
+# Route — a single registered path + method + handler descriptor
+# ============================================================================
+
+S Route {
+    method: str,      # "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "WS"
+    path: str,        # Full path, e.g. "/api/v1/users/:id"
+    handler_id: str,  # Symbolic handler name (resolved at dispatch time)
+}
+
+X Route {
+    F new(method: str, path: str, handler_id: str) -> Route {
+        Route { method, path, handler_id }
+    }
+}
+
+# ============================================================================
+# MiddlewareEntry — a registered middleware descriptor
+# ============================================================================
+
+S MiddlewareEntry {
+    name: str,
+}
+
+X MiddlewareEntry {
+    F new(name: str) -> MiddlewareEntry {
+        MiddlewareEntry { name }
+    }
+}
+
+# ============================================================================
+# App — the top-level application object
+# ============================================================================
+
+S App {
+    config: ServerConfig,
+    routes: Vec<Route>,
+    middlewares: Vec<MiddlewareEntry>,
+    prefix: str,      # Non-empty only for sub-apps created by group()
+}
+
+X App {
+    # Create a new App with the given configuration
+    F new(config: ServerConfig) -> App {
+        App {
+            config,
+            routes: Vec.new(),
+            middlewares: Vec.new(),
+            prefix: "",
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Middleware registration
+    # -------------------------------------------------------------------------
+
+    # Register a named middleware to run on every request
+    F use(mut self, name: str) {
+        entry := MiddlewareEntry.new(name)
+        self.middlewares.push(entry)
+    }
+
+    # -------------------------------------------------------------------------
+    # Route registration helpers
+    # -------------------------------------------------------------------------
+
+    F _add_route(mut self, method: str, path: str, handler_id: str) {
+        full_path := self.prefix + path
+        r := Route.new(method, full_path, handler_id)
+        self.routes.push(r)
+    }
+
+    # GET route
+    F get(mut self, path: str, handler_id: str) {
+        self._add_route("GET", path, handler_id)
+    }
+
+    # POST route
+    F post(mut self, path: str, handler_id: str) {
+        self._add_route("POST", path, handler_id)
+    }
+
+    # PUT route
+    F put(mut self, path: str, handler_id: str) {
+        self._add_route("PUT", path, handler_id)
+    }
+
+    # DELETE route
+    F delete(mut self, path: str, handler_id: str) {
+        self._add_route("DELETE", path, handler_id)
+    }
+
+    # PATCH route
+    F patch(mut self, path: str, handler_id: str) {
+        self._add_route("PATCH", path, handler_id)
+    }
+
+    # WebSocket upgrade route
+    F ws(mut self, path: str, handler_id: str) {
+        self._add_route("WS", path, handler_id)
+    }
+
+    # -------------------------------------------------------------------------
+    # Route groups — returns a new App scoped to a prefix
+    # -------------------------------------------------------------------------
+
+    # Creates a scoped sub-application that prepends `prefix` to all routes
+    F group(self, prefix: str) -> App {
+        App {
+            config: self.config,
+            routes: Vec.new(),
+            middlewares: Vec.new(),
+            prefix: self.prefix + prefix,
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
+
+    F route_count(self) -> i64 {
+        self.routes.len()
+    }
+
+    F middleware_count(self) -> i64 {
+        self.middlewares.len()
+    }
+
+    # -------------------------------------------------------------------------
+    # Server startup
+    # -------------------------------------------------------------------------
+
+    # Validate config, print startup banner, and begin accepting connections.
+    # FUTURE(std/http_server): delegates to the HTTP server runtime.
+    F listen(self, addr: str) -> Result<(), VaisServerError> {
+        M self.config.validate() {
+            Ok(_) => {},
+            Err(e) => { R Err(e) },
+        }
+
+        println("vais-server v0.1.0")
+        println("  env:             {self.config.env}")
+        println("  address:         {addr}")
+        println("  max_connections: {self.config.max_connections}")
+        println("  log_level:       {self.config.log_level}")
+        println("  routes:          {self.route_count()}")
+        println("  middlewares:     {self.middleware_count()}")
+        println("")
+        println("Listening on {addr} ...")
+
+        # FUTURE(std/http_server): block on accept loop
+        Ok(())
+    }
+}

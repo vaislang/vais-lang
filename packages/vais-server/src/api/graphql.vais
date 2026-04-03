@@ -1,0 +1,454 @@
+# GraphQL Engine
+# Provides schema definition, request parsing, execution, and introspection.
+
+U std/string
+U std/vec
+U std/option
+
+# ============================================================================
+# Schema Types
+# ============================================================================
+
+E GqlTypeKind {
+    Object,
+    Input,
+    Enum,
+    Scalar,
+}
+
+S GqlArg {
+    name:     str,
+    arg_type: str,
+    required: i64,   # 1 = required, 0 = optional
+}
+
+S GqlField {
+    name:        str,
+    field_type:  str,
+    args:        Vec<GqlArg>,
+    resolver_id: i64,   # opaque handle; 0 = no resolver (introspection)
+}
+
+S GqlType {
+    name:   str,
+    fields: Vec<GqlField>,
+    kind:   GqlTypeKind,
+}
+
+X GqlType {
+    F new(name: str, kind: GqlTypeKind) -> GqlType {
+        GqlType {
+            name:   name,
+            fields: Vec.new(),
+            kind:   kind,
+        }
+    }
+
+    F add_field(mut self, field: GqlField) {
+        self.fields.push(field)
+    }
+}
+
+S GqlSchema {
+    types:     Vec<GqlType>,
+    queries:   Vec<GqlField>,
+    mutations: Vec<GqlField>,
+}
+
+X GqlSchema {
+    F new() -> GqlSchema {
+        GqlSchema {
+            types:     Vec.new(),
+            queries:   Vec.new(),
+            mutations: Vec.new(),
+        }
+    }
+
+    F add_type(mut self, t: GqlType) {
+        self.types.push(t)
+    }
+
+    F add_query(mut self, field: GqlField) {
+        self.queries.push(field)
+    }
+
+    F add_mutation(mut self, field: GqlField) {
+        self.mutations.push(field)
+    }
+}
+
+# ============================================================================
+# Request / Response
+# ============================================================================
+
+S GqlRequest {
+    query:          str,
+    variables:      str,   # JSON-encoded variable map (may be "")
+    operation_name: str,   # may be ""
+}
+
+X GqlRequest {
+    F new(query: str) -> GqlRequest {
+        GqlRequest {
+            query:          query,
+            variables:      "",
+            operation_name: "",
+        }
+    }
+
+    F with_variables(mut self, variables: str) -> GqlRequest {
+        self.variables = variables
+        self
+    }
+
+    F with_operation(mut self, operation_name: str) -> GqlRequest {
+        self.operation_name = operation_name
+        self
+    }
+}
+
+S GqlError {
+    message:   str,
+    locations: str,   # JSON array of {"line":n,"column":n} (may be "[]")
+}
+
+X GqlError {
+    F new(message: str) -> GqlError {
+        GqlError { message: message, locations: "[]" }
+    }
+
+    F to_json(self) -> str {
+        "{\"message\": \"" + self.message + "\", \"locations\": " + self.locations + "}"
+    }
+}
+
+S GqlResponse {
+    data:   str,          # JSON-encoded data object or "null"
+    errors: Vec<GqlError>,
+    ok:     i64,          # 1 = no errors, 0 = has errors
+}
+
+X GqlResponse {
+    F success(data: str) -> GqlResponse {
+        GqlResponse {
+            data:   data,
+            errors: Vec.new(),
+            ok:     1,
+        }
+    }
+
+    F error(message: str) -> GqlResponse {
+        errors := Vec.new()
+        errors.push(GqlError.new(message))
+        GqlResponse {
+            data:   "null",
+            errors: errors,
+            ok:     0,
+        }
+    }
+
+    # Serialise to the standard GraphQL over HTTP JSON envelope.
+    F to_json(self) -> str {
+        I self.ok == 1 {
+            R "{\"data\": " + self.data + "}"
+        }
+        errors_json := gql_errors_to_json(self.errors)
+        "{\"data\": " + self.data + ", \"errors\": " + errors_json + "}"
+    }
+}
+
+F gql_errors_to_json(errors: Vec<GqlError>) -> str {
+    I errors.len() == 0 { R "[]" }
+    result := mut "["
+    i := mut 0
+    L i < errors.len() {
+        I i > 0 { result = result + ", " }
+        result = result + errors.get(i).to_json()
+        i += 1
+    }
+    result = result + "]"
+    result
+}
+
+# ============================================================================
+# Query Parsing helpers
+# ============================================================================
+
+# Minimal tokeniser: extract the top-level operation type and root field name.
+# Returns a ParsedOp with op_type ("query"/"mutation"/"subscription"/"unknown")
+# and the first selection field name.
+S ParsedOp {
+    op_type:    str,   # "query" | "mutation" | "subscription" | "unknown"
+    field_name: str,   # first top-level field selected
+    is_introspection: i64,   # 1 if field starts with "__"
+}
+
+X ParsedOp {
+    F unknown() -> ParsedOp {
+        ParsedOp { op_type: "unknown", field_name: "", is_introspection: 0 }
+    }
+}
+
+# Skip leading whitespace; return index of first non-space character.
+F skip_ws(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0    { R i }
+    I c == 32   { R skip_ws(s, i + 1) }   # space
+    I c == 9    { R skip_ws(s, i + 1) }   # tab
+    I c == 10   { R skip_ws(s, i + 1) }   # \n
+    I c == 13   { R skip_ws(s, i + 1) }   # \r
+    i
+}
+
+# Read an identifier [a-zA-Z_][a-zA-Z0-9_]* starting at index i.
+# Returns the identifier string (may be "").
+F read_ident(s: str, start: i64) -> str {
+    end := read_ident_end(s, start)
+    str_slice(s, start, end)
+}
+
+F read_ident_end(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0 { R i }
+    # a-z: 97-122, A-Z: 65-90, 0-9: 48-57, _: 95
+    I c >= 97 && c <= 122 { R read_ident_end(s, i + 1) }
+    I c >= 65 && c <= 90  { R read_ident_end(s, i + 1) }
+    I c >= 48 && c <= 57  { R read_ident_end(s, i + 1) }
+    I c == 95             { R read_ident_end(s, i + 1) }
+    i
+}
+
+# Check whether an identifier starts with "__" (introspection).
+F is_introspection_field(name: str) -> i64 {
+    c0 := str_char_at(name, 0)   # 95 = '_'
+    c1 := str_char_at(name, 1)
+    I c0 == 95 && c1 == 95 { 1 } E { 0 }
+}
+
+# Parse the raw query string into a ParsedOp.
+F parse_operation(query: str) -> ParsedOp {
+    i := skip_ws(query, 0)
+    kw := read_ident(query, i)
+
+    # Determine op_type and advance past keyword
+    op_type := mut "query"
+    M kw {
+        "query"        => { op_type = "query" },
+        "mutation"     => { op_type = "mutation" },
+        "subscription" => { op_type = "subscription" },
+        "{"            => { op_type = "query" },   # shorthand
+        _              => { op_type = "unknown" },
+    }
+
+    # Advance past the keyword and any operation name to the opening "{"
+    i2 := find_open_brace(query, i)
+    I i2 < 0 { R ParsedOp.unknown() }
+
+    # Skip "{" and whitespace, then read first field name
+    i3 := skip_ws(query, i2 + 1)
+    field := read_ident(query, i3)
+    I field == "" { R ParsedOp.unknown() }
+
+    ParsedOp {
+        op_type:          op_type,
+        field_name:       field,
+        is_introspection: is_introspection_field(field),
+    }
+}
+
+F find_open_brace(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0  { R 0 - 1 }
+    I c == 123 { R i }   # 123 = '{'
+    find_open_brace(s, i + 1)
+}
+
+# ============================================================================
+# Resolver dispatch
+# ============================================================================
+
+# Find the GqlField in a Vec<GqlField> whose name matches field_name.
+# Returns resolver_id, or -1 if not found.
+F find_resolver_id(fields: Vec<GqlField>, field_name: str) -> i64 {
+    find_resolver_id_rec(fields, field_name, 0)
+}
+
+F find_resolver_id_rec(fields: Vec<GqlField>, field_name: str, i: i64) -> i64 {
+    I i >= fields.len() { R 0 - 1 }
+    f := fields.get(i)
+    I f.name == field_name { R f.resolver_id }
+    find_resolver_id_rec(fields, field_name, i + 1)
+}
+
+# ============================================================================
+# Introspection
+# ============================================================================
+
+F type_kind_to_str(kind: GqlTypeKind) -> str {
+    M kind {
+        GqlTypeKind.Object => { "OBJECT" },
+        GqlTypeKind.Input  => { "INPUT_OBJECT" },
+        GqlTypeKind.Enum   => { "ENUM" },
+        GqlTypeKind.Scalar => { "SCALAR" },
+    }
+}
+
+F introspect_field_to_json(field: GqlField) -> str {
+    "{\"name\": \"" + field.name + "\", \"type\": {\"name\": \"" + field.field_type + "\"}}"
+}
+
+F introspect_fields_to_json(fields: Vec<GqlField>) -> str {
+    I fields.len() == 0 { R "[]" }
+    result := mut "["
+    i := mut 0
+    L i < fields.len() {
+        I i > 0 { result = result + ", " }
+        result = result + introspect_field_to_json(fields.get(i))
+        i += 1
+    }
+    result + "]"
+}
+
+F introspect_type_to_json(t: GqlType) -> str {
+    kind_str := type_kind_to_str(t.kind)
+    fields_json := introspect_fields_to_json(t.fields)
+    "{\"name\": \"" + t.name + "\", \"kind\": \"" + kind_str + "\", \"fields\": " + fields_json + "}"
+}
+
+# Handle __schema introspection: returns a JSON representation of the schema.
+F handle_schema_introspection(schema: GqlSchema) -> GqlResponse {
+    types_json := mut "["
+    i := mut 0
+    L i < schema.types.len() {
+        I i > 0 { types_json = types_json + ", " }
+        types_json = types_json + introspect_type_to_json(schema.types.get(i))
+        i += 1
+    }
+    types_json = types_json + "]"
+
+    query_fields_json := introspect_fields_to_json(schema.queries)
+    mutation_fields_json := introspect_fields_to_json(schema.mutations)
+
+    data := "{\"__schema\": {\"types\": " + types_json
+          + ", \"queryType\": {\"fields\": " + query_fields_json + "}"
+          + ", \"mutationType\": {\"fields\": " + mutation_fields_json + "}}}"
+
+    GqlResponse.success(data)
+}
+
+# Handle __type(name:) introspection: returns the named type or null.
+F handle_type_introspection(schema: GqlSchema, type_name: str) -> GqlResponse {
+    i := mut 0
+    L i < schema.types.len() {
+        t := schema.types.get(i)
+        I t.name == type_name {
+            data := "{\"__type\": " + introspect_type_to_json(t) + "}"
+            R GqlResponse.success(data)
+        }
+        i += 1
+    }
+    GqlResponse.success("{\"__type\": null}")
+}
+
+# ============================================================================
+# execute — public entry point
+# ============================================================================
+
+# Execute a GqlRequest against the schema.
+# Flow: parse query → introspection shortcut OR resolver dispatch → GqlResponse
+F execute(schema: GqlSchema, request: GqlRequest) -> GqlResponse {
+    I request.query == "" {
+        R GqlResponse.error("Empty query")
+    }
+
+    op := parse_operation(request.query)
+
+    M op.op_type {
+        "unknown" => {
+            R GqlResponse.error("Could not parse operation")
+        },
+        _ => {},
+    }
+
+    # Introspection
+    I op.is_introspection == 1 {
+        M op.field_name {
+            "__schema" => {
+                R handle_schema_introspection(schema)
+            },
+            "__type" => {
+                # Extract type name from variables JSON or default to "Query"
+                type_name := extract_type_name_from_variables(request.variables)
+                R handle_type_introspection(schema, type_name)
+            },
+            _ => {
+                R GqlResponse.error("Unknown introspection field: " + op.field_name)
+            },
+        }
+    }
+
+    # Regular field dispatch
+    fields := M op.op_type {
+        "mutation" => { schema.mutations },
+        _          => { schema.queries },
+    }
+
+    resolver_id := find_resolver_id(fields, op.field_name)
+    I resolver_id < 0 {
+        R GqlResponse.error("Unknown field: " + op.field_name)
+    }
+
+    # Resolver invocation is host-environment specific; return a stub that
+    # includes the resolver_id so the host can complete dispatch.
+    data := "{\"_resolver_id\": " + i64_to_str(resolver_id)
+          + ", \"_field\": \"" + op.field_name + "\""
+          + ", \"_op\": \"" + op.op_type + "\"}"
+    GqlResponse.success(data)
+}
+
+# Minimal helper: extract "name" string value from a variables JSON blob.
+# E.g. {"name": "User"} -> "User".  Returns "Query" on failure.
+F extract_type_name_from_variables(variables: str) -> str {
+    I variables == "" { R "Query" }
+    # Look for "name": "..." pattern
+    key := "\"name\": \""
+    idx := str_find_substr(variables, key, 0)
+    I idx < 0 { R "Query" }
+    start := idx + str_len(key)
+    end := str_find_char(variables, 34, start)   # 34 = '"'
+    I end < 0 { R "Query" }
+    str_slice(variables, start, end)
+}
+
+F str_find_substr(haystack: str, needle: str, from: i64) -> i64 {
+    c := str_char_at(haystack, from)
+    I c == 0 { R 0 - 1 }
+    I str_match_prefix(haystack, from, needle, 0) == 1 { R from }
+    str_find_substr(haystack, needle, from + 1)
+}
+
+F str_find_char(s: str, target: i64, from: i64) -> i64 {
+    c := str_char_at(s, from)
+    I c == 0 { R 0 - 1 }
+    I c == target { R from }
+    str_find_char(s, target, from + 1)
+}
+
+F str_match_prefix(a: str, ai: i64, b: str, bi: i64) -> i64 {
+    cb := str_char_at(b, bi)
+    I cb == 0 { 1 }
+    E {
+        ca := str_char_at(a, ai)
+        I ca != cb { 0 }
+        E { str_match_prefix(a, ai + 1, b, bi + 1) }
+    }
+}
+
+# ============================================================================
+# External helpers
+# ============================================================================
+
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F i64_to_str(n: i64) -> str

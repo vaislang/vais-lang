@@ -1,0 +1,221 @@
+U std/string
+U std/vec
+U std/option
+U router/tree
+U router/route
+U router/params
+
+# HTTP method constants
+C METHOD_GET: i64    = 0
+C METHOD_POST: i64   = 1
+C METHOD_PUT: i64    = 2
+C METHOD_DELETE: i64 = 3
+C METHOD_PATCH: i64  = 4
+C METHOD_HEAD: i64   = 5
+C METHOD_OPTIONS: i64 = 6
+
+# Total number of distinct HTTP methods tracked
+C METHOD_COUNT: i64 = 7
+
+# Result returned by match_route
+E RouteMatchStatus {
+    Found,
+    NotFound,
+    MethodNotAllowed,
+}
+
+S RouterMatchResult {
+    status: RouteMatchStatus,
+    handler_id: i64,
+    params: Params,
+    middleware_ids: Vec<i64>,
+    allowed_methods: Vec<str>,
+}
+
+X RouterMatchResult {
+    F not_found() -> RouterMatchResult {
+        RouterMatchResult {
+            status: RouteMatchStatus.NotFound,
+            handler_id: 0,
+            params: Params.new(),
+            middleware_ids: Vec.new(),
+            allowed_methods: Vec.new(),
+        }
+    }
+
+    F method_not_allowed(allowed: Vec<str>) -> RouterMatchResult {
+        RouterMatchResult {
+            status: RouteMatchStatus.MethodNotAllowed,
+            handler_id: 0,
+            params: Params.new(),
+            middleware_ids: Vec.new(),
+            allowed_methods: allowed,
+        }
+    }
+
+    F found(handler_id: i64, params: Params, middleware_ids: Vec<i64>) -> RouterMatchResult {
+        RouterMatchResult {
+            status: RouteMatchStatus.Found,
+            handler_id: handler_id,
+            params: params,
+            middleware_ids: middleware_ids,
+            allowed_methods: Vec.new(),
+        }
+    }
+
+    F is_found(self) -> bool {
+        self.status == RouteMatchStatus.Found
+    }
+
+    F is_not_found(self) -> bool {
+        self.status == RouteMatchStatus.NotFound
+    }
+
+    F is_method_not_allowed(self) -> bool {
+        self.status == RouteMatchStatus.MethodNotAllowed
+    }
+}
+
+# One RadixTree per HTTP method
+S MethodTrees {
+    trees: Vec<RadixTree>,
+}
+
+X MethodTrees {
+    F new() -> MethodTrees {
+        trees := Vec.new()
+        I i = 0; i < METHOD_COUNT; i = i + 1 {
+            trees.push(RadixTree.new())
+        }
+        MethodTrees { trees: trees }
+    }
+
+    F get_tree(self, method: i64) -> RadixTree {
+        self.trees.get(method)
+    }
+
+    F get_tree_mut(mut self, method: i64) -> RadixTree {
+        self.trees.get(method)
+    }
+}
+
+S Router {
+    routes: Vec<RouteEntry>,
+    trees: MethodTrees,
+}
+
+X Router {
+    F new() -> Router {
+        Router {
+            routes: Vec.new(),
+            trees: MethodTrees.new(),
+        }
+    }
+
+    # Register a route for any HTTP method integer
+    F add(mut self, method: i64, path: str, handler_id: i64) {
+        route := Route.new(method, path, handler_id)
+        entry := RouteEntry.new(route)
+        self.routes.push(entry)
+        tree := self.trees.get_tree_mut(method)
+        tree.insert(path, handler_id)
+    }
+
+    # Register a route with associated middleware IDs
+    F add_with_middleware(mut self, method: i64, path: str, handler_id: i64, middleware_ids: Vec<i64>) {
+        route := Route.new(method, path, handler_id)
+        entry := RouteEntry.with_middleware(route, middleware_ids)
+        self.routes.push(entry)
+        tree := self.trees.get_tree_mut(method)
+        tree.insert(path, handler_id)
+    }
+
+    # Convenience methods
+    F get(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_GET, path, handler_id)
+    }
+
+    F post(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_POST, path, handler_id)
+    }
+
+    F put(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_PUT, path, handler_id)
+    }
+
+    F delete(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_DELETE, path, handler_id)
+    }
+
+    F patch(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_PATCH, path, handler_id)
+    }
+
+    F head(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_HEAD, path, handler_id)
+    }
+
+    F options(mut self, path: str, handler_id: i64) {
+        self.add(METHOD_OPTIONS, path, handler_id)
+    }
+
+    # Match a request: returns Found, NotFound, or MethodNotAllowed
+    F match_route(self, method: i64, path: str) -> RouterMatchResult {
+        # Validate method range
+        I method < 0 || method >= METHOD_COUNT {
+            R RouterMatchResult.not_found()
+        }
+
+        # Try to match in the tree for the given method
+        tree := self.trees.get_tree(method)
+        tree_result := tree.match_path(path)
+
+        M tree_result {
+            Some(match_res) => {
+                # Build Params from tree ParamEntry list
+                params := Params.new()
+                I i = 0; i < match_res.params.len(); i = i + 1 {
+                    pe := match_res.params.get(i)
+                    params.add_path(pe.key, pe.value)
+                }
+
+                # Find the RouteEntry to retrieve middleware_ids
+                middleware_ids := Vec.new()
+                I i = 0; i < self.routes.len(); i = i + 1 {
+                    entry := self.routes.get(i)
+                    I entry.method() == method && entry.handler_id() == match_res.handler_id {
+                        middleware_ids = entry.middleware_ids
+                    }
+                }
+
+                RouterMatchResult.found(match_res.handler_id, params, middleware_ids)
+            },
+            None => {
+                # Path not matched for this method — check other methods for 405
+                allowed := self._find_allowed_methods(path)
+                I allowed.len() > 0 {
+                    RouterMatchResult.method_not_allowed(allowed)
+                } else {
+                    RouterMatchResult.not_found()
+                }
+            },
+        }
+    }
+
+    # Check all method trees for matches on the same path (for 405 detection)
+    F _find_allowed_methods(self, path: str) -> Vec<str> {
+        allowed := Vec.new()
+        method_names := ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+        I i = 0; i < METHOD_COUNT; i = i + 1 {
+            tree := self.trees.get_tree(i)
+            result := tree.match_path(path)
+            M result {
+                Some(_) => {
+                    allowed.push(method_names.get(i))
+                },
+                None => {},
+            }
+        }
+        allowed
+    }
+}

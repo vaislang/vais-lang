@@ -1,0 +1,258 @@
+# Session Management
+# In-memory session store with TTL-based expiry and key-value data bags.
+# Expired sessions are purged lazily on every access and explicitly via cleanup().
+
+U std/string
+U std/vec
+U std/option
+
+# ============================================================================
+# SessionEntry — a single key/value datum attached to a session
+# ============================================================================
+
+S SessionEntry {
+    key:   str,
+    value: str,
+}
+
+X SessionEntry {
+    F new(key: str, value: str) -> SessionEntry {
+        SessionEntry { key, value }
+    }
+}
+
+# ============================================================================
+# Session — per-user session record
+# ============================================================================
+
+S Session {
+    session_id: str,
+    user_id:    str,
+    data:       Vec<SessionEntry>,
+    created_at: i64,
+    expires_at: i64,
+}
+
+X Session {
+    F new(session_id: str, user_id: str, created_at: i64, expires_at: i64) -> Session {
+        Session {
+            session_id,
+            user_id,
+            data: Vec.new(),
+            created_at,
+            expires_at,
+        }
+    }
+
+    # Returns true when this session is past its expiry timestamp.
+    F is_expired(self, now: i64) -> bool {
+        self.expires_at < now
+    }
+
+    # Look up a value by key within the session data bag.
+    F get_value(self, key: str) -> str {
+        session_find_value(self.data, key, 0)
+    }
+
+    # Set or update a key in the data bag (returns new Session for immutability).
+    F set_value(mut self, key: str, value: str) -> Session {
+        self.data := session_upsert(self.data, key, value, 0)
+        self
+    }
+}
+
+# ============================================================================
+# SessionStore — collection of all live sessions
+# ============================================================================
+
+S SessionStore {
+    sessions: Vec<Session>,
+}
+
+X SessionStore {
+    F new() -> SessionStore {
+        SessionStore { sessions: Vec.with_capacity(256) }
+    }
+
+    # Create a new session for user_id; ttl is in seconds.
+    F create(mut self, user_id: str, ttl: i64) -> Session {
+        now        := current_time_sec()
+        expires_at := now + ttl
+        session_id := session_generate_id(user_id, now)
+        session    := Session.new(session_id, user_id, now, expires_at)
+        self.sessions.push(session)
+        session
+    }
+
+    # Retrieve a live (non-expired) session by ID, or "" if absent/expired.
+    # Expired sessions encountered during lookup are considered absent.
+    F get(self, session_id: str) -> str {
+        now := current_time_sec()
+        session_find_by_id(self.sessions, session_id, now, 0)
+    }
+
+    # Retrieve the full Session struct (returns a sentinel with empty session_id when absent).
+    F get_session(self, session_id: str) -> Session {
+        now := current_time_sec()
+        session_find_full(self.sessions, session_id, now, 0)
+    }
+
+    # Remove a session from the store.
+    F destroy(mut self, session_id: str) {
+        self.sessions := session_remove(self.sessions, session_id, 0, Vec.new())
+    }
+
+    # Set a key/value pair on an existing session.
+    F set_data(mut self, session_id: str, key: str, value: str) {
+        self.sessions := session_update_data(self.sessions, session_id, key, value, 0)
+    }
+
+    # Retrieve a value from a session's data bag ("" when absent).
+    F get_data(self, session_id: str, key: str) -> str {
+        now := current_time_sec()
+        s   := session_find_full(self.sessions, session_id, now, 0)
+        I s.session_id == "" {
+            R ""
+        }
+        s.get_value(key)
+    }
+
+    # Purge all expired sessions (call periodically to reclaim memory).
+    F cleanup(mut self) {
+        now := current_time_sec()
+        self.sessions := session_filter_live(self.sessions, now, 0, Vec.new())
+    }
+
+    # Number of sessions currently in the store (including expired until cleanup).
+    F count(self) -> i64 {
+        self.sessions.len()
+    }
+}
+
+# ============================================================================
+# Recursive helpers
+# ============================================================================
+
+# Generate a deterministic session ID from user_id and timestamp.
+# FUTURE: use cryptographic random bytes.
+F session_generate_id(user_id: str, now: i64) -> str {
+    "sess_" + user_id + "_" + i64_to_str(now)
+}
+
+# Find the session_id string of a live session; returns "" if not found/expired.
+F session_find_by_id(sessions: Vec<Session>, session_id: str, now: i64, i: i64) -> str {
+    I i >= sessions.len() { R "" }
+    s := sessions.get(i)
+    I s.session_id == session_id {
+        I s.is_expired(now) { R "" }
+        R s.session_id
+    }
+    session_find_by_id(sessions, session_id, now, i + 1)
+}
+
+# Find and return the full Session struct (sentinel with empty session_id = not found).
+F session_find_full(sessions: Vec<Session>, session_id: str, now: i64, i: i64) -> Session {
+    I i >= sessions.len() {
+        R Session.new("", "", 0, 0)
+    }
+    s := sessions.get(i)
+    I s.session_id == session_id {
+        I s.is_expired(now) {
+            R Session.new("", "", 0, 0)
+        }
+        R s
+    }
+    session_find_full(sessions, session_id, now, i + 1)
+}
+
+# Remove a session by ID from the vector; builds a new Vec without that entry.
+F session_remove(sessions: Vec<Session>, session_id: str, i: i64, acc: Vec<Session>) -> Vec<Session> {
+    I i >= sessions.len() { R acc }
+    s := sessions.get(i)
+    I s.session_id != session_id {
+        acc.push(s)
+    }
+    session_remove(sessions, session_id, i + 1, acc)
+}
+
+# Keep only live sessions.
+F session_filter_live(sessions: Vec<Session>, now: i64, i: i64, acc: Vec<Session>) -> Vec<Session> {
+    I i >= sessions.len() { R acc }
+    s := sessions.get(i)
+    I !s.is_expired(now) {
+        acc.push(s)
+    }
+    session_filter_live(sessions, now, i + 1, acc)
+}
+
+# Update the data bag on the matching session.
+F session_update_data(sessions: Vec<Session>, session_id: str, key: str, value: str, i: i64) -> Vec<Session> {
+    I i >= sessions.len() { R sessions }
+    s := sessions.get(i)
+    I s.session_id == session_id {
+        sessions.set(i, s.set_value(key, value))
+        R sessions
+    }
+    session_update_data(sessions, session_id, key, value, i + 1)
+}
+
+# Find a value by key in a data bag.
+F session_find_value(data: Vec<SessionEntry>, key: str, i: i64) -> str {
+    I i >= data.len() { R "" }
+    entry := data.get(i)
+    I entry.key == key { R entry.value }
+    session_find_value(data, key, i + 1)
+}
+
+# Insert or update a key in the data bag (recursive, builds no new Vec).
+F session_upsert(data: Vec<SessionEntry>, key: str, value: str, i: i64) -> Vec<SessionEntry> {
+    I i >= data.len() {
+        data.push(SessionEntry.new(key, value))
+        R data
+    }
+    entry := data.get(i)
+    I entry.key == key {
+        data.set(i, SessionEntry.new(key, value))
+        R data
+    }
+    session_upsert(data, key, value, i + 1)
+}
+
+# ============================================================================
+# Numeric utilities
+# ============================================================================
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch    := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F current_time_sec() -> i64

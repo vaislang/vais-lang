@@ -1,0 +1,216 @@
+# WebSocket Message Types
+# Wire-level framing (WsFrame) and application-level message (WsMessage)
+
+U std/string
+U std/vec
+
+# ============================================================================
+# MessageType — application-level message classification
+# ============================================================================
+
+E MessageType {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+# ============================================================================
+# WsMessage — application-level WebSocket message
+# ============================================================================
+
+S WsMessage {
+    msg_type: MessageType,
+    payload:  str,
+}
+
+X WsMessage {
+    # Construct a Text message
+    F text(payload: str) -> WsMessage {
+        WsMessage {
+            msg_type: MessageType.Text,
+            payload:  payload,
+        }
+    }
+
+    # Construct a Binary message
+    F binary(payload: str) -> WsMessage {
+        WsMessage {
+            msg_type: MessageType.Binary,
+            payload:  payload,
+        }
+    }
+
+    # Construct a Ping message
+    F ping(payload: str) -> WsMessage {
+        WsMessage {
+            msg_type: MessageType.Ping,
+            payload:  payload,
+        }
+    }
+
+    # Construct a Pong message
+    F pong(payload: str) -> WsMessage {
+        WsMessage {
+            msg_type: MessageType.Pong,
+            payload:  payload,
+        }
+    }
+
+    # Construct a Close message with optional reason
+    F close(reason: str) -> WsMessage {
+        WsMessage {
+            msg_type: MessageType.Close,
+            payload:  reason,
+        }
+    }
+
+    # Returns true when the message carries UTF-8 text data
+    F is_text(self) -> bool {
+        self.msg_type == MessageType.Text
+    }
+
+    # Returns true when the message carries raw binary data
+    F is_binary(self) -> bool {
+        self.msg_type == MessageType.Binary
+    }
+
+    # Returns true when the message is a ping control frame
+    F is_ping(self) -> bool {
+        self.msg_type == MessageType.Ping
+    }
+
+    # Returns true when the message is a pong control frame
+    F is_pong(self) -> bool {
+        self.msg_type == MessageType.Pong
+    }
+
+    # Returns true when the message signals connection close
+    F is_close(self) -> bool {
+        self.msg_type == MessageType.Close
+    }
+
+    # Human-readable representation for logging
+    F to_string(self) -> str {
+        M self.msg_type {
+            MessageType.Text   => { "Text({self.payload})" },
+            MessageType.Binary => { "Binary(len={self.payload})" },
+            MessageType.Ping   => { "Ping({self.payload})" },
+            MessageType.Pong   => { "Pong({self.payload})" },
+            MessageType.Close  => { "Close({self.payload})" },
+        }
+    }
+}
+
+# ============================================================================
+# WsFrame — wire-protocol framing unit (RFC 6455)
+#
+# opcode values (RFC 6455 §11.8):
+#   0  = Continuation
+#   1  = Text
+#   2  = Binary
+#   8  = Close
+#   9  = Ping
+#   10 = Pong
+# ============================================================================
+
+C WS_OPCODE_CONTINUATION: i64 = 0
+C WS_OPCODE_TEXT:         i64 = 1
+C WS_OPCODE_BINARY:       i64 = 2
+C WS_OPCODE_CLOSE:        i64 = 8
+C WS_OPCODE_PING:         i64 = 9
+C WS_OPCODE_PONG:         i64 = 10
+
+S WsFrame {
+    opcode:   i64,
+    payload:  str,
+    is_final: bool,
+}
+
+X WsFrame {
+    # Generic constructor
+    F new(opcode: i64, payload: str, is_final: bool) -> WsFrame {
+        WsFrame {
+            opcode:   opcode,
+            payload:  payload,
+            is_final: is_final,
+        }
+    }
+
+    # Create a final text frame
+    F text(payload: str) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_TEXT,
+            payload:  payload,
+            is_final: true,
+        }
+    }
+
+    # Create a final binary frame
+    F binary(payload: str) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_BINARY,
+            payload:  payload,
+            is_final: true,
+        }
+    }
+
+    # Create a ping control frame (always final)
+    F ping(payload: str) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_PING,
+            payload:  payload,
+            is_final: true,
+        }
+    }
+
+    # Create a pong control frame (always final)
+    F pong(payload: str) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_PONG,
+            payload:  payload,
+            is_final: true,
+        }
+    }
+
+    # Create a close control frame
+    F close(reason: str) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_CLOSE,
+            payload:  reason,
+            is_final: true,
+        }
+    }
+
+    # Continuation frame (fragment, non-final by default)
+    F continuation(payload: str, is_final: bool) -> WsFrame {
+        WsFrame {
+            opcode:   WS_OPCODE_CONTINUATION,
+            payload:  payload,
+            is_final: is_final,
+        }
+    }
+
+    # Convert a WsFrame to a WsMessage (best-effort; continuation frames become Binary)
+    F to_message(self) -> WsMessage {
+        I self.opcode == WS_OPCODE_TEXT {
+            WsMessage.text(self.payload)
+        } E I self.opcode == WS_OPCODE_BINARY {
+            WsMessage.binary(self.payload)
+        } E I self.opcode == WS_OPCODE_PING {
+            WsMessage.ping(self.payload)
+        } E I self.opcode == WS_OPCODE_PONG {
+            WsMessage.pong(self.payload)
+        } E I self.opcode == WS_OPCODE_CLOSE {
+            WsMessage.close(self.payload)
+        } E {
+            WsMessage.binary(self.payload)
+        }
+    }
+
+    # True when this frame is a control frame (Close/Ping/Pong)
+    F is_control(self) -> bool {
+        self.opcode == WS_OPCODE_CLOSE || self.opcode == WS_OPCODE_PING || self.opcode == WS_OPCODE_PONG
+    }
+}

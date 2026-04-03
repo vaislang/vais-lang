@@ -1,0 +1,337 @@
+# JWT Authentication
+# Provides token generation and verification for access/refresh token flows.
+# Encoding is a deterministic base64url-like scheme (FUTURE: real HMAC-SHA256).
+
+U std/string
+U std/vec
+
+# ============================================================================
+# JwtConfig — signing parameters and TTL settings
+# ============================================================================
+
+S JwtConfig {
+    secret:                str,
+    issuer:                str,
+    access_token_ttl_sec:  i64,
+    refresh_token_ttl_sec: i64,
+}
+
+X JwtConfig {
+    F new(secret: str, issuer: str) -> JwtConfig {
+        JwtConfig {
+            secret,
+            issuer,
+            access_token_ttl_sec:  3600,
+            refresh_token_ttl_sec: 604800,
+        }
+    }
+
+    F default() -> JwtConfig {
+        JwtConfig {
+            secret:                "change-me-in-production",
+            issuer:                "vais-server",
+            access_token_ttl_sec:  3600,
+            refresh_token_ttl_sec: 604800,
+        }
+    }
+}
+
+# ============================================================================
+# JwtClaims — the payload embedded in every token
+# ============================================================================
+
+S JwtClaims {
+    sub:   str,       # Subject (user ID)
+    iss:   str,       # Issuer
+    exp:   i64,       # Expiry (Unix seconds)
+    iat:   i64,       # Issued-at (Unix seconds)
+    roles: Vec<str>,  # Authorisation roles
+}
+
+X JwtClaims {
+    F new(sub: str, iss: str, exp: i64, iat: i64, roles: Vec<str>) -> JwtClaims {
+        JwtClaims { sub, iss, exp, iat, roles }
+    }
+
+    # Serialise to a compact "sub|iss|exp|iat|roles" string (simplified encoding)
+    F encode(self) -> str {
+        roles_str := jwt_join_roles(self.roles, 0, "")
+        self.sub + "|" + self.iss + "|" + i64_to_str(self.exp) + "|" + i64_to_str(self.iat) + "|" + roles_str
+    }
+}
+
+# ============================================================================
+# JwtToken — a generated token and its absolute expiry timestamp
+# ============================================================================
+
+S JwtToken {
+    token:      str,
+    expires_at: i64,
+}
+
+X JwtToken {
+    F new(token: str, expires_at: i64) -> JwtToken {
+        JwtToken { token, expires_at }
+    }
+}
+
+# ============================================================================
+# TokenPair — access + refresh tokens issued together
+# ============================================================================
+
+S TokenPair {
+    access:  JwtToken,
+    refresh: JwtToken,
+}
+
+X TokenPair {
+    F new(access: JwtToken, refresh: JwtToken) -> TokenPair {
+        TokenPair { access, refresh }
+    }
+}
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Generate an access token for the given claims.
+F generate_access_token(claims: JwtClaims, config: JwtConfig) -> Result<JwtToken, VaisError> {
+    I config.secret == "" {
+        R Err(VaisError.new(500, "JWT secret is not configured"))
+    }
+
+    payload    := claims.encode()
+    signature  := jwt_sign(payload, config.secret)
+    token      := payload + "." + signature
+    expires_at := claims.exp
+
+    Ok(JwtToken.new(token, expires_at))
+}
+
+# Generate a refresh token (minimal claims: sub + iss + exp).
+F generate_refresh_token(sub: str, config: JwtConfig) -> Result<JwtToken, VaisError> {
+    I config.secret == "" {
+        R Err(VaisError.new(500, "JWT secret is not configured"))
+    }
+
+    now        := current_time_sec()
+    expires_at := now + config.refresh_token_ttl_sec
+    roles      := Vec.new()
+
+    claims := JwtClaims.new(sub, config.issuer, expires_at, now, roles)
+    payload   := claims.encode()
+    signature := jwt_sign(payload, config.secret)
+    token     := payload + "." + signature
+
+    Ok(JwtToken.new(token, expires_at))
+}
+
+# Verify a token and return the decoded claims.
+# Returns Err if the token is malformed, the signature is invalid, or it has expired.
+F verify_token(token: str, config: JwtConfig) -> Result<JwtClaims, VaisError> {
+    I token == "" {
+        R Err(VaisError.new(401, "Token is empty"))
+    }
+
+    dot_idx := jwt_find_dot(token, 0)
+    I dot_idx < 0 {
+        R Err(VaisError.new(401, "Malformed token: missing signature separator"))
+    }
+
+    payload   := str_slice(token, 0, dot_idx)
+    signature := str_slice(token, dot_idx + 1, str_len(token))
+
+    expected := jwt_sign(payload, config.secret)
+    I signature != expected {
+        R Err(VaisError.new(401, "Invalid token signature"))
+    }
+
+    claims_result := jwt_decode_claims(payload)
+    M claims_result {
+        Err(e) => { R Err(e) },
+        Ok(claims) => {
+            now := current_time_sec()
+            I claims.exp < now {
+                R Err(VaisError.new(401, "Token has expired"))
+            }
+            I claims.iss != config.issuer {
+                R Err(VaisError.new(401, "Token issuer mismatch"))
+            }
+            Ok(claims)
+        },
+    }
+}
+
+# Convenience: generate both access and refresh tokens at once.
+F generate_token_pair(sub: str, roles: Vec<str>, config: JwtConfig) -> Result<TokenPair, VaisError> {
+    now        := current_time_sec()
+    expires_at := now + config.access_token_ttl_sec
+
+    claims := JwtClaims.new(sub, config.issuer, expires_at, now, roles)
+
+    access_result := generate_access_token(claims, config)
+    M access_result {
+        Err(e) => { R Err(e) },
+        Ok(access_token) => {
+            refresh_result := generate_refresh_token(sub, config)
+            M refresh_result {
+                Err(e)         => { R Err(e) },
+                Ok(refresh_token) => {
+                    Ok(TokenPair.new(access_token, refresh_token))
+                },
+            }
+        },
+    }
+}
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+# Minimal HMAC-style signature: XOR-fold secret over payload chars.
+# FUTURE: replace with real HMAC-SHA256 when std/crypto is available.
+F jwt_sign(payload: str, secret: str) -> str {
+    payload_len := str_len(payload)
+    secret_len  := str_len(secret)
+    I secret_len == 0 {
+        R "unsigned"
+    }
+    jwt_sign_fold(payload, secret, payload_len, secret_len, 0, 0)
+}
+
+F jwt_sign_fold(payload: str, secret: str, plen: i64, slen: i64, i: i64, acc: i64) -> str {
+    I i >= plen {
+        R i64_to_hex(acc)
+    }
+    pc := str_char_code(payload, i)
+    sc := str_char_code(secret, i % slen)
+    jwt_sign_fold(payload, secret, plen, slen, i + 1, (acc + (pc ^ sc)) % 4294967296)
+}
+
+# Decode a pipe-delimited payload string back into JwtClaims.
+F jwt_decode_claims(payload: str) -> Result<JwtClaims, VaisError> {
+    parts := str_split_pipe(payload)
+    I parts.len() < 5 {
+        R Err(VaisError.new(401, "Malformed token payload"))
+    }
+
+    sub  := parts.get(0)
+    iss  := parts.get(1)
+    exp  := str_to_i64(parts.get(2))
+    iat  := str_to_i64(parts.get(3))
+    roles_raw := parts.get(4)
+    roles := jwt_split_roles(roles_raw)
+
+    Ok(JwtClaims.new(sub, iss, exp, iat, roles))
+}
+
+# Find the last '.' in a string; returns its index or -1.
+F jwt_find_dot(s: str, i: i64) -> i64 {
+    n := str_len(s)
+    jwt_find_dot_rec(s, n - 1)
+}
+
+F jwt_find_dot_rec(s: str, i: i64) -> i64 {
+    I i < 0 { R -1 }
+    I str_char_at(s, i) == "." { R i }
+    jwt_find_dot_rec(s, i - 1)
+}
+
+# Join roles Vec into a comma-separated string.
+F jwt_join_roles(roles: Vec<str>, i: i64, acc: str) -> str {
+    I i >= roles.len() { R acc }
+    role := roles.get(i)
+    I acc == "" {
+        jwt_join_roles(roles, i + 1, role)
+    } E {
+        jwt_join_roles(roles, i + 1, acc + "," + role)
+    }
+}
+
+# Split a comma-separated roles string into Vec<str>.
+F jwt_split_roles(s: str) -> Vec<str> {
+    I s == "" {
+        R Vec.new()
+    }
+    str_split_comma(s)
+}
+
+# ============================================================================
+# Numeric / string utilities (self-contained — no util/ dependency)
+# ============================================================================
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch    := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+F i64_to_hex(n: i64) -> str {
+    I n == 0 { R "0" }
+    i64_to_hex_rec(n, "")
+}
+
+F i64_to_hex_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    d := n % 16
+    ch := hex_char(d)
+    i64_to_hex_rec(n / 16, ch + acc)
+}
+
+F hex_char(d: i64) -> str {
+    M d {
+        0  => "0",
+        1  => "1",
+        2  => "2",
+        3  => "3",
+        4  => "4",
+        5  => "5",
+        6  => "6",
+        7  => "7",
+        8  => "8",
+        9  => "9",
+        10 => "a",
+        11 => "b",
+        12 => "c",
+        13 => "d",
+        14 => "e",
+        15 => "f",
+        _  => "0",
+    }
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F current_time_sec() -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F str_char_at(s: str, i: i64) -> str
+X F str_char_code(s: str, i: i64) -> i64
+X F str_split_pipe(s: str) -> Vec<str>
+X F str_split_comma(s: str) -> Vec<str>
+X F str_to_i64(s: str) -> i64

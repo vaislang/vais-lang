@@ -1,0 +1,300 @@
+# WebSocket Server
+# WsServer manages connections and handles the HTTP→WebSocket upgrade flow.
+# WsConnection represents a single live WebSocket connection.
+# WsConfig holds all tunable server parameters.
+
+U std/string
+U std/vec
+U core/error
+U ws/message
+
+# ============================================================================
+# WsConfig — tunable parameters for the WebSocket server
+# ============================================================================
+
+S WsConfig {
+    max_connections:  i64,   # Maximum number of concurrent WebSocket connections
+    ping_interval_ms: i64,   # Interval between server-initiated pings, in milliseconds
+    max_message_size: i64,   # Maximum allowed inbound message size, in bytes
+}
+
+X WsConfig {
+    # Returns a sensible out-of-the-box configuration
+    F default() -> WsConfig {
+        WsConfig {
+            max_connections:  1000,
+            ping_interval_ms: 30000,
+            max_message_size: 65536,
+        }
+    }
+
+    # Validate all config fields; returns Err on the first violation found
+    F validate(self) -> Result<(), VaisServerError> {
+        I self.max_connections <= 0 {
+            R Err(VaisServerError.bad_request("max_connections must be greater than 0"))
+        }
+        I self.ping_interval_ms < 0 {
+            R Err(VaisServerError.bad_request("ping_interval_ms must be >= 0"))
+        }
+        I self.max_message_size <= 0 {
+            R Err(VaisServerError.bad_request("max_message_size must be greater than 0"))
+        }
+        Ok(())
+    }
+
+    # Returns true when heartbeat pings are enabled (interval > 0)
+    F heartbeat_enabled(self) -> bool {
+        self.ping_interval_ms > 0
+    }
+}
+
+# ============================================================================
+# ConnectionState — lifecycle state of a single WebSocket connection
+# ============================================================================
+
+E ConnectionState {
+    Connected,   # Handshake complete; frames may flow in both directions
+    Closing,     # Close handshake initiated; waiting for peer close frame
+    Closed,      # Connection fully closed; no further I/O
+}
+
+# ============================================================================
+# WsConnection — a single live WebSocket connection
+# ============================================================================
+
+S WsConnection {
+    conn_id:     i64,
+    state:       ConnectionState,
+    remote_addr: str,
+}
+
+X WsConnection {
+    # Create a new connection in the Connected state
+    F new(conn_id: i64, remote_addr: str) -> WsConnection {
+        WsConnection {
+            conn_id:     conn_id,
+            state:       ConnectionState.Connected,
+            remote_addr: remote_addr,
+        }
+    }
+
+    # Send a message to this connection.
+    # Returns Err when the connection is not in the Connected state.
+    F send(self, msg: WsMessage) -> Result<(), VaisServerError> {
+        M self.state {
+            ConnectionState.Connected => {
+                # FUTURE(std/ws_runtime): hand off msg to the I/O runtime
+                Ok(())
+            },
+            ConnectionState.Closing => {
+                Err(VaisServerError.new(1001, "Connection is closing", 400))
+            },
+            ConnectionState.Closed => {
+                Err(VaisServerError.new(1002, "Connection is closed", 400))
+            },
+        }
+    }
+
+    # Initiate a graceful close handshake.
+    # code:   WebSocket close status code (e.g. 1000 = normal closure)
+    # reason: human-readable reason string
+    F close(mut self, code: i64, reason: str) -> Result<(), VaisServerError> {
+        M self.state {
+            ConnectionState.Connected => {
+                self.state = ConnectionState.Closing
+                close_msg := WsMessage.close(reason)
+                # FUTURE(std/ws_runtime): deliver close frame with code
+                Ok(())
+            },
+            ConnectionState.Closing => {
+                # Already closing — no-op
+                Ok(())
+            },
+            ConnectionState.Closed => {
+                Err(VaisServerError.new(1003, "Connection already closed", 400))
+            },
+        }
+    }
+
+    # Send a ping frame to the peer (heartbeat)
+    F ping(self, payload: str) -> Result<(), VaisServerError> {
+        self.send(WsMessage.ping(payload))
+    }
+
+    # Send a pong frame in response to a ping
+    F pong(self, payload: str) -> Result<(), VaisServerError> {
+        self.send(WsMessage.pong(payload))
+    }
+
+    # Returns true when the connection is in the Connected state
+    F is_connected(self) -> bool {
+        self.state == ConnectionState.Connected
+    }
+
+    # Returns true when the connection has been fully closed
+    F is_closed(self) -> bool {
+        self.state == ConnectionState.Closed
+    }
+}
+
+# ============================================================================
+# ConnectionEntry — internal conn_id→connection record stored in WsServer
+# ============================================================================
+
+S ConnectionEntry {
+    conn_id:    i64,
+    connection: WsConnection,
+}
+
+X ConnectionEntry {
+    F new(conn: WsConnection) -> ConnectionEntry {
+        ConnectionEntry {
+            conn_id:    conn.conn_id,
+            connection: conn,
+        }
+    }
+}
+
+# ============================================================================
+# WsServer — manages all WebSocket connections and the upgrade protocol
+# ============================================================================
+
+S WsServer {
+    config:      WsConfig,
+    connections: Vec<ConnectionEntry>,
+    next_id:     i64,
+}
+
+X WsServer {
+    # Create a new WsServer with the given configuration
+    F new(config: WsConfig) -> WsServer {
+        WsServer {
+            config:      config,
+            connections: Vec.new(),
+            next_id:     1,
+        }
+    }
+
+    # Create a WsServer with default configuration
+    F default() -> WsServer {
+        WsServer.new(WsConfig.default())
+    }
+
+    # -------------------------------------------------------------------------
+    # Connection lifecycle
+    # -------------------------------------------------------------------------
+
+    # Perform the HTTP→WebSocket upgrade for an incoming request.
+    # Allocates a new WsConnection, registers it, and returns it.
+    # Returns Err when the connection limit has been reached.
+    F upgrade_request(mut self, remote_addr: str) -> Result<WsConnection, VaisServerError> {
+        active := self._active_count()
+        I active >= self.config.max_connections {
+            R Err(VaisServerError.new(1008, "Connection limit reached", 503))
+        }
+
+        conn_id := self.next_id
+        self.next_id += 1
+
+        conn  := WsConnection.new(conn_id, remote_addr)
+        entry := ConnectionEntry.new(conn)
+        self.connections.push(entry)
+
+        # FUTURE(std/ws_runtime): send 101 Switching Protocols response with
+        # required headers (Upgrade, Connection, Sec-WebSocket-Accept).
+
+        R Ok(conn)
+    }
+
+    # Mark a connection as Closed and remove it from the active pool.
+    F remove_connection(mut self, conn_id: i64) {
+        new_conns := mut Vec.new()
+        i := mut 0
+        L i < self.connections.len() {
+            entry := self.connections.get(i)
+            I entry.conn_id != conn_id {
+                new_conns.push(entry)
+            }
+            i += 1
+        }
+        self.connections = new_conns
+    }
+
+    # Retrieve a connection by conn_id.
+    # Returns a default closed connection when the id is not found.
+    F get_connection(self, conn_id: i64) -> WsConnection {
+        i := mut 0
+        L i < self.connections.len() {
+            entry := self.connections.get(i)
+            I entry.conn_id == conn_id {
+                R entry.connection
+            }
+            i += 1
+        }
+        # Return a sentinel closed connection
+        closed := mut WsConnection.new(conn_id, "")
+        closed.state = ConnectionState.Closed
+        closed
+    }
+
+    # Returns true when a connection with the given id exists in the pool
+    F has_connection(self, conn_id: i64) -> bool {
+        i := mut 0
+        L i < self.connections.len() {
+            entry := self.connections.get(i)
+            I entry.conn_id == conn_id {
+                R true
+            }
+            i += 1
+        }
+        false
+    }
+
+    # -------------------------------------------------------------------------
+    # Heartbeat (ping/pong)
+    # -------------------------------------------------------------------------
+
+    # Send a ping to all currently Connected peers.
+    # Intended to be called on a timer at config.ping_interval_ms intervals.
+    # Returns the number of connections pinged.
+    F broadcast_ping(self, payload: str) -> i64 {
+        count := mut 0
+        i := mut 0
+        L i < self.connections.len() {
+            entry := self.connections.get(i)
+            I entry.connection.is_connected() {
+                entry.connection.ping(payload)
+                count += 1
+            }
+            i += 1
+        }
+        count
+    }
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
+
+    # Total number of tracked connection entries (including closing/closed)
+    F connection_count(self) -> i64 {
+        self.connections.len()
+    }
+
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    # Count connections that are in the Connected state
+    F _active_count(self) -> i64 {
+        count := mut 0
+        i := mut 0
+        L i < self.connections.len() {
+            entry := self.connections.get(i)
+            I entry.connection.is_connected() {
+                count += 1
+            }
+            i += 1
+        }
+        count
+    }
+}

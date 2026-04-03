@@ -1,0 +1,170 @@
+# Logger Middleware
+# Logs request start and completion.
+# Format: "[METHOD] /path -> STATUS (Xms)"
+
+U std/string
+U core/context
+U middleware/pipeline
+
+# ============================================================================
+# LogLevel
+# ============================================================================
+
+E LogLevel {
+    Info,
+    Debug,
+}
+
+# ============================================================================
+# LoggerConfig
+# ============================================================================
+
+S LoggerConfig {
+    level: LogLevel,
+}
+
+X LoggerConfig {
+    F default() -> LoggerConfig {
+        LoggerConfig { level: LogLevel.Info }
+    }
+
+    F debug() -> LoggerConfig {
+        LoggerConfig { level: LogLevel.Debug }
+    }
+}
+
+# ============================================================================
+# LoggerMiddleware
+# ============================================================================
+
+S LoggerMiddleware {
+    config: LoggerConfig,
+}
+
+X LoggerMiddleware {
+    F new(config: LoggerConfig) -> LoggerMiddleware {
+        LoggerMiddleware { config: config }
+    }
+
+    F default() -> LoggerMiddleware {
+        LoggerMiddleware.new(LoggerConfig.default())
+    }
+
+    # -------------------------------------------------------------------------
+    # before — log the incoming request and record the start timestamp
+    # -------------------------------------------------------------------------
+    F before(self, ctx: Context) -> BeforeResult {
+        level_str := logger_level_str(self.config.level)
+        println("[{level_str}] [{ctx.method}] {ctx.path} - request started")
+
+        # Store the start time (ms since epoch) in ctx.state for after()
+        # External runtime provides current_time_ms(); we embed it in state.
+        start_ms := current_time_ms()
+        start_str := i64_to_str(start_ms)
+        updated_ctx := ctx.set_state("start_ms=" + start_str)
+
+        # Return Next — pipeline continues with the updated context
+        BeforeResult.next()
+    }
+
+    # -------------------------------------------------------------------------
+    # after — log the completed request with status code and elapsed time
+    # -------------------------------------------------------------------------
+    F after(self, ctx: Context, response: Response) -> Response {
+        start_ms := logger_parse_start_ms(ctx.state)
+        end_ms   := current_time_ms()
+        elapsed  := end_ms - start_ms
+
+        status_str  := u16_to_str(response.status)
+        elapsed_str := i64_to_str(elapsed)
+        level_str   := logger_level_str(self.config.level)
+
+        println("[{level_str}] [{ctx.method}] {ctx.path} -> {status_str} ({elapsed_str}ms)")
+
+        response
+    }
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+F logger_level_str(level: LogLevel) -> str {
+    M level {
+        LogLevel.Info  => "INFO",
+        LogLevel.Debug => "DEBUG",
+    }
+}
+
+# Parse "start_ms=<number>" stored in ctx.state; returns 0 if missing/malformed
+F logger_parse_start_ms(state: str) -> i64 {
+    prefix := "start_ms="
+    prefix_len := str_len(prefix)
+    state_len  := str_len(state)
+
+    I state_len <= prefix_len {
+        R 0
+    }
+
+    head := str_slice(state, 0, prefix_len)
+    I head != prefix {
+        R 0
+    }
+
+    num_str := str_slice(state, prefix_len, state_len)
+    str_to_i64(num_str)
+}
+
+# Simple string -> i64 parser for non-negative integers
+F str_to_i64(s: str) -> i64 {
+    str_to_i64_rec(s, 0, 0)
+}
+
+F str_to_i64_rec(s: str, i: i64, acc: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0 { R acc }
+    digit := c - 48   # ASCII '0' = 48
+    I digit < 0 || digit > 9 { R acc }
+    str_to_i64_rec(s, i + 1, acc * 10 + digit)
+}
+
+# Minimal i64 -> str for elapsed time
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+# u16 -> str (status code is u16 in Response)
+F u16_to_str(n: u16) -> str {
+    i64_to_str(n)
+}
+
+# External runtime functions
+X F current_time_ms() -> i64
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str

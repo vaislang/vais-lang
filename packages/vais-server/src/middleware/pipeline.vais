@@ -1,0 +1,207 @@
+# Middleware Pipeline
+# Defines the MiddlewareHandler trait and Pipeline struct.
+# Execution order: before (index 0..N) -> handler -> after (index N..0, reversed)
+
+U std/vec
+U std/option
+U core/context
+
+# ============================================================================
+# MiddlewareResult — outcome of a before() call
+# ============================================================================
+
+E MiddlewareResult {
+    Next,       # Continue to the next middleware / handler
+    Respond,    # Short-circuit: use the attached response
+}
+
+S BeforeResult {
+    kind:     MiddlewareResult,
+    response: Response,
+}
+
+X BeforeResult {
+    # Signal that the pipeline should continue
+    F next() -> BeforeResult {
+        BeforeResult {
+            kind: MiddlewareResult.Next,
+            response: Response.empty(),
+        }
+    }
+
+    # Signal that the pipeline should short-circuit with this response
+    F respond(res: Response) -> BeforeResult {
+        BeforeResult {
+            kind: MiddlewareResult.Respond,
+            response: res,
+        }
+    }
+
+    F is_next(self) -> bool {
+        self.kind == MiddlewareResult.Next
+    }
+}
+
+# ============================================================================
+# MiddlewareHandler — interface every middleware must satisfy
+# ============================================================================
+
+# Each middleware implementation stores its own state in a dedicated struct.
+# The Pipeline calls before/after through handler-ID dispatch so that concrete
+# middleware types do not need to share a vtable (Vais has no trait objects).
+#
+# Concrete middlewares expose:
+#   F before(ctx: Context) -> BeforeResult
+#   F after(ctx: Context, response: Response) -> Response
+
+# ============================================================================
+# PipelineEntry — a slot in the pipeline (name only; dispatch is symbolic)
+# ============================================================================
+
+S PipelineEntry {
+    name: str,
+}
+
+X PipelineEntry {
+    F new(name: str) -> PipelineEntry {
+        PipelineEntry { name: name }
+    }
+}
+
+# ============================================================================
+# Pipeline — ordered collection of middleware entries
+# ============================================================================
+
+S Pipeline {
+    entries: Vec<PipelineEntry>,
+    count:   i64,
+}
+
+X Pipeline {
+    # Create an empty pipeline
+    F new() -> Pipeline {
+        Pipeline {
+            entries: Vec.with_capacity(16),
+            count:   0,
+        }
+    }
+
+    # Append a middleware by name
+    F add(mut self, name: str) -> Pipeline {
+        entry := PipelineEntry.new(name)
+        self.entries.push(entry)
+        self.count += 1
+        self
+    }
+
+    # Return the number of registered middlewares
+    F len(self) -> i64 {
+        self.count
+    }
+
+    # Retrieve the name at position i
+    F name_at(self, i: i64) -> str {
+        entry := self.entries.get(i)
+        entry.name
+    }
+
+    # -------------------------------------------------------------------------
+    # execute — run before(0..N) -> handler response -> after(N-1..0)
+    #
+    # Because Vais has no first-class function pointers in scope here, the
+    # caller passes the pre-computed handler response directly.  The pipeline
+    # is responsible only for the before/after wrapping logic.
+    #
+    # Usage pattern in the dispatcher:
+    #   1. Call pipeline.run_before(ctx) — returns (modified_ctx, early_response)
+    #   2. If no early response, invoke handler(ctx) -> handler_response
+    #   3. Call pipeline.run_after(ctx, handler_response) -> final_response
+    # -------------------------------------------------------------------------
+
+    # Run all before() hooks in order.
+    # Returns a BeforeResult: Next means continue, Respond means short-circuit.
+    # ctx is passed by value; modifications accumulate via set_header/set_state.
+    F run_before(self, ctx: Context) -> PipelineBeforeOutput {
+        pipeline_run_before(self, ctx, 0)
+    }
+
+    # Run all after() hooks in reverse order.
+    F run_after(self, ctx: Context, response: Response) -> Response {
+        pipeline_run_after(self, ctx, response, self.count - 1)
+    }
+}
+
+# ============================================================================
+# PipelineBeforeOutput — result of run_before
+# ============================================================================
+
+S PipelineBeforeOutput {
+    short_circuit: bool,   # true if a middleware returned Respond
+    response:      Response,
+    ctx:           Context,
+}
+
+X PipelineBeforeOutput {
+    F continue_with(ctx: Context) -> PipelineBeforeOutput {
+        PipelineBeforeOutput {
+            short_circuit: false,
+            response:      Response.empty(),
+            ctx:           ctx,
+        }
+    }
+
+    F stop_with(response: Response, ctx: Context) -> PipelineBeforeOutput {
+        PipelineBeforeOutput {
+            short_circuit: true,
+            response:      response,
+            ctx:           ctx,
+        }
+    }
+}
+
+# ============================================================================
+# Recursive helpers (Vais does not allow loops that mutate outer structs)
+# ============================================================================
+
+# Forward pass: index 0 .. pipeline.count-1
+F pipeline_run_before(pipeline: Pipeline, ctx: Context, i: i64) -> PipelineBeforeOutput {
+    I i >= pipeline.count {
+        R PipelineBeforeOutput.continue_with(ctx)
+    }
+
+    name := pipeline.name_at(i)
+    result := dispatch_before(name, ctx)
+
+    I result.is_next() {
+        pipeline_run_before(pipeline, ctx, i + 1)
+    } E {
+        PipelineBeforeOutput.stop_with(result.response, ctx)
+    }
+}
+
+# Reverse pass: index pipeline.count-1 .. 0
+F pipeline_run_after(pipeline: Pipeline, ctx: Context, response: Response, i: i64) -> Response {
+    I i < 0 {
+        R response
+    }
+
+    name := pipeline.name_at(i)
+    updated := dispatch_after(name, ctx, response)
+    pipeline_run_after(pipeline, ctx, updated, i - 1)
+}
+
+# ============================================================================
+# Dispatch stubs — concrete middleware modules register via these functions.
+# In production the runtime resolves names to concrete before/after calls.
+# These stubs provide a pass-through so the pipeline compiles stand-alone.
+# ============================================================================
+
+F dispatch_before(name: str, ctx: Context) -> BeforeResult {
+    # Resolved by the runtime dispatcher; default: pass through
+    BeforeResult.next()
+}
+
+F dispatch_after(name: str, ctx: Context, response: Response) -> Response {
+    # Resolved by the runtime dispatcher; default: pass through
+    response
+}

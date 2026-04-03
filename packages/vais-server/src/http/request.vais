@@ -1,0 +1,182 @@
+# HTTP Request
+# Represents an incoming HTTP request
+
+U std/vec
+U src/http/method
+U src/http/header
+
+S KVPair {
+    key:   str,
+    value: str,
+}
+
+S Request {
+    method:       HttpMethod,
+    path:         str,
+    headers:      Headers,
+    query_params: Vec<KVPair>,
+    path_params:  Vec<KVPair>,
+    body:         str,
+    raw_url:      str,
+}
+
+X Request {
+    # Create a new empty Request
+    F new(method: HttpMethod, path: str) -> Request {
+        Request {
+            method:       method,
+            path:         path,
+            headers:      Headers.new(),
+            query_params: Vec.with_capacity(8),
+            path_params:  Vec.with_capacity(8),
+            body:         "",
+            raw_url:      path,
+        }
+    }
+
+    # Parse query string from raw_url and populate query_params
+    # Expects raw_url of the form "/path?key=value&key2=value2"
+    F parse_query_string(mut self) -> Request {
+        qs := request_extract_query_string(self.raw_url)
+        self.query_params = parse_kv_pairs(qs, 38)
+        self
+    }
+
+    # Get a path parameter by name
+    # Returns empty string if not found
+    F get_param(self, name: str) -> str {
+        kv_vec_get(self.path_params, name)
+    }
+
+    # Get a query parameter by name
+    # Returns empty string if not found
+    F get_query(self, name: str) -> str {
+        kv_vec_get(self.query_params, name)
+    }
+
+    # Get a request header value by name
+    # Returns empty string if not found
+    F get_header(self, name: str) -> str {
+        self.headers.get(name)
+    }
+
+    # Get the Content-Type header value
+    F content_type(self) -> str {
+        self.headers.get(CONTENT_TYPE)
+    }
+
+    # Check if the request has a JSON content type
+    F is_json(self) -> i64 {
+        ct := self.content_type()
+        str_contains_substr(ct, "application/json")
+    }
+}
+
+# Extract the query string portion of a URL (after '?')
+F request_extract_query_string(url: str) -> str {
+    req_find_query_start(url, 0)
+}
+
+F req_find_query_start(url: str, i: i64) -> str {
+    c := str_char_at(url, i)
+    I c == 0 { "" }
+    E I c == 63 {
+        # 63 = '?'
+        str_slice(url, i + 1, str_len(url))
+    }
+    E { req_find_query_start(url, i + 1) }
+}
+
+# Parse a query/form-encoded string into a Vec<KVPair>
+# separator: ASCII code of the pair separator (38 = '&')
+F parse_kv_pairs(s: str, separator: i64) -> Vec<KVPair> {
+    pairs := Vec.with_capacity(8)
+    I s == "" {
+        R pairs
+    }
+    parse_kv_pairs_rec(s, separator, 0, 0, pairs)
+}
+
+F parse_kv_pairs_rec(s: str, sep: i64, start: i64, i: i64, pairs: Vec<KVPair>) -> Vec<KVPair> {
+    c := str_char_at(s, i)
+    I c == 0 {
+        # End of string — flush the last segment
+        segment := str_slice(s, start, i)
+        I segment != "" {
+            pair := parse_single_kv(segment)
+            pairs.push(pair)
+        }
+        pairs
+    } E I c == sep {
+        segment := str_slice(s, start, i)
+        I segment != "" {
+            pair := parse_single_kv(segment)
+            pairs.push(pair)
+        }
+        parse_kv_pairs_rec(s, sep, i + 1, i + 1, pairs)
+    } E {
+        parse_kv_pairs_rec(s, sep, start, i + 1, pairs)
+    }
+}
+
+# Parse "key=value" into a KVPair
+F parse_single_kv(segment: str) -> KVPair {
+    eq := req_find_eq(segment, 0)
+    I eq < 0 {
+        KVPair { key: segment, value: "" }
+    } E {
+        k := str_slice(segment, 0, eq)
+        v := str_slice(segment, eq + 1, str_len(segment))
+        KVPair { key: k, value: v }
+    }
+}
+
+F req_find_eq(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0 { 0 - 1 }
+    E I c == 61 { i }
+    E { req_find_eq(s, i + 1) }
+}
+
+# Look up a key in a Vec<KVPair>; returns value or empty string
+F kv_vec_get(vec: Vec<KVPair>, name: str) -> str {
+    kv_vec_get_rec(vec, name, 0)
+}
+
+F kv_vec_get_rec(vec: Vec<KVPair>, name: str, i: i64) -> str {
+    I i >= vec.len() { "" }
+    E {
+        pair := vec.get(i)
+        I pair.key == name { pair.value }
+        E { kv_vec_get_rec(vec, name, i + 1) }
+    }
+}
+
+# Check if string a contains string b as a substring
+F str_contains_substr(a: str, b: str) -> i64 {
+    str_contains_substr_rec(a, b, 0)
+}
+
+F str_contains_substr_rec(a: str, b: str, i: i64) -> i64 {
+    ca := str_char_at(a, i)
+    I ca == 0 { 0 }
+    E {
+        I str_match_prefix(a, i, b, 0) == 1 { 1 }
+        E { str_contains_substr_rec(a, b, i + 1) }
+    }
+}
+
+F str_match_prefix(a: str, ai: i64, b: str, bi: i64) -> i64 {
+    cb := str_char_at(b, bi)
+    I cb == 0 { 1 }
+    E {
+        ca := str_char_at(a, ai)
+        I ca != cb { 0 }
+        E { str_match_prefix(a, ai + 1, b, bi + 1) }
+    }
+}
+
+# External string helpers
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str

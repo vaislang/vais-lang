@@ -1,0 +1,229 @@
+# CORS Middleware
+# Handles Cross-Origin Resource Sharing headers and OPTIONS preflight responses.
+
+U std/vec
+U std/string
+U core/context
+U middleware/pipeline
+
+# ============================================================================
+# CorsConfig — configuration for allowed origins, methods, headers, etc.
+# ============================================================================
+
+S CorsConfig {
+    allowed_origins:     Vec<str>,
+    allowed_methods:     Vec<str>,
+    allowed_headers:     Vec<str>,
+    allow_credentials:   bool,
+    max_age:             i64,
+}
+
+X CorsConfig {
+    # Default: allow all origins (*), common methods and headers
+    F default() -> CorsConfig {
+        origins := Vec.new()
+        origins.push("*")
+
+        methods := Vec.new()
+        methods.push("GET")
+        methods.push("POST")
+        methods.push("PUT")
+        methods.push("DELETE")
+        methods.push("PATCH")
+        methods.push("OPTIONS")
+
+        headers := Vec.new()
+        headers.push("Content-Type")
+        headers.push("Authorization")
+        headers.push("Accept")
+
+        CorsConfig {
+            allowed_origins:   origins,
+            allowed_methods:   methods,
+            allowed_headers:   headers,
+            allow_credentials: false,
+            max_age:           86400,
+        }
+    }
+
+    # Convenience constructor for a restrictive single-origin config
+    F for_origin(origin: str) -> CorsConfig {
+        origins := Vec.new()
+        origins.push(origin)
+
+        methods := Vec.new()
+        methods.push("GET")
+        methods.push("POST")
+        methods.push("PUT")
+        methods.push("DELETE")
+        methods.push("PATCH")
+        methods.push("OPTIONS")
+
+        headers := Vec.new()
+        headers.push("Content-Type")
+        headers.push("Authorization")
+
+        CorsConfig {
+            allowed_origins:   origins,
+            allowed_methods:   methods,
+            allowed_headers:   headers,
+            allow_credentials: true,
+            max_age:           86400,
+        }
+    }
+}
+
+# ============================================================================
+# CorsMiddleware
+# ============================================================================
+
+S CorsMiddleware {
+    config: CorsConfig,
+}
+
+X CorsMiddleware {
+    F new(config: CorsConfig) -> CorsMiddleware {
+        CorsMiddleware { config: config }
+    }
+
+    # Shorthand: create with default (allow-all) config
+    F default() -> CorsMiddleware {
+        CorsMiddleware.new(CorsConfig.default())
+    }
+
+    # -------------------------------------------------------------------------
+    # before — inject CORS headers; short-circuit OPTIONS preflight
+    # -------------------------------------------------------------------------
+
+    F before(self, ctx: Context) -> BeforeResult {
+        origin_header := cors_get_origin(ctx)
+        allowed_origin := cors_resolve_origin(self.config, origin_header)
+
+        # Build a context with CORS headers appended
+        ctx2 := ctx.set_header("Access-Control-Allow-Origin", allowed_origin)
+        ctx3 := cors_set_methods_header(ctx2, self.config)
+        ctx4 := cors_set_headers_header(ctx3, self.config)
+        ctx5 := cors_set_credentials(ctx4, self.config)
+
+        # OPTIONS preflight — respond immediately with 204 No Content
+        I ctx.method == "OPTIONS" {
+            max_age_str := i64_to_str(self.config.max_age)
+            ctx6 := ctx5.set_header("Access-Control-Max-Age", max_age_str)
+            preflight := Response {
+                status:       204,
+                body:         "",
+                content_type: "text/plain",
+                headers:      ctx6.response_headers,
+                redirect_url: "",
+            }
+            R BeforeResult.respond(preflight)
+        }
+
+        BeforeResult.next()
+    }
+
+    # after — no-op; headers are already set on the context in before()
+    F after(self, ctx: Context, response: Response) -> Response {
+        response
+    }
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Extract the Origin header from the request context (stored in state or via
+# the request path — in this framework the raw headers are not directly on
+# Context, so we check state; the dispatcher sets ctx.state = origin value
+# when known, otherwise we use "*").
+F cors_get_origin(ctx: Context) -> str {
+    # The runtime populates ctx.state with the Origin header value when present.
+    # Fall back to empty string if not set.
+    I ctx.state == "" { "" } E { ctx.state }
+}
+
+# Determine which origin value to echo back.
+# If config allows "*" we always return "*".
+# Otherwise we check whether the request origin is in the allowed list.
+F cors_resolve_origin(config: CorsConfig, request_origin: str) -> str {
+    I config.allowed_origins.len() == 0 {
+        R "*"
+    }
+
+    first := config.allowed_origins.get(0)
+    I first == "*" {
+        R "*"
+    }
+
+    I cors_origin_allowed(config.allowed_origins, request_origin, 0) {
+        R request_origin
+    }
+
+    # Origin not in the list — return the first allowed origin as a safe default
+    first
+}
+
+F cors_origin_allowed(origins: Vec<str>, target: str, i: i64) -> bool {
+    I i >= origins.len() { R false }
+    I origins.get(i) == target { R true }
+    cors_origin_allowed(origins, target, i + 1)
+}
+
+# Join a Vec<str> with ", " separator
+F cors_join_vec(items: Vec<str>, i: i64, acc: str) -> str {
+    I i >= items.len() { R acc }
+    item := items.get(i)
+    I acc == "" {
+        cors_join_vec(items, i + 1, item)
+    } E {
+        cors_join_vec(items, i + 1, acc + ", " + item)
+    }
+}
+
+F cors_set_methods_header(ctx: Context, config: CorsConfig) -> Context {
+    methods_str := cors_join_vec(config.allowed_methods, 0, "")
+    ctx.set_header("Access-Control-Allow-Methods", methods_str)
+}
+
+F cors_set_headers_header(ctx: Context, config: CorsConfig) -> Context {
+    headers_str := cors_join_vec(config.allowed_headers, 0, "")
+    ctx.set_header("Access-Control-Allow-Headers", headers_str)
+}
+
+F cors_set_credentials(ctx: Context, config: CorsConfig) -> Context {
+    I config.allow_credentials {
+        ctx.set_header("Access-Control-Allow-Credentials", "true")
+    } E {
+        ctx
+    }
+}
+
+# Minimal i64 -> str conversion (positive integers only, used for max_age)
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}

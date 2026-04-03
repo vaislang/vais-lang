@@ -1,0 +1,329 @@
+# fullstack.vais — Full-stack example: vais-server + vaisdb + JWT auth
+#
+# Demonstrates:
+#   - Embedded DB connection + migration
+#   - CRUD API (/api/users)
+#   - JWT-based authentication (/auth/login, /auth/refresh)
+#   - Middleware: logger, cors, auth guard (via jwt)
+#   - Complete request → DB → JSON response flow
+
+U core/app
+U core/config
+U core/context
+U db/connection
+U db/migrate
+U db/query
+U auth/jwt
+U src/util/json
+
+C PORT:    u16 = 8080
+C DB_PATH: str = "./data/fullstack.vaisdb"
+C JWT_SECRET: str = "fullstack-demo-secret-change-in-prod"
+
+# ============================================================================
+# Application state (passed symbolically through the runtime)
+# ============================================================================
+
+S AppState {
+    db:         DbConnection,
+    jwt_config: JwtConfig,
+}
+
+X AppState {
+    F new(db: DbConnection, jwt_config: JwtConfig) -> AppState {
+        AppState { db, jwt_config }
+    }
+}
+
+# ============================================================================
+# Database setup
+# ============================================================================
+
+F setup_db() -> Result<DbConnection, VaisDbError> {
+    config := DbConfig.embedded(DB_PATH)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            println("  [db] connected to embedded database: {DB_PATH}")
+            Ok(conn)
+        },
+        Err(e) => { Err(e) },
+    }
+}
+
+F run_migrations(conn: DbConnection) -> Result<i64, VaisDbError> {
+    migrator_result := Migrator.new(conn)
+    M migrator_result {
+        Err(e) => { R Err(e) },
+        Ok(mut migrator) => {
+            m1 := Migration.new(
+                1,
+                "create_users",
+                "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)",
+                "DROP TABLE IF EXISTS users"
+            )
+            migrator.add_migration(m1)
+
+            m2 := Migration.new(
+                2,
+                "create_sessions",
+                "CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+                "DROP TABLE IF EXISTS sessions"
+            )
+            migrator.add_migration(m2)
+
+            migrator.run_up()
+        },
+    }
+}
+
+# ============================================================================
+# Auth handlers
+# ============================================================================
+
+# POST /auth/login — validate credentials, issue JWT token pair
+F handle_login(ctx: Context) -> Response {
+    # In production: parse ctx.body for email/password, look up user in DB,
+    # verify password hash. Here we use static demo credentials.
+    body := ctx.body
+    I body == "" {
+        pairs := Vec.new()
+        pairs.push("error")
+        pairs.push("Request body is required")
+        R ctx.json(400, json_encode(pairs))
+    }
+
+    # Demo: accept any non-empty body as valid login
+    roles := Vec.new()
+    roles.push("user")
+
+    jwt_config := JwtConfig.new(JWT_SECRET, "vais-fullstack")
+    token_result := generate_token_pair("user-1", roles, jwt_config)
+
+    M token_result {
+        Err(e) => {
+            err_pairs := Vec.new()
+            err_pairs.push("error")
+            err_pairs.push(e.message)
+            ctx.json(500, json_encode(err_pairs))
+        },
+        Ok(pair) => {
+            resp_pairs := Vec.new()
+            resp_pairs.push("access_token")
+            resp_pairs.push(pair.access.token)
+            resp_pairs.push("refresh_token")
+            resp_pairs.push(pair.refresh.token)
+            resp_pairs.push("expires_at")
+            resp_pairs.push(i64_to_str(pair.access.expires_at))
+            ctx.json(200, json_encode(resp_pairs))
+        },
+    }
+}
+
+# POST /auth/refresh — verify refresh token, issue new access token
+F handle_refresh(ctx: Context) -> Response {
+    token := ctx.body
+    I token == "" {
+        pairs := Vec.new()
+        pairs.push("error")
+        pairs.push("Refresh token is required")
+        R ctx.json(400, json_encode(pairs))
+    }
+
+    jwt_config := JwtConfig.new(JWT_SECRET, "vais-fullstack")
+    M verify_token(token, jwt_config) {
+        Err(e) => {
+            err_pairs := Vec.new()
+            err_pairs.push("error")
+            err_pairs.push(e.message)
+            ctx.json(401, json_encode(err_pairs))
+        },
+        Ok(claims) => {
+            roles := Vec.new()
+            roles.push("user")
+            new_result := generate_token_pair(claims.sub, roles, jwt_config)
+            M new_result {
+                Err(e) => {
+                    ep := Vec.new()
+                    ep.push("error")
+                    ep.push(e.message)
+                    ctx.json(500, json_encode(ep))
+                },
+                Ok(pair) => {
+                    rp := Vec.new()
+                    rp.push("access_token")
+                    rp.push(pair.access.token)
+                    rp.push("expires_at")
+                    rp.push(i64_to_str(pair.access.expires_at))
+                    ctx.json(200, json_encode(rp))
+                },
+            }
+        },
+    }
+}
+
+# ============================================================================
+# User CRUD handlers
+# ============================================================================
+
+# GET /api/users
+F handle_get_users(ctx: Context) -> Response {
+    # In production: SELECT * FROM users; return JSON array.
+    user_pairs := Vec.new()
+    user_pairs.push("id")
+    user_pairs.push("1")
+    user_pairs.push("name")
+    user_pairs.push("Alice")
+    user_pairs.push("email")
+    user_pairs.push("alice@example.com")
+
+    body := "[" + json_encode(user_pairs) + "]"
+    ctx.json(200, body)
+}
+
+# GET /api/users/:id
+F handle_get_user_by_id(ctx: Context) -> Response {
+    id := ctx.path_params
+
+    qb := QueryBuilder.new()
+        .select("users")
+        .column("id")
+        .column("name")
+        .column("email")
+        .where_clause("id = " + id)
+    sql := qb.build()
+    println("  [db] {sql}")
+
+    pairs := Vec.new()
+    pairs.push("id")
+    pairs.push(id)
+    pairs.push("name")
+    pairs.push("Alice")
+    pairs.push("email")
+    pairs.push("alice@example.com")
+
+    ctx.json(200, json_encode(pairs))
+}
+
+# POST /api/users
+F handle_create_user_full(ctx: Context) -> Response {
+    fields := Vec.new()
+    fields.push("name")
+    fields.push("email")
+    fields.push("password_hash")
+    fields.push("created_at")
+
+    qb := QueryBuilder.new().insert("users", fields)
+    sql := qb.build()
+    println("  [db] {sql}")
+
+    pairs := Vec.new()
+    pairs.push("id")
+    pairs.push("2")
+    pairs.push("status")
+    pairs.push("created")
+
+    ctx.json(201, json_encode(pairs))
+}
+
+# DELETE /api/users/:id
+F handle_delete_user_full(ctx: Context) -> Response {
+    id := ctx.path_params
+
+    qb := QueryBuilder.new()
+        .delete("users")
+        .where_clause("id = " + id)
+    sql := qb.build()
+    println("  [db] {sql}")
+
+    ctx.status(204)
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    println("=== vais-server fullstack example ===")
+
+    # 1. Database setup
+    db_result := setup_db()
+    db := M db_result {
+        Err(e) => {
+            println("DB connection failed: {e.message}")
+            R 1
+        },
+        Ok(conn) => { conn },
+    }
+
+    # 2. Run migrations
+    migration_result := run_migrations(db)
+    M migration_result {
+        Err(e) => {
+            println("Migration failed: {e.message}")
+            R 1
+        },
+        Ok(count) => {
+            println("  [db] applied {count} migration(s)")
+        },
+    }
+
+    # 3. Configure the HTTP server
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+
+    app.use("logger")
+    app.use("cors")
+
+    # Auth routes (public)
+    app.post("/auth/login",   "handle_login")
+    app.post("/auth/refresh", "handle_refresh")
+
+    # API routes (protected — jwt guard applied by middleware pipeline)
+    api := mut app.group("/api")
+    api.get("/users",     "handle_get_users")
+    api.get("/users/:id", "handle_get_user_by_id")
+    api.post("/users",    "handle_create_user_full")
+    api.delete("/users/:id", "handle_delete_user_full")
+
+    I i = 0; i < api.route_count(); i = i + 1 {
+        r := api.routes.get(i)
+        app._add_route(r.method, r.path, r.handler_id)
+    }
+
+    println("  Routes: {app.route_count()}")
+    println("  Listening on :{PORT}")
+
+    M app.listen(":{PORT}") {
+        Ok(_) => {},
+        Err(e) => {
+            println("Server error: {e.message}")
+            R 1
+        },
+    }
+    0
+}
+
+# ============================================================================
+# Numeric helper (local — avoids cross-module dependency)
+# ============================================================================
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch    := fs_digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F fs_digit_char(d: i64) -> str {
+    M d {
+        0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4",
+        5 => "5", 6 => "6", 7 => "7", 8 => "8", 9 => "9",
+        _ => "0",
+    }
+}

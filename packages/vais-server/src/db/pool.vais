@@ -1,0 +1,214 @@
+# vaisdb Connection Pool
+# Manages a bounded set of DbConnections with acquire/release and health check
+
+U std/string
+U std/vec
+U db/connection
+
+# ============================================================================
+# PoolConfig — tuneable pool parameters
+# ============================================================================
+
+S PoolConfig {
+    min_connections: u32,
+    max_connections: u32,
+    idle_timeout_ms: u32,
+}
+
+X PoolConfig {
+    F new(min_connections: u32, max_connections: u32, idle_timeout_ms: u32) -> PoolConfig {
+        PoolConfig {
+            min_connections,
+            max_connections,
+            idle_timeout_ms,
+        }
+    }
+
+    F default() -> PoolConfig {
+        PoolConfig {
+            min_connections: 2,
+            max_connections: 10,
+            idle_timeout_ms: 30000,
+        }
+    }
+}
+
+# ============================================================================
+# PoolStats — snapshot of pool utilisation
+# ============================================================================
+
+S PoolStats {
+    active: i64,   # Connections currently in use by callers
+    idle: i64,     # Connections sitting in the pool, ready to use
+    total: i64,    # active + idle
+}
+
+X PoolStats {
+    F new(active: i64, idle: i64) -> PoolStats {
+        PoolStats {
+            active,
+            idle,
+            total: active + idle,
+        }
+    }
+
+    F to_string(self) -> str {
+        "PoolStats { active={self.active}, idle={self.idle}, total={self.total} }"
+    }
+}
+
+# ============================================================================
+# PoolEntry — internal wrapper that tracks whether a slot is in use
+# ============================================================================
+
+S PoolEntry {
+    conn: DbConnection,
+    in_use: i64,   # 0 = idle, 1 = acquired
+}
+
+X PoolEntry {
+    F new(conn: DbConnection) -> PoolEntry {
+        PoolEntry { conn, in_use: 0 }
+    }
+
+    F is_idle(self) -> bool {
+        self.in_use == 0
+    }
+}
+
+# ============================================================================
+# ConnectionPool — bounded connection pool
+# ============================================================================
+
+S ConnectionPool {
+    db_config: DbConfig,
+    pool_config: PoolConfig,
+    entries: Vec<PoolEntry>,
+    active_count: i64,
+}
+
+X ConnectionPool {
+    # Create a pool and pre-open min_connections connections.
+    F new(db_config: DbConfig, pool_config: PoolConfig) -> Result<ConnectionPool, VaisDbError> {
+        I pool_config.min_connections > pool_config.max_connections {
+            R Err(VaisDbError.new(3001, "min_connections must not exceed max_connections"))
+        }
+        I pool_config.max_connections == 0 {
+            R Err(VaisDbError.new(3002, "max_connections must be greater than 0"))
+        }
+
+        entries := mut Vec.new()
+
+        # Pre-open min_connections connections
+        I i = 0; i < pool_config.min_connections; i = i + 1 {
+            M DbConnection.connect(db_config) {
+                Ok(conn) => {
+                    entry := PoolEntry.new(conn)
+                    entries.push(entry)
+                },
+                Err(e) => {
+                    R Err(e)
+                },
+            }
+        }
+
+        pool := ConnectionPool {
+            db_config,
+            pool_config,
+            entries,
+            active_count: 0,
+        }
+        Ok(pool)
+    }
+
+    # Acquire an idle connection from the pool.
+    # If no idle connection is available and the pool has not reached
+    # max_connections, a new connection is opened.
+    F acquire(mut self) -> Result<DbConnection, VaisDbError> {
+        # Look for an idle entry
+        I i = 0; i < self.entries.len(); i = i + 1 {
+            entry := self.entries.get(i)
+            I entry.is_idle() {
+                entry.in_use = 1
+                self.active_count = self.active_count + 1
+                R Ok(entry.conn)
+            }
+        }
+
+        # No idle connection found — try to open a new one if below cap
+        total := self.entries.len()
+        I total < self.pool_config.max_connections {
+            M DbConnection.connect(self.db_config) {
+                Ok(conn) => {
+                    # Keep a copy to return; add an in-use entry to the pool
+                    new_entry := PoolEntry {
+                        conn,
+                        in_use: 1,
+                    }
+                    self.entries.push(new_entry)
+                    self.active_count = self.active_count + 1
+                    R Ok(conn)
+                },
+                Err(e) => {
+                    R Err(e)
+                },
+            }
+        }
+
+        Err(VaisDbError.new(3003, "Connection pool exhausted — all connections are in use"))
+    }
+
+    # Return a previously acquired connection to the pool.
+    F release(mut self, conn: DbConnection) {
+        I i = 0; i < self.entries.len(); i = i + 1 {
+            entry := self.entries.get(i)
+            I entry.conn.conn_id == conn.conn_id {
+                entry.in_use = 0
+                I self.active_count > 0 {
+                    self.active_count = self.active_count - 1
+                }
+                R
+            }
+        }
+    }
+
+    # Verify each idle connection is still alive; remove dead ones.
+    # A ping is simulated via execute("SELECT 1").
+    F health_check(mut self) {
+        I i = 0; i < self.entries.len(); i = i + 1 {
+            entry := self.entries.get(i)
+            I entry.is_idle() {
+                M entry.conn.execute("SELECT 1") {
+                    Ok(_) => {},
+                    Err(_) => {
+                        # Remove stale entry — replace with a fresh connection
+                        M DbConnection.connect(self.db_config) {
+                            Ok(fresh) => {
+                                entry.conn = fresh
+                            },
+                            Err(_) => {
+                                entry.conn.close()
+                            },
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    # Return a point-in-time snapshot of pool utilisation.
+    F stats(self) -> PoolStats {
+        idle := self.entries.len() - self.active_count
+        PoolStats.new(self.active_count, idle)
+    }
+
+    # Close all connections and empty the pool.
+    F close_all(mut self) {
+        I i = 0; i < self.entries.len(); i = i + 1 {
+            entry := self.entries.get(i)
+            entry.conn.close()
+        }
+        self.entries = Vec.new()
+        self.active_count = 0
+    }
+}

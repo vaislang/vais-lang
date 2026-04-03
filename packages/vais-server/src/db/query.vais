@@ -1,0 +1,434 @@
+# vaisdb Query Builder
+# Hybrid query builder covering SQL, VECTOR_SEARCH, GRAPH_TRAVERSE, FULLTEXT_MATCH
+
+U std/string
+U std/vec
+
+# ============================================================================
+# SortDirection — ORDER BY direction
+# ============================================================================
+
+E SortDirection {
+    Asc,
+    Desc,
+}
+
+# ============================================================================
+# QueryKind — tracks what type of specialised clause is active
+# ============================================================================
+
+E QueryKind {
+    Standard,
+    VectorSearch,
+    GraphTraverse,
+    FulltextMatch,
+}
+
+# ============================================================================
+# JoinEntry — a single JOIN clause
+# ============================================================================
+
+S JoinEntry {
+    table: str,
+    on_clause: str,
+}
+
+X JoinEntry {
+    F new(table: str, on_clause: str) -> JoinEntry {
+        JoinEntry { table, on_clause }
+    }
+}
+
+# ============================================================================
+# OrderEntry — a single ORDER BY term
+# ============================================================================
+
+S OrderEntry {
+    field: str,
+    direction: SortDirection,
+}
+
+X OrderEntry {
+    F new(field: str, direction: SortDirection) -> OrderEntry {
+        OrderEntry { field, direction }
+    }
+
+    F to_string(self) -> str {
+        M self.direction {
+            SortDirection.Asc  => { "{self.field} ASC" },
+            SortDirection.Desc => { "{self.field} DESC" },
+        }
+    }
+}
+
+# ============================================================================
+# QueryBuilder — fluent builder producing vaisdb SQL / hybrid query strings
+# ============================================================================
+
+S QueryBuilder {
+    kind: QueryKind,
+
+    # SELECT state
+    from_table: str,
+    columns: Vec<str>,
+    where_conditions: Vec<str>,
+    joins: Vec<JoinEntry>,
+    order_entries: Vec<OrderEntry>,
+    limit_val: i64,    # -1 = no limit
+
+    # INSERT / UPDATE / DELETE state
+    dml_table: str,
+    dml_fields: Vec<str>,   # "col=val" pairs for INSERT/UPDATE
+
+    # VECTOR_SEARCH state
+    vector_column: str,
+    vector_literal: str,   # "[0.1, 0.2, ...]"
+    vector_top_k: i64,
+
+    # GRAPH_TRAVERSE state
+    graph_start: str,
+    graph_depth: i64,
+    graph_direction: str,   # "outbound" | "inbound" | "any"
+
+    # FULLTEXT_MATCH state
+    fulltext_column: str,
+    fulltext_query: str,
+}
+
+X QueryBuilder {
+    # Create a blank builder
+    F new() -> QueryBuilder {
+        QueryBuilder {
+            kind: QueryKind.Standard,
+
+            from_table: "",
+            columns: Vec.new(),
+            where_conditions: Vec.new(),
+            joins: Vec.new(),
+            order_entries: Vec.new(),
+            limit_val: -1,
+
+            dml_table: "",
+            dml_fields: Vec.new(),
+
+            vector_column: "",
+            vector_literal: "",
+            vector_top_k: 10,
+
+            graph_start: "",
+            graph_depth: 1,
+            graph_direction: "outbound",
+
+            fulltext_column: "",
+            fulltext_query: "",
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # SELECT helpers
+    # -------------------------------------------------------------------------
+
+    # Set the FROM table and switch to Standard SELECT mode
+    F select(mut self, table: str) -> QueryBuilder {
+        self.kind = QueryKind.Standard
+        self.from_table = table
+        self
+    }
+
+    # Append a column to the SELECT list
+    F column(mut self, col: str) -> QueryBuilder {
+        self.columns.push(col)
+        self
+    }
+
+    # Add a WHERE condition (ANDed together at build time)
+    F where_clause(mut self, condition: str) -> QueryBuilder {
+        self.where_conditions.push(condition)
+        self
+    }
+
+    # Add a JOIN clause
+    F join(mut self, table: str, on: str) -> QueryBuilder {
+        entry := JoinEntry.new(table, on)
+        self.joins.push(entry)
+        self
+    }
+
+    # Add an ORDER BY term
+    F order_by(mut self, field: str, direction: SortDirection) -> QueryBuilder {
+        entry := OrderEntry.new(field, direction)
+        self.order_entries.push(entry)
+        self
+    }
+
+    # Set a LIMIT
+    F limit(mut self, n: i64) -> QueryBuilder {
+        self.limit_val = n
+        self
+    }
+
+    # -------------------------------------------------------------------------
+    # DML helpers
+    # -------------------------------------------------------------------------
+
+    # Prepare an INSERT statement
+    F insert(mut self, table: str, fields: Vec<str>) -> QueryBuilder {
+        self.dml_table = table
+        self.dml_fields = fields
+        self.kind = QueryKind.Standard
+        self
+    }
+
+    # Prepare an UPDATE statement
+    F update(mut self, table: str, fields: Vec<str>) -> QueryBuilder {
+        self.dml_table = table
+        self.dml_fields = fields
+        self.kind = QueryKind.Standard
+        self
+    }
+
+    # Prepare a DELETE statement
+    F delete(mut self, table: str) -> QueryBuilder {
+        self.dml_table = table
+        self.kind = QueryKind.Standard
+        self
+    }
+
+    # -------------------------------------------------------------------------
+    # Specialised vaisdb query helpers
+    # -------------------------------------------------------------------------
+
+    # Configure a VECTOR_SEARCH clause
+    F vector_search(mut self, column: str, vector: str, top_k: i64) -> QueryBuilder {
+        self.kind = QueryKind.VectorSearch
+        self.vector_column = column
+        self.vector_literal = vector
+        self.vector_top_k = top_k
+        self
+    }
+
+    # Configure a GRAPH_TRAVERSE clause
+    F graph_traverse(mut self, start: str, depth: i64, direction: str) -> QueryBuilder {
+        self.kind = QueryKind.GraphTraverse
+        self.graph_start = start
+        self.graph_depth = depth
+        self.graph_direction = direction
+        self
+    }
+
+    # Configure a FULLTEXT_MATCH clause
+    F fulltext_match(mut self, column: str, query: str) -> QueryBuilder {
+        self.kind = QueryKind.FulltextMatch
+        self.fulltext_column = column
+        self.fulltext_query = query
+        self
+    }
+
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    F _build_column_list(self) -> str {
+        I self.columns.len() == 0 {
+            R "*"
+        }
+        result := mut ""
+        I i = 0; i < self.columns.len(); i = i + 1 {
+            I i > 0 {
+                result = result + ", "
+            }
+            result = result + self.columns.get(i)
+        }
+        result
+    }
+
+    F _build_where(self) -> str {
+        I self.where_conditions.len() == 0 {
+            R ""
+        }
+        clause := mut "WHERE "
+        I i = 0; i < self.where_conditions.len(); i = i + 1 {
+            I i > 0 {
+                clause = clause + " AND "
+            }
+            clause = clause + self.where_conditions.get(i)
+        }
+        clause
+    }
+
+    F _build_joins(self) -> str {
+        result := mut ""
+        I i = 0; i < self.joins.len(); i = i + 1 {
+            entry := self.joins.get(i)
+            result = result + " JOIN " + entry.table + " ON " + entry.on_clause
+        }
+        result
+    }
+
+    F _build_order(self) -> str {
+        I self.order_entries.len() == 0 {
+            R ""
+        }
+        clause := mut "ORDER BY "
+        I i = 0; i < self.order_entries.len(); i = i + 1 {
+            I i > 0 {
+                clause = clause + ", "
+            }
+            clause = clause + self.order_entries.get(i).to_string()
+        }
+        clause
+    }
+
+    F _build_limit(self) -> str {
+        I self.limit_val >= 0 {
+            "LIMIT {self.limit_val}"
+        } E {
+            ""
+        }
+    }
+
+    F _build_select(self) -> str {
+        sql := mut "SELECT "
+        sql = sql + self._build_column_list()
+        sql = sql + " FROM " + self.from_table
+        sql = sql + self._build_joins()
+        where_str := self._build_where()
+        I where_str != "" {
+            sql = sql + " " + where_str
+        }
+        order_str := self._build_order()
+        I order_str != "" {
+            sql = sql + " " + order_str
+        }
+        limit_str := self._build_limit()
+        I limit_str != "" {
+            sql = sql + " " + limit_str
+        }
+        sql
+    }
+
+    F _build_insert(self) -> str {
+        cols := mut ""
+        vals := mut ""
+        I i = 0; i < self.dml_fields.len(); i = i + 1 {
+            I i > 0 {
+                cols = cols + ", "
+                vals = vals + ", "
+            }
+            cols = cols + self.dml_fields.get(i)
+            vals = vals + "?"
+        }
+        "INSERT INTO {self.dml_table} ({cols}) VALUES ({vals})"
+    }
+
+    F _build_update(self) -> str {
+        sets := mut ""
+        I i = 0; i < self.dml_fields.len(); i = i + 1 {
+            I i > 0 {
+                sets = sets + ", "
+            }
+            sets = sets + self.dml_fields.get(i) + " = ?"
+        }
+        sql := mut "UPDATE {self.dml_table} SET {sets}"
+        where_str := self._build_where()
+        I where_str != "" {
+            sql = sql + " " + where_str
+        }
+        sql
+    }
+
+    F _build_delete(self) -> str {
+        sql := mut "DELETE FROM {self.dml_table}"
+        where_str := self._build_where()
+        I where_str != "" {
+            sql = sql + " " + where_str
+        }
+        sql
+    }
+
+    F _build_vector_search(self) -> str {
+        sql := mut "SELECT "
+        sql = sql + self._build_column_list()
+        sql = sql + " FROM " + self.from_table
+        sql = sql + " WHERE VECTOR_SEARCH({self.vector_column}, {self.vector_literal}, {self.vector_top_k})"
+        where_str := self._build_where()
+        # Append additional WHERE conditions if present
+        I where_str != "" {
+            sql = sql + " AND " + self.where_conditions.get(0)
+        }
+        limit_str := self._build_limit()
+        I limit_str != "" {
+            sql = sql + " " + limit_str
+        }
+        sql
+    }
+
+    F _build_graph_traverse(self) -> str {
+        sql := mut "SELECT "
+        sql = sql + self._build_column_list()
+        sql = sql + " FROM GRAPH_TRAVERSE('{self.graph_start}', {self.graph_depth}, '{self.graph_direction}')"
+        where_str := self._build_where()
+        I where_str != "" {
+            sql = sql + " " + where_str
+        }
+        order_str := self._build_order()
+        I order_str != "" {
+            sql = sql + " " + order_str
+        }
+        limit_str := self._build_limit()
+        I limit_str != "" {
+            sql = sql + " " + limit_str
+        }
+        sql
+    }
+
+    F _build_fulltext_match(self) -> str {
+        sql := mut "SELECT "
+        sql = sql + self._build_column_list()
+        sql = sql + " FROM " + self.from_table
+        sql = sql + " WHERE FULLTEXT_MATCH({self.fulltext_column}, '{self.fulltext_query}')"
+        where_str := self._build_where()
+        I where_str != "" {
+            sql = sql + " AND " + self.where_conditions.get(0)
+        }
+        order_str := self._build_order()
+        I order_str != "" {
+            sql = sql + " " + order_str
+        }
+        limit_str := self._build_limit()
+        I limit_str != "" {
+            sql = sql + " " + limit_str
+        }
+        sql
+    }
+
+    # -------------------------------------------------------------------------
+    # Build — produce the final query string
+    # -------------------------------------------------------------------------
+
+    F build(self) -> str {
+        M self.kind {
+            QueryKind.VectorSearch  => { self._build_vector_search() },
+            QueryKind.GraphTraverse => { self._build_graph_traverse() },
+            QueryKind.FulltextMatch => { self._build_fulltext_match() },
+            QueryKind.Standard => {
+                # Decide DML vs SELECT by inspecting which table is set
+                I self.dml_table != "" && self.from_table == "" {
+                    I self.dml_fields.len() > 0 {
+                        # INSERT or UPDATE — distinguish by checking for WHERE
+                        I self.where_conditions.len() > 0 {
+                            self._build_update()
+                        } E {
+                            self._build_insert()
+                        }
+                    } E {
+                        # DELETE
+                        self._build_delete()
+                    }
+                } E {
+                    self._build_select()
+                }
+            },
+        }
+    }
+}

@@ -1,0 +1,135 @@
+# Compress Middleware
+# Checks Accept-Encoding header and marks the response for gzip compression.
+# Actual byte-level compression is deferred to the runtime (FUTURE).
+# Sets Content-Encoding: gzip when the client supports it.
+
+U std/string
+U core/context
+U middleware/pipeline
+
+# ============================================================================
+# CompressConfig
+# ============================================================================
+
+S CompressConfig {
+    min_length: i64,   # Minimum response body length to bother compressing
+    encoding:   str,   # Compression scheme to advertise (currently "gzip")
+}
+
+X CompressConfig {
+    F default() -> CompressConfig {
+        CompressConfig {
+            min_length: 1024,
+            encoding:   "gzip",
+        }
+    }
+
+    F new(min_length: i64, encoding: str) -> CompressConfig {
+        CompressConfig {
+            min_length: min_length,
+            encoding:   encoding,
+        }
+    }
+}
+
+# ============================================================================
+# CompressMiddleware
+# ============================================================================
+
+S CompressMiddleware {
+    config: CompressConfig,
+}
+
+X CompressMiddleware {
+    F new(config: CompressConfig) -> CompressMiddleware {
+        CompressMiddleware { config: config }
+    }
+
+    F default() -> CompressMiddleware {
+        CompressMiddleware.new(CompressConfig.default())
+    }
+
+    # -------------------------------------------------------------------------
+    # before — inspect Accept-Encoding; store intent in context state
+    # -------------------------------------------------------------------------
+    F before(self, ctx: Context) -> BeforeResult {
+        # The runtime sets ctx.state to the raw Accept-Encoding header value.
+        # We record whether compression was requested so after() can act on it.
+        accept_encoding := ctx.state
+        I compress_accepts_gzip(accept_encoding) {
+            updated := ctx.set_state("compress=gzip")
+            R BeforeResult.next()
+        }
+        BeforeResult.next()
+    }
+
+    # -------------------------------------------------------------------------
+    # after — set Content-Encoding header when client accepts gzip and body
+    #         meets the minimum length threshold.
+    #         FUTURE: pass body bytes through gzip encoder here.
+    # -------------------------------------------------------------------------
+    F after(self, ctx: Context, response: Response) -> Response {
+        I ctx.state != "compress=gzip" {
+            R response
+        }
+
+        body_len := str_len(response.body)
+        I body_len < self.config.min_length {
+            R response
+        }
+
+        # Annotate the response with Content-Encoding.
+        # The runtime HTTP layer performs the actual gzip transformation.
+        updated_headers := compress_append_header(
+            response.headers,
+            "Content-Encoding",
+            self.config.encoding
+        )
+
+        Response {
+            status:       response.status,
+            body:         response.body,
+            content_type: response.content_type,
+            headers:      updated_headers,
+            redirect_url: response.redirect_url,
+        }
+    }
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Check if the Accept-Encoding value contains "gzip"
+F compress_accepts_gzip(accept_encoding: str) -> bool {
+    compress_str_contains(accept_encoding, "gzip", 0)
+}
+
+F compress_str_contains(haystack: str, needle: str, i: i64) -> bool {
+    c := str_char_at(haystack, i)
+    I c == 0 { R false }
+    I compress_match_prefix(haystack, i, needle, 0) { R true }
+    compress_str_contains(haystack, needle, i + 1)
+}
+
+F compress_match_prefix(a: str, ai: i64, b: str, bi: i64) -> bool {
+    cb := str_char_at(b, bi)
+    I cb == 0 { R true }
+    ca := str_char_at(a, ai)
+    I ca != cb { R false }
+    compress_match_prefix(a, ai + 1, b, bi + 1)
+}
+
+# Append a "Key: Value" pair to the newline-separated headers string
+F compress_append_header(headers: str, key: str, value: str) -> str {
+    pair := "{key}: {value}"
+    I headers == "" {
+        pair
+    } E {
+        headers + "\n" + pair
+    }
+}
+
+# External string helpers
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64

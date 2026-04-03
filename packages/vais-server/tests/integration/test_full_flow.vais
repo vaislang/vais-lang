@@ -1,0 +1,300 @@
+# test_full_flow.vais — Integration test: App creation → route registration
+#                        → middleware → simulated request dispatch
+
+U core/app
+U core/config
+U core/context
+U core/error
+U router/router
+U middleware/pipeline
+
+# ============================================================================
+# Integration tests
+# ============================================================================
+
+# Test 1: App creation and basic configuration
+F test_app_creation() -> i64 {
+    config := ServerConfig.default()
+    app    := App.new(config)
+
+    I app.route_count() != 0 {
+        println("FAIL test_app_creation: new app should have 0 routes, got {app.route_count()}")
+        R 1
+    }
+    I app.middleware_count() != 0 {
+        println("FAIL test_app_creation: new app should have 0 middlewares, got {app.middleware_count()}")
+        R 1
+    }
+    println("PASS test_app_creation")
+    0
+}
+
+# Test 2: Route registration
+F test_app_route_registration() -> i64 {
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+
+    app.get("/",          "handle_home")
+    app.post("/users",    "handle_create")
+    app.get("/users/:id", "handle_get")
+    app.put("/users/:id", "handle_update")
+    app.delete("/users/:id", "handle_delete")
+
+    I app.route_count() != 5 {
+        println("FAIL test_app_route_registration: expected 5 routes, got {app.route_count()}")
+        R 1
+    }
+    println("PASS test_app_route_registration")
+    0
+}
+
+# Test 3: Middleware registration
+F test_app_middleware_registration() -> i64 {
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+
+    app.use("logger")
+    app.use("cors")
+    app.use("rate_limit")
+
+    I app.middleware_count() != 3 {
+        println("FAIL test_app_middleware_registration: expected 3 middlewares, got {app.middleware_count()}")
+        R 1
+    }
+    println("PASS test_app_middleware_registration")
+    0
+}
+
+# Test 4: Route group prefix is applied
+F test_app_route_group() -> i64 {
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+    v1     := mut app.group("/api/v1")
+
+    v1.get("/users", "list_users")
+    v1.post("/users", "create_user")
+
+    # Check that the group routes have the prefix
+    I v1.route_count() != 2 {
+        println("FAIL test_app_route_group: expected 2 routes in group, got {v1.route_count()}")
+        R 1
+    }
+    r0 := v1.routes.get(0)
+    I r0.path != "/api/v1/users" {
+        println("FAIL test_app_route_group: expected path=/api/v1/users, got {r0.path}")
+        R 1
+    }
+    println("PASS test_app_route_group")
+    0
+}
+
+# Test 5: Config validation blocks listen on invalid config
+F test_app_listen_invalid_config() -> i64 {
+    bad_config := ServerConfig {
+        port:              0,
+        host:              "0.0.0.0",
+        env:               "dev",
+        max_connections:   1000,
+        read_timeout_ms:   5000,
+        write_timeout_ms:  5000,
+        log_level:         "info",
+    }
+    app := App.new(bad_config)
+    result := app.listen(":0")
+    M result {
+        Ok(_) => {
+            println("FAIL test_app_listen_invalid_config: should have failed on port=0")
+            R 1
+        },
+        Err(e) => {
+            I e.status != 400 {
+                println("FAIL test_app_listen_invalid_config: expected status=400, got {e.status}")
+                R 1
+            }
+        },
+    }
+    println("PASS test_app_listen_invalid_config")
+    0
+}
+
+# Test 6: Router-level dispatch simulation (route found)
+F test_router_dispatch_found() -> i64 {
+    router := mut Router.new()
+    router.get("/",          1)
+    router.get("/users",     2)
+    router.get("/users/:id", 3)
+    router.post("/users",    4)
+
+    # GET /users/99 → handler 3
+    result := router.match_route(METHOD_GET, "/users/99")
+    I !result.is_found() {
+        println("FAIL test_router_dispatch_found: expected Found for GET /users/99")
+        R 1
+    }
+    I result.handler_id != 3 {
+        println("FAIL test_router_dispatch_found: expected handler_id=3, got {result.handler_id}")
+        R 1
+    }
+
+    # GET / → handler 1
+    root_result := router.match_route(METHOD_GET, "/")
+    I !root_result.is_found() {
+        println("FAIL test_router_dispatch_found: expected Found for GET /")
+        R 1
+    }
+
+    println("PASS test_router_dispatch_found")
+    0
+}
+
+# Test 7: Router-level dispatch — 404 and 405
+F test_router_dispatch_errors() -> i64 {
+    router := mut Router.new()
+    router.get("/hello", 10)
+
+    # 404
+    nf := router.match_route(METHOD_GET, "/world")
+    I !nf.is_not_found() {
+        println("FAIL test_router_dispatch_errors: expected 404 for /world")
+        R 1
+    }
+
+    # 405
+    mna := router.match_route(METHOD_POST, "/hello")
+    I !mna.is_method_not_allowed() {
+        println("FAIL test_router_dispatch_errors: expected 405 for POST /hello")
+        R 1
+    }
+
+    println("PASS test_router_dispatch_errors")
+    0
+}
+
+# Test 8: Pipeline integration with context
+F test_pipeline_with_context() -> i64 {
+    p   := mut Pipeline.new()
+    p   = p.add("logger")
+    p   = p.add("auth")
+
+    ctx := Context.new("GET", "/api/users")
+    out := p.run_before(ctx)
+
+    # Default stubs pass through — no short-circuit
+    I out.short_circuit {
+        println("FAIL test_pipeline_with_context: should not short-circuit")
+        R 1
+    }
+
+    # Simulate a handler producing a response
+    handler_response := out.ctx.json(200, "[{\"id\":\"1\"}]")
+    I handler_response.status != 200 {
+        println("FAIL test_pipeline_with_context: handler response status should be 200")
+        R 1
+    }
+
+    # Run after pass
+    final := p.run_after(out.ctx, handler_response)
+    I final.status != 200 {
+        println("FAIL test_pipeline_with_context: final response status should be 200")
+        R 1
+    }
+
+    println("PASS test_pipeline_with_context")
+    0
+}
+
+# Test 9: Context state propagation
+F test_context_state() -> i64 {
+    ctx  := mut Context.new("GET", "/protected")
+    ctx  = ctx.set_state("{\"user_id\":\"42\",\"role\":\"admin\"}")
+    data := ctx.get_state()
+    I data == "" {
+        println("FAIL test_context_state: state should not be empty")
+        R 1
+    }
+    println("PASS test_context_state")
+    0
+}
+
+# Test 10: End-to-end — app configure → route match → response generation
+F test_end_to_end_flow() -> i64 {
+    # Configure app
+    config := ServerConfig.default()
+    app    := mut App.new(config)
+    app.use("logger")
+    app.get("/health", "handle_health")
+    app.get("/api/users", "handle_list_users")
+    app.post("/api/users", "handle_create_user")
+
+    # Verify app state
+    I app.route_count() != 3 {
+        println("FAIL test_end_to_end_flow: expected 3 routes, got {app.route_count()}")
+        R 1
+    }
+    I app.middleware_count() != 1 {
+        println("FAIL test_end_to_end_flow: expected 1 middleware, got {app.middleware_count()}")
+        R 1
+    }
+
+    # Simulate routing a request
+    router := mut Router.new()
+    router.get("/health",      1)
+    router.get("/api/users",   2)
+    router.post("/api/users",  3)
+
+    # GET /health → handler 1
+    h := router.match_route(METHOD_GET, "/health")
+    I !h.is_found() || h.handler_id != 1 {
+        println("FAIL test_end_to_end_flow: GET /health routing failed")
+        R 1
+    }
+
+    # POST /api/users → handler 3
+    c := router.match_route(METHOD_POST, "/api/users")
+    I !c.is_found() || c.handler_id != 3 {
+        println("FAIL test_end_to_end_flow: POST /api/users routing failed")
+        R 1
+    }
+
+    # Simulate handler execution via Context
+    ctx := Context.new("GET", "/health")
+    res := ctx.json(200, "{\"status\":\"ok\"}")
+    I res.status != 200 {
+        println("FAIL test_end_to_end_flow: health check response should be 200")
+        R 1
+    }
+    I res.content_type != "application/json; charset=utf-8" {
+        println("FAIL test_end_to_end_flow: health check response should be JSON")
+        R 1
+    }
+
+    println("PASS test_end_to_end_flow")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    println("=== Integration Tests: Full Request Flow ===")
+
+    failures := mut 0
+    failures += test_app_creation()
+    failures += test_app_route_registration()
+    failures += test_app_middleware_registration()
+    failures += test_app_route_group()
+    failures += test_app_listen_invalid_config()
+    failures += test_router_dispatch_found()
+    failures += test_router_dispatch_errors()
+    failures += test_pipeline_with_context()
+    failures += test_context_state()
+    failures += test_end_to_end_flow()
+
+    I failures > 0 {
+        println("FAILED: {failures} integration test(s) failed")
+        R 1
+    }
+    println("ALL INTEGRATION TESTS PASSED")
+    0
+}

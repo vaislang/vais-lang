@@ -1,0 +1,242 @@
+U std/string
+U std/vec
+U std/option
+
+# Node type: static segment, :param, or *wildcard
+E NodeType {
+    Static,
+    Param,
+    Wildcard,
+}
+
+S ParamEntry {
+    key: str,
+    value: str,
+}
+
+S MatchResult {
+    handler_id: i64,
+    params: Vec<ParamEntry>,
+}
+
+S TreeNode {
+    segment: str,
+    node_type: NodeType,
+    children: Vec<TreeNode>,
+    handler_id: i64,
+    has_handler: bool,
+    param_name: str,
+}
+
+X TreeNode {
+    F new(segment: str, node_type: NodeType) -> TreeNode {
+        TreeNode {
+            segment: segment,
+            node_type: node_type,
+            children: Vec.new(),
+            handler_id: 0,
+            has_handler: false,
+            param_name: "",
+        }
+    }
+
+    F new_param(param_name: str) -> TreeNode {
+        TreeNode {
+            segment: ":",
+            node_type: NodeType.Param,
+            children: Vec.new(),
+            handler_id: 0,
+            has_handler: false,
+            param_name: param_name,
+        }
+    }
+
+    F new_wildcard(wildcard_name: str) -> TreeNode {
+        TreeNode {
+            segment: "*",
+            node_type: NodeType.Wildcard,
+            children: Vec.new(),
+            handler_id: 0,
+            has_handler: false,
+            param_name: wildcard_name,
+        }
+    }
+}
+
+# Split a path into segments, filtering empty strings from leading "/"
+F split_segments(path: str) -> Vec<str> {
+    parts := path.split("/")
+    result := Vec.new()
+    I i = 0; i < parts.len(); i = i + 1 {
+        seg := parts.get(i)
+        I seg.len() > 0 {
+            result.push(seg)
+        }
+    }
+    result
+}
+
+S RadixTree {
+    root: TreeNode,
+}
+
+X RadixTree {
+    F new() -> RadixTree {
+        RadixTree {
+            root: TreeNode.new("", NodeType.Static),
+        }
+    }
+
+    # Insert a route: path like "/users/:id" or "/files/*path"
+    F insert(mut self, path: str, handler_id: i64) {
+        segments := split_segments(path)
+        self._insert_node(mut self.root, segments, 0, handler_id)
+    }
+
+    F _insert_node(mut self, mut node: TreeNode, segments: Vec<str>, depth: i64, handler_id: i64) {
+        I depth >= segments.len() {
+            node.has_handler = true
+            node.handler_id = handler_id
+            R
+        }
+
+        seg := segments.get(depth)
+
+        # Determine segment type
+        I seg.starts_with("*") {
+            # Wildcard segment — consume rest of path
+            wildcard_name := seg.slice(1, seg.len())
+            I wildcard_name.len() == 0 {
+                wildcard_name = "wildcard"
+            }
+            found := false
+            I i = 0; i < node.children.len(); i = i + 1 {
+                child := node.children.get(i)
+                I child.node_type == NodeType.Wildcard {
+                    child.has_handler = true
+                    child.handler_id = handler_id
+                    found = true
+                }
+            }
+            I !found {
+                new_child := TreeNode.new_wildcard(wildcard_name)
+                new_child.has_handler = true
+                new_child.handler_id = handler_id
+                node.children.push(new_child)
+            }
+            R
+        }
+
+        I seg.starts_with(":") {
+            # Param segment
+            param_name := seg.slice(1, seg.len())
+            found := false
+            I i = 0; i < node.children.len(); i = i + 1 {
+                child := node.children.get(i)
+                I child.node_type == NodeType.Param {
+                    self._insert_node(mut child, segments, depth + 1, handler_id)
+                    found = true
+                }
+            }
+            I !found {
+                new_child := TreeNode.new_param(param_name)
+                self._insert_node(mut new_child, segments, depth + 1, handler_id)
+                node.children.push(new_child)
+            }
+            R
+        }
+
+        # Static segment
+        found := false
+        I i = 0; i < node.children.len(); i = i + 1 {
+            child := node.children.get(i)
+            I child.node_type == NodeType.Static && child.segment == seg {
+                self._insert_node(mut child, segments, depth + 1, handler_id)
+                found = true
+            }
+        }
+        I !found {
+            new_child := TreeNode.new(seg, NodeType.Static)
+            self._insert_node(mut new_child, segments, depth + 1, handler_id)
+            node.children.push(new_child)
+        }
+    }
+
+    # Match a request path and return handler_id + extracted params
+    F match_path(self, path: str) -> Option<MatchResult> {
+        segments := split_segments(path)
+        params := Vec.new()
+        self._match_node(self.root, segments, 0, mut params)
+    }
+
+    F _match_node(self, node: TreeNode, segments: Vec<str>, depth: i64, mut params: Vec<ParamEntry>) -> Option<MatchResult> {
+        I depth >= segments.len() {
+            I node.has_handler {
+                result := MatchResult {
+                    handler_id: node.handler_id,
+                    params: params,
+                }
+                R Some(result)
+            }
+            R None
+        }
+
+        seg := segments.get(depth)
+
+        # Try static children first (highest priority)
+        I i = 0; i < node.children.len(); i = i + 1 {
+            child := node.children.get(i)
+            I child.node_type == NodeType.Static && child.segment == seg {
+                result := self._match_node(child, segments, depth + 1, mut params)
+                I result.is_some() {
+                    R result
+                }
+            }
+        }
+
+        # Try param children next
+        I i = 0; i < node.children.len(); i = i + 1 {
+            child := node.children.get(i)
+            I child.node_type == NodeType.Param {
+                entry := ParamEntry {
+                    key: child.param_name,
+                    value: seg,
+                }
+                params.push(entry)
+                result := self._match_node(child, segments, depth + 1, mut params)
+                I result.is_some() {
+                    R result
+                }
+                # Backtrack: remove the param we just added
+                params.pop()
+            }
+        }
+
+        # Try wildcard children last (lowest priority)
+        I i = 0; i < node.children.len(); i = i + 1 {
+            child := node.children.get(i)
+            I child.node_type == NodeType.Wildcard && child.has_handler {
+                # Collect remaining segments into one value
+                remaining := ""
+                I j = depth; j < segments.len(); j = j + 1 {
+                    I j > depth {
+                        remaining = remaining + "/"
+                    }
+                    remaining = remaining + segments.get(j)
+                }
+                entry := ParamEntry {
+                    key: child.param_name,
+                    value: remaining,
+                }
+                params.push(entry)
+                result := MatchResult {
+                    handler_id: child.handler_id,
+                    params: params,
+                }
+                R Some(result)
+            }
+        }
+
+        None
+    }
+}
