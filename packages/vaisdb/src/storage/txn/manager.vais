@@ -1,0 +1,437 @@
+# Transaction Manager
+# Orchestrates transaction lifecycle: begin, commit, abort
+# Coordinates ATT, CLOG, undo log, rollback, conflict detection, and deadlock detection
+# Based on Stage 3 MVCC Strategy
+
+U std/sync.{Mutex, AtomicU64};
+U storage/constants.{
+    INVALID_TXN_ID, NULL_UNDO_PTR, DEFAULT_TXN_TIMEOUT_SEC,
+    DEFAULT_CLOG_CACHE_PAGES, UNDO_INSERT, UNDO_DELETE, UNDO_UPDATE,
+};
+U storage/error.{VaisError, err_internal, err_deadlock, err_txn_timeout};
+U storage/txn/snapshot.{Snapshot, IsolationLevel, DEFAULT_ISOLATION};
+U storage/txn/clog.{Clog, TxnStatus};
+U storage/txn/undo.{UndoLog};
+U storage/txn/undo_entry.{UndoEntry};
+# NOTE: RollbackExecutor not used directly in manager
+# FUTURE(refactor): Refactor RollbackExecutor to take &UndoLog instead of owning it
+U storage/txn/att.{ActiveTransactionTable, ActiveTransactionEntry, TxnState};
+U storage/txn/conflict.{ConflictDetector};
+U storage/txn/deadlock.{WaitForGraph};
+U storage/buffer/pool.{BufferPool};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/header.{ENGINE_META};
+U storage/wal/record_types.{
+    TXN_BEGIN, TXN_COMMIT, TXN_ABORT,
+    TxnBeginPayload, TxnCommitPayload, TxnAbortPayload,
+};
+U storage/page/heap.{HeapPage};
+U storage/page/tuple.{Tuple};
+U storage/page/mvcc.{MvccTupleMeta};
+U std/bytes.{ByteBuffer};
+
+# Transaction Manager: central coordinator for transaction lifecycle
+S TransactionManager {
+    att: ActiveTransactionTable,
+    clog: Clog,
+    undo_log: UndoLog,
+    conflict_detector: ConflictDetector,
+    deadlock_detector: WaitForGraph,
+    gcm: GroupCommitManager,    # WAL group commit manager for writing records
+    next_txn_id: AtomicU64,     # Monotonically increasing txn ID
+    txn_timeout_sec: u32,       # Transaction timeout in seconds
+    lock: Mutex,
+}
+
+X TransactionManager {
+    # Create a new transaction manager
+    F new(page_size: u32, gcm: GroupCommitManager) -> TransactionManager {
+        TransactionManager {
+            att: ActiveTransactionTable.new(),
+            clog: Clog.new(page_size, DEFAULT_CLOG_CACHE_PAGES),
+            undo_log: UndoLog.new(page_size),
+            conflict_detector: ConflictDetector.new(),
+            deadlock_detector: WaitForGraph.new(),
+            gcm,
+            next_txn_id: AtomicU64.new(1),  # Start from 1 (0 is INVALID_TXN_ID)
+            txn_timeout_sec: DEFAULT_TXN_TIMEOUT_SEC,
+            lock: Mutex.new(),
+        }
+    }
+
+    # Begin a new transaction
+    # Returns the new transaction ID
+    F begin(mut self, isolation_level: IsolationLevel) -> Result<u64, VaisError> {
+        guard := mut self.lock.lock();
+
+        # Allocate new transaction ID
+        txn_id := mut self.next_txn_id.fetch_add(1);
+
+        # Register in Active Transaction Table (creates snapshot)
+        _entry := mut self.att.register(txn_id, isolation_level);
+
+        # Set CLOG status to IN_PROGRESS
+        self.clog.set_status(txn_id, TxnStatus.InProgress);
+
+        drop(guard);
+
+        # Write TXN_BEGIN WAL record
+        begin_payload := mut TxnBeginPayload { isolation_level: isolation_level as u8 };
+        buf := mut ByteBuffer.with_capacity(4);
+        begin_payload.serialize(&buf);
+        self.gcm.write_record(txn_id, TXN_BEGIN, ENGINE_META, buf.as_bytes())?;
+
+        Ok(txn_id)
+    }
+
+    # Begin a new transaction with default isolation level
+    F begin_default(mut self) -> Result<u64, VaisError> {
+        self.begin(DEFAULT_ISOLATION)
+    }
+
+    # Commit a transaction
+    # This writes TXN_COMMIT WAL record, sets CLOG to COMMITTED, releases locks
+    F commit(mut self, txn_id: u64, pool: &mut BufferPool) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+
+        # Verify transaction is active
+        I !self.att.is_active(txn_id) {
+            drop(guard);
+            R Err(err_internal("Cannot commit: transaction {txn_id} is not active"));
+        }
+
+        # Set state to COMMITTING
+        self.att.set_state(txn_id, TxnState.Committing);
+
+        # Write TXN_COMMIT WAL record (must be durable before we return success)
+        commit_payload := mut TxnCommitPayload {};
+        buf := mut ByteBuffer.with_capacity(4);
+        commit_payload.serialize(&buf);
+        commit_lsn := mut self.gcm.write_record(
+            txn_id, TXN_COMMIT, ENGINE_META, buf.as_bytes()
+        )?;
+
+        # Ensure commit record is fsynced (group commit batches for efficiency)
+        self.gcm.commit_and_wait(txn_id, commit_lsn)?;
+
+        # Set CLOG status to COMMITTED
+        self.clog.set_status(txn_id, TxnStatus.Committed);
+
+        # Release all write locks held by this transaction
+        self.conflict_detector.release_locks(txn_id);
+
+        # Remove from deadlock graph
+        self.deadlock_detector.remove_txn(txn_id);
+
+        # Set state to COMMITTED
+        self.att.set_state(txn_id, TxnState.Committed);
+
+        # Keep in ATT for now (GC will remove later)
+        # This allows concurrent readers to check transaction status
+
+        drop(guard);
+
+        Ok(())
+    }
+
+    # Abort a transaction
+    # This rolls back via undo chain, writes TXN_ABORT WAL record, sets CLOG to ABORTED
+    F abort(mut self, txn_id: u64, pool: &mut BufferPool) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+
+        # Verify transaction exists
+        entry := mut M self.att.get(txn_id) {
+            Some(e) => e,
+            None => {
+                drop(guard);
+                R Err(err_internal("Cannot abort: transaction {txn_id} not found"));
+            }
+        };
+
+        # Set state to ABORTING
+        self.att.set_state(txn_id, TxnState.Aborting);
+
+        # Get the last undo pointer
+        last_undo_ptr := mut entry.get_last_undo_ptr();
+
+        # Rollback via undo chain (eager undo)
+        I last_undo_ptr != NULL_UNDO_PTR {
+            # Perform rollback using the undo log
+            _count := mut self.perform_rollback(
+                txn_id,
+                last_undo_ptr,
+                pool
+            )?;
+        }
+
+        # Write TXN_ABORT WAL record (after rollback is complete)
+        abort_payload := mut TxnAbortPayload {};
+        abort_buf := mut ByteBuffer.with_capacity(4);
+        abort_payload.serialize(&abort_buf);
+        self.gcm.write_record(txn_id, TXN_ABORT, ENGINE_META, abort_buf.as_bytes())?;
+
+        # Set CLOG status to ABORTED
+        self.clog.set_status(txn_id, TxnStatus.Aborted);
+
+        # Release all write locks held by this transaction
+        self.conflict_detector.release_locks(txn_id);
+
+        # Remove from deadlock graph
+        self.deadlock_detector.remove_txn(txn_id);
+
+        # Set state to ABORTED
+        self.att.set_state(txn_id, TxnState.Aborted);
+
+        drop(guard);
+
+        Ok(())
+    }
+
+    # Create a snapshot for a transaction
+    # This is called internally during BEGIN
+    F create_snapshot(self, txn_id: u64) -> Snapshot {
+        active_txns := mut self.att.get_active_txn_ids();
+        Snapshot.new(txn_id, active_txns)
+    }
+
+    # Check for write-write conflict (first-writer-wins)
+    # Returns error if row is locked by another transaction
+    F check_conflict(
+        mut self,
+        txn_id: u64,
+        file_id: u8,
+        page_id: u32,
+        slot_id: u16,
+    ) -> Result<(), VaisError> {
+        self.conflict_detector.check_and_lock(file_id, page_id, slot_id, txn_id)
+    }
+
+    # Record an undo entry for a transaction
+    # Returns the undo_ptr for the new entry
+    F record_undo(
+        mut self,
+        txn_id: u64,
+        entry: &UndoEntry,
+        pool: &mut BufferPool,
+    ) -> Result<u64, VaisError> {
+        # Write undo entry to undo log
+        undo_ptr := mut self.undo_log.write_entry(entry, pool)?;
+
+        # Update ATT with latest undo pointer
+        self.att.set_last_undo_ptr(txn_id, undo_ptr);
+
+        Ok(undo_ptr)
+    }
+
+    # Check if a transaction is active
+    F is_active(self, txn_id: u64) -> bool {
+        self.att.is_active(txn_id)
+    }
+
+    # Get snapshot for a transaction
+    F get_snapshot(self, txn_id: u64) -> Option<&Snapshot> {
+        self.att.get_snapshot(txn_id)
+    }
+
+    # Get transaction status from CLOG
+    F get_txn_status(self, txn_id: u64) -> TxnStatus {
+        self.clog.get_status(txn_id)
+    }
+
+    # Check if a transaction is committed
+    F is_committed(self, txn_id: u64) -> bool {
+        self.clog.is_committed(txn_id)
+    }
+
+    # Check if a transaction is aborted
+    F is_aborted(self, txn_id: u64) -> bool {
+        self.clog.is_aborted(txn_id)
+    }
+
+    # Get the minimum active transaction ID (low water mark for GC)
+    F get_low_water_mark(self) -> u64 {
+        self.att.get_min_active_txn()
+    }
+
+    # Get number of active transactions
+    F count_active_transactions(self) -> u64 {
+        self.att.count_active()
+    }
+
+    # Detect deadlocks in the wait-for graph
+    # Returns Some(victim_txn_id) if deadlock detected
+    F detect_deadlock(self) -> Option<u64> {
+        self.deadlock_detector.has_cycle()
+    }
+
+    # Add a wait edge for deadlock detection
+    # Called when txn waiter blocks waiting for txn holder
+    F add_wait_edge(mut self, waiter: u64, holder: u64) {
+        self.deadlock_detector.add_wait(waiter, holder);
+    }
+
+    # Check for timed-out transactions and abort them
+    # Returns list of aborted transaction IDs
+    F check_transaction_timeouts(mut self, pool: &mut BufferPool) -> Vec<u64> {
+        timed_out := mut self.att.find_timed_out_transactions(self.txn_timeout_sec);
+        aborted_txns := mut Vec.new();
+
+        L (txn_id, elapsed_sec): timed_out {
+            # Abort the timed-out transaction
+            M self.abort(txn_id, pool) {
+                Ok(_) => {
+                    aborted_txns.push(txn_id);
+                },
+                Err(_) => {
+                    # Log error but continue checking other transactions
+                }
+            }
+        }
+
+        aborted_txns
+    }
+
+    # Set transaction timeout (in seconds)
+    F set_timeout(mut self, timeout_sec: u32) {
+        guard := mut self.lock.lock();
+        self.txn_timeout_sec = timeout_sec;
+        drop(guard);
+    }
+
+    # Get transaction timeout (in seconds)
+    F get_timeout(self) -> u32 {
+        self.txn_timeout_sec
+    }
+
+    # Get reference to CLOG (for visibility checks)
+    F get_clog(self) -> &Clog {
+        &self.clog
+    }
+
+    # Get reference to undo log
+    F get_undo_log(self) -> &UndoLog {
+        &self.undo_log
+    }
+
+    # Get reference to ATT
+    F get_att(self) -> &ActiveTransactionTable {
+        &self.att
+    }
+
+    # Get statistics for monitoring
+    F get_stats(self) -> TxnManagerStats {
+        TxnManagerStats {
+            active_txns: self.att.count_active(),
+            next_txn_id: self.next_txn_id.load(),
+            total_locks: self.conflict_detector.count_total_locks(),
+            deadlock_edges: self.deadlock_detector.edge_count(),
+            low_water_mark: self.get_low_water_mark(),
+        }
+    }
+
+    # Advance command ID in a transaction's snapshot
+    # Called at the start of each statement within a transaction
+    F advance_cmd_id(mut self, txn_id: u64) {
+        self.att.advance_cmd_id(txn_id);
+    }
+
+    # Internal helper: perform rollback by traversing undo chain
+    # Applies actual undo operations for each entry in reverse chronological order
+    F perform_rollback(
+        mut self,
+        txn_id: u64,
+        undo_ptr: u64,
+        pool: &mut BufferPool,
+    ) -> Result<u32, VaisError> {
+        I undo_ptr == NULL_UNDO_PTR {
+            R Ok(0);
+        }
+
+        # Read the entire undo chain
+        entries := mut self.undo_log.read_chain(undo_ptr, pool)?;
+        count := mut 0u32;
+
+        # Process each undo entry in reverse chronological order (newest first)
+        L entry: entries {
+            I entry.txn_id != txn_id {
+                R Err(err_internal(
+                    "Undo entry txn_id mismatch: expected {txn_id}, got {entry.txn_id}"
+                ));
+            }
+
+            # Apply the actual undo operation based on entry type
+            M entry.entry_type {
+                UNDO_INSERT => {
+                    # Undo INSERT: mark the inserted tuple's slot as dead
+                    frame := mut pool.fetch_page(entry.file_id, entry.page_id)?;
+                    page_data := mut pool.get_page_mut(frame);
+                    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
+                    heap.mark_slot_dead(entry.slot_id)?;
+                    flushed := mut heap.flush();
+                    L i: 0..flushed.len() {
+                        page_data[i] = flushed[i];
+                    }
+                    pool.unpin_page(frame, true);
+                },
+                UNDO_DELETE => {
+                    # Undo DELETE: restore the tuple's MVCC metadata (clear txn_id_expire)
+                    # The old_data contains the original tuple before deletion
+                    frame := mut pool.fetch_page(entry.file_id, entry.page_id)?;
+                    page_data := mut pool.get_page_mut(frame);
+                    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
+                    # Restore original MVCC: clear expiration so tuple becomes visible again
+                    original_tuple := mut Tuple.read_from(&entry.old_data, 0, entry.old_data.len() as u64)?;
+                    heap.update_mvcc(entry.slot_id, &original_tuple.mvcc)?;
+                    flushed := mut heap.flush();
+                    L i: 0..flushed.len() {
+                        page_data[i] = flushed[i];
+                    }
+                    pool.unpin_page(frame, true);
+                },
+                UNDO_UPDATE => {
+                    # Undo UPDATE: restore old tuple data
+                    # For MVCC-style updates: the old version was expired and a new version inserted
+                    # Undo: restore old version's MVCC (clear expiration), remove new version
+                    frame := mut pool.fetch_page(entry.file_id, entry.page_id)?;
+                    page_data := mut pool.get_page_mut(frame);
+                    heap := mut HeapPage.from_page_data(page_data, pool.page_size)?;
+                    # Restore the old tuple's MVCC metadata
+                    original_tuple := mut Tuple.read_from(&entry.old_data, 0, entry.old_data.len() as u64)?;
+                    heap.update_mvcc(entry.slot_id, &original_tuple.mvcc)?;
+                    # Mark the latest inserted version (new version) as dead
+                    last_slot := mut heap.item_count() - 1;
+                    I last_slot > entry.slot_id {
+                        heap.mark_slot_dead(last_slot)?;
+                    }
+                    flushed := mut heap.flush();
+                    L i: 0..flushed.len() {
+                        page_data[i] = flushed[i];
+                    }
+                    pool.unpin_page(frame, true);
+                },
+                _ => {
+                    # Unknown undo entry type — skip
+                },
+            }
+
+            count += 1;
+        }
+
+        Ok(count)
+    }
+}
+
+# Statistics for monitoring
+S TxnManagerStats {
+    active_txns: u64,
+    next_txn_id: u64,
+    total_locks: u64,
+    deadlock_edges: u64,
+    low_water_mark: u64,
+}
+
+X TxnManagerStats {
+    F to_string(self) -> Str {
+        "TxnManagerStats {{ active_txns: {self.active_txns}, next_txn_id: {self.next_txn_id}, total_locks: {self.total_locks}, deadlock_edges: {self.deadlock_edges}, low_water_mark: {self.low_water_mark} }}"
+    }
+}

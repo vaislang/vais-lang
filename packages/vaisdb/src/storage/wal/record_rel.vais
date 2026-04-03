@@ -1,0 +1,290 @@
+# Relational WAL Record Payloads (0x10-0x1F)
+# Based on Stage 2: WAL Design
+# Physiological logging: physical to the page, logical within the page
+
+U storage/error.{VaisError};
+U storage/bytes.{write_bytes, read_bytes};
+U std/bytes.{ByteBuffer};
+
+# ============================================================================
+# PAGE_WRITE (0x10) - Raw page-level write
+# ============================================================================
+
+S PageWritePayload {
+    file_id: u8,
+    page_id: u32,
+    offset: u16,         # Offset within page
+    old_data: Vec<u8>,   # Old data at this offset (for undo)
+    new_data: Vec<u8>,   # New data to write
+}
+
+X PageWritePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u16_le(self.offset);
+        write_bytes(buf, &self.old_data);
+        write_bytes(buf, &self.new_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<PageWritePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        offset := mut buf.get_u16_le()?;
+        old_data := mut read_bytes(buf)?;
+        new_data := mut read_bytes(buf)?;
+        Ok(PageWritePayload {
+            file_id,
+            page_id,
+            offset,
+            old_data,
+            new_data,
+        })
+    }
+}
+
+# ============================================================================
+# TUPLE_INSERT (0x11) - Insert a tuple into a heap page
+# ============================================================================
+
+S TupleInsertPayload {
+    file_id: u8,
+    page_id: u32,
+    slot: u16,              # Slot number in page
+    tuple_data: Vec<u8>,    # Serialized tuple (including MVCC metadata)
+}
+
+X TupleInsertPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u16_le(self.slot);
+        write_bytes(buf, &self.tuple_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TupleInsertPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        slot := mut buf.get_u16_le()?;
+        tuple_data := mut read_bytes(buf)?;
+        Ok(TupleInsertPayload {
+            file_id,
+            page_id,
+            slot,
+            tuple_data,
+        })
+    }
+}
+
+# ============================================================================
+# TUPLE_DELETE (0x12) - Mark tuple as deleted (MVCC style)
+# ============================================================================
+
+S TupleDeletePayload {
+    file_id: u8,
+    page_id: u32,
+    slot: u16,
+    old_tuple: Vec<u8>,     # Old tuple data for undo
+}
+
+X TupleDeletePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u16_le(self.slot);
+        write_bytes(buf, &self.old_tuple);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TupleDeletePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        slot := mut buf.get_u16_le()?;
+        old_tuple := mut read_bytes(buf)?;
+        Ok(TupleDeletePayload {
+            file_id,
+            page_id,
+            slot,
+            old_tuple,
+        })
+    }
+}
+
+# ============================================================================
+# TUPLE_UPDATE (0x13) - Update tuple in place
+# ============================================================================
+
+S TupleUpdatePayload {
+    file_id: u8,
+    page_id: u32,
+    slot: u16,
+    old_tuple: Vec<u8>,     # Old tuple data for undo
+    new_tuple: Vec<u8>,     # New tuple data
+}
+
+X TupleUpdatePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u16_le(self.slot);
+        write_bytes(buf, &self.old_tuple);
+        write_bytes(buf, &self.new_tuple);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TupleUpdatePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        slot := mut buf.get_u16_le()?;
+        old_tuple := mut read_bytes(buf)?;
+        new_tuple := mut read_bytes(buf)?;
+        Ok(TupleUpdatePayload {
+            file_id,
+            page_id,
+            slot,
+            old_tuple,
+            new_tuple,
+        })
+    }
+}
+
+# ============================================================================
+# BTREE_SPLIT (0x14) - B+Tree page split
+# ============================================================================
+
+S BtreeSplitPayload {
+    file_id: u8,
+    page_id: u32,           # Original page being split
+    new_page_id: u32,       # New page created
+    split_key: Vec<u8>,     # Key at which split occurred
+    direction: u8,          # 0=left, 1=right (which side gets new page)
+}
+
+X BtreeSplitPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u32_le(self.new_page_id);
+        write_bytes(buf, &self.split_key);
+        buf.put_u8(self.direction);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<BtreeSplitPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        new_page_id := mut buf.get_u32_le()?;
+        split_key := mut read_bytes(buf)?;
+        direction := mut buf.get_u8()?;
+        Ok(BtreeSplitPayload {
+            file_id,
+            page_id,
+            new_page_id,
+            split_key,
+            direction,
+        })
+    }
+}
+
+# ============================================================================
+# BTREE_MERGE (0x15) - B+Tree page merge
+# ============================================================================
+
+S BtreeMergePayload {
+    file_id: u8,
+    page_id: u32,           # Page being merged
+    sibling_id: u32,        # Sibling page to merge with
+    parent_id: u32,         # Parent page
+}
+
+X BtreeMergePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u32_le(self.sibling_id);
+        buf.put_u32_le(self.parent_id);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<BtreeMergePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        sibling_id := mut buf.get_u32_le()?;
+        parent_id := mut buf.get_u32_le()?;
+        Ok(BtreeMergePayload {
+            file_id,
+            page_id,
+            sibling_id,
+            parent_id,
+        })
+    }
+}
+
+# ============================================================================
+# BTREE_INSERT (0x16) - Insert key-value into B+Tree
+# ============================================================================
+
+S BtreeInsertPayload {
+    file_id: u8,
+    page_id: u32,
+    key: Vec<u8>,           # Key being inserted
+    value: Vec<u8>,         # Value (TID for index, or actual data)
+}
+
+X BtreeInsertPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        write_bytes(buf, &self.key);
+        write_bytes(buf, &self.value);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<BtreeInsertPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        key := mut read_bytes(buf)?;
+        value := mut read_bytes(buf)?;
+        Ok(BtreeInsertPayload {
+            file_id,
+            page_id,
+            key,
+            value,
+        })
+    }
+}
+
+# ============================================================================
+# BTREE_DELETE (0x17) - Delete key from B+Tree
+# ============================================================================
+
+S BtreeDeletePayload {
+    file_id: u8,
+    page_id: u32,
+    key: Vec<u8>,           # Key being deleted
+    old_value: Vec<u8>,     # Old value for undo
+}
+
+X BtreeDeletePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        write_bytes(buf, &self.key);
+        write_bytes(buf, &self.old_value);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<BtreeDeletePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        key := mut read_bytes(buf)?;
+        old_value := mut read_bytes(buf)?;
+        Ok(BtreeDeletePayload {
+            file_id,
+            page_id,
+            key,
+            old_value,
+        })
+    }
+}
+
+# ============================================================================
+# Split Direction Constants
+# ============================================================================
+
+C SPLIT_LEFT: u8 = 0;
+C SPLIT_RIGHT: u8 = 1;

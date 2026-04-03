@@ -1,0 +1,318 @@
+# Hybrid Query Planner — Module Facade
+# Cost-based optimizer across vector, graph, SQL, and full-text engines.
+#
+# Pipeline: SQL text → parse → analyze → build → optimize → cache → execute
+#
+# Sub-modules:
+# - types:        HybridPlanNode, HybridCost, EngineType, FusionMethod, params, stats
+# - cost_model:   Per-engine cost estimation (HNSW, graph traverse, BM25)
+# - analyzer:     AST walker to detect engine function calls (VECTOR_SEARCH, etc.)
+# - optimizer:    4-pass optimization (pushdown, fusion, join reorder, cost recalc)
+# - vector_plan:  Vector scan plan builder (pre/post filter strategy)
+# - graph_plan:   Graph traversal plan builder (BFS/DFS selection)
+# - fulltext_plan: Full-text search plan builder (mode detection, top_k adjustment)
+# - pipeline:     Volcano-model execution engine for hybrid plans
+# - statistics:   Per-table/per-engine statistics collection (ANALYZE)
+# - cache:        LRU plan cache with DDL invalidation
+# - explain:      EXPLAIN / EXPLAIN ANALYZE output formatting
+
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U sql/parser/ast.{SelectQuery, Expr};
+U sql/executor/mod.{ExecutorRow, ExecContext};
+U sql/catalog/manager.{CatalogManager};
+U planner/types.{
+    HybridPlanNode, HybridCost, EngineType, FusionMethod,
+    QueryProfile, HybridExecStats, err_hybrid_plan_failed
+};
+U planner/cost_model.{HybridStats};
+U planner/analyzer.{analyze_query};
+U planner/optimizer.{optimize_plan, build_initial_plan, OptimizerConfig};
+U planner/pipeline.{execute_plan};
+U planner/statistics.{StatisticsCollector, AnalyzeResult};
+U planner/cache.{PlanCache, PlanCacheKey, normalize_query, extract_tables};
+U planner/explain.{explain_plan, ExplainOptions, ExplainFormat};
+
+# ============================================================================
+# Error Codes: EE=00 (common/planner), CC=08 (planner), DD=00 (mod)
+# ============================================================================
+
+C ERR_CODE_PLANNER_INIT_FAILED: Str = "VAIS-0008000";
+
+F err_planner_init_failed(reason: Str) -> VaisError {
+    VaisError.new(ERR_CODE_PLANNER_INIT_FAILED, "Planner init failed: {reason}")
+}
+
+# ============================================================================
+# HybridPlanner — Main Entry Point
+# ============================================================================
+
+# The HybridPlanner orchestrates the full query planning pipeline:
+# 1. Analyze query to detect engine functions
+# 2. Check plan cache for a cached plan
+# 3. Build initial plan from query profile
+# 4. Optimize plan (predicate pushdown, fusion selection, join reorder)
+# 5. Cache the optimized plan
+# 6. Execute and R results
+S HybridPlanner {
+    cache: PlanCache,
+    stats: HybridStats,
+    optimizer_config: OptimizerConfig,
+    stats_collector: StatisticsCollector,
+    total_queries: u64,
+    hybrid_queries: u64,    # Queries involving 2+ engines
+}
+
+X HybridPlanner {
+    ## Create a new HybridPlanner with default configuration
+    F new() -> HybridPlanner {
+        HybridPlanner {
+            cache: PlanCache.new(),
+            stats: HybridStats.new(),
+            optimizer_config: OptimizerConfig.default(),
+            stats_collector: StatisticsCollector.new(),
+            total_queries: 0,
+            hybrid_queries: 0,
+        }
+    }
+
+    ## Create with custom optimizer configuration
+    F with_config(config: OptimizerConfig) -> HybridPlanner {
+        HybridPlanner {
+            cache: PlanCache.new(),
+            stats: HybridStats.new(),
+            optimizer_config: config,
+            stats_collector: StatisticsCollector.new(),
+            total_queries: 0,
+            hybrid_queries: 0,
+        }
+    }
+
+    # ========================================================================
+    # Full Pipeline: plan + execute
+    # ========================================================================
+
+    ## Plan and execute a SELECT query end-to-end
+    ##
+    ## Steps:
+    ## 1. analyze_query -> QueryProfile
+    ## 2. cache lookup -> hit: use cached plan
+    ## 3. miss -> build_initial_plan -> optimize -> cache
+    ## 4. execute_plan -> Vec<ExecutorRow>
+    F execute_query(
+        mut self,
+        query: &SelectQuery,
+        ctx: &ExecContext,
+    ) -> Result<Vec<ExecutorRow>, VaisError> {
+        self.total_queries += 1;
+
+        # Step 1: Analyze query
+        profile := mut analyze_query(query)?;
+
+        I profile.engine_count() > 1 {
+            self.hybrid_queries += 1;
+        }
+
+        # Step 2: Plan (with cache)
+        plan := mut self.plan_query(query, &profile)?;
+
+        # Step 3: Execute
+        execute_plan(&plan, ctx)
+    }
+
+    # ========================================================================
+    # Planning Only (no execution)
+    # ========================================================================
+
+    ## Plan a query without executing it
+    ## Returns the optimized HybridPlanNode tree
+    F plan_query(
+        mut self,
+        query: &SelectQuery,
+        profile: &QueryProfile,
+    ) -> Result<HybridPlanNode, VaisError> {
+        # Check cache
+        normalized := mut normalize_query(&query.to_string());
+        cache_key := mut PlanCacheKey.new(normalized);
+
+        M self.cache.get(&cache_key) {
+            Some(cached_plan) => {
+                R Ok(cached_plan.clone());
+            },
+            None => {},
+        }
+
+        # Build initial plan from profile
+        plan := mut build_initial_plan(profile, &self.stats)?;
+
+        # Optimize
+        plan = optimize_plan(plan, &self.stats, &self.optimizer_config)?;
+
+        # Cache the optimized plan
+        tables := mut extract_tables(&plan);
+        self.cache.put(cache_key, plan.clone(), plan.get_cost().clone(), tables);
+
+        Ok(plan)
+    }
+
+    # ========================================================================
+    # EXPLAIN
+    # ========================================================================
+
+    ## Generate EXPLAIN output for a query
+    F explain(
+        mut self,
+        query: &SelectQuery,
+        options: &ExplainOptions,
+    ) -> Result<Str, VaisError> {
+        # Analyze and plan
+        profile := mut analyze_query(query)?;
+        plan := mut self.plan_query(query, &profile)?;
+
+        # Format output
+        explain_plan(&plan, options)
+    }
+
+    # ========================================================================
+    # ANALYZE (statistics refresh)
+    # ========================================================================
+
+    ## Run ANALYZE on a table to refresh statistics
+    F analyze_table(
+        mut self,
+        catalog: &CatalogManager,
+        pool: &BufferPool,
+        table_name: &Str,
+    ) -> Result<AnalyzeResult, VaisError> {
+        result := mut self.stats_collector.analyze_table(catalog, pool, table_name)?;
+
+        # Invalidate cached plans for this table since stats changed
+        self.cache.invalidate_table(table_name);
+
+        Ok(result)
+    }
+
+    ## Refresh all statistics
+    F analyze_all(
+        mut self,
+        catalog: &CatalogManager,
+        pool: &BufferPool,
+    ) -> Result<(), VaisError> {
+        self.stats = self.stats_collector.collect_all(catalog, pool)?;
+
+        # Invalidate entire cache since stats changed
+        self.cache.invalidate_all();
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Cache Management
+    # ========================================================================
+
+    ## Invalidate cached plans for a table (called on DDL)
+    F invalidate_table(mut self, table_name: &Str) -> u32 {
+        self.cache.invalidate_table(table_name)
+    }
+
+    ## Clear entire plan cache
+    F invalidate_all(mut self) {
+        self.cache.invalidate_all();
+    }
+
+    # ========================================================================
+    # Statistics & Diagnostics
+    # ========================================================================
+
+    ## Get planner statistics
+    F planner_stats(self) -> PlannerStats {
+        cache_stats := mut self.cache.stats();
+        PlannerStats {
+            total_queries: self.total_queries,
+            hybrid_queries: self.hybrid_queries,
+            cache_hits: cache_stats.hits,
+            cache_misses: cache_stats.misses,
+            cache_evictions: cache_stats.evictions,
+            cache_entries: cache_stats.entries,
+            cache_hit_rate: cache_stats.hit_rate(),
+        }
+    }
+
+    ## Update engine statistics (called by stats collector or external source)
+    F update_stats(mut self, stats: HybridStats) {
+        self.stats = stats;
+        # Invalidate cache since cost estimates may change
+        self.cache.invalidate_all();
+    }
+}
+
+# ============================================================================
+# Planner Statistics
+# ============================================================================
+
+# Aggregated planner statistics for monitoring
+S PlannerStats {
+    total_queries: u64,
+    hybrid_queries: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
+    cache_entries: u64,
+    cache_hit_rate: f64,
+}
+
+X PlannerStats {
+    F to_string(self) -> Str {
+        result := mut Str.new();
+        result.push_str("Planner Stats:\n");
+        result.push_str("  Total queries:   ");
+        result.push_str(&self.total_queries.to_string());
+        result.push_str("\n  Hybrid queries:  ");
+        result.push_str(&self.hybrid_queries.to_string());
+        result.push_str("\n  Cache hits:      ");
+        result.push_str(&self.cache_hits.to_string());
+        result.push_str("\n  Cache misses:    ");
+        result.push_str(&self.cache_misses.to_string());
+        result.push_str("\n  Cache evictions: ");
+        result.push_str(&self.cache_evictions.to_string());
+        result.push_str("\n  Cache entries:   ");
+        result.push_str(&self.cache_entries.to_string());
+        result.push_str("\n  Cache hit rate:  ");
+        # Format hit_rate as percentage
+        pct := mut (self.cache_hit_rate * 100.0) as u32;
+        result.push_str(&pct.to_string());
+        result.push_str("%\n");
+        result
+    }
+}
+
+# ============================================================================
+# Convenience Functions (Module-Level)
+# ============================================================================
+
+## Quick plan: analyze + build + optimize in one call
+## For use outside the HybridPlanner (e.g., testing, one-shot queries)
+F quick_plan(
+    query: &SelectQuery,
+    stats: &HybridStats,
+) -> Result<HybridPlanNode, VaisError> {
+    profile := mut analyze_query(query)?;
+    plan := mut build_initial_plan(&profile, stats)?;
+    plan = optimize_plan(plan, stats, &OptimizerConfig.default())?;
+    Ok(plan)
+}
+
+## Quick explain: plan + format in one call
+F quick_explain(
+    query: &SelectQuery,
+    stats: &HybridStats,
+    verbose: bool,
+) -> Result<Str, VaisError> {
+    plan := mut quick_plan(query, stats)?;
+    options := mut ExplainOptions {
+        analyze: false,
+        verbose,
+        format: ExplainFormat.Text,
+    };
+    explain_plan(&plan, &options)
+}

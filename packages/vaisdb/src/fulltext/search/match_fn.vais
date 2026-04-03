@@ -1,0 +1,294 @@
+# src/fulltext/search/match_fn.vais
+# Volcano-style iterator for FULLTEXT_MATCH() SQL function
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U fulltext/types.{
+    FullTextConfig, FullTextMeta, PostingEntry,
+    DictEntry, err_fulltext_index_not_found
+};
+U storage/hash.{fnv1a_hash};
+U fulltext/tokenizer.{Tokenizer, TermFreqInfo};
+U fulltext/index/dictionary.{DictionaryIndex};
+U fulltext/index/posting.{PostingStore};
+U fulltext/search/bm25.{BM25Scorer};
+U fulltext/visibility.{is_posting_visible, filter_visible_postings};
+
+# Result structure for a single full-text M S FullTextMatchResult {
+    doc_id: u64,
+    score: f64,
+    table_id: u32,
+    row_tid: u32,
+}
+
+X FullTextMatchResult {
+    # Create a new M result
+    F new(doc_id: u64, score: f64, table_id: u32, row_tid: u32) -> FullTextMatchResult {
+        FullTextMatchResult {
+            doc_id: doc_id,
+            score: score,
+            table_id: table_id,
+            row_tid: row_tid,
+        }
+    }
+
+    # Clone the result
+    F clone(self) -> FullTextMatchResult {
+        FullTextMatchResult {
+            doc_id: self.doc_id,
+            score: self.score,
+            table_id: self.table_id,
+            row_tid: self.row_tid,
+        }
+    }
+}
+
+# Volcano-style executor for FULLTEXT_MATCH(column, query_text, top_k)
+S FullTextMatchExecutor {
+    index_id: u32,
+    query_text: Str,
+    top_k: u32,
+    results: Vec<FullTextMatchResult>,
+    cursor: u64,
+    is_open: bool,
+}
+
+X FullTextMatchExecutor {
+    # Create a new full-text M executor
+    F new(index_id: u32, query_text: Str, top_k: u32) -> FullTextMatchExecutor {
+        FullTextMatchExecutor {
+            index_id: index_id,
+            query_text: query_text,
+            top_k: top_k,
+            results: Vec.new(),
+            cursor: 0,
+            is_open: false,
+        }
+    }
+
+    # Execute the full-text search and populate results
+    # Steps:
+    # 1. Tokenize query_text
+    # 2. Lookup posting lists for each term
+    # 3. Read PostingEntries from PostingStore
+    # 4. Filter by MVCC visibility (post-filter strategy)
+    # 5. Score with BM25
+    # 6. Sort by score descending
+    # 7. Return top_k results
+    F execute_search(
+        mut self,
+        meta: &FullTextMeta,
+        config: &FullTextConfig,
+        dict_index: &DictionaryIndex,
+        posting_store: &PostingStore,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        pool: &BufferPool,
+    ) -> Result<(), VaisError> {
+        # Step 1: Tokenize query
+        tokenizer := mut Tokenizer.new(config.clone());
+        query_terms := mut tokenizer.tokenize_with_freqs(&self.query_text);
+
+        I query_terms.is_empty() {
+            # No terms to search, return empty results
+            self.results = Vec.new();
+            R Ok(());
+        }
+
+        # Step 2 & 3: Lookup posting lists and collect candidates
+        candidates: Vec<(u64, u32, u32, f64)> := mut Vec.new(); # (doc_id, table_id, row_tid, raw_score)
+        term_doc_freqs: Vec<(Str, u32)> := mut Vec.new(); # (term, df)
+
+        L term_freq_info: query_terms {
+            term := mut term_freq_info.term.clone();
+
+            # Lookup term in dictionary
+            M dict_index.lookup_term(&term, pool) {
+                Ok(Some(dict_entry)) => {
+                    # Read posting list
+                    M posting_store.read_all_entries(dict_entry.posting_head_page, pool) {
+                        Ok(postings) => {
+                            # Step 4: Filter by visibility (post-filter strategy)
+                            visible_postings := mut filter_visible_postings(&postings, snapshot, clog);
+
+                            # Store term df for BM25
+                            term_doc_freqs.push((term.clone(), visible_postings.len() as u32));
+
+                            # Collect candidates with term frequency
+                            L posting: visible_postings {
+                                tf := mut posting.term_freq as f64;
+                                candidates.push((
+                                    posting.doc_id,
+                                    posting.table_id,
+                                    posting.row_tid,
+                                    tf, # Will be replaced with BM25 score
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            R Err(e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    # Term not found, skip
+                }
+                Err(e) => {
+                    R Err(e);
+                }
+            }
+        }
+
+        # Step 5: Score with BM25
+        scorer := mut BM25Scorer.new(config.clone());
+        total_docs := mut meta.total_docs;
+        avg_doc_length := mut meta.avg_doc_length;
+
+        L mut candidate: candidates.iter_mut() {
+            doc_id := mut candidate.0;
+            tf := mut candidate.3;
+
+            # Find df for this term (simplified: use first matching term)
+            df := mut 1u32;
+            I !term_doc_freqs.is_empty() {
+                df = term_doc_freqs[0].1;
+            }
+
+            # Get document length (simplified: use avg_doc_length)
+            doc_length := mut avg_doc_length;
+
+            # Calculate BM25 score
+            score := mut scorer.score(tf as u32, df, doc_length as u32, avg_doc_length as u32, total_docs);
+            candidate.3 = score;
+        }
+
+        # Step 6: Sort by score descending
+        candidates.sort_by(|a, b| {
+            # Sort descending
+            I b.3 > a.3 {
+                R 1;
+            } E I b.3 < a.3 {
+                R -1;
+            } E {
+                R 0;
+            }
+        });
+
+        # Step 7: Take top_k results
+        top_k_count := mut I candidates.len() < self.top_k as u64 {
+            candidates.len()
+        } E {
+            self.top_k as u64
+        };
+
+        self.results = Vec.with_capacity(top_k_count);
+        L i: 0..top_k_count {
+            candidate := mut &candidates[i];
+            self.results.push(FullTextMatchResult.new(
+                candidate.0,
+                candidate.3,
+                candidate.1,
+                candidate.2,
+            ));
+        }
+
+        Ok(())
+    }
+
+    # Volcano interface: open the iterator
+    F open(mut self) {
+        self.cursor = 0;
+        self.is_open = true;
+    }
+
+    # Volcano interface: get next result
+    F next(mut self) -> Option<FullTextMatchResult> {
+        I !self.is_open || self.cursor >= self.results.len() {
+            R None;
+        }
+        result := mut self.results[self.cursor].clone();
+        self.cursor += 1;
+        Some(result)
+    }
+
+    # Volcano interface: close the iterator
+    F close(mut self) {
+        self.is_open = false;
+    }
+
+    # Get the current cursor position
+    F cursor_position(self) -> u64 {
+        self.cursor
+    }
+
+    # Get total number of results
+    F result_count(self) -> u64 {
+        self.results.len()
+    }
+
+    # Check if iterator is open
+    F is_open(self) -> bool {
+        self.is_open
+    }
+}
+
+# Simplified scoring for multi-term queries
+# Aggregates scores across all query terms for each document
+S MultiTermScorer {
+    config: FullTextConfig,
+}
+
+X MultiTermScorer {
+    # Create a new multi-term scorer
+    F new(config: FullTextConfig) -> MultiTermScorer {
+        MultiTermScorer {
+            config: config,
+        }
+    }
+
+    # Score a document against multiple query terms
+    # Returns aggregated BM25 score (sum of individual term scores)
+    F score_document(
+        &self,
+        doc_id: u64,
+        term_postings: &Vec<(Str, Vec<PostingEntry>)>,
+        meta: &FullTextMeta,
+    ) -> f64 {
+        scorer := mut BM25Scorer.new(self.config.clone());
+        total_score := mut 0.0f64;
+        total_docs := mut meta.total_docs;
+        avg_doc_length := mut meta.avg_doc_length;
+
+        L term_posting_pair: term_postings {
+            postings := mut &term_posting_pair.1;
+            df := mut postings.len() as u32;
+
+            # Find posting for this doc_id
+            doc_found := mut false;
+            L posting: postings {
+                I !doc_found && posting.doc_id == doc_id {
+                    tf := mut posting.term_freq;
+                    doc_length := mut posting.doc_length;
+
+                    term_score := mut scorer.score(
+                        tf,
+                        df,
+                        doc_length,
+                        avg_doc_length as u32,
+                        total_docs,
+                    );
+
+                    total_score += term_score;
+                    doc_found = true;
+                }
+            }
+        }
+
+        total_score
+    }
+}

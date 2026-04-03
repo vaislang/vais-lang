@@ -1,0 +1,383 @@
+# RAG MVCC Visibility
+# Determines chunk/document/memory visibility within a transaction snapshot
+# Delegates to storage layer's unified 3-case visibility check
+
+U std/vec.Vec;
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/constants.{INVALID_TXN_ID};
+U rag/types.{ChunkMeta, DocumentMeta};
+U rag/memory/types.{MemoryEntry};
+
+## Check if a chunk is visible to the given snapshot
+## Uses the unified 3-case visibility:
+## Case 1: created_by == current_txn → visible if cmd_id < snapshot.cmd_id AND (not expired OR expire_cmd_id > snapshot.cmd_id)
+## Case 2: created_by != current_txn → visible if is_committed(created_by) AND (not expired OR is_committed(expired_by) is false)
+## Case 3: expired_by == current_txn → visible if expire_cmd_id > snapshot.cmd_id
+F is_chunk_visible(
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> bool {
+    # Fast path: aborted creator means invisible
+    I clog.is_aborted(txn_id_create) {
+        R false;
+    }
+
+    # Case 1: Created by current transaction
+    I txn_id_create == snapshot.txn_id {
+        I cmd_id_create > snapshot.cmd_id {
+            R false;  # Created after our command
+        }
+        # Check if expired by ourselves
+        I txn_id_expire == snapshot.txn_id {
+            R cmd_id_expire > snapshot.cmd_id;
+        }
+        R txn_id_expire == INVALID_TXN_ID;  # Not expired = visible
+    }
+
+    # Case 2: Created by another transaction
+    I !clog.is_committed(txn_id_create) {
+        R false;  # Creator not committed
+    }
+    I !snapshot.is_visible_txn(txn_id_create) {
+        R false;  # Created after our snapshot
+    }
+
+    # Check expiration
+    I txn_id_expire == INVALID_TXN_ID {
+        R true;  # Not expired
+    }
+
+    # Case 3: Expired by current transaction
+    I txn_id_expire == snapshot.txn_id {
+        R cmd_id_expire > snapshot.cmd_id;
+    }
+
+    # Expired by another transaction
+    I clog.is_aborted(txn_id_expire) {
+        R true;  # Expirer aborted, so still visible
+    }
+    I !clog.is_committed(txn_id_expire) {
+        R true;  # Expirer not committed yet
+    }
+    !snapshot.is_visible_txn(txn_id_expire)
+}
+
+## Check if a document is visible to the given snapshot
+## Same 3-case visibility logic as chunks
+F is_document_visible(
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> bool {
+    # Fast path: aborted creator means invisible
+    I clog.is_aborted(txn_id_create) {
+        R false;
+    }
+
+    # Case 1: Created by current transaction
+    I txn_id_create == snapshot.txn_id {
+        I cmd_id_create > snapshot.cmd_id {
+            R false;  # Created after our command
+        }
+        # Check if expired by ourselves
+        I txn_id_expire == snapshot.txn_id {
+            R cmd_id_expire > snapshot.cmd_id;
+        }
+        R txn_id_expire == INVALID_TXN_ID;  # Not expired = visible
+    }
+
+    # Case 2: Created by another transaction
+    I !clog.is_committed(txn_id_create) {
+        R false;  # Creator not committed
+    }
+    I !snapshot.is_visible_txn(txn_id_create) {
+        R false;  # Created after our snapshot
+    }
+
+    # Check expiration
+    I txn_id_expire == INVALID_TXN_ID {
+        R true;  # Not expired
+    }
+
+    # Case 3: Expired by current transaction
+    I txn_id_expire == snapshot.txn_id {
+        R cmd_id_expire > snapshot.cmd_id;
+    }
+
+    # Expired by another transaction
+    I clog.is_aborted(txn_id_expire) {
+        R true;  # Expirer aborted, so still visible
+    }
+    I !clog.is_committed(txn_id_expire) {
+        R true;  # Expirer not committed yet
+    }
+    !snapshot.is_visible_txn(txn_id_expire)
+}
+
+## Check if a memory entry is visible to the given snapshot
+## Same 3-case visibility logic as chunks and documents
+F is_memory_visible(
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> bool {
+    # Fast path: aborted creator means invisible
+    I clog.is_aborted(txn_id_create) {
+        R false;
+    }
+
+    # Case 1: Created by current transaction
+    I txn_id_create == snapshot.txn_id {
+        I cmd_id_create > snapshot.cmd_id {
+            R false;  # Created after our command
+        }
+        # Check if expired by ourselves
+        I txn_id_expire == snapshot.txn_id {
+            R cmd_id_expire > snapshot.cmd_id;
+        }
+        R txn_id_expire == INVALID_TXN_ID;  # Not expired = visible
+    }
+
+    # Case 2: Created by another transaction
+    I !clog.is_committed(txn_id_create) {
+        R false;  # Creator not committed
+    }
+    I !snapshot.is_visible_txn(txn_id_create) {
+        R false;  # Created after our snapshot
+    }
+
+    # Check expiration
+    I txn_id_expire == INVALID_TXN_ID {
+        R true;  # Not expired
+    }
+
+    # Case 3: Expired by current transaction
+    I txn_id_expire == snapshot.txn_id {
+        R cmd_id_expire > snapshot.cmd_id;
+    }
+
+    # Expired by another transaction
+    I clog.is_aborted(txn_id_expire) {
+        R true;  # Expirer aborted, so still visible
+    }
+    I !clog.is_committed(txn_id_expire) {
+        R true;  # Expirer not committed yet
+    }
+    !snapshot.is_visible_txn(txn_id_expire)
+}
+
+## Filter chunks to only those visible to snapshot
+F filter_visible_chunks(
+    chunks: &Vec<ChunkMeta>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<ChunkMeta> {
+    visible := mut Vec.new();
+    L chunk: chunks {
+        I is_chunk_visible(
+            chunk.txn_id_create,
+            chunk.txn_id_expire,
+            chunk.cmd_id_create,
+            chunk.cmd_id_expire,
+            snapshot,
+            clog,
+        ) {
+            visible.push(chunk.clone());
+        }
+    }
+    visible
+}
+
+## Filter documents to only those visible to snapshot
+F filter_visible_documents(
+    documents: &Vec<DocumentMeta>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<DocumentMeta> {
+    visible := mut Vec.new();
+    L doc: documents {
+        I is_document_visible(
+            doc.txn_id_create,
+            doc.txn_id_expire,
+            doc.cmd_id_create,
+            doc.cmd_id_expire,
+            snapshot,
+            clog,
+        ) {
+            visible.push(doc.clone());
+        }
+    }
+    visible
+}
+
+## Filter memory entries to only those visible to snapshot
+F filter_visible_memories(
+    memories: &Vec<MemoryEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<MemoryEntry> {
+    visible := mut Vec.new();
+    L mem: memories {
+        I is_memory_visible(
+            mem.txn_id_create,
+            mem.txn_id_expire,
+            mem.cmd_id_create,
+            mem.cmd_id_expire,
+            snapshot,
+            clog,
+        ) {
+            visible.push(mem.clone());
+        }
+    }
+    visible
+}
+
+## Check if chunk should be included in GC scan
+## Chunks are GC candidates if:
+## - Created by committed transaction
+## - Expired by committed transaction
+## - Both transactions are older than GC horizon
+F is_chunk_gc_candidate(
+    chunk: &ChunkMeta,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> bool {
+    # Must be expired
+    I chunk.txn_id_expire == INVALID_TXN_ID {
+        R false;
+    }
+
+    # Creator must be committed and old
+    I !clog.is_committed(chunk.txn_id_create) {
+        R false;
+    }
+    I chunk.txn_id_create >= gc_horizon {
+        R false;
+    }
+
+    # Expirer must be committed and old
+    I !clog.is_committed(chunk.txn_id_expire) {
+        R false;
+    }
+    I chunk.txn_id_expire >= gc_horizon {
+        R false;
+    }
+
+    true
+}
+
+## Check if document should be included in GC scan
+F is_document_gc_candidate(
+    doc: &DocumentMeta,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> bool {
+    # Must be expired
+    I doc.txn_id_expire == INVALID_TXN_ID {
+        R false;
+    }
+
+    # Creator must be committed and old
+    I !clog.is_committed(doc.txn_id_create) {
+        R false;
+    }
+    I doc.txn_id_create >= gc_horizon {
+        R false;
+    }
+
+    # Expirer must be committed and old
+    I !clog.is_committed(doc.txn_id_expire) {
+        R false;
+    }
+    I doc.txn_id_expire >= gc_horizon {
+        R false;
+    }
+
+    true
+}
+
+## Check if memory entry should be included in GC scan
+F is_memory_gc_candidate(
+    mem: &MemoryEntry,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> bool {
+    # Must be expired
+    I mem.txn_id_expire == INVALID_TXN_ID {
+        R false;
+    }
+
+    # Creator must be committed and old
+    I !clog.is_committed(mem.txn_id_create) {
+        R false;
+    }
+    I mem.txn_id_create >= gc_horizon {
+        R false;
+    }
+
+    # Expirer must be committed and old
+    I !clog.is_committed(mem.txn_id_expire) {
+        R false;
+    }
+    I mem.txn_id_expire >= gc_horizon {
+        R false;
+    }
+
+    true
+}
+
+## Collect GC candidates from chunk list
+F collect_chunk_gc_candidates(
+    chunks: &Vec<ChunkMeta>,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> Vec<u64> {
+    candidates := mut Vec.new();
+    L chunk: chunks {
+        I is_chunk_gc_candidate(chunk, gc_horizon, clog) {
+            candidates.push(chunk.chunk_id);
+        }
+    }
+    candidates
+}
+
+## Collect GC candidates from document list
+F collect_document_gc_candidates(
+    documents: &Vec<DocumentMeta>,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> Vec<u64> {
+    candidates := mut Vec.new();
+    L doc: documents {
+        I is_document_gc_candidate(doc, gc_horizon, clog) {
+            candidates.push(doc.doc_id);
+        }
+    }
+    candidates
+}
+
+## Collect GC candidates from memory list
+F collect_memory_gc_candidates(
+    memories: &Vec<MemoryEntry>,
+    gc_horizon: u64,
+    clog: &Clog,
+) -> Vec<u64> {
+    candidates := mut Vec.new();
+    L mem: memories {
+        I is_memory_gc_candidate(mem, gc_horizon, clog) {
+            candidates.push(mem.memory_id);
+        }
+    }
+    candidates
+}

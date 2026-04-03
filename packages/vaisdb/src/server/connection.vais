@@ -1,0 +1,472 @@
+# Connection & Session Management
+# Per-connection state, session config, prepared statements, connection pool
+# Error codes: EE=06 (server), CC=03 (connection pool), CC=08 (connection)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/sync.{Mutex, AtomicU64, Ordering};
+U std/hashmap.HashMap;
+U storage/error.VaisError;
+U server/types.{
+    ConnectionState, TransactionState,
+    SessionConfig, PreparedStmtInfo, BindParams,
+    err_max_connections, err_connection_closed,
+    err_invalid_state, err_prepared_stmt_not_found, err_portal_not_found,
+};
+U server/config.ServerConfig;
+
+# ============================================================================
+# Connection ID Generator
+# ============================================================================
+
+S ConnectionIdGen {
+    next_id: AtomicU64,
+}
+
+X ConnectionIdGen {
+    F new() -> ConnectionIdGen {
+        ConnectionIdGen {
+            next_id: AtomicU64.new(1),
+        }
+    }
+
+    F next(mut self) -> u64 {
+        self.next_id.fetch_add(1, Ordering.Relaxed)
+    }
+}
+
+# ============================================================================
+# Connection — Per-connection state
+# ============================================================================
+
+S Connection {
+    id: u64,
+    state: ConnectionState,
+    txn_state: TransactionState,
+    user: Str,
+    database: Str,
+    application_name: Str,
+    session_config: SessionConfig,
+    prepared_stmts: HashMap<Str, PreparedStmtInfo>,
+    portals: HashMap<Str, PortalInfo>,
+    current_txn_id: Option<u64>,
+    created_at: u64,       # timestamp
+    last_active_at: u64,   # timestamp
+}
+
+X Connection {
+    F new(id: u64, user: Str, database: Str) -> Connection {
+        Connection {
+            id,
+            state: ConnectionState.New,
+            txn_state: TransactionState.Idle,
+            user,
+            database,
+            application_name: "",
+            session_config: SessionConfig.new(),
+            prepared_stmts: HashMap.new(),
+            portals: HashMap.new(),
+            current_txn_id: None,
+            created_at: 0,
+            last_active_at: 0,
+        }
+    }
+
+    F with_application_name(mut self, name: Str) -> Connection {
+        self.application_name = name;
+        self
+    }
+
+    F with_timestamp(mut self, ts: u64) -> Connection {
+        self.created_at = ts;
+        self.last_active_at = ts;
+        self
+    }
+
+    # State transitions
+    F set_state(mut self, new_state: ConnectionState) -> Result<(), VaisError> {
+        # Validate transition
+        valid := mut false;
+
+        M &self.state {
+            ConnectionState.New => {
+                M &new_state {
+                    ConnectionState.Authenticating => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.Authenticating => {
+                M &new_state {
+                    ConnectionState.Ready => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.Ready => {
+                M &new_state {
+                    ConnectionState.InQuery => { valid = true; },
+                    ConnectionState.InTransaction => { valid = true; },
+                    ConnectionState.CopyIn => { valid = true; },
+                    ConnectionState.CopyOut => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.InQuery => {
+                M &new_state {
+                    ConnectionState.Ready => { valid = true; },
+                    ConnectionState.InTransaction => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.InTransaction => {
+                M &new_state {
+                    ConnectionState.InQuery => { valid = true; },
+                    ConnectionState.Ready => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.CopyIn => {
+                M &new_state {
+                    ConnectionState.Ready => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.CopyOut => {
+                M &new_state {
+                    ConnectionState.Ready => { valid = true; },
+                    ConnectionState.Closing => { valid = true; },
+                    _ => {},
+                }
+            },
+            ConnectionState.Closing => {
+                # Terminal state — no valid transitions
+            },
+        }
+
+        I !valid {
+            R Err(err_invalid_state(
+                state_name(&self.state),
+                state_name(&new_state),
+            ));
+        }
+
+        self.state = new_state;
+        Ok(())
+    }
+
+    F get_state(self) -> &ConnectionState {
+        &self.state
+    }
+
+    F get_txn_state(self) -> &TransactionState {
+        &self.txn_state
+    }
+
+    # Transaction management
+    F begin_transaction(mut self, txn_id: u64) {
+        self.txn_state = TransactionState.InBlock;
+        self.current_txn_id = Some(txn_id);
+    }
+
+    F commit_transaction(mut self) {
+        self.txn_state = TransactionState.Idle;
+        self.current_txn_id = None;
+    }
+
+    F rollback_transaction(mut self) {
+        self.txn_state = TransactionState.Idle;
+        self.current_txn_id = None;
+    }
+
+    F mark_txn_failed(mut self) {
+        self.txn_state = TransactionState.Failed;
+    }
+
+    F is_in_transaction(self) -> bool {
+        M &self.txn_state {
+            TransactionState.InBlock => true,
+            TransactionState.Failed => true,
+            _ => false,
+        }
+    }
+
+    # Prepared statement management
+    F add_prepared_stmt(mut self, stmt: PreparedStmtInfo) {
+        self.prepared_stmts.insert(stmt.name.clone(), stmt);
+    }
+
+    F get_prepared_stmt(self, name: &Str) -> Result<&PreparedStmtInfo, VaisError> {
+        M self.prepared_stmts.get(name) {
+            Some(stmt) => Ok(stmt),
+            None => Err(err_prepared_stmt_not_found(name.clone())),
+        }
+    }
+
+    F remove_prepared_stmt(mut self, name: &Str) -> Result<(), VaisError> {
+        M self.prepared_stmts.remove(name) {
+            Some(_) => Ok(()),
+            None => Err(err_prepared_stmt_not_found(name.clone())),
+        }
+    }
+
+    F has_prepared_stmt(self, name: &Str) -> bool {
+        self.prepared_stmts.contains_key(name)
+    }
+
+    # Portal management
+    F add_portal(mut self, portal: PortalInfo) {
+        self.portals.insert(portal.name.clone(), portal);
+    }
+
+    F get_portal(self, name: &Str) -> Result<&PortalInfo, VaisError> {
+        M self.portals.get(name) {
+            Some(portal) => Ok(portal),
+            None => Err(err_portal_not_found(name.clone())),
+        }
+    }
+
+    F remove_portal(mut self, name: &Str) -> Result<(), VaisError> {
+        M self.portals.remove(name) {
+            Some(_) => Ok(()),
+            None => Err(err_portal_not_found(name.clone())),
+        }
+    }
+
+    # Clear all portals (done on Sync)
+    F clear_portals(mut self) {
+        self.portals.clear();
+    }
+
+    # Session config
+    F get_session_config(self) -> &SessionConfig {
+        &self.session_config
+    }
+
+    F get_session_config_mut(mut self) -> &mut SessionConfig {
+        &self.session_config
+    }
+
+    # Activity tracking
+    F touch(mut self, timestamp: u64) {
+        self.last_active_at = timestamp;
+    }
+
+    F idle_duration(self, now: u64) -> u64 {
+        I now > self.last_active_at {
+            now - self.last_active_at
+        } E {
+            0
+        }
+    }
+
+    F get_id(self) -> u64 {
+        self.id
+    }
+
+    F get_user(self) -> &Str {
+        &self.user
+    }
+
+    F get_database(self) -> &Str {
+        &self.database
+    }
+}
+
+# Portal: a bound prepared statement ready for execution
+S PortalInfo {
+    name: Str,
+    stmt_name: Str,
+    param_values: Vec<ParamValue>,
+}
+
+X PortalInfo {
+    F new(name: Str, stmt_name: Str, param_values: Vec<ParamValue>) -> PortalInfo {
+        PortalInfo { name, stmt_name, param_values }
+    }
+}
+
+# Import ParamValue for portal
+U server/types.ParamValue;
+
+# ============================================================================
+# ConnectionPool — Server-side connection management
+# ============================================================================
+
+S ConnectionPool {
+    connections: Mutex<HashMap<u64, Connection>>,
+    id_gen: ConnectionIdGen,
+    max_connections: u32,
+    active_count: AtomicU64,
+}
+
+X ConnectionPool {
+    F new(max_connections: u32) -> ConnectionPool {
+        ConnectionPool {
+            connections: Mutex.new(HashMap.new()),
+            id_gen: ConnectionIdGen.new(),
+            max_connections,
+            active_count: AtomicU64.new(0),
+        }
+    }
+
+    F from_config(config: &ServerConfig) -> ConnectionPool {
+        ConnectionPool.new(config.max_connections)
+    }
+
+    # Create a new connection and add it to the pool.
+    # Returns the connection ID, or error if max connections exceeded.
+    F create_connection(mut self, user: Str, database: Str, timestamp: u64) -> Result<u64, VaisError> {
+        current := mut self.active_count.load(Ordering.Relaxed);
+        I current >= self.max_connections as u64 {
+            R Err(err_max_connections(self.max_connections));
+        }
+
+        id := mut self.id_gen.next();
+        conn := mut Connection.new(id, user, database);
+        conn = conn.with_timestamp(timestamp);
+
+        guard := mut self.connections.lock();
+        guard.insert(id, conn);
+        self.active_count.fetch_add(1, Ordering.Relaxed);
+
+        Ok(id)
+    }
+
+    # Remove a connection from the pool
+    F remove_connection(mut self, conn_id: u64) -> Option<Connection> {
+        guard := mut self.connections.lock();
+        removed := mut guard.remove(&conn_id);
+        I removed.is_some() {
+            self.active_count.fetch_sub(1, Ordering.Relaxed);
+        }
+        removed
+    }
+
+    # Get current active connection count
+    F active_count(self) -> u64 {
+        self.active_count.load(Ordering.Relaxed)
+    }
+
+    # Check if pool has capacity for another connection
+    F has_capacity(self) -> bool {
+        self.active_count.load(Ordering.Relaxed) < self.max_connections as u64
+    }
+
+    # Execute a function with a locked reference to a connection.
+    # Returns error if connection not found.
+    F with_connection<T>(
+        mut self,
+        conn_id: u64,
+        f: F(&mut Connection) -> T,
+    ) -> Result<T, VaisError> {
+        guard := mut self.connections.lock();
+        M guard.get_mut(&conn_id) {
+            Some(conn) => Ok(f(conn)),
+            None => Err(err_connection_closed()),
+        }
+    }
+
+    # Execute a read-only function with a connection reference
+    F with_connection_ref<T>(
+        self,
+        conn_id: u64,
+        f: F(&Connection) -> T,
+    ) -> Result<T, VaisError> {
+        guard := mut self.connections.lock();
+        M guard.get(&conn_id) {
+            Some(conn) => Ok(f(conn)),
+            None => Err(err_connection_closed()),
+        }
+    }
+
+    # Get connection IDs for monitoring
+    F connection_ids(self) -> Vec<u64> {
+        guard := mut self.connections.lock();
+        ids := mut Vec.new();
+        L entry: guard.iter() {
+            ids.push(*entry.0);
+        }
+        ids
+    }
+
+    # Find idle connections exceeding timeout (for cleanup)
+    F find_idle_connections(self, now: u64, idle_timeout_sec: u32) -> Vec<u64> {
+        guard := mut self.connections.lock();
+        idle_ids := mut Vec.new();
+        timeout := mut idle_timeout_sec as u64;
+
+        L entry: guard.iter() {
+            conn := mut entry.1;
+            I conn.idle_duration(now) > timeout {
+                # Only close connections that are idle (not mid-query/transaction)
+                M conn.get_state() {
+                    ConnectionState.Ready => {
+                        I !conn.is_in_transaction() {
+                            idle_ids.push(*entry.0);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        idle_ids
+    }
+}
+
+# ============================================================================
+# ConnectionStats — Monitoring info
+# ============================================================================
+
+S ConnectionStats {
+    conn_id: u64,
+    user: Str,
+    database: Str,
+    state: Str,
+    txn_state: Str,
+    idle_seconds: u64,
+}
+
+X ConnectionStats {
+    F from_connection(conn: &Connection, now: u64) -> ConnectionStats {
+        ConnectionStats {
+            conn_id: conn.id,
+            user: conn.user.clone(),
+            database: conn.database.clone(),
+            state: state_name(conn.get_state()),
+            txn_state: txn_state_name(conn.get_txn_state()),
+            idle_seconds: conn.idle_duration(now),
+        }
+    }
+}
+
+# ============================================================================
+# Helper: State names for debugging/monitoring
+# ============================================================================
+
+F state_name(state: &ConnectionState) -> Str {
+    M state {
+        ConnectionState.New => "new",
+        ConnectionState.Authenticating => "authenticating",
+        ConnectionState.Ready => "ready",
+        ConnectionState.InQuery => "in_query",
+        ConnectionState.InTransaction => "in_transaction",
+        ConnectionState.CopyIn => "copy_in",
+        ConnectionState.CopyOut => "copy_out",
+        ConnectionState.Closing => "closing",
+    }
+}
+
+F txn_state_name(state: &TransactionState) -> Str {
+    M state {
+        TransactionState.Idle => "idle",
+        TransactionState.InBlock => "in_block",
+        TransactionState.Failed => "failed",
+    }
+}

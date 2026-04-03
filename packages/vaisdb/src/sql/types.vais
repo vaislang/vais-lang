@@ -1,0 +1,1182 @@
+# SQL Type System
+# Core types: INT, FLOAT, BOOL, VARCHAR(n), TEXT, BLOB, DATE, TIMESTAMP, VECTOR(dim), NULL
+# Based on the unified type system shared across all VaisDB engines
+
+U std/bytes.{ByteBuffer};
+U storage/error.{VaisError};
+U storage/bytes.{write_string, read_string, write_bytes, read_bytes};
+
+# Type tag constants for serialization
+C TYPE_TAG_NULL: u8 = 0;
+C TYPE_TAG_INT: u8 = 1;
+C TYPE_TAG_FLOAT: u8 = 2;
+C TYPE_TAG_BOOL: u8 = 3;
+C TYPE_TAG_VARCHAR: u8 = 4;
+C TYPE_TAG_TEXT: u8 = 5;
+C TYPE_TAG_BLOB: u8 = 6;
+C TYPE_TAG_DATE: u8 = 7;
+C TYPE_TAG_TIMESTAMP: u8 = 8;
+C TYPE_TAG_VECTOR: u8 = 9;
+
+# SQL data type descriptor
+L SqlType =
+    Int |
+    Float |
+    Bool |
+    Varchar { max_len: u32 } |
+    Text |
+    Blob |
+    Date |         # Days since Unix epoch (i32)
+    Timestamp |    # Microseconds since Unix epoch (i64)
+    Vector { dim: u32 };
+
+# SQL value - tagged union for runtime values
+L SqlValue =
+    Null |
+    IntVal { v: i64 } |
+    FloatVal { v: f64 } |
+    BoolVal { v: bool } |
+    StringVal { v: Str } |
+    BlobVal { v: Vec<u8> } |
+    DateVal { v: i32 } |          # days since epoch
+    TimestampVal { v: i64 } |     # microseconds since epoch
+    VectorVal { v: Vec<f32> };
+
+# --- Error constructors (EE=01 for SQL engine, CC=09 for type system) ---
+
+F err_type_mismatch(expected: Str, actual: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0109001",
+        "Type mismatch: expected {expected}, got {actual}"
+    )
+}
+
+F err_cast_error(value: Str, from_type: Str, to_type: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0109002",
+        "Cannot cast '{value}' from {from_type} to {to_type}"
+    )
+}
+
+F err_division_by_zero() -> VaisError {
+    VaisError.new(
+        "VAIS-0109003",
+        "Division by zero"
+    )
+}
+
+F err_null_comparison() -> VaisError {
+    VaisError.new(
+        "VAIS-0109004",
+        "Cannot order NULL values"
+    )
+}
+
+F err_invalid_type_tag(tag: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0109005",
+        "Invalid type tag: {tag}"
+    )
+}
+
+F err_incompatible_types(op: Str, left: Str, right: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0109006",
+        "Incompatible types L {op}: {left} and {right}"
+    )
+}
+
+# --- SqlType implementation ---
+
+X SqlType {
+    # Get unique type tag for serialization
+    F type_id(self) -> u8 {
+        M self {
+            SqlType.Int => TYPE_TAG_INT,
+            SqlType.Float => TYPE_TAG_FLOAT,
+            SqlType.Bool => TYPE_TAG_BOOL,
+            SqlType.Varchar { .. } => TYPE_TAG_VARCHAR,
+            SqlType.Text => TYPE_TAG_TEXT,
+            SqlType.Blob => TYPE_TAG_BLOB,
+            SqlType.Date => TYPE_TAG_DATE,
+            SqlType.Timestamp => TYPE_TAG_TIMESTAMP,
+            SqlType.Vector { .. } => TYPE_TAG_VECTOR,
+        }
+    }
+
+    # Reverse lookup from type tag to SqlType
+    # VARCHAR gets max_len=255 default, VECTOR gets dim=0 placeholder
+    F from_type_id(id: u8) -> Result<SqlType, VaisError> {
+        M id {
+            1 => Ok(SqlType.Int),
+            2 => Ok(SqlType.Float),
+            3 => Ok(SqlType.Bool),
+            4 => Ok(SqlType.Varchar { max_len: 255 }),
+            5 => Ok(SqlType.Text),
+            6 => Ok(SqlType.Blob),
+            7 => Ok(SqlType.Date),
+            8 => Ok(SqlType.Timestamp),
+            9 => Ok(SqlType.Vector { dim: 0 }),
+            _ => Err(err_invalid_type_tag(id)),
+        }
+    }
+
+    # Human-readable display name
+    F name(self) -> Str {
+        M self {
+            SqlType.Int => "INT",
+            SqlType.Float => "FLOAT",
+            SqlType.Bool => "BOOL",
+            SqlType.Varchar { max_len } => "VARCHAR({max_len})",
+            SqlType.Text => "TEXT",
+            SqlType.Blob => "BLOB",
+            SqlType.Date => "DATE",
+            SqlType.Timestamp => "TIMESTAMP",
+            SqlType.Vector { dim } => "VECTOR({dim})",
+        }
+    }
+
+    # Check if type is numeric (Int or Float)
+    F is_numeric(self) -> bool {
+        M self {
+            SqlType.Int | SqlType.Float => true,
+            _ => false,
+        }
+    }
+
+    # Check if type is string-like (Varchar or Text)
+    F is_string(self) -> bool {
+        M self {
+            SqlType.Varchar { .. } | SqlType.Text => true,
+            _ => false,
+        }
+    }
+
+    # Check type compatibility for assignment/comparison
+    # Numeric types are compatible with each other, string types are compatible with each other,
+    # and identical types are always compatible
+    F is_compatible(self, other: &SqlType) -> bool {
+        M (self, other) {
+            # Same base type
+            (SqlType.Int, SqlType.Int) => true,
+            (SqlType.Float, SqlType.Float) => true,
+            (SqlType.Bool, SqlType.Bool) => true,
+            (SqlType.Date, SqlType.Date) => true,
+            (SqlType.Timestamp, SqlType.Timestamp) => true,
+            (SqlType.Text, SqlType.Text) => true,
+            (SqlType.Blob, SqlType.Blob) => true,
+
+            # Numeric cross-compatibility
+            (SqlType.Int, SqlType.Float) => true,
+            (SqlType.Float, SqlType.Int) => true,
+
+            # String cross-compatibility
+            (SqlType.Varchar { .. }, SqlType.Varchar { .. }) => true,
+            (SqlType.Varchar { .. }, SqlType.Text) => true,
+            (SqlType.Text, SqlType.Varchar { .. }) => true,
+
+            # Date/Timestamp cross-compatibility
+            (SqlType.Date, SqlType.Timestamp) => true,
+            (SqlType.Timestamp, SqlType.Date) => true,
+
+            # Vector compatibility requires matching dimensions (0 = wildcard)
+            (SqlType.Vector { dim: d1 }, SqlType.Vector { dim: d2 }) => {
+                d1 == 0 || d2 == 0 || d1 == d2
+            },
+
+            _ => false,
+        }
+    }
+
+    # Get the default value for this type
+    F default_value(self) -> SqlValue {
+        M self {
+            SqlType.Int => SqlValue.IntVal { v: 0 },
+            SqlType.Float => SqlValue.FloatVal { v: 0.0 },
+            SqlType.Bool => SqlValue.BoolVal { v: false },
+            SqlType.Varchar { .. } => SqlValue.StringVal { v: "" },
+            SqlType.Text => SqlValue.StringVal { v: "" },
+            SqlType.Blob => SqlValue.BlobVal { v: Vec.new() },
+            SqlType.Date => SqlValue.DateVal { v: 0 },
+            SqlType.Timestamp => SqlValue.TimestampVal { v: 0 },
+            SqlType.Vector { dim } => {
+                v := mut Vec.with_capacity(dim as u64);
+                L _: 0..dim {
+                    v.push(0.0f32);
+                }
+                SqlValue.VectorVal { v }
+            },
+        }
+    }
+
+    # Serialize SqlType to ByteBuffer for catalog storage
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.type_id());
+        M self {
+            SqlType.Varchar { max_len } => buf.put_u32_le(max_len),
+            SqlType.Vector { dim } => buf.put_u32_le(dim),
+            _ => {},
+        }
+    }
+
+    # Deserialize SqlType from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<SqlType, VaisError> {
+        tag := mut buf.get_u8()?;
+        M tag {
+            1 => Ok(SqlType.Int),
+            2 => Ok(SqlType.Float),
+            3 => Ok(SqlType.Bool),
+            4 => {
+                max_len := mut buf.get_u32_le()?;
+                Ok(SqlType.Varchar { max_len })
+            },
+            5 => Ok(SqlType.Text),
+            6 => Ok(SqlType.Blob),
+            7 => Ok(SqlType.Date),
+            8 => Ok(SqlType.Timestamp),
+            9 => {
+                dim := mut buf.get_u32_le()?;
+                Ok(SqlType.Vector { dim })
+            },
+            _ => Err(err_invalid_type_tag(tag)),
+        }
+    }
+}
+
+# --- SqlValue implementation ---
+
+X SqlValue {
+    # Infer the SqlType from a runtime value
+    F get_type(self) -> SqlType {
+        M self {
+            SqlValue.Null => SqlType.Int,  # NULL has no inherent type; default to Int
+            SqlValue.IntVal { .. } => SqlType.Int,
+            SqlValue.FloatVal { .. } => SqlType.Float,
+            SqlValue.BoolVal { .. } => SqlType.Bool,
+            SqlValue.StringVal { .. } => SqlType.Text,
+            SqlValue.BlobVal { .. } => SqlType.Blob,
+            SqlValue.DateVal { .. } => SqlType.Date,
+            SqlValue.TimestampVal { .. } => SqlType.Timestamp,
+            SqlValue.VectorVal { v } => SqlType.Vector { dim: v.len() as u32 },
+        }
+    }
+
+    # Check if this value is NULL
+    F is_null(self) -> bool {
+        M self {
+            SqlValue.Null => true,
+            _ => false,
+        }
+    }
+
+    # Display representation of the value
+    F to_string(self) -> Str {
+        M self {
+            SqlValue.Null => "NULL",
+            SqlValue.IntVal { v } => "{v}",
+            SqlValue.FloatVal { v } => "{v}",
+            SqlValue.BoolVal { v } => I v { "TRUE" } E { "FALSE" },
+            SqlValue.StringVal { v } => "'{v}'",
+            SqlValue.BlobVal { v } => {
+                hex := mut "x'";
+                L b: v {
+                    hex = "{hex}{b:02x}";
+                }
+                "{hex}'"
+            },
+            SqlValue.DateVal { v } => "DATE({v})",
+            SqlValue.TimestampVal { v } => "TIMESTAMP({v})",
+            SqlValue.VectorVal { v } => {
+                s := mut "[";
+                L i: 0..v.len() {
+                    I i > 0 {
+                        s = "{s}, ";
+                    }
+                    s = "{s}{v[i]}";
+                }
+                "{s}]"
+            },
+        }
+    }
+
+    # Compare two SqlValues: returns -1, 0, or 1
+    # NULL comparison returns an error (NULL propagation for ORDER BY)
+    F compare(self, other: &SqlValue) -> Result<i32, VaisError> {
+        # NULL propagation: comparing with NULL is undefined
+        I self.is_null() || other.is_null() {
+            R Err(err_null_comparison());
+        }
+
+        M (self, other) {
+            (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
+                I a < *b { Ok(-1) }
+                E I a > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                I a < *b { Ok(-1) }
+                E I a > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            # INT vs FLOAT cross-comparison: promote INT to FLOAT
+            (SqlValue.IntVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                af := mut a as f64;
+                I af < *b { Ok(-1) }
+                E I af > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.IntVal { v: b }) => {
+                bf := mut *b as f64;
+                I *a < bf { Ok(-1) }
+                E I *a > bf { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.BoolVal { v: a }, SqlValue.BoolVal { v: b }) => {
+                ai := mut I a { 1 } E { 0 };
+                bi := mut I *b { 1 } E { 0 };
+                I ai < bi { Ok(-1) }
+                E I ai > bi { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.StringVal { v: a }, SqlValue.StringVal { v: b }) => {
+                I a < b { Ok(-1) }
+                E I a > b { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.DateVal { v: a }, SqlValue.DateVal { v: b }) => {
+                I a < *b { Ok(-1) }
+                E I a > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.TimestampVal { v: a }, SqlValue.TimestampVal { v: b }) => {
+                I a < *b { Ok(-1) }
+                E I a > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            # DATE vs TIMESTAMP cross-comparison: promote DATE to TIMESTAMP
+            (SqlValue.DateVal { v: a }, SqlValue.TimestampVal { v: b }) => {
+                a_us := mut (a as i64) * 86400_000_000;  # days to microseconds
+                I a_us < *b { Ok(-1) }
+                E I a_us > *b { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.TimestampVal { v: a }, SqlValue.DateVal { v: b }) => {
+                b_us := mut (*b as i64) * 86400_000_000;
+                I *a < b_us { Ok(-1) }
+                E I *a > b_us { Ok(1) }
+                E { Ok(0) }
+            },
+            (SqlValue.BlobVal { v: a }, SqlValue.BlobVal { v: b }) => {
+                min_len := mut I a.len() < b.len() { a.len() } E { b.len() };
+                L i: 0..min_len {
+                    I a[i] < b[i] { R Ok(-1); }
+                    I a[i] > b[i] { R Ok(1); }
+                }
+                I a.len() < b.len() { Ok(-1) }
+                E I a.len() > b.len() { Ok(1) }
+                E { Ok(0) }
+            },
+            _ => {
+                Err(err_incompatible_types(
+                    "compare",
+                    self.get_type().name(),
+                    other.get_type().name()
+                ))
+            },
+        }
+    }
+
+    # Serialize value: write type_tag(u8) + value bytes
+    F serialize(self, buf: &mut ByteBuffer) {
+        M self {
+            SqlValue.Null => {
+                buf.put_u8(TYPE_TAG_NULL);
+            },
+            SqlValue.IntVal { v } => {
+                buf.put_u8(TYPE_TAG_INT);
+                buf.put_i64_le(v);
+            },
+            SqlValue.FloatVal { v } => {
+                buf.put_u8(TYPE_TAG_FLOAT);
+                buf.put_f64_le(v);
+            },
+            SqlValue.BoolVal { v } => {
+                buf.put_u8(TYPE_TAG_BOOL);
+                buf.put_u8(I v { 1 } E { 0 });
+            },
+            SqlValue.StringVal { v } => {
+                buf.put_u8(TYPE_TAG_TEXT);
+                write_string(buf, &v);
+            },
+            SqlValue.BlobVal { v } => {
+                buf.put_u8(TYPE_TAG_BLOB);
+                write_bytes(buf, v.as_slice());
+            },
+            SqlValue.DateVal { v } => {
+                buf.put_u8(TYPE_TAG_DATE);
+                buf.put_i32_le(v);
+            },
+            SqlValue.TimestampVal { v } => {
+                buf.put_u8(TYPE_TAG_TIMESTAMP);
+                buf.put_i64_le(v);
+            },
+            SqlValue.VectorVal { v } => {
+                buf.put_u8(TYPE_TAG_VECTOR);
+                buf.put_u32_le(v.len() as u32);
+                L f: v {
+                    buf.put_f32_le(f);
+                }
+            },
+        }
+    }
+
+    # Deserialize value from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<SqlValue, VaisError> {
+        tag := mut buf.get_u8()?;
+        M tag {
+            0 => Ok(SqlValue.Null),
+            1 => {
+                v := mut buf.get_i64_le()?;
+                Ok(SqlValue.IntVal { v })
+            },
+            2 => {
+                v := mut buf.get_f64_le()?;
+                Ok(SqlValue.FloatVal { v })
+            },
+            3 => {
+                b := mut buf.get_u8()?;
+                Ok(SqlValue.BoolVal { v: b != 0 })
+            },
+            4 | 5 => {
+                v := mut read_string(buf)?;
+                Ok(SqlValue.StringVal { v })
+            },
+            6 => {
+                v := mut read_bytes(buf)?;
+                Ok(SqlValue.BlobVal { v })
+            },
+            7 => {
+                v := mut buf.get_i32_le()?;
+                Ok(SqlValue.DateVal { v })
+            },
+            8 => {
+                v := mut buf.get_i64_le()?;
+                Ok(SqlValue.TimestampVal { v })
+            },
+            9 => {
+                dim := mut buf.get_u32_le()? as u64;
+                v := mut Vec.with_capacity(dim);
+                L _: 0..dim {
+                    v.push(buf.get_f32_le()?);
+                }
+                Ok(SqlValue.VectorVal { v })
+            },
+            _ => Err(err_invalid_type_tag(tag)),
+        }
+    }
+
+    # --- Arithmetic operations ---
+
+    # Addition: INT+INT, FLOAT+FLOAT, INT+FLOAT->FLOAT
+    F add(self, other: &SqlValue) -> Result<SqlValue, VaisError> {
+        # NULL propagation
+        I self.is_null() || other.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        M (self, other) {
+            (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.IntVal { v: a + *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: a + *b })
+            },
+            (SqlValue.IntVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: (a as f64) + *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: *a + (*b as f64) })
+            },
+            _ => Err(err_incompatible_types(
+                "add", self.get_type().name(), other.get_type().name()
+            )),
+        }
+    }
+
+    # Subtraction: INT-INT, FLOAT-FLOAT, INT-FLOAT->FLOAT
+    F sub(self, other: &SqlValue) -> Result<SqlValue, VaisError> {
+        I self.is_null() || other.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        M (self, other) {
+            (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.IntVal { v: a - *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: a - *b })
+            },
+            (SqlValue.IntVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: (a as f64) - *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: *a - (*b as f64) })
+            },
+            _ => Err(err_incompatible_types(
+                "subtract", self.get_type().name(), other.get_type().name()
+            )),
+        }
+    }
+
+    # Multiplication: INT*INT, FLOAT*FLOAT, INT*FLOAT->FLOAT
+    F mul(self, other: &SqlValue) -> Result<SqlValue, VaisError> {
+        I self.is_null() || other.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        M (self, other) {
+            (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.IntVal { v: a * *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: a * *b })
+            },
+            (SqlValue.IntVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: (a as f64) * *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: *a * (*b as f64) })
+            },
+            _ => Err(err_incompatible_types(
+                "multiply", self.get_type().name(), other.get_type().name()
+            )),
+        }
+    }
+
+    # Division: INT/INT->INT, FLOAT/FLOAT, INT/FLOAT->FLOAT
+    # Division by zero returns VAIS-0109003
+    F div(self, other: &SqlValue) -> Result<SqlValue, VaisError> {
+        I self.is_null() || other.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        # Check for division by zero
+        M other {
+            SqlValue.IntVal { v: 0 } => { R Err(err_division_by_zero()); },
+            SqlValue.FloatVal { v: 0.0 } => { R Err(err_division_by_zero()); },
+            _ => {},
+        }
+
+        M (self, other) {
+            (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.IntVal { v: a / *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: a / *b })
+            },
+            (SqlValue.IntVal { v: a }, SqlValue.FloatVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: (a as f64) / *b })
+            },
+            (SqlValue.FloatVal { v: a }, SqlValue.IntVal { v: b }) => {
+                Ok(SqlValue.FloatVal { v: *a / (*b as f64) })
+            },
+            _ => Err(err_incompatible_types(
+                "divide", self.get_type().name(), other.get_type().name()
+            )),
+        }
+    }
+
+    # Unary minus (negation)
+    F negate(self) -> Result<SqlValue, VaisError> {
+        I self.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        M self {
+            SqlValue.IntVal { v } => Ok(SqlValue.IntVal { v: -v }),
+            SqlValue.FloatVal { v } => Ok(SqlValue.FloatVal { v: -v }),
+            _ => Err(err_incompatible_types(
+                "negate", self.get_type().name(), ""
+            )),
+        }
+    }
+
+    # --- Logical operations (3-valued SQL logic with NULL propagation) ---
+
+    # AND with NULL propagation:
+    #   TRUE  AND TRUE  = TRUE
+    #   TRUE  AND FALSE = FALSE
+    #   FALSE AND TRUE  = FALSE
+    #   FALSE AND FALSE = FALSE
+    #   TRUE  AND NULL  = NULL
+    #   NULL  AND TRUE  = NULL
+    #   FALSE AND NULL  = FALSE
+    #   NULL  AND FALSE = FALSE
+    #   NULL  AND NULL  = NULL
+    F and_bool(self, other: &SqlValue) -> SqlValue {
+        M (self, other) {
+            (SqlValue.BoolVal { v: a }, SqlValue.BoolVal { v: b }) => {
+                SqlValue.BoolVal { v: a && *b }
+            },
+            (SqlValue.BoolVal { v: false }, SqlValue.Null) => {
+                SqlValue.BoolVal { v: false }
+            },
+            (SqlValue.Null, SqlValue.BoolVal { v: false }) => {
+                SqlValue.BoolVal { v: false }
+            },
+            _ => SqlValue.Null,
+        }
+    }
+
+    # OR with NULL propagation:
+    #   TRUE  OR TRUE  = TRUE
+    #   TRUE  OR FALSE = TRUE
+    #   FALSE OR TRUE  = TRUE
+    #   FALSE OR FALSE = FALSE
+    #   TRUE  OR NULL  = TRUE
+    #   NULL  OR TRUE  = TRUE
+    #   FALSE OR NULL  = NULL
+    #   NULL  OR FALSE = NULL
+    #   NULL  OR NULL  = NULL
+    F or_bool(self, other: &SqlValue) -> SqlValue {
+        M (self, other) {
+            (SqlValue.BoolVal { v: a }, SqlValue.BoolVal { v: b }) => {
+                SqlValue.BoolVal { v: a || *b }
+            },
+            (SqlValue.BoolVal { v: true }, SqlValue.Null) => {
+                SqlValue.BoolVal { v: true }
+            },
+            (SqlValue.Null, SqlValue.BoolVal { v: true }) => {
+                SqlValue.BoolVal { v: true }
+            },
+            _ => SqlValue.Null,
+        }
+    }
+
+    # NOT with NULL propagation:
+    #   NOT TRUE  = FALSE
+    #   NOT FALSE = TRUE
+    #   NOT NULL  = NULL
+    F not_bool(self) -> SqlValue {
+        M self {
+            SqlValue.BoolVal { v } => SqlValue.BoolVal { v: !v },
+            SqlValue.Null => SqlValue.Null,
+            _ => SqlValue.Null,
+        }
+    }
+
+    # --- Type casting ---
+
+    # Cast this value to the target type
+    F cast_to(self, target: &SqlType) -> Result<SqlValue, VaisError> {
+        I self.is_null() {
+            R Ok(SqlValue.Null);
+        }
+
+        self_type_name := mut self.get_type().name();
+        target_name := mut target.name();
+
+        M (self, target) {
+            # Identity casts
+            (SqlValue.IntVal { .. }, SqlType.Int) => Ok(self),
+            (SqlValue.FloatVal { .. }, SqlType.Float) => Ok(self),
+            (SqlValue.BoolVal { .. }, SqlType.Bool) => Ok(self),
+            (SqlValue.StringVal { .. }, SqlType.Text) => Ok(self),
+            (SqlValue.StringVal { .. }, SqlType.Varchar { .. }) => Ok(self),
+            (SqlValue.BlobVal { .. }, SqlType.Blob) => Ok(self),
+            (SqlValue.DateVal { .. }, SqlType.Date) => Ok(self),
+            (SqlValue.TimestampVal { .. }, SqlType.Timestamp) => Ok(self),
+            (SqlValue.VectorVal { .. }, SqlType.Vector { .. }) => Ok(self),
+
+            # INT -> FLOAT
+            (SqlValue.IntVal { v }, SqlType.Float) => {
+                Ok(SqlValue.FloatVal { v: v as f64 })
+            },
+            # FLOAT -> INT (truncate)
+            (SqlValue.FloatVal { v }, SqlType.Int) => {
+                Ok(SqlValue.IntVal { v: v as i64 })
+            },
+            # BOOL -> INT
+            (SqlValue.BoolVal { v }, SqlType.Int) => {
+                Ok(SqlValue.IntVal { v: I v { 1 } E { 0 } })
+            },
+            # INT -> BOOL (0=false, else=true)
+            (SqlValue.IntVal { v }, SqlType.Bool) => {
+                Ok(SqlValue.BoolVal { v: v != 0 })
+            },
+
+            # DATE -> TIMESTAMP (days to microseconds)
+            (SqlValue.DateVal { v }, SqlType.Timestamp) => {
+                Ok(SqlValue.TimestampVal { v: (v as i64) * 86400_000_000 })
+            },
+            # TIMESTAMP -> DATE (microseconds to days, truncate)
+            (SqlValue.TimestampVal { v }, SqlType.Date) => {
+                Ok(SqlValue.DateVal { v: (v / 86400_000_000) as i32 })
+            },
+
+            # Any -> STRING (use to_string representation but unquoted for non-string)
+            (SqlValue.IntVal { v }, SqlType.Text) => {
+                Ok(SqlValue.StringVal { v: "{v}" })
+            },
+            (SqlValue.IntVal { v }, SqlType.Varchar { .. }) => {
+                Ok(SqlValue.StringVal { v: "{v}" })
+            },
+            (SqlValue.FloatVal { v }, SqlType.Text) => {
+                Ok(SqlValue.StringVal { v: "{v}" })
+            },
+            (SqlValue.FloatVal { v }, SqlType.Varchar { .. }) => {
+                Ok(SqlValue.StringVal { v: "{v}" })
+            },
+            (SqlValue.BoolVal { v }, SqlType.Text) => {
+                Ok(SqlValue.StringVal { v: I v { "true" } E { "false" } })
+            },
+            (SqlValue.BoolVal { v }, SqlType.Varchar { .. }) => {
+                Ok(SqlValue.StringVal { v: I v { "true" } E { "false" } })
+            },
+
+            # STRING -> INT (parse)
+            (SqlValue.StringVal { v }, SqlType.Int) => {
+                M i64.parse(&v) {
+                    Ok(n) => Ok(SqlValue.IntVal { v: n }),
+                    Err(_) => Err(err_cast_error(v, self_type_name, target_name)),
+                }
+            },
+            # STRING -> FLOAT (parse)
+            (SqlValue.StringVal { v }, SqlType.Float) => {
+                M f64.parse(&v) {
+                    Ok(n) => Ok(SqlValue.FloatVal { v: n }),
+                    Err(_) => Err(err_cast_error(v, self_type_name, target_name)),
+                }
+            },
+            # STRING -> BOOL (parse)
+            (SqlValue.StringVal { v }, SqlType.Bool) => {
+                lower := mut v.to_lowercase();
+                M lower.as_str() {
+                    "true" | "1" | "yes" => Ok(SqlValue.BoolVal { v: true }),
+                    "false" | "0" | "no" => Ok(SqlValue.BoolVal { v: false }),
+                    _ => Err(err_cast_error(v, self_type_name, target_name)),
+                }
+            },
+
+            # Unsupported cast
+            _ => Err(err_cast_error(
+                self.to_string(), self_type_name, target_name
+            )),
+        }
+    }
+
+    # SQL equality: NULL = NULL -> NULL (not TRUE)
+    # Returns BoolVal(true/false) or Null
+    F equals(self, other: &SqlValue) -> SqlValue {
+        I self.is_null() || other.is_null() {
+            R SqlValue.Null;
+        }
+
+        M self.compare(other) {
+            Ok(0) => SqlValue.BoolVal { v: true },
+            Ok(_) => SqlValue.BoolVal { v: false },
+            Err(_) => SqlValue.BoolVal { v: false },  # Incompatible types -> not equal
+        }
+    }
+
+    # IS DISTINCT FROM: returns true even for NULL vs NULL comparison
+    # NULL IS DISTINCT FROM NULL → false
+    # NULL IS DISTINCT FROM 1 → true
+    # 1 IS DISTINCT FROM 1 → false
+    F is_distinct_from(self, other: &SqlValue) -> SqlValue {
+        M (self.is_null(), other.is_null()) {
+            # Both NULL -> not distinct
+            (true, true) => SqlValue.BoolVal { v: false },
+            # One NULL, one non-NULL -> distinct
+            (true, false) | (false, true) => SqlValue.BoolVal { v: true },
+            # Both non-NULL -> use regular comparison
+            (false, false) => {
+                M self.compare(other) {
+                    Ok(0) => SqlValue.BoolVal { v: false },
+                    Ok(_) => SqlValue.BoolVal { v: true },
+                    Err(_) => SqlValue.BoolVal { v: true },  # Incompatible types -> distinct
+                }
+            },
+        }
+    }
+
+    # NULL-safe equals (IS NOT DISTINCT FROM)
+    # Equivalent to: NOT (a IS DISTINCT FROM b)
+    F null_safe_equals(self, other: &SqlValue) -> SqlValue {
+        M self.is_distinct_from(other) {
+            SqlValue.BoolVal { v: b } => SqlValue.BoolVal { v: !b },
+            _ => SqlValue.Null,  # Should never happen, but handle gracefully
+        }
+    }
+
+    # BETWEEN: val BETWEEN low AND high → low <= val AND val <= high
+    # Returns Null if any operand is Null
+    F between(self, low: &SqlValue, high: &SqlValue) -> SqlValue {
+        # NULL propagation
+        I self.is_null() || low.is_null() || high.is_null() {
+            R SqlValue.Null;
+        }
+
+        # val >= low
+        ge_low := mut M self.compare(low) {
+            Ok(cmp) => cmp >= 0,
+            Err(_) => { R SqlValue.BoolVal { v: false }; },
+        };
+
+        # val <= high
+        le_high := mut M self.compare(high) {
+            Ok(cmp) => cmp <= 0,
+            Err(_) => { R SqlValue.BoolVal { v: false }; },
+        };
+
+        SqlValue.BoolVal { v: ge_low && le_high }
+    }
+
+    # IN list check: val IN (v1, v2, ...)
+    # Returns true if matches any, NULL if no M and any comparison was NULL
+    F in_list(self, list: &[SqlValue]) -> SqlValue {
+        found_null := mut false;
+
+        L item: list {
+            M self.equals(item) {
+                SqlValue.BoolVal { v: true } => {
+                    R SqlValue.BoolVal { v: true };
+                },
+                SqlValue.Null => {
+                    found_null = true;
+                },
+                _ => {},
+            }
+        }
+
+        # No M found
+        I found_null {
+            SqlValue.Null
+        } E {
+            SqlValue.BoolVal { v: false }
+        }
+    }
+
+    # LIKE pattern match: val LIKE pattern
+    # '%' matches any sequence, '_' matches any single char
+    # Only works on StringVal; returns Null if either is Null
+    F like_match(self, pattern: &SqlValue) -> SqlValue {
+        # NULL propagation
+        I self.is_null() || pattern.is_null() {
+            R SqlValue.Null;
+        }
+
+        M (self, pattern) {
+            (SqlValue.StringVal { v: text }, SqlValue.StringVal { v: pat }) => {
+                SqlValue.BoolVal { v: like_match_internal(&text, &pat) }
+            },
+            _ => SqlValue.BoolVal { v: false },
+        }
+    }
+}
+
+# --- File-level helper functions ---
+
+# Internal LIKE pattern matching implementation
+# Supports % (any sequence) and _ (any single char)
+F like_match_internal(text: &Str, pattern: &Str) -> bool {
+    t_chars := mut text.chars().collect.<Vec<char>>();
+    p_chars := mut pattern.chars().collect.<Vec<char>>();
+    t_idx := mut 0;
+    p_idx := mut 0;
+    star_idx := mut -1i32;
+    match_idx := mut 0;
+
+    L t_idx < t_chars.len() {
+        advanced := mut false;
+        I p_idx < p_chars.len() {
+            I p_chars[p_idx] == '%' {
+                # Found a %, remember position
+                star_idx = p_idx as i32;
+                match_idx = t_idx;
+                p_idx += 1;
+                advanced = true;
+            } E I p_chars[p_idx] == '_' || p_chars[p_idx] == t_chars[t_idx] {
+                # _ matches any char, or exact match
+                t_idx += 1;
+                p_idx += 1;
+                advanced = true;
+            }
+        }
+
+        I !advanced {
+            # No match at current position
+            I star_idx != -1 {
+                # Backtrack to last % and try matching one more char
+                p_idx = (star_idx as u64) + 1;
+                match_idx += 1;
+                t_idx = match_idx;
+            } E {
+                R false;
+            }
+        }
+    }
+
+    # Consume remaining % in pattern
+    L p_idx < p_chars.len() && p_chars[p_idx] == '%' {
+        p_idx += 1;
+    }
+
+    p_idx == p_chars.len()
+}
+
+# Aggregate helpers that handle NULL correctly per SQL spec
+
+# COUNT(*) — counts all rows including NULLs (just count)
+# COUNT(col) — counts non-NULL values only
+F agg_count_value(val: &SqlValue) -> bool {
+    !val.is_null()
+}
+
+# SUM: skip NULLs, return NULL if all values are NULL
+# Pass accumulator (Option<SqlValue>) and next value
+F agg_sum(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, VaisError> {
+    # Skip NULL values
+    I val.is_null() {
+        R Ok(*acc);
+    }
+
+    M acc {
+        None => {
+            # First non-NULL value
+            Ok(Some(val.clone()))
+        },
+        Some(sum) => {
+            # Add to running sum
+            M sum.add(val) {
+                Ok(new_sum) => Ok(Some(new_sum)),
+                Err(e) => Err(e),
+            }
+        },
+    }
+}
+
+# AVG: skip NULLs, return NULL if all values are NULL
+# Track (sum, count) pair
+F agg_avg_accumulate(sum: &Option<SqlValue>, count: &u64, val: &SqlValue) -> Result<(Option<SqlValue>, u64), VaisError> {
+    # Skip NULL values
+    I val.is_null() {
+        R Ok((*sum, *count));
+    }
+
+    M sum {
+        None => {
+            # First non-NULL value
+            Ok((Some(val.clone()), 1))
+        },
+        Some(s) => {
+            # Add to running sum
+            M s.add(val) {
+                Ok(new_sum) => Ok((Some(new_sum), *count + 1)),
+                Err(e) => Err(e),
+            }
+        },
+    }
+}
+
+F agg_avg_finalize(sum: &Option<SqlValue>, count: u64) -> Result<SqlValue, VaisError> {
+    M sum {
+        None => Ok(SqlValue.Null),  # No non-NULL values
+        Some(s) => {
+            I count == 0 {
+                R Ok(SqlValue.Null);
+            }
+
+            # Divide sum by count
+            divisor := mut SqlValue.IntVal { v: count as i64 };
+            s.div(&divisor)
+        },
+    }
+}
+
+# MIN/MAX: skip NULLs, return NULL if all values are NULL
+F agg_min(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, VaisError> {
+    # Skip NULL values
+    I val.is_null() {
+        R Ok(*acc);
+    }
+
+    M acc {
+        None => {
+            # First non-NULL value
+            Ok(Some(val.clone()))
+        },
+        Some(min) => {
+            # Compare and keep smaller
+            M min.compare(val) {
+                Ok(cmp) => {
+                    I cmp > 0 {
+                        Ok(Some(val.clone()))
+                    } E {
+                        Ok(Some(min.clone()))
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        },
+    }
+}
+
+F agg_max(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, VaisError> {
+    # Skip NULL values
+    I val.is_null() {
+        R Ok(*acc);
+    }
+
+    M acc {
+        None => {
+            # First non-NULL value
+            Ok(Some(val.clone()))
+        },
+        Some(max) => {
+            # Compare and keep larger
+            M max.compare(val) {
+                Ok(cmp) => {
+                    I cmp < 0 {
+                        Ok(Some(val.clone()))
+                    } E {
+                        Ok(Some(max.clone()))
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        },
+    }
+}
+
+# Compute a group key that treats all NULLs as equal (one group)
+# Returns a comparable representation for hash-based grouping
+F group_key_hash(values: &[SqlValue]) -> u64 {
+    use std/hash.{Hash, Hasher};
+
+    hasher := mut Hasher.new();
+
+    L val: values {
+        M val {
+            SqlValue.Null => {
+                # All NULLs hash to same value
+                hasher.write_u8(TYPE_TAG_NULL);
+            },
+            SqlValue.IntVal { v } => {
+                hasher.write_u8(TYPE_TAG_INT);
+                hasher.write_i64(*v);
+            },
+            SqlValue.FloatVal { v } => {
+                hasher.write_u8(TYPE_TAG_FLOAT);
+                hasher.write_f64(*v);
+            },
+            SqlValue.BoolVal { v } => {
+                hasher.write_u8(TYPE_TAG_BOOL);
+                hasher.write_u8(I *v { 1 } E { 0 });
+            },
+            SqlValue.StringVal { v } => {
+                hasher.write_u8(TYPE_TAG_TEXT);
+                hasher.write_str(v);
+            },
+            SqlValue.BlobVal { v } => {
+                hasher.write_u8(TYPE_TAG_BLOB);
+                hasher.write_bytes(v.as_slice());
+            },
+            SqlValue.DateVal { v } => {
+                hasher.write_u8(TYPE_TAG_DATE);
+                hasher.write_i32(*v);
+            },
+            SqlValue.TimestampVal { v } => {
+                hasher.write_u8(TYPE_TAG_TIMESTAMP);
+                hasher.write_i64(*v);
+            },
+            SqlValue.VectorVal { v } => {
+                hasher.write_u8(TYPE_TAG_VECTOR);
+                L f: v {
+                    hasher.write_f32(*f);
+                }
+            },
+        }
+    }
+
+    hasher.finish()
+}
+
+# Compare two values for ORDER BY with NULLS FIRST/LAST support
+# asc: true=ascending, false=descending
+# nulls_first: None=default (NULLS LAST for ASC, NULLS FIRST for DESC), Some(true/false)=explicit
+F order_by_compare(a: &SqlValue, b: &SqlValue, asc: bool, nulls_first: Option<bool>) -> i32 {
+    # Determine NULL ordering
+    null_order := mut M nulls_first {
+        Some(nf) => nf,
+        None => !asc,  # Default: NULLS LAST for ASC (false), NULLS FIRST for DESC (true)
+    };
+
+    M (a.is_null(), b.is_null()) {
+        (true, true) => 0,  # Both NULL -> equal
+        (true, false) => {
+            # a is NULL, b is not
+            I null_order { -1 } E { 1 }
+        },
+        (false, true) => {
+            # b is NULL, a is not
+            I null_order { 1 } E { -1 }
+        },
+        (false, false) => {
+            # Neither NULL -> regular comparison
+            M a.compare(b) {
+                Ok(cmp) => {
+                    I asc { cmp } E { -cmp }
+                },
+                Err(_) => 0,  # Incompatible types -> treat as equal
+            }
+        },
+    }
+}
+
+# Coerce two values to a common type for comparison/arithmetic
+# INT + FLOAT → both become FLOAT
+# VARCHAR + TEXT → both stay as strings
+# DATE + TIMESTAMP → DATE promoted to TIMESTAMP
+# Returns the coerced pair, or error if incompatible
+F coerce_types(a: &SqlValue, b: &SqlValue) -> Result<(SqlValue, SqlValue), VaisError> {
+    # NULL values don't need coercion
+    I a.is_null() || b.is_null() {
+        R Ok((a.clone(), b.clone()));
+    }
+
+    M (a, b) {
+        # Same types -> no coercion needed
+        (SqlValue.IntVal { .. }, SqlValue.IntVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.FloatVal { .. }, SqlValue.FloatVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.BoolVal { .. }, SqlValue.BoolVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.StringVal { .. }, SqlValue.StringVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.BlobVal { .. }, SqlValue.BlobVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.DateVal { .. }, SqlValue.DateVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.TimestampVal { .. }, SqlValue.TimestampVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.VectorVal { .. }, SqlValue.VectorVal { .. }) => Ok((a.clone(), b.clone())),
+
+        # INT + FLOAT -> both FLOAT
+        (SqlValue.IntVal { v: av }, SqlValue.FloatVal { .. }) => {
+            Ok((SqlValue.FloatVal { v: *av as f64 }, b.clone()))
+        },
+        (SqlValue.FloatVal { .. }, SqlValue.IntVal { v: bv }) => {
+            Ok((a.clone(), SqlValue.FloatVal { v: *bv as f64 }))
+        },
+
+        # DATE + TIMESTAMP -> both TIMESTAMP
+        (SqlValue.DateVal { v: av }, SqlValue.TimestampVal { .. }) => {
+            Ok((SqlValue.TimestampVal { v: (*av as i64) * 86400_000_000 }, b.clone()))
+        },
+        (SqlValue.TimestampVal { .. }, SqlValue.DateVal { v: bv }) => {
+            Ok((a.clone(), SqlValue.TimestampVal { v: (*bv as i64) * 86400_000_000 }))
+        },
+
+        # Incompatible types
+        _ => Err(err_incompatible_types(
+            "coerce",
+            a.get_type().name(),
+            b.get_type().name()
+        )),
+    }
+}

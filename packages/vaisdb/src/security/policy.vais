@@ -1,0 +1,394 @@
+# RLS Policy Engine
+# Implements CREATE POLICY, DROP POLICY, policy evaluation
+# Manages row-level security policies per table
+# Policies are evaluated as WHERE clause conditions injected into scans
+# Supports permissive (OR) and restrictive (AND) policy types
+# Error codes: EE=09 (security), CC=02 (constraint), CC=10 (not found)
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError, err_internal};
+U storage/constants.{INVALID_TXN_ID};
+U storage/buffer/pool.{BufferPool};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{SECURITY_GRANT_CHANGE};
+U sql/catalog/manager.{CatalogManager};
+U sql/catalog/schema.{PolicyCatalogEntry};
+U sql/parser/ast.{CreatePolicyStmt, PolicyCmdScope, PolicyType};
+U security/types.{
+    SecurityMeta, PolicyEntry, SessionContext,
+    ENGINE_TAG_SECURITY,
+    POLICY_TYPE_PERMISSIVE, POLICY_TYPE_RESTRICTIVE,
+    POLICY_CMD_ALL, POLICY_CMD_SELECT, POLICY_CMD_INSERT,
+    POLICY_CMD_UPDATE, POLICY_CMD_DELETE,
+    err_policy_not_found, err_policy_already_exists,
+    err_privilege_superuser_required, err_invalid_policy_expr,
+};
+
+# ============================================================================
+# PolicyEngine — Manages RLS policy definitions
+# ============================================================================
+
+S PolicyEngine {
+    # Policies indexed by table_name for fast lookup
+    policies_by_table: HashMap<Str, Vec<PolicyEntry>>,
+}
+
+X PolicyEngine {
+    F new() -> PolicyEngine {
+        PolicyEngine {
+            policies_by_table: HashMap.new(),
+        }
+    }
+
+    # Load policies from catalog at startup
+    F load_from_catalog(catalog: &CatalogManager) -> PolicyEngine {
+        engine := mut PolicyEngine.new();
+
+        cat_policies := mut catalog.all_policies();
+        i: u64 := mut 0;
+        L i < cat_policies.len() {
+            entry := mut cat_policies[i];
+            policy := mut PolicyEntry.new(
+                entry.policy_id,
+                entry.policy_name.clone(),
+                entry.table_name.clone(),
+                "",  # role_name (not in catalog entry, defaults to all)
+                entry.policy_type,
+                entry.cmd_scope,
+                "",  # using_expr (stored separately or in WAL)
+                "",  # check_expr
+                0,   # txn_id
+                0,   # cmd_id
+            );
+
+            M engine.policies_by_table.get_mut(&entry.table_name) {
+                Some(list) => {
+                    list.push(policy);
+                },
+                None => {
+                    list := mut Vec.new();
+                    list.push(policy);
+                    engine.policies_by_table.insert(entry.table_name.clone(), list);
+                },
+            };
+
+            i = i + 1;
+        }
+
+        engine
+    }
+
+    # ========================================================================
+    # Execute CREATE POLICY
+    # ========================================================================
+
+    F execute_create_policy(
+        mut self,
+        stmt: &CreatePolicyStmt,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<u64, VaisError> {
+        # 1. Permission check (only superusers/table owners can create policies)
+        I !session.is_superuser {
+            R Err(err_privilege_superuser_required());
+        }
+
+        # 2. Check for duplicate policy on same table
+        M self.policies_by_table.get(&stmt.table_name) {
+            Some(policies) => {
+                i: u64 := mut 0;
+                L i < policies.len() {
+                    I policies[i].policy_name == stmt.policy_name && policies[i].is_active() {
+                        R Err(err_policy_already_exists(&stmt.policy_name));
+                    }
+                    i = i + 1;
+                }
+            },
+            None => {},
+        };
+
+        # 3. Validate policy expression (basic syntax check)
+        using_expr := mut M &stmt.using_expr {
+            Some(expr) => expr.clone(),
+            None => "",
+        };
+        check_expr := mut M &stmt.check_expr {
+            Some(expr) => expr.clone(),
+            None => "",
+        };
+
+        I using_expr.len() == 0 && check_expr.len() == 0 {
+            R Err(err_invalid_policy_expr("Policy must have USING or WITH CHECK expression"));
+        }
+
+        # 4. Convert AST types to constants
+        policy_type := mut M &stmt.policy_type {
+            PolicyType.Permissive => POLICY_TYPE_PERMISSIVE,
+            PolicyType.Restrictive => POLICY_TYPE_RESTRICTIVE,
+        };
+
+        cmd_scope := mut M &stmt.cmd_scope {
+            PolicyCmdScope.All => POLICY_CMD_ALL,
+            PolicyCmdScope.Select => POLICY_CMD_SELECT,
+            PolicyCmdScope.Insert => POLICY_CMD_INSERT,
+            PolicyCmdScope.Update => POLICY_CMD_UPDATE,
+            PolicyCmdScope.Delete => POLICY_CMD_DELETE,
+        };
+
+        role_name := mut M &stmt.role_name {
+            Some(r) => r.clone(),
+            None => "",  # Applies to all roles
+        };
+
+        # 5. Allocate policy ID
+        policy_id := mut meta.alloc_policy_id();
+
+        # 6. Create PolicyEntry
+        policy := mut PolicyEntry.new(
+            policy_id,
+            stmt.policy_name.clone(),
+            stmt.table_name.clone(),
+            role_name,
+            policy_type,
+            cmd_scope,
+            using_expr,
+            check_expr,
+            txn_id,
+            cmd_id,
+        );
+
+        # 7. Write WAL
+        wal_payload := mut policy.to_bytes();
+        gcm.write_record(txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &wal_payload)?;
+
+        # 8. Register in catalog
+        cat_entry := mut PolicyCatalogEntry.new(
+            policy_id,
+            stmt.policy_name.clone(),
+            stmt.table_name.clone(),
+            policy_type,
+            cmd_scope,
+        );
+        catalog.register_policy(cat_entry, pool, gcm, txn_id)?;
+
+        # 9. Update in-memory cache
+        meta.policy_count = meta.policy_count + 1;
+        M self.policies_by_table.get_mut(&stmt.table_name) {
+            Some(list) => {
+                list.push(policy);
+            },
+            None => {
+                list := mut Vec.new();
+                list.push(policy);
+                self.policies_by_table.insert(stmt.table_name.clone(), list);
+            },
+        };
+
+        Ok(policy_id)
+    }
+
+    # ========================================================================
+    # Execute DROP POLICY
+    # ========================================================================
+
+    F execute_drop_policy(
+        mut self,
+        policy_name: &Str,
+        table_name: &Str,
+        if_exists: bool,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        # 1. Permission check
+        I !session.is_superuser {
+            R Err(err_privilege_superuser_required());
+        }
+
+        # 2. Find and remove the policy
+        M self.policies_by_table.get_mut(table_name) {
+            Some(policies) => {
+                found_idx: i64 := mut -1;
+                i: u64 := mut 0;
+                L i < policies.len() {
+                    I policies[i].policy_name == *policy_name && policies[i].is_active() {
+                        found_idx = i as i64;
+                    }
+                    i = i + 1;
+                }
+
+                I found_idx < 0 {
+                    I if_exists {
+                        R Ok(());
+                    }
+                    R Err(err_policy_not_found(policy_name));
+                }
+
+                # 3. Write WAL
+                wal_buf := mut ByteBuffer.new(128);
+                wal_buf.put_string(table_name);
+                wal_buf.put_string(policy_name);
+                wal_bytes := mut wal_buf.to_vec();
+                gcm.write_record(txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &wal_bytes)?;
+
+                # 4. Unregister from catalog
+                catalog.unregister_policy(table_name, policy_name, pool, gcm, txn_id)?;
+
+                # 5. Remove from in-memory
+                policies.remove(found_idx as u64);
+                meta.policy_count = meta.policy_count - 1;
+            },
+            None => {
+                I if_exists {
+                    R Ok(());
+                }
+                R Err(err_policy_not_found(policy_name));
+            },
+        };
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Policy Evaluation
+    # ========================================================================
+
+    # Get all applicable policies for a table/command/role combination
+    # Returns the USING expression as a WHERE clause fragment
+    F evaluate_policy(
+        self,
+        table_name: &Str,
+        cmd_type: u8,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        # Superuser bypasses RLS
+        I session.is_superuser {
+            R None;
+        }
+
+        M self.policies_by_table.get(table_name) {
+            Some(policies) => {
+                permissive_exprs := mut Vec.new();
+                restrictive_exprs := mut Vec.new();
+
+                i: u64 := mut 0;
+                L i < policies.len() {
+                    p := mut &policies[i];
+                    I p.is_active() && p.enabled && p.applies_to_cmd(cmd_type) {
+                        # Check if policy applies to this role/user
+                        I p.applies_to_role(&session.username) || p.role_name.len() == 0 {
+                            I p.using_expr.len() > 0 {
+                                I p.is_permissive() {
+                                    permissive_exprs.push(p.using_expr.clone());
+                                } E {
+                                    restrictive_exprs.push(p.using_expr.clone());
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+
+                # No policies = no restriction
+                I permissive_exprs.len() == 0 && restrictive_exprs.len() == 0 {
+                    R None;
+                }
+
+                # Combine: (permissive1 OR permissive2 OR ...) AND restrictive1 AND restrictive2 AND ...
+                result := mut Str.new();
+
+                I permissive_exprs.len() > 0 {
+                    result.push_str("(");
+                    j: u64 := mut 0;
+                    L j < permissive_exprs.len() {
+                        I j > 0 {
+                            result.push_str(" OR ");
+                        }
+                        result.push_str("(");
+                        result.push_str(&permissive_exprs[j]);
+                        result.push_str(")");
+                        j = j + 1;
+                    }
+                    result.push_str(")");
+                }
+
+                I restrictive_exprs.len() > 0 {
+                    k: u64 := mut 0;
+                    L k < restrictive_exprs.len() {
+                        I result.len() > 0 {
+                            result.push_str(" AND ");
+                        }
+                        result.push_str("(");
+                        result.push_str(&restrictive_exprs[k]);
+                        result.push_str(")");
+                        k = k + 1;
+                    }
+                }
+
+                Some(result)
+            },
+            None => None,
+        }
+    }
+
+    # ========================================================================
+    # Lookup Helpers
+    # ========================================================================
+
+    # Get all policies for a table
+    F get_policies_for_table(self, table_name: &Str) -> Vec<&PolicyEntry> {
+        result := mut Vec.new();
+        M self.policies_by_table.get(table_name) {
+            Some(policies) => {
+                i: u64 := mut 0;
+                L i < policies.len() {
+                    I policies[i].is_active() {
+                        result.push(&policies[i]);
+                    }
+                    i = i + 1;
+                }
+            },
+            None => {},
+        };
+        result
+    }
+
+    # Check if a table has any RLS policies
+    F has_policies(self, table_name: &Str) -> bool {
+        M self.policies_by_table.get(table_name) {
+            Some(policies) => {
+                i: u64 := mut 0;
+                L i < policies.len() {
+                    I policies[i].is_active() {
+                        R true;
+                    }
+                    i = i + 1;
+                }
+                false
+            },
+            None => false,
+        }
+    }
+
+    # Get total policy count
+    F policy_count(self) -> u64 {
+        count: u64 := mut 0;
+        L _, policies: &self.policies_by_table {
+            count = count + policies.len();
+        }
+        count
+    }
+}

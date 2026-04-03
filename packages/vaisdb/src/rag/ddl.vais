@@ -1,0 +1,303 @@
+# RAG DDL Operations
+# CREATE RAG INDEX, DROP RAG INDEX, ALTER EMBEDDING MODEL
+# Manages RAG index lifecycle at the DDL level
+#
+# SQL syntax:
+#   CREATE RAG INDEX [name] ON [table] (content_column)
+#     WITH (chunk_strategy='sentence', target_size=512, model='default')
+#   DROP RAG INDEX [name]
+#   ALTER EMBEDDING MODEL SET model_name='new_model' REINDEX
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+U rag/types.{
+    RagConfig, RagMeta,
+    CHUNK_STRATEGY_FIXED_SIZE, CHUNK_STRATEGY_SENTENCE, CHUNK_STRATEGY_PARAGRAPH,
+    DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK_SIZE, DEFAULT_MAX_CHUNK_SIZE,
+    DEFAULT_OVERLAP_TOKENS,
+    err_rag_engine_closed
+};
+
+# ============================================================================
+# Error Codes: EE=08 (RAG), CC=09 (DDL)
+# ============================================================================
+
+F err_rag_index_exists(name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0809001",
+        "RAG index '{name}' already exists"
+    )
+}
+
+F err_rag_index_not_found(name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0809002",
+        "RAG index '{name}' not found"
+    )
+}
+
+F err_rag_invalid_option(key: &Str, value: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0809003",
+        "Invalid RAG index option: {key}='{value}'"
+    )
+}
+
+# ============================================================================
+# RagIndexDef — Definition of a RAG index
+# ============================================================================
+
+S RagIndexDef {
+    index_name: Str,
+    table_name: Str,
+    content_column: Str,
+    chunk_strategy: u8,
+    target_chunk_size: u32,
+    min_chunk_size: u32,
+    max_chunk_size: u32,
+    overlap_tokens: u32,
+    embedding_model: Str,           # Model name (resolved at runtime)
+    auto_embed: bool,
+    auto_chunk: bool,
+    enable_hierarchy: bool,
+    created_at: i64,
+}
+
+X RagIndexDef {
+    F new(index_name: Str, table_name: Str, content_column: Str) -> RagIndexDef {
+        RagIndexDef {
+            index_name,
+            table_name,
+            content_column,
+            chunk_strategy: CHUNK_STRATEGY_SENTENCE,
+            target_chunk_size: DEFAULT_CHUNK_SIZE,
+            min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
+            max_chunk_size: DEFAULT_MAX_CHUNK_SIZE,
+            overlap_tokens: DEFAULT_OVERLAP_TOKENS,
+            embedding_model: "default",
+            auto_embed: false,
+            auto_chunk: true,
+            enable_hierarchy: true,
+            created_at: 0,
+        }
+    }
+
+    ## Apply WITH clause options
+    F apply_option(mut self, key: &Str, value: &Str) -> Result<(), VaisError> {
+        M key.as_str() {
+            "chunk_strategy" => {
+                M value.as_str() {
+                    "fixed" => { self.chunk_strategy = CHUNK_STRATEGY_FIXED_SIZE; },
+                    "sentence" => { self.chunk_strategy = CHUNK_STRATEGY_SENTENCE; },
+                    "paragraph" => { self.chunk_strategy = CHUNK_STRATEGY_PARAGRAPH; },
+                    _ => { R Err(err_rag_invalid_option(key, value)); },
+                }
+            },
+            "target_size" => {
+                size := mut parse_u32(value)?;
+                I size < 16 || size > 65536 {
+                    R Err(err_rag_invalid_option(key, value));
+                }
+                self.target_chunk_size = size;
+            },
+            "min_size" => {
+                size := mut parse_u32(value)?;
+                I size < 1 || size > 65536 {
+                    R Err(err_rag_invalid_option(key, value));
+                }
+                self.min_chunk_size = size;
+            },
+            "max_size" => {
+                size := mut parse_u32(value)?;
+                I size < 16 || size > 131072 {
+                    R Err(err_rag_invalid_option(key, value));
+                }
+                self.max_chunk_size = size;
+            },
+            "overlap" => {
+                overlap := mut parse_u32(value)?;
+                I overlap > 16384 {
+                    R Err(err_rag_invalid_option(key, value));
+                }
+                self.overlap_tokens = overlap;
+            },
+            "model" => {
+                self.embedding_model = value.clone();
+            },
+            "auto_embed" => {
+                self.auto_embed = value == "true";
+            },
+            "hierarchy" => {
+                self.enable_hierarchy = value == "true";
+            },
+            _ => {
+                R Err(err_rag_invalid_option(key, value));
+            },
+        }
+        Ok(())
+    }
+
+    ## Convert to RagConfig (merging with base config)
+    F to_rag_config(self, page_size: u32) -> RagConfig {
+        RagConfig {
+            chunk_strategy: self.chunk_strategy,
+            target_chunk_size: self.target_chunk_size,
+            min_chunk_size: self.min_chunk_size,
+            max_chunk_size: self.max_chunk_size,
+            overlap_tokens: self.overlap_tokens,
+            vector_weight: 0.4,
+            fulltext_weight: 0.3,
+            graph_weight: 0.3,
+            enable_auto_embed: self.auto_embed,
+            enable_auto_chunk: self.auto_chunk,
+            enable_hierarchy: self.enable_hierarchy,
+            page_size,
+        }
+    }
+}
+
+# ============================================================================
+# RagDDL — Manages RAG index catalog
+# ============================================================================
+
+S RagDDL {
+    indexes: Vec<RagIndexDef>,
+}
+
+X RagDDL {
+    F new() -> RagDDL {
+        RagDDL {
+            indexes: Vec.new(),
+        }
+    }
+
+    ## CREATE RAG INDEX
+    F create_index(mut self, def: RagIndexDef) -> Result<(), VaisError> {
+        # Check for duplicate
+        i: u32 := mut 0;
+        L i < self.indexes.len() as u32 {
+            existing := mut self.indexes.get(i as u64);
+            I existing.index_name == def.index_name {
+                R Err(err_rag_index_exists(&def.index_name));
+            }
+            i = i + 1;
+        }
+
+        self.indexes.push(def);
+        Ok(())
+    }
+
+    ## DROP RAG INDEX
+    F drop_index(mut self, name: &Str) -> Result<(), VaisError> {
+        found := mut false;
+        new_indexes := mut Vec.new();
+
+        i: u32 := mut 0;
+        L i < self.indexes.len() as u32 {
+            idx := mut self.indexes.get(i as u64);
+            I idx.index_name == *name {
+                found = true;
+            } E {
+                copy := mut RagIndexDef.new(
+                    idx.index_name.clone(),
+                    idx.table_name.clone(),
+                    idx.content_column.clone(),
+                );
+                copy.chunk_strategy = idx.chunk_strategy;
+                copy.target_chunk_size = idx.target_chunk_size;
+                copy.min_chunk_size = idx.min_chunk_size;
+                copy.max_chunk_size = idx.max_chunk_size;
+                copy.overlap_tokens = idx.overlap_tokens;
+                copy.embedding_model = idx.embedding_model.clone();
+                copy.auto_embed = idx.auto_embed;
+                copy.auto_chunk = idx.auto_chunk;
+                copy.enable_hierarchy = idx.enable_hierarchy;
+                copy.created_at = idx.created_at;
+                new_indexes.push(copy);
+            }
+            i = i + 1;
+        }
+
+        I !found {
+            R Err(err_rag_index_not_found(name));
+        }
+
+        self.indexes = new_indexes;
+        Ok(())
+    }
+
+    ## Get a RAG index definition by name
+    F get_index(self, name: &Str) -> Option<&RagIndexDef> {
+        i: u32 := mut 0;
+        L i < self.indexes.len() as u32 {
+            idx := mut self.indexes.get(i as u64);
+            I idx.index_name == *name {
+                R Some(idx);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Get all indexes for a table
+    F get_indexes_for_table(self, table_name: &Str) -> Vec<&RagIndexDef> {
+        result := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.indexes.len() as u32 {
+            idx := mut self.indexes.get(i as u64);
+            I idx.table_name == *table_name {
+                result.push(idx);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    ## Get total index count
+    F index_count(self) -> u32 {
+        self.indexes.len() as u32
+    }
+}
+
+# ============================================================================
+# Helper: parse u32 from string
+# ============================================================================
+
+F parse_u32(s: &Str) -> Result<u32, VaisError> {
+    I s.len() == 0 {
+        R Err(VaisError.new(
+            "VAIS-0809004",
+            "Cannot parse empty string as integer"
+        ))
+    }
+    # Max u32 = 4294967295 (10 digits). Reject strings > 10 digits upfront.
+    I s.len() > 10 {
+        R Err(VaisError.new(
+            "VAIS-0809004",
+            "Integer overflow: '{s}' exceeds u32 range"
+        ))
+    }
+    result: u64 := mut 0;
+    i: u32 := mut 0;
+    L i < s.len() {
+        c := mut s.byte_at(i);
+        I c < 48 || c > 57 {
+            R Err(VaisError.new(
+                "VAIS-0809004",
+                "Cannot parse '{s}' as integer"
+            ));
+        }
+        result = result * 10 + (c - 48) as u64;
+        I result > 4294967295 {
+            R Err(VaisError.new(
+                "VAIS-0809004",
+                "Integer overflow: '{s}' exceeds u32 range"
+            ))
+        }
+        i = i + 1;
+    }
+    Ok(result as u32)
+}

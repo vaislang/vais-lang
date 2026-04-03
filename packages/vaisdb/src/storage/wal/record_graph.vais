@@ -1,0 +1,303 @@
+# Graph Engine WAL Record Payloads (0x30-0x3F)
+# Based on Stage 2: WAL Design
+# Bidirectional edge records: both adjacency lists must be updated
+
+U storage/error.{VaisError};
+U storage/bytes.{write_bytes, read_bytes, write_string, read_string};
+U std/bytes.{ByteBuffer};
+
+# ============================================================================
+# GRAPH_NODE_INSERT (0x30) - Insert a graph node
+# ============================================================================
+
+S GraphNodeInsertPayload {
+    file_id: u8,
+    page_id: u32,
+    node_id: u64,
+    labels: Vec<Str>,       # Node labels (e.g., ["Person", "Employee"])
+    properties: Vec<u8>,    # Serialized property map
+}
+
+X GraphNodeInsertPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u64_le(self.node_id);
+
+        # Serialize labels
+        buf.put_u32_le(self.labels.len() as u32);
+        L label: &self.labels {
+            write_string(buf, label);
+        }
+
+        write_bytes(buf, &self.properties);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<GraphNodeInsertPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        node_id := mut buf.get_u64_le()?;
+
+        # Deserialize labels
+        labels_count := mut buf.get_u32_le()? as u64;
+        labels := mut Vec.with_capacity(labels_count);
+        L _: 0..labels_count {
+            labels.push(read_string(buf)?);
+        }
+
+        properties := mut read_bytes(buf)?;
+
+        Ok(GraphNodeInsertPayload {
+            file_id,
+            page_id,
+            node_id,
+            labels,
+            properties,
+        })
+    }
+}
+
+# ============================================================================
+# GRAPH_NODE_DELETE (0x31) - Delete a graph node
+# ============================================================================
+
+S GraphNodeDeletePayload {
+    file_id: u8,
+    page_id: u32,
+    node_id: u64,
+    old_labels: Vec<Str>,
+    old_properties: Vec<u8>,
+}
+
+X GraphNodeDeletePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u64_le(self.node_id);
+
+        # Serialize old_labels
+        buf.put_u32_le(self.old_labels.len() as u32);
+        L label: &self.old_labels {
+            write_string(buf, label);
+        }
+
+        write_bytes(buf, &self.old_properties);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<GraphNodeDeletePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        node_id := mut buf.get_u64_le()?;
+
+        # Deserialize old_labels
+        labels_count := mut buf.get_u32_le()? as u64;
+        old_labels := mut Vec.with_capacity(labels_count);
+        L _: 0..labels_count {
+            old_labels.push(read_string(buf)?);
+        }
+
+        old_properties := mut read_bytes(buf)?;
+
+        Ok(GraphNodeDeletePayload {
+            file_id,
+            page_id,
+            node_id,
+            old_labels,
+            old_properties,
+        })
+    }
+}
+
+# ============================================================================
+# GRAPH_EDGE_INSERT (0x32) - Insert a graph edge (bidirectional)
+# ============================================================================
+
+S GraphEdgeInsertPayload {
+    file_id: u8,
+    edge_id: u64,
+    src: u64,               # Source node ID
+    dst: u64,               # Destination node ID
+    edge_type: Str,         # Edge type (e.g., "FOLLOWS", "LIKES")
+    properties: Vec<u8>,    # Serialized property map
+    src_adj_page: u32,      # Source node's adjacency list page
+    dst_adj_page: u32,      # Destination node's adjacency list page
+}
+
+X GraphEdgeInsertPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u64_le(self.edge_id);
+        buf.put_u64_le(self.src);
+        buf.put_u64_le(self.dst);
+        write_string(buf, &self.edge_type);
+        write_bytes(buf, &self.properties);
+        buf.put_u32_le(self.src_adj_page);
+        buf.put_u32_le(self.dst_adj_page);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<GraphEdgeInsertPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        edge_id := mut buf.get_u64_le()?;
+        src := mut buf.get_u64_le()?;
+        dst := mut buf.get_u64_le()?;
+        edge_type := mut read_string(buf)?;
+        properties := mut read_bytes(buf)?;
+        src_adj_page := mut buf.get_u32_le()?;
+        dst_adj_page := mut buf.get_u32_le()?;
+
+        Ok(GraphEdgeInsertPayload {
+            file_id,
+            edge_id,
+            src,
+            dst,
+            edge_type,
+            properties,
+            src_adj_page,
+            dst_adj_page,
+        })
+    }
+}
+
+# ============================================================================
+# GRAPH_EDGE_DELETE (0x33) - Delete a graph edge (bidirectional)
+# ============================================================================
+
+S GraphEdgeDeletePayload {
+    file_id: u8,
+    edge_id: u64,
+    src: u64,
+    dst: u64,
+    src_adj_page: u32,
+    dst_adj_page: u32,
+    old_data: Vec<u8>,      # Old edge data for undo
+}
+
+X GraphEdgeDeletePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u64_le(self.edge_id);
+        buf.put_u64_le(self.src);
+        buf.put_u64_le(self.dst);
+        buf.put_u32_le(self.src_adj_page);
+        buf.put_u32_le(self.dst_adj_page);
+        write_bytes(buf, &self.old_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<GraphEdgeDeletePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        edge_id := mut buf.get_u64_le()?;
+        src := mut buf.get_u64_le()?;
+        dst := mut buf.get_u64_le()?;
+        src_adj_page := mut buf.get_u32_le()?;
+        dst_adj_page := mut buf.get_u32_le()?;
+        old_data := mut read_bytes(buf)?;
+
+        Ok(GraphEdgeDeletePayload {
+            file_id,
+            edge_id,
+            src,
+            dst,
+            src_adj_page,
+            dst_adj_page,
+            old_data,
+        })
+    }
+}
+
+# ============================================================================
+# GRAPH_PROPERTY_UPDATE (0x34) - Update node/edge properties
+# ============================================================================
+
+S GraphPropertyUpdatePayload {
+    file_id: u8,
+    page_id: u32,
+    entity_type: u8,        # 0=node, 1=edge
+    entity_id: u64,
+    old_properties: Vec<u8>,
+    new_properties: Vec<u8>,
+}
+
+X GraphPropertyUpdatePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u8(self.entity_type);
+        buf.put_u64_le(self.entity_id);
+        write_bytes(buf, &self.old_properties);
+        write_bytes(buf, &self.new_properties);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<GraphPropertyUpdatePayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        entity_type := mut buf.get_u8()?;
+        entity_id := mut buf.get_u64_le()?;
+        old_properties := mut read_bytes(buf)?;
+        new_properties := mut read_bytes(buf)?;
+
+        Ok(GraphPropertyUpdatePayload {
+            file_id,
+            page_id,
+            entity_type,
+            entity_id,
+            old_properties,
+            new_properties,
+        })
+    }
+}
+
+# ============================================================================
+# ADJ_LIST_PAGE_SPLIT (0x35) - Adjacency list page split
+# ============================================================================
+
+S AdjListPageSplitPayload {
+    file_id: u8,
+    node_id: u64,
+    old_page: u32,
+    new_page: u32,
+    direction: u8,          # 0=outgoing, 1=incoming
+    split_data: Vec<u8>,    # Serialized split information
+}
+
+X AdjListPageSplitPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u64_le(self.node_id);
+        buf.put_u32_le(self.old_page);
+        buf.put_u32_le(self.new_page);
+        buf.put_u8(self.direction);
+        write_bytes(buf, &self.split_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<AdjListPageSplitPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        node_id := mut buf.get_u64_le()?;
+        old_page := mut buf.get_u32_le()?;
+        new_page := mut buf.get_u32_le()?;
+        direction := mut buf.get_u8()?;
+        split_data := mut read_bytes(buf)?;
+
+        Ok(AdjListPageSplitPayload {
+            file_id,
+            node_id,
+            old_page,
+            new_page,
+            direction,
+            split_data,
+        })
+    }
+}
+
+# ============================================================================
+# Entity Type Constants
+# ============================================================================
+
+C ENTITY_NODE: u8 = 0;
+C ENTITY_EDGE: u8 = 1;
+
+# ============================================================================
+# Adjacency List Direction Constants
+# ============================================================================
+
+C ADJ_OUTGOING: u8 = 0;
+C ADJ_INCOMING: u8 = 1;

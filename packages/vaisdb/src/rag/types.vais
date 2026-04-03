@@ -1,0 +1,673 @@
+# RAG Engine Core Types
+# Semantic chunking, embedding management, context preservation, agent memory
+# Based on Phase 7: RAG & AI-Native Features
+# Error codes: EE=08 (RAG), CC=01-10
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/constants.{
+    PAGE_HEADER_SIZE, INVALID_TXN_ID, NULL_PAGE,
+    MVCC_TUPLE_META_SIZE
+};
+U storage/error.{VaisError, ErrorSeverity};
+U storage/hash.{fnv1a_hash};
+U storage/page/header.{PageHeader};
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# RAG format version
+C RAG_FORMAT_VERSION: u8 = 1;
+
+# File ID for RAG engine
+C FILE_ID_RAG: u8 = 5;
+
+# File name within .vaisdb directory
+C FILE_NAME_RAG: Str = "rag.vdb";
+
+# Chunking strategy constants
+C CHUNK_STRATEGY_FIXED_SIZE: u8 = 0;
+C CHUNK_STRATEGY_SENTENCE: u8 = 1;
+C CHUNK_STRATEGY_PARAGRAPH: u8 = 2;
+
+# Default chunking parameters
+C DEFAULT_CHUNK_SIZE: u32 = 512;         # tokens
+C DEFAULT_MIN_CHUNK_SIZE: u32 = 64;      # tokens
+C DEFAULT_MAX_CHUNK_SIZE: u32 = 1024;    # tokens
+C DEFAULT_OVERLAP_TOKENS: u32 = 50;      # tokens
+
+# Memory type constants
+C MEMORY_TYPE_EPISODIC: u8 = 0;
+C MEMORY_TYPE_SEMANTIC: u8 = 1;
+C MEMORY_TYPE_PROCEDURAL: u8 = 2;
+C MEMORY_TYPE_WORKING: u8 = 3;
+
+# Default TTL per memory type (seconds)
+C DEFAULT_TTL_EPISODIC: u64 = 7776000;     # 90 days
+C DEFAULT_TTL_SEMANTIC: u64 = 0;            # no expiry
+C DEFAULT_TTL_PROCEDURAL: u64 = 0;          # no expiry
+C DEFAULT_TTL_WORKING: u64 = 86400;         # 1 day
+
+# Importance decay half-life (seconds)
+C DEFAULT_DECAY_HALF_LIFE: u64 = 604800;    # 7 days
+
+# Score fusion defaults
+C DEFAULT_VECTOR_WEIGHT: f64 = 0.4;
+C DEFAULT_FULLTEXT_WEIGHT: f64 = 0.3;
+C DEFAULT_GRAPH_WEIGHT: f64 = 0.3;
+C DEFAULT_MEMORY_WEIGHT: f64 = 0.2;
+
+# RAG page types (0x60-0x6F range in page type registry)
+C PAGE_TYPE_RAG_CHUNK: u8 = 0x60;       # Chunk data pages
+C PAGE_TYPE_RAG_DOC_META: u8 = 0x61;    # Document metadata pages
+C PAGE_TYPE_RAG_EMBED_META: u8 = 0x62;  # Embedding model metadata
+C PAGE_TYPE_RAG_MEMORY: u8 = 0x63;      # Agent memory pages
+
+# Engine tag for RAG
+C ENGINE_TAG_RAG: u8 = 0x05;
+
+# Embedding distance metrics
+C DISTANCE_COSINE: u8 = 0;
+C DISTANCE_L2: u8 = 1;
+C DISTANCE_DOT_PRODUCT: u8 = 2;
+
+# Reindex strategy
+C REINDEX_STRATEGY_BACKGROUND: u8 = 0;
+C REINDEX_STRATEGY_IMMEDIATE: u8 = 1;
+
+# Reindex status
+C REINDEX_STATUS_IDLE: u8 = 0;
+C REINDEX_STATUS_RUNNING: u8 = 1;
+C REINDEX_STATUS_COMPLETE: u8 = 2;
+C REINDEX_STATUS_FAILED: u8 = 3;
+
+# Maximum chunk graph edges per chunk
+C MAX_CHUNK_EDGES: u32 = 64;
+
+# Maximum document hierarchy depth
+C MAX_HIERARCHY_DEPTH: u32 = 8;
+
+# ============================================================================
+# Error Codes: EE=08 (RAG)
+# ============================================================================
+
+F err_rag_engine_closed() -> VaisError {
+    VaisError.new(
+        "VAIS-0810001",
+        "RAG engine is not open"
+    )
+}
+
+F err_rag_doc_not_found(doc_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0810002",
+        "Document {doc_id} not found"
+    )
+}
+
+F err_rag_chunk_not_found(chunk_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0810003",
+        "Chunk {chunk_id} not found"
+    )
+}
+
+F err_rag_model_not_found(model_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0810004",
+        "Embedding model '{model_name}' not found"
+    )
+}
+
+F err_rag_model_version_mismatch(expected: u32, found: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0802001",
+        "Embedding model version mismatch: expected {expected}, found {found}"
+    ).with_hint("Run ALTER EMBEDDING MODEL ... REINDEX to update vectors")
+}
+
+F err_rag_dimension_mismatch(expected: u32, found: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0802002",
+        "Vector dimension mismatch: expected {expected}, found {found}"
+    )
+}
+
+F err_rag_reindex_in_progress(index_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0804001",
+        "Reindex already in progress L index {index_id}"
+    )
+}
+
+F err_rag_chunk_too_large(token_count: u32, max: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0802003",
+        "Chunk token count {token_count} exceeds maximum {max}"
+    )
+}
+
+F err_rag_memory_not_found(memory_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0810005",
+        "Memory entry {memory_id} not found"
+    )
+}
+
+F err_rag_session_not_found(session_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0810006",
+        "Agent session {session_id} not found"
+    )
+}
+
+F err_rag_invalid_embedding_config(msg: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0807001",
+        "Invalid embedding configuration: {msg}"
+    )
+}
+
+F err_rag_ttl_expired(entity_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0810007",
+        "Entity {entity_id} has expired (TTL)"
+    )
+}
+
+F err_rag_page_corrupt(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0805001",
+        "RAG page {page_id} corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+# ============================================================================
+# RagConfig — Engine configuration
+# ============================================================================
+
+S RagConfig {
+    chunk_strategy: u8,         # Default chunking strategy
+    target_chunk_size: u32,     # Default target tokens per chunk
+    min_chunk_size: u32,        # Minimum chunk tokens
+    max_chunk_size: u32,        # Maximum chunk tokens
+    overlap_tokens: u32,        # Overlap between consecutive chunks
+    vector_weight: f64,         # RAG_SEARCH vector score weight
+    fulltext_weight: f64,       # RAG_SEARCH fulltext score weight
+    graph_weight: f64,          # RAG_SEARCH graph proximity weight
+    enable_auto_embed: bool,    # Auto-embed on INSERT
+    enable_auto_chunk: bool,    # Auto-chunk on INSERT
+    enable_hierarchy: bool,     # Build document hierarchy graph
+    page_size: u32,             # Inherited from database
+}
+
+X RagConfig {
+    F default(page_size: u32) -> RagConfig {
+        RagConfig {
+            chunk_strategy: CHUNK_STRATEGY_SENTENCE,
+            target_chunk_size: DEFAULT_CHUNK_SIZE,
+            min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
+            max_chunk_size: DEFAULT_MAX_CHUNK_SIZE,
+            overlap_tokens: DEFAULT_OVERLAP_TOKENS,
+            vector_weight: DEFAULT_VECTOR_WEIGHT,
+            fulltext_weight: DEFAULT_FULLTEXT_WEIGHT,
+            graph_weight: DEFAULT_GRAPH_WEIGHT,
+            enable_auto_embed: false,
+            enable_auto_chunk: true,
+            enable_hierarchy: true,
+            page_size,
+        }
+    }
+
+    ## Serialize config (48 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.chunk_strategy);
+        buf.put_u8(0);  # reserved alignment
+        buf.put_u16_le(0);  # reserved alignment
+        buf.put_u32_le(self.target_chunk_size);
+        buf.put_u32_le(self.min_chunk_size);
+        buf.put_u32_le(self.max_chunk_size);
+        buf.put_u32_le(self.overlap_tokens);
+        buf.put_f64_le(self.vector_weight);
+        buf.put_f64_le(self.fulltext_weight);
+        buf.put_f64_le(self.graph_weight);
+        flags: u8 := mut 0;
+        I self.enable_auto_embed { flags = flags | 0x01; }
+        I self.enable_auto_chunk { flags = flags | 0x02; }
+        I self.enable_hierarchy { flags = flags | 0x04; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_u16_le(0);  # reserved
+    }
+
+    ## Deserialize config (48 bytes)
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<RagConfig, VaisError> {
+        chunk_strategy := mut buf.get_u8()?;
+        buf.get_u8()?;   # reserved
+        buf.get_u16_le()?;  # reserved
+        target_chunk_size := mut buf.get_u32_le()?;
+        min_chunk_size := mut buf.get_u32_le()?;
+        max_chunk_size := mut buf.get_u32_le()?;
+        overlap_tokens := mut buf.get_u32_le()?;
+        vector_weight := mut buf.get_f64_le()?;
+        fulltext_weight := mut buf.get_f64_le()?;
+        graph_weight := mut buf.get_f64_le()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;   # reserved
+        buf.get_u16_le()?;  # reserved
+        Ok(RagConfig {
+            chunk_strategy,
+            target_chunk_size,
+            min_chunk_size,
+            max_chunk_size,
+            overlap_tokens,
+            vector_weight,
+            fulltext_weight,
+            graph_weight,
+            enable_auto_embed: (flags & 0x01) != 0,
+            enable_auto_chunk: (flags & 0x02) != 0,
+            enable_hierarchy: (flags & 0x04) != 0,
+            page_size,
+        })
+    }
+}
+
+# ============================================================================
+# RagMeta — Persistent metadata for RAG engine
+# ============================================================================
+
+S RagMeta {
+    format_version: u8,
+    doc_count: u64,             # Total documents ingested
+    chunk_count: u64,           # Total chunks created
+    memory_count: u64,          # Total memory entries
+    session_count: u64,         # Total agent sessions
+    next_doc_id: u64,           # Next document ID to assign
+    next_chunk_id: u64,         # Next chunk ID to assign
+    next_memory_id: u64,        # Next memory ID to assign
+    next_session_id: u64,       # Next session ID to assign
+    active_model_id: u32,       # Currently active embedding model
+    config: RagConfig,
+}
+
+X RagMeta {
+    F new(page_size: u32) -> RagMeta {
+        RagMeta {
+            format_version: RAG_FORMAT_VERSION,
+            doc_count: 0,
+            chunk_count: 0,
+            memory_count: 0,
+            session_count: 0,
+            next_doc_id: 1,
+            next_chunk_id: 1,
+            next_memory_id: 1,
+            next_session_id: 1,
+            active_model_id: 0,
+            config: RagConfig.default(page_size),
+        }
+    }
+
+    F alloc_doc_id(mut self) -> u64 {
+        id := mut self.next_doc_id;
+        self.next_doc_id = self.next_doc_id + 1;
+        id
+    }
+
+    F alloc_chunk_id(mut self) -> u64 {
+        id := mut self.next_chunk_id;
+        self.next_chunk_id = self.next_chunk_id + 1;
+        id
+    }
+
+    F alloc_memory_id(mut self) -> u64 {
+        id := mut self.next_memory_id;
+        self.next_memory_id = self.next_memory_id + 1;
+        id
+    }
+
+    F alloc_session_id(mut self) -> u64 {
+        id := mut self.next_session_id;
+        self.next_session_id = self.next_session_id + 1;
+        id
+    }
+
+    ## Serialize (104 bytes + config 48 bytes = 152 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.format_version);
+        buf.put_u8(0);   # reserved alignment
+        buf.put_u16_le(0);  # reserved alignment
+        buf.put_u32_le(self.active_model_id);
+        buf.put_u64_le(self.doc_count);
+        buf.put_u64_le(self.chunk_count);
+        buf.put_u64_le(self.memory_count);
+        buf.put_u64_le(self.session_count);
+        buf.put_u64_le(self.next_doc_id);
+        buf.put_u64_le(self.next_chunk_id);
+        buf.put_u64_le(self.next_memory_id);
+        buf.put_u64_le(self.next_session_id);
+        self.config.serialize(buf);
+    }
+
+    ## Deserialize
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<RagMeta, VaisError> {
+        format_version := mut buf.get_u8()?;
+        buf.get_u8()?;   # reserved
+        buf.get_u16_le()?;  # reserved
+        active_model_id := mut buf.get_u32_le()?;
+        doc_count := mut buf.get_u64_le()?;
+        chunk_count := mut buf.get_u64_le()?;
+        memory_count := mut buf.get_u64_le()?;
+        session_count := mut buf.get_u64_le()?;
+        next_doc_id := mut buf.get_u64_le()?;
+        next_chunk_id := mut buf.get_u64_le()?;
+        next_memory_id := mut buf.get_u64_le()?;
+        next_session_id := mut buf.get_u64_le()?;
+        config := mut RagConfig.deserialize(buf, page_size)?;
+        Ok(RagMeta {
+            format_version,
+            doc_count, chunk_count, memory_count, session_count,
+            next_doc_id, next_chunk_id, next_memory_id, next_session_id,
+            active_model_id, config,
+        })
+    }
+}
+
+# ============================================================================
+# ChunkInfo — Metadata for a document chunk
+# ============================================================================
+
+S ChunkInfo {
+    chunk_id: u64,
+    parent_doc_id: u64,
+    position_in_doc: u32,       # 0-based position index
+    chunk_text: Str,
+    chunk_type: u8,             # CHUNK_STRATEGY_* constant
+    token_count: u32,
+    overlap_start: u32,         # Byte offset of overlap region start in chunk
+    overlap_end: u32,           # Byte offset of overlap region end in chunk
+    created_at: i64,            # Unix timestamp
+}
+
+X ChunkInfo {
+    ## Serialize chunk metadata (without text, for on-disk storage)
+    ## Fixed part: 40 bytes
+    F serialize_meta(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.chunk_id);
+        buf.put_u64_le(self.parent_doc_id);
+        buf.put_u32_le(self.position_in_doc);
+        buf.put_u8(self.chunk_type);
+        buf.put_u8(0);  # reserved
+        buf.put_u16_le(0);  # reserved
+        buf.put_u32_le(self.token_count);
+        buf.put_u32_le(self.overlap_start);
+        buf.put_u32_le(self.overlap_end);
+        buf.put_i64_le(self.created_at);
+    }
+
+    ## Deserialize chunk metadata (40 bytes)
+    F deserialize_meta(buf: &ByteBuffer) -> Result<ChunkInfo, VaisError> {
+        chunk_id := mut buf.get_u64_le()?;
+        parent_doc_id := mut buf.get_u64_le()?;
+        position_in_doc := mut buf.get_u32_le()?;
+        chunk_type := mut buf.get_u8()?;
+        buf.get_u8()?;   # reserved
+        buf.get_u16_le()?;  # reserved
+        token_count := mut buf.get_u32_le()?;
+        overlap_start := mut buf.get_u32_le()?;
+        overlap_end := mut buf.get_u32_le()?;
+        created_at := mut buf.get_i64_le()?;
+        Ok(ChunkInfo {
+            chunk_id, parent_doc_id, position_in_doc,
+            chunk_text: Str.new(),
+            chunk_type, token_count, overlap_start, overlap_end, created_at,
+        })
+    }
+}
+
+# ============================================================================
+# DocumentInfo — Document-level metadata
+# ============================================================================
+
+S DocumentInfo {
+    doc_id: u64,
+    title: Str,
+    source_uri: Str,            # Original source location
+    content_hash: u64,          # FNV-1a hash of full content
+    chunk_count: u32,
+    total_tokens: u32,
+    embedding_model_id: u32,    # Model used to embed chunks
+    ttl_seconds: u64,           # 0 = no expiry
+    created_at: i64,
+    updated_at: i64,
+}
+
+X DocumentInfo {
+    ## Serialize fixed metadata (56 bytes, excluding variable-length strings)
+    F serialize_meta(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.doc_id);
+        buf.put_u64_le(self.content_hash);
+        buf.put_u32_le(self.chunk_count);
+        buf.put_u32_le(self.total_tokens);
+        buf.put_u32_le(self.embedding_model_id);
+        buf.put_u32_le(0);  # reserved
+        buf.put_u64_le(self.ttl_seconds);
+        buf.put_i64_le(self.created_at);
+        buf.put_i64_le(self.updated_at);
+    }
+
+    ## Deserialize fixed metadata (56 bytes)
+    F deserialize_meta(buf: &ByteBuffer) -> Result<DocumentInfo, VaisError> {
+        doc_id := mut buf.get_u64_le()?;
+        content_hash := mut buf.get_u64_le()?;
+        chunk_count := mut buf.get_u32_le()?;
+        total_tokens := mut buf.get_u32_le()?;
+        embedding_model_id := mut buf.get_u32_le()?;
+        buf.get_u32_le()?;  # reserved
+        ttl_seconds := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        updated_at := mut buf.get_i64_le()?;
+        Ok(DocumentInfo {
+            doc_id, title: Str.new(), source_uri: Str.new(),
+            content_hash, chunk_count, total_tokens,
+            embedding_model_id, ttl_seconds, created_at, updated_at,
+        })
+    }
+}
+
+# ============================================================================
+# RagSearchResult — Result from RAG_SEARCH()
+# ============================================================================
+
+S RagSearchResult {
+    source_id: u64,             # doc_id or memory_id
+    chunk_id: u64,              # Specific chunk (0 if entire document)
+    parent_doc_id: u64,         # Document containing chunk
+    score: f64,                 # Fused relevance score [0, 1]
+    source_engine: u8,          # ENGINE_TAG_* that found this result
+    source_text: Str,           # Retrieved text content
+    context_before: Str,        # Surrounding context from graph (prev chunk)
+    context_after: Str,         # Surrounding context from graph (next chunk)
+    metadata: HashMap<Str, Str>,  # Key-value metadata
+}
+
+X RagSearchResult {
+    F new(source_id: u64, chunk_id: u64, score: f64, text: Str) -> RagSearchResult {
+        RagSearchResult {
+            source_id,
+            chunk_id,
+            parent_doc_id: 0,
+            score,
+            source_engine: ENGINE_TAG_RAG,
+            source_text: text,
+            context_before: Str.new(),
+            context_after: Str.new(),
+            metadata: HashMap.new(),
+        }
+    }
+
+    F with_context(mut self, before: Str, after: Str) -> RagSearchResult {
+        self.context_before = before;
+        self.context_after = after;
+        self
+    }
+
+    F with_parent(mut self, parent_doc_id: u64) -> RagSearchResult {
+        self.parent_doc_id = parent_doc_id;
+        self
+    }
+}
+
+# ============================================================================
+# RagFusionConfig — Score fusion weights for RAG_SEARCH
+# ============================================================================
+
+S RagFusionConfig {
+    vector_weight: f64,         # Weight for vector similarity [0, 1]
+    fulltext_weight: f64,       # Weight for BM25 score [0, 1]
+    graph_weight: f64,          # Weight for graph proximity [0, 1]
+    memory_weight: f64,         # Weight for memory importance [0, 1]
+    fusion_method: u8,          # 0=WeightedSum, 1=RRF
+    rrf_k: u32,                 # RRF constant (default 60)
+    top_k: u32,                 # Number of results to return
+    max_context_tokens: u32,    # Maximum tokens for context expansion
+}
+
+X RagFusionConfig {
+    F default() -> RagFusionConfig {
+        RagFusionConfig {
+            vector_weight: DEFAULT_VECTOR_WEIGHT,
+            fulltext_weight: DEFAULT_FULLTEXT_WEIGHT,
+            graph_weight: DEFAULT_GRAPH_WEIGHT,
+            memory_weight: DEFAULT_MEMORY_WEIGHT,
+            fusion_method: 0,   # WeightedSum
+            rrf_k: 60,
+            top_k: 10,
+            max_context_tokens: 2048,
+        }
+    }
+
+    ## Validate weights sum to reasonable range
+    F validate(self) -> Result<(), VaisError> {
+        total := mut self.vector_weight + self.fulltext_weight + self.graph_weight;
+        I total < 0.01 {
+            R Err(err_rag_invalid_embedding_config("All search weights are zero"));
+        }
+        I self.top_k == 0 {
+            R Err(err_rag_invalid_embedding_config("top_k must be > 0"));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# ScoredChunk — Unified scored result for internal pipeline
+# ============================================================================
+
+S ScoredChunk {
+    chunk_id: u64,
+    doc_id: u64,
+    score: f64,
+    source_engine: u8,
+}
+
+X ScoredChunk {
+    F new(chunk_id: u64, doc_id: u64, score: f64, engine: u8) -> ScoredChunk {
+        ScoredChunk { chunk_id, doc_id, score, source_engine: engine }
+    }
+}
+
+# ============================================================================
+# Graph Edge Type Constants for RAG
+# ============================================================================
+
+C EDGE_TYPE_NEXT_CHUNK: Str = "NEXT_CHUNK";
+C EDGE_TYPE_SAME_SECTION: Str = "SAME_SECTION";
+C EDGE_TYPE_SAME_DOCUMENT: Str = "SAME_DOCUMENT";
+C EDGE_TYPE_CONTAINS: Str = "CONTAINS";
+C EDGE_TYPE_REFERENCES: Str = "REFERENCES";
+C EDGE_TYPE_SUPERSEDES: Str = "SUPERSEDES";
+C EDGE_TYPE_RELATED_TO: Str = "RELATED_TO";
+C EDGE_TYPE_TEMPORAL_NEXT: Str = "TEMPORAL_NEXT";
+C EDGE_TYPE_SESSION_CONTEXT: Str = "SESSION_CONTEXT";
+
+# Graph node labels for RAG
+C LABEL_DOCUMENT: Str = "DOCUMENT";
+C LABEL_SECTION: Str = "SECTION";
+C LABEL_PARAGRAPH: Str = "PARAGRAPH";
+C LABEL_CHUNK: Str = "CHUNK";
+C LABEL_MEMORY: Str = "MEMORY";
+C LABEL_SESSION: Str = "SESSION";
+
+# Re-export fnv1a_hash from storage/hash for backwards compatibility
+# (imported at top: U storage/hash.{fnv1a_hash})
+
+# ============================================================================
+# MVCC Metadata Wrappers — used by visibility filter/GC functions
+# These carry MVCC tuple fields alongside entity IDs.
+# ============================================================================
+
+## Chunk MVCC metadata for visibility checks
+S ChunkMeta {
+    chunk_id: u64,
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+}
+
+X ChunkMeta {
+    F new(chunk_id: u64, txn_id_create: u64) -> ChunkMeta {
+        ChunkMeta {
+            chunk_id,
+            txn_id_create,
+            txn_id_expire: 0,
+            cmd_id_create: 0,
+            cmd_id_expire: 0,
+        }
+    }
+
+    F clone(self) -> ChunkMeta {
+        ChunkMeta {
+            chunk_id: self.chunk_id,
+            txn_id_create: self.txn_id_create,
+            txn_id_expire: self.txn_id_expire,
+            cmd_id_create: self.cmd_id_create,
+            cmd_id_expire: self.cmd_id_expire,
+        }
+    }
+}
+
+## Document MVCC metadata for visibility checks
+S DocumentMeta {
+    doc_id: u64,
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+}
+
+X DocumentMeta {
+    F new(doc_id: u64, txn_id_create: u64) -> DocumentMeta {
+        DocumentMeta {
+            doc_id,
+            txn_id_create,
+            txn_id_expire: 0,
+            cmd_id_create: 0,
+            cmd_id_expire: 0,
+        }
+    }
+
+    F clone(self) -> DocumentMeta {
+        DocumentMeta {
+            doc_id: self.doc_id,
+            txn_id_create: self.txn_id_create,
+            txn_id_expire: self.txn_id_expire,
+            cmd_id_create: self.cmd_id_create,
+            cmd_id_expire: self.cmd_id_expire,
+        }
+    }
+}

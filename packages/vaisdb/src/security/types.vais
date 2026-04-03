@@ -1,0 +1,1860 @@
+# Security Engine Core Types
+# User management, role-based access control, grants, policies, encryption, audit
+# Based on Phase 10: Security & Multi-tenancy
+# Error codes: EE=09 (security), CC=01-10
+# WAL record types: 0x60-0x65
+# ENGINE_TAG_SECURITY = 0x06
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/constants.{
+    PAGE_HEADER_SIZE, INVALID_TXN_ID, NULL_PAGE,
+    MVCC_TUPLE_META_SIZE
+};
+U storage/error.{VaisError, ErrorSeverity};
+U storage/hash.{fnv1a_hash};
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Security format version
+C SECURITY_FORMAT_VERSION: u8 = 1;
+
+# Engine tag for security
+C ENGINE_TAG_SECURITY: u8 = 0x06;
+
+# File ID for security engine (system catalog pages)
+C FILE_ID_SECURITY: u8 = 6;
+
+# File name within .vaisdb directory
+C FILE_NAME_SECURITY: Str = "security.vdb";
+
+# Page types for security engine (0x70-0x7F range)
+C PAGE_TYPE_SECURITY_USER: u8 = 0x70;       # User catalog pages
+C PAGE_TYPE_SECURITY_ROLE: u8 = 0x71;       # Role catalog pages
+C PAGE_TYPE_SECURITY_GRANT: u8 = 0x72;      # Grant/privilege pages
+C PAGE_TYPE_SECURITY_POLICY: u8 = 0x73;     # RLS policy pages
+C PAGE_TYPE_SECURITY_AUDIT: u8 = 0x74;      # Audit log pages
+C PAGE_TYPE_SECURITY_META: u8 = 0x75;       # Security metadata page
+
+# WAL record types for security engine (0x60-0x65)
+C WAL_USER_CREATE: u8 = 0x60;
+C WAL_USER_ALTER: u8 = 0x61;
+C WAL_USER_DROP: u8 = 0x62;
+C WAL_ROLE_CREATE: u8 = 0x63;
+C WAL_ROLE_DROP: u8 = 0x64;
+C WAL_GRANT_CHANGE: u8 = 0x65;
+
+# Maximum lengths
+C MAX_USERNAME_LENGTH: u32 = 128;
+C MAX_ROLE_NAME_LENGTH: u32 = 128;
+C MAX_PASSWORD_HASH_LENGTH: u32 = 256;
+C MAX_POLICY_NAME_LENGTH: u32 = 128;
+C MAX_POLICY_EXPR_LENGTH: u32 = 4096;
+C MAX_ROLES_PER_USER: u32 = 64;
+C MAX_GRANTS_PER_ROLE: u32 = 1024;
+
+# Password hash algorithm constants
+C HASH_ALGO_ARGON2ID: u8 = 0;
+C HASH_ALGO_SCRYPT: u8 = 1;
+C HASH_ALGO_BCRYPT: u8 = 2;
+C HASH_ALGO_SHA256_SALT: u8 = 3;    # Fallback for embedded mode
+
+# Default hash algorithm
+C DEFAULT_HASH_ALGO: u8 = HASH_ALGO_ARGON2ID;
+
+# Argon2id default parameters
+C ARGON2_MEMORY_COST: u32 = 65536;  # 64 MB
+C ARGON2_TIME_COST: u32 = 3;        # iterations
+C ARGON2_PARALLELISM: u32 = 4;      # threads
+C ARGON2_HASH_LENGTH: u32 = 32;     # output bytes
+C ARGON2_SALT_LENGTH: u32 = 16;     # salt bytes
+
+# Privilege type constants
+C PRIV_SELECT: u8 = 0x01;
+C PRIV_INSERT: u8 = 0x02;
+C PRIV_UPDATE: u8 = 0x04;
+C PRIV_DELETE: u8 = 0x08;
+C PRIV_CREATE: u8 = 0x10;
+C PRIV_DROP: u8 = 0x20;
+C PRIV_ALTER: u8 = 0x40;
+C PRIV_ALL: u8 = 0x7F;              # All privileges combined
+
+# Object type constants (what the privilege applies to)
+C OBJ_TYPE_TABLE: u8 = 0;
+C OBJ_TYPE_COLUMN: u8 = 1;
+C OBJ_TYPE_INDEX: u8 = 2;
+C OBJ_TYPE_DATABASE: u8 = 3;
+C OBJ_TYPE_SCHEMA: u8 = 4;
+C OBJ_TYPE_FUNCTION: u8 = 5;
+
+# Policy type constants
+C POLICY_TYPE_PERMISSIVE: u8 = 0;   # OR with other permissive policies
+C POLICY_TYPE_RESTRICTIVE: u8 = 1;  # AND with other policies
+
+# Policy command scope (which DML commands the policy applies to)
+C POLICY_CMD_ALL: u8 = 0x0F;        # SELECT | INSERT | UPDATE | DELETE
+C POLICY_CMD_SELECT: u8 = 0x01;
+C POLICY_CMD_INSERT: u8 = 0x02;
+C POLICY_CMD_UPDATE: u8 = 0x04;
+C POLICY_CMD_DELETE: u8 = 0x08;
+
+# Audit event type constants
+C AUDIT_DDL: u8 = 0;               # DDL operations (CREATE, ALTER, DROP)
+C AUDIT_DML: u8 = 1;               # DML operations (SELECT, INSERT, UPDATE, DELETE)
+C AUDIT_AUTH: u8 = 2;              # Authentication events (login, logout, fail)
+C AUDIT_PRIVILEGE: u8 = 3;         # Privilege changes (GRANT, REVOKE)
+C AUDIT_POLICY: u8 = 4;           # Policy changes (CREATE/ALTER/DROP POLICY)
+C AUDIT_ADMIN: u8 = 5;            # Administrative events (VACUUM, REINDEX, CONFIG)
+
+# Audit result
+C AUDIT_RESULT_SUCCESS: u8 = 0;
+C AUDIT_RESULT_FAILURE: u8 = 1;
+C AUDIT_RESULT_DENIED: u8 = 2;
+
+# Encryption algorithm constants
+C ENCRYPT_ALGO_NONE: u8 = 0;
+C ENCRYPT_ALGO_AES_256_CTR: u8 = 1;
+C ENCRYPT_ALGO_AES_256_GCM: u8 = 2;
+
+# Default encryption for at-rest
+C DEFAULT_ENCRYPT_ALGO: u8 = ENCRYPT_ALGO_AES_256_CTR;
+
+# Key derivation
+C KDF_PBKDF2: u8 = 0;
+C KDF_HKDF: u8 = 1;
+
+# Key rotation status
+C KEY_ROTATION_IDLE: u8 = 0;
+C KEY_ROTATION_IN_PROGRESS: u8 = 1;
+C KEY_ROTATION_COMPLETE: u8 = 2;
+C KEY_ROTATION_FAILED: u8 = 3;
+
+# System user/role IDs (reserved)
+C SYSTEM_USER_ID: u64 = 0;       # Internal system user (not loginable)
+C SUPERUSER_ROLE_ID: u64 = 0;    # Built-in superuser role
+C PUBLIC_ROLE_ID: u64 = 1;       # Default role for all users
+
+# Invalid IDs
+C INVALID_USER_ID: u64 = 0xFFFFFFFFFFFFFFFF;
+C INVALID_ROLE_ID: u64 = 0xFFFFFFFFFFFFFFFF;
+
+# ============================================================================
+# Error Codes: EE=09 (security)
+# CC categories:
+#   01 = syntax/validation
+#   02 = constraint violation
+#   03 = resource
+#   04 = concurrency
+#   05 = data corruption
+#   06 = authentication
+#   07 = configuration
+#   08 = system/OS
+#   09 = privilege/authorization
+#   10 = not found
+# ============================================================================
+
+# --- Authentication Errors (CC=06) ---
+
+F err_auth_failed(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0906001",
+        "Authentication failed for user '{username}'"
+    )
+}
+
+F err_auth_password_expired(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0906002",
+        "Password expired for user '{username}'"
+    ).with_hint("Run ALTER USER '{username}' SET PASSWORD '...' to reset")
+}
+
+F err_auth_account_locked(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0906003",
+        "Account locked for user '{username}'"
+    ).with_hint("Contact a superuser to unlock the account")
+}
+
+F err_auth_too_many_attempts(username: &Str, max: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0906004",
+        "Too many failed login attempts for '{username}' (max {max})"
+    )
+}
+
+F err_auth_connection_limit(username: &Str, max: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0906005",
+        "Connection limit reached for user '{username}' (max {max})"
+    )
+}
+
+# --- Authorization/Privilege Errors (CC=09) ---
+
+F err_privilege_denied(username: &Str, privilege: &Str, object: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0909001",
+        "Permission denied: user '{username}' lacks {privilege} on '{object}'"
+    )
+}
+
+F err_privilege_insufficient() -> VaisError {
+    VaisError.new(
+        "VAIS-0909002",
+        "Insufficient privileges for this operation"
+    )
+}
+
+F err_privilege_superuser_required() -> VaisError {
+    VaisError.new(
+        "VAIS-0909003",
+        "Superuser privilege required"
+    )
+}
+
+F err_privilege_grant_option_required(privilege: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0909004",
+        "No GRANT OPTION for privilege: {privilege}"
+    )
+}
+
+F err_privilege_revoke_cascade(object: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0909005",
+        "Cannot revoke: dependent grants exist on '{object}'. Use REVOKE ... CASCADE"
+    )
+}
+
+# --- Not Found Errors (CC=10) ---
+
+F err_user_not_found(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0910001",
+        "User '{username}' not found"
+    )
+}
+
+F err_role_not_found(role_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0910002",
+        "Role '{role_name}' not found"
+    )
+}
+
+F err_policy_not_found(policy_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0910003",
+        "Policy '{policy_name}' not found"
+    )
+}
+
+F err_grant_not_found(role: &Str, object: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0910004",
+        "No grants found for role '{role}' on '{object}'"
+    )
+}
+
+# --- Constraint Violations (CC=02) ---
+
+F err_user_already_exists(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902001",
+        "User '{username}' already exists"
+    )
+}
+
+F err_role_already_exists(role_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902002",
+        "Role '{role_name}' already exists"
+    )
+}
+
+F err_policy_already_exists(policy_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902003",
+        "Policy '{policy_name}' already exists on this table"
+    )
+}
+
+F err_role_dependency(role_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902004",
+        "Cannot drop role '{role_name}': users or grants depend on it"
+    ).with_hint("Use DROP ROLE '{role_name}' CASCADE or reassign dependencies first")
+}
+
+F err_user_dependency(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902005",
+        "Cannot drop user '{username}': owned objects exist"
+    ).with_hint("Use DROP USER '{username}' CASCADE or reassign objects first")
+}
+
+F err_circular_role_grant(from_role: &Str, to_role: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0902006",
+        "Circular role membership: granting '{from_role}' to '{to_role}' would create a cycle"
+    )
+}
+
+F err_password_too_weak(reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0901001",
+        "Password does not meet security requirements: {reason}"
+    )
+}
+
+F err_max_roles_exceeded(user: &Str, max: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0902007",
+        "User '{user}' exceeds maximum role memberships ({max})"
+    )
+}
+
+# --- Validation Errors (CC=01) ---
+
+F err_invalid_username(username: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0901002",
+        "Invalid username: '{username}'"
+    ).with_hint("Username must be 1-128 characters, alphanumeric and underscore only")
+}
+
+F err_invalid_role_name(role_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0901003",
+        "Invalid role name: '{role_name}'"
+    ).with_hint("Role name must be 1-128 characters, alphanumeric and underscore only")
+}
+
+F err_invalid_policy_expr(msg: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0901004",
+        "Invalid policy expression: {msg}"
+    )
+}
+
+F err_invalid_privilege(priv_name: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0901005",
+        "Unknown privilege: '{priv_name}'"
+    )
+}
+
+# --- Encryption Errors (CC=08) ---
+
+F err_encryption_key_not_set() -> VaisError {
+    VaisError.new(
+        "VAIS-0908001",
+        "Encryption key not configured"
+    ).with_hint("Set encryption_key in server config or provide via KMS")
+    .with_severity(ErrorSeverity.Fatal)
+}
+
+F err_encryption_failed(detail: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0908002",
+        "Encryption operation failed: {detail}"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_decryption_failed(detail: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0908003",
+        "Decryption operation failed: {detail}"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_key_rotation_in_progress() -> VaisError {
+    VaisError.new(
+        "VAIS-0908004",
+        "Key rotation already in progress"
+    )
+}
+
+F err_invalid_encryption_config(msg: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0907001",
+        "Invalid encryption configuration: {msg}"
+    )
+}
+
+# --- Data Corruption (CC=05) ---
+
+F err_security_page_corrupt(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0905001",
+        "Security catalog page {page_id} corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_audit_log_tampered(entry_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0905002",
+        "Audit log integrity violation at entry {entry_id}: checksum chain broken"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+# --- Engine State (CC=10) ---
+
+F err_security_engine_closed() -> VaisError {
+    VaisError.new(
+        "VAIS-0910005",
+        "Security engine is not initialized"
+    )
+}
+
+# ============================================================================
+# SecurityConfig — Immutable configuration for security engine
+# ============================================================================
+
+S SecurityConfig {
+    password_hash_algo: u8,              # HASH_ALGO_* constant
+    password_min_length: u32,            # Minimum password length
+    password_require_uppercase: bool,    # Require uppercase letter
+    password_require_digit: bool,        # Require numeric digit
+    password_require_special: bool,      # Require special character
+    max_failed_login_attempts: u32,      # 0 = unlimited
+    lockout_duration_seconds: u64,       # 0 = permanent until manual unlock
+    password_expiry_days: u32,           # 0 = never expires
+    max_connections_per_user: u32,       # 0 = unlimited
+    enable_rls: bool,                    # Enable row-level security
+    enable_audit: bool,                  # Enable audit logging
+    audit_dml: bool,                     # Audit DML operations (can be verbose)
+    encrypt_algo: u8,                    # ENCRYPT_ALGO_* constant
+    encrypt_wal: bool,                   # Encrypt WAL records
+    page_size: u32,                      # Inherited from database
+}
+
+X SecurityConfig {
+    F default(page_size: u32) -> SecurityConfig {
+        SecurityConfig {
+            password_hash_algo: DEFAULT_HASH_ALGO,
+            password_min_length: 8,
+            password_require_uppercase: true,
+            password_require_digit: true,
+            password_require_special: false,
+            max_failed_login_attempts: 5,
+            lockout_duration_seconds: 300,   # 5 minutes
+            password_expiry_days: 0,         # Never
+            max_connections_per_user: 0,     # Unlimited
+            enable_rls: false,
+            enable_audit: true,
+            audit_dml: false,
+            encrypt_algo: ENCRYPT_ALGO_NONE,
+            encrypt_wal: false,
+            page_size,
+        }
+    }
+
+    # Serialize (32 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.password_hash_algo);
+        buf.put_u8(self.encrypt_algo);
+        buf.put_u16_le(0);  # reserved alignment
+        buf.put_u32_le(self.password_min_length);
+        buf.put_u32_le(self.max_failed_login_attempts);
+        buf.put_u32_le(self.password_expiry_days);
+        buf.put_u32_le(self.max_connections_per_user);
+        buf.put_u64_le(self.lockout_duration_seconds);
+        # Pack booleans into a flags byte
+        flags: u8 := mut 0;
+        I self.password_require_uppercase { flags = flags | 0x01; }
+        I self.password_require_digit { flags = flags | 0x02; }
+        I self.password_require_special { flags = flags | 0x04; }
+        I self.enable_rls { flags = flags | 0x08; }
+        I self.enable_audit { flags = flags | 0x10; }
+        I self.audit_dml { flags = flags | 0x20; }
+        I self.encrypt_wal { flags = flags | 0x40; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_u16_le(0);  # reserved
+    }
+
+    # Deserialize (32 bytes)
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<SecurityConfig, VaisError> {
+        password_hash_algo := mut buf.get_u8()?;
+        encrypt_algo := mut buf.get_u8()?;
+        buf.get_u16_le()?;  # reserved
+        password_min_length := mut buf.get_u32_le()?;
+        max_failed_login_attempts := mut buf.get_u32_le()?;
+        password_expiry_days := mut buf.get_u32_le()?;
+        max_connections_per_user := mut buf.get_u32_le()?;
+        lockout_duration_seconds := mut buf.get_u64_le()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;  # reserved
+        buf.get_u16_le()?;  # reserved
+        Ok(SecurityConfig {
+            password_hash_algo,
+            password_min_length,
+            password_require_uppercase: (flags & 0x01) != 0,
+            password_require_digit: (flags & 0x02) != 0,
+            password_require_special: (flags & 0x04) != 0,
+            max_failed_login_attempts,
+            lockout_duration_seconds,
+            password_expiry_days,
+            max_connections_per_user,
+            enable_rls: (flags & 0x08) != 0,
+            enable_audit: (flags & 0x10) != 0,
+            audit_dml: (flags & 0x20) != 0,
+            encrypt_algo,
+            encrypt_wal: (flags & 0x40) != 0,
+            page_size,
+        })
+    }
+}
+
+# ============================================================================
+# SecurityMeta — Persistent metadata for security engine
+# ============================================================================
+
+S SecurityMeta {
+    format_version: u8,
+    user_count: u64,                   # Total registered users
+    role_count: u64,                   # Total registered roles
+    grant_count: u64,                  # Total active grants
+    policy_count: u64,                 # Total RLS policies
+    audit_entry_count: u64,            # Total audit log entries
+    next_user_id: u64,                 # Next user ID to assign
+    next_role_id: u64,                 # Next role ID to assign
+    next_grant_id: u64,                # Next grant ID to assign
+    next_policy_id: u64,               # Next policy ID to assign
+    next_audit_id: u64,                # Next audit entry ID to assign
+    user_catalog_page: u32,            # Root page for user catalog
+    role_catalog_page: u32,            # Root page for role catalog
+    grant_catalog_page: u32,           # Root page for grant catalog
+    policy_catalog_page: u32,          # Root page for policy catalog
+    audit_head_page: u32,              # Head of audit log page chain
+    encryption_key_id: u32,            # Current active encryption key ID
+    key_rotation_status: u8,           # KEY_ROTATION_* constant
+    config: SecurityConfig,
+}
+
+X SecurityMeta {
+    F new(page_size: u32) -> SecurityMeta {
+        SecurityMeta {
+            format_version: SECURITY_FORMAT_VERSION,
+            user_count: 0,
+            role_count: 2,    # superuser + public built-in
+            grant_count: 0,
+            policy_count: 0,
+            audit_entry_count: 0,
+            next_user_id: 1,  # 0 = SYSTEM_USER_ID (reserved)
+            next_role_id: 2,  # 0 = superuser, 1 = public (reserved)
+            next_grant_id: 1,
+            next_policy_id: 1,
+            next_audit_id: 1,
+            user_catalog_page: NULL_PAGE,
+            role_catalog_page: NULL_PAGE,
+            grant_catalog_page: NULL_PAGE,
+            policy_catalog_page: NULL_PAGE,
+            audit_head_page: NULL_PAGE,
+            encryption_key_id: 0,
+            key_rotation_status: KEY_ROTATION_IDLE,
+            config: SecurityConfig.default(page_size),
+        }
+    }
+
+    F alloc_user_id(mut self) -> u64 {
+        id := mut self.next_user_id;
+        self.next_user_id = self.next_user_id + 1;
+        id
+    }
+
+    F alloc_role_id(mut self) -> u64 {
+        id := mut self.next_role_id;
+        self.next_role_id = self.next_role_id + 1;
+        id
+    }
+
+    F alloc_grant_id(mut self) -> u64 {
+        id := mut self.next_grant_id;
+        self.next_grant_id = self.next_grant_id + 1;
+        id
+    }
+
+    F alloc_policy_id(mut self) -> u64 {
+        id := mut self.next_policy_id;
+        self.next_policy_id = self.next_policy_id + 1;
+        id
+    }
+
+    F alloc_audit_id(mut self) -> u64 {
+        id := mut self.next_audit_id;
+        self.next_audit_id = self.next_audit_id + 1;
+        id
+    }
+
+    # Serialize (128 bytes + config 32 bytes = 160 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.format_version);
+        buf.put_u8(self.key_rotation_status);
+        buf.put_u16_le(0);  # reserved alignment
+        buf.put_u32_le(self.encryption_key_id);
+        buf.put_u64_le(self.user_count);
+        buf.put_u64_le(self.role_count);
+        buf.put_u64_le(self.grant_count);
+        buf.put_u64_le(self.policy_count);
+        buf.put_u64_le(self.audit_entry_count);
+        buf.put_u64_le(self.next_user_id);
+        buf.put_u64_le(self.next_role_id);
+        buf.put_u64_le(self.next_grant_id);
+        buf.put_u64_le(self.next_policy_id);
+        buf.put_u64_le(self.next_audit_id);
+        buf.put_u32_le(self.user_catalog_page);
+        buf.put_u32_le(self.role_catalog_page);
+        buf.put_u32_le(self.grant_catalog_page);
+        buf.put_u32_le(self.policy_catalog_page);
+        buf.put_u32_le(self.audit_head_page);
+        buf.put_u32_le(0);  # reserved
+        self.config.serialize(buf);
+    }
+
+    # Deserialize
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<SecurityMeta, VaisError> {
+        format_version := mut buf.get_u8()?;
+        key_rotation_status := mut buf.get_u8()?;
+        buf.get_u16_le()?;  # reserved
+        encryption_key_id := mut buf.get_u32_le()?;
+        user_count := mut buf.get_u64_le()?;
+        role_count := mut buf.get_u64_le()?;
+        grant_count := mut buf.get_u64_le()?;
+        policy_count := mut buf.get_u64_le()?;
+        audit_entry_count := mut buf.get_u64_le()?;
+        next_user_id := mut buf.get_u64_le()?;
+        next_role_id := mut buf.get_u64_le()?;
+        next_grant_id := mut buf.get_u64_le()?;
+        next_policy_id := mut buf.get_u64_le()?;
+        next_audit_id := mut buf.get_u64_le()?;
+        user_catalog_page := mut buf.get_u32_le()?;
+        role_catalog_page := mut buf.get_u32_le()?;
+        grant_catalog_page := mut buf.get_u32_le()?;
+        policy_catalog_page := mut buf.get_u32_le()?;
+        audit_head_page := mut buf.get_u32_le()?;
+        buf.get_u32_le()?;  # reserved
+        config := mut SecurityConfig.deserialize(buf, page_size)?;
+        Ok(SecurityMeta {
+            format_version, user_count, role_count, grant_count,
+            policy_count, audit_entry_count,
+            next_user_id, next_role_id, next_grant_id,
+            next_policy_id, next_audit_id,
+            user_catalog_page, role_catalog_page,
+            grant_catalog_page, policy_catalog_page,
+            audit_head_page, encryption_key_id,
+            key_rotation_status, config,
+        })
+    }
+}
+
+# ============================================================================
+# UserInfo — User account record
+# ============================================================================
+
+S UserInfo {
+    user_id: u64,
+    username: Str,
+    password_hash: Str,                # Hashed password (algo-dependent format)
+    password_salt: Vec<u8>,            # Salt for password hash
+    hash_algo: u8,                     # HASH_ALGO_* constant
+    is_superuser: bool,
+    can_login: bool,                   # false = role-only account
+    is_locked: bool,                   # Account locked due to failed attempts
+    failed_login_count: u32,           # Consecutive failed logins
+    connection_limit: u32,             # 0 = use global default
+    role_ids: Vec<u64>,                # Granted role memberships
+    created_at: i64,                   # Unix timestamp
+    updated_at: i64,                   # Unix timestamp
+    password_changed_at: i64,          # Unix timestamp of last password change
+    locked_at: i64,                    # Unix timestamp when locked (0 = not locked)
+
+    # MVCC metadata (24 bytes)
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id: u32,
+    expire_cmd_id: u32,
+}
+
+X UserInfo {
+    F new(
+        user_id: u64,
+        username: Str,
+        password_hash: Str,
+        password_salt: Vec<u8>,
+        hash_algo: u8,
+        is_superuser: bool,
+        can_login: bool,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> UserInfo {
+        now := mut std/time.unix_timestamp();
+        UserInfo {
+            user_id,
+            username,
+            password_hash,
+            password_salt,
+            hash_algo,
+            is_superuser,
+            can_login,
+            is_locked: false,
+            failed_login_count: 0,
+            connection_limit: 0,
+            role_ids: Vec.new(),
+            created_at: now,
+            updated_at: now,
+            password_changed_at: now,
+            locked_at: 0,
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Mark user as deleted (soft delete via MVCC)
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if record is active (not expired)
+    F is_active(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Clear expiration (rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Record a failed login attempt
+    F record_failed_login(mut self, max_attempts: u32) {
+        self.failed_login_count = self.failed_login_count + 1;
+        I max_attempts > 0 && self.failed_login_count >= max_attempts {
+            self.is_locked = true;
+            self.locked_at = std/time.unix_timestamp();
+        }
+    }
+
+    # Reset failed login counter on successful login
+    F record_successful_login(mut self) {
+        self.failed_login_count = 0;
+    }
+
+    # Check if account lockout has expired
+    F is_lockout_expired(self, lockout_duration: u64) -> bool {
+        I !self.is_locked {
+            R true;
+        }
+        I lockout_duration == 0 {
+            R false;  # Permanent lock
+        }
+        now := mut std/time.unix_timestamp();
+        I now < self.locked_at {
+            R false;  # Clock skew guard
+        }
+        elapsed := mut (now - self.locked_at) as u64;
+        elapsed >= lockout_duration
+    }
+
+    # Unlock account
+    F unlock(mut self) {
+        self.is_locked = false;
+        self.failed_login_count = 0;
+        self.locked_at = 0;
+    }
+
+    # Check if password has expired
+    F is_password_expired(self, expiry_days: u32) -> bool {
+        I expiry_days == 0 {
+            R false;  # Never expires
+        }
+        now := mut std/time.unix_timestamp();
+        I now < self.password_changed_at {
+            R false;  # Clock skew guard
+        }
+        elapsed_seconds := mut (now - self.password_changed_at) as u64;
+        expiry_seconds := mut expiry_days as u64 * 86400;
+        elapsed_seconds >= expiry_seconds
+    }
+
+    # Add role membership
+    F add_role(mut self, role_id: u64) -> Result<(), VaisError> {
+        I self.role_ids.len() >= MAX_ROLES_PER_USER as u64 {
+            R Err(err_max_roles_exceeded(&self.username, MAX_ROLES_PER_USER));
+        }
+        # Check for duplicate
+        i: u64 := mut 0;
+        L i < self.role_ids.len() {
+            I self.role_ids[i] == role_id {
+                R Ok(());  # Already a member, idempotent
+            }
+            i = i + 1;
+        }
+        self.role_ids.push(role_id);
+        self.updated_at = std/time.unix_timestamp();
+        Ok(())
+    }
+
+    # Remove role membership
+    F remove_role(mut self, role_id: u64) -> bool {
+        i: u64 := mut 0;
+        L i < self.role_ids.len() {
+            I self.role_ids[i] == role_id {
+                self.role_ids.remove(i);
+                self.updated_at = std/time.unix_timestamp();
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    # Check if user has a specific role
+    F has_role(self, role_id: u64) -> bool {
+        i: u64 := mut 0;
+        L i < self.role_ids.len() {
+            I self.role_ids[i] == role_id {
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    # Serialize to ByteBuffer (variable size)
+    F serialize(self, buf: &mut ByteBuffer) {
+        # Fixed fields (u64 first for alignment)
+        buf.put_u64_le(self.user_id);
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_i64_le(self.created_at);
+        buf.put_i64_le(self.updated_at);
+        buf.put_i64_le(self.password_changed_at);
+        buf.put_i64_le(self.locked_at);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+        buf.put_u32_le(self.failed_login_count);
+        buf.put_u32_le(self.connection_limit);
+        buf.put_u8(self.hash_algo);
+        flags: u8 := mut 0;
+        I self.is_superuser { flags = flags | 0x01; }
+        I self.can_login { flags = flags | 0x02; }
+        I self.is_locked { flags = flags | 0x04; }
+        buf.put_u8(flags);
+        buf.put_u16_le(self.role_ids.len() as u16);
+
+        # Variable-length fields
+        buf.put_string(&self.username);
+        buf.put_string(&self.password_hash);
+        buf.put_u32_le(self.password_salt.len() as u32);
+        i: u64 := mut 0;
+        L i < self.password_salt.len() {
+            buf.put_u8(self.password_salt[i]);
+            i = i + 1;
+        }
+
+        # Role IDs
+        j: u64 := mut 0;
+        L j < self.role_ids.len() {
+            buf.put_u64_le(self.role_ids[j]);
+            j = j + 1;
+        }
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<UserInfo, VaisError> {
+        user_id := mut buf.get_u64_le()?;
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        updated_at := mut buf.get_i64_le()?;
+        password_changed_at := mut buf.get_i64_le()?;
+        locked_at := mut buf.get_i64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+        failed_login_count := mut buf.get_u32_le()?;
+        connection_limit := mut buf.get_u32_le()?;
+        hash_algo := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        role_count := mut buf.get_u16_le()? as u64;
+
+        username := mut buf.get_string()?;
+        password_hash := mut buf.get_string()?;
+        salt_len := mut buf.get_u32_le()? as u64;
+        password_salt := mut Vec.with_capacity(salt_len);
+        i: u64 := mut 0;
+        L i < salt_len {
+            password_salt.push(buf.get_u8()?);
+            i = i + 1;
+        }
+
+        role_ids := mut Vec.with_capacity(role_count);
+        j: u64 := mut 0;
+        L j < role_count {
+            role_ids.push(buf.get_u64_le()?);
+            j = j + 1;
+        }
+
+        Ok(UserInfo {
+            user_id, username, password_hash, password_salt, hash_algo,
+            is_superuser: (flags & 0x01) != 0,
+            can_login: (flags & 0x02) != 0,
+            is_locked: (flags & 0x04) != 0,
+            failed_login_count, connection_limit, role_ids,
+            created_at, updated_at, password_changed_at, locked_at,
+            txn_id_create, txn_id_expire, cmd_id, expire_cmd_id,
+        })
+    }
+
+    # Serialize to standalone byte vector (for WAL payload)
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(512);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector (for WAL redo)
+    F from_bytes(data: &[u8]) -> Result<UserInfo, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        UserInfo.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# RoleInfo — Role definition record
+# ============================================================================
+
+S RoleInfo {
+    role_id: u64,
+    role_name: Str,
+    parent_role_ids: Vec<u64>,         # Role inheritance chain (granted roles)
+    is_system: bool,                    # System role (cannot be dropped)
+    created_at: i64,
+    updated_at: i64,
+
+    # MVCC metadata (24 bytes)
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id: u32,
+    expire_cmd_id: u32,
+}
+
+X RoleInfo {
+    F new(
+        role_id: u64,
+        role_name: Str,
+        is_system: bool,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> RoleInfo {
+        now := mut std/time.unix_timestamp();
+        RoleInfo {
+            role_id,
+            role_name,
+            parent_role_ids: Vec.new(),
+            is_system,
+            created_at: now,
+            updated_at: now,
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Built-in superuser role
+    F superuser() -> RoleInfo {
+        RoleInfo {
+            role_id: SUPERUSER_ROLE_ID,
+            role_name: "superuser",
+            parent_role_ids: Vec.new(),
+            is_system: true,
+            created_at: 0,
+            updated_at: 0,
+            txn_id_create: 1,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id: 0,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Built-in public role (all users get this implicitly)
+    F public_role() -> RoleInfo {
+        RoleInfo {
+            role_id: PUBLIC_ROLE_ID,
+            role_name: "public",
+            parent_role_ids: Vec.new(),
+            is_system: true,
+            created_at: 0,
+            updated_at: 0,
+            txn_id_create: 1,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id: 0,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Mark role as deleted (soft delete via MVCC)
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if record is active
+    F is_active(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Clear expiration (rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Add parent role (role inheritance)
+    F add_parent_role(mut self, parent_role_id: u64) {
+        # Check for duplicate
+        i: u64 := mut 0;
+        L i < self.parent_role_ids.len() {
+            I self.parent_role_ids[i] == parent_role_id {
+                R;  # Already inherited
+            }
+            i = i + 1;
+        }
+        self.parent_role_ids.push(parent_role_id);
+        self.updated_at = std/time.unix_timestamp();
+    }
+
+    # Remove parent role
+    F remove_parent_role(mut self, parent_role_id: u64) -> bool {
+        i: u64 := mut 0;
+        L i < self.parent_role_ids.len() {
+            I self.parent_role_ids[i] == parent_role_id {
+                self.parent_role_ids.remove(i);
+                self.updated_at = std/time.unix_timestamp();
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    # Serialize to ByteBuffer
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.role_id);
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_i64_le(self.created_at);
+        buf.put_i64_le(self.updated_at);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+        flags: u8 := mut 0;
+        I self.is_system { flags = flags | 0x01; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_u16_le(self.parent_role_ids.len() as u16);
+        buf.put_string(&self.role_name);
+
+        # Parent role IDs
+        i: u64 := mut 0;
+        L i < self.parent_role_ids.len() {
+            buf.put_u64_le(self.parent_role_ids[i]);
+            i = i + 1;
+        }
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<RoleInfo, VaisError> {
+        role_id := mut buf.get_u64_le()?;
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        updated_at := mut buf.get_i64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;  # reserved
+        parent_count := mut buf.get_u16_le()? as u64;
+        role_name := mut buf.get_string()?;
+
+        parent_role_ids := mut Vec.with_capacity(parent_count);
+        i: u64 := mut 0;
+        L i < parent_count {
+            parent_role_ids.push(buf.get_u64_le()?);
+            i = i + 1;
+        }
+
+        Ok(RoleInfo {
+            role_id, role_name, parent_role_ids,
+            is_system: (flags & 0x01) != 0,
+            created_at, updated_at,
+            txn_id_create, txn_id_expire, cmd_id, expire_cmd_id,
+        })
+    }
+
+    # Serialize to standalone byte vector
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(256);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector
+    F from_bytes(data: &[u8]) -> Result<RoleInfo, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        RoleInfo.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# GrantEntry — Privilege grant record
+# ============================================================================
+
+S GrantEntry {
+    grant_id: u64,
+    role_id: u64,                       # Role receiving the privilege
+    grantor_id: u64,                    # User who granted (for REVOKE cascade)
+    object_type: u8,                    # OBJ_TYPE_* constant
+    object_name: Str,                   # Table/index/schema name
+    column_name: Str,                   # Column name (empty = whole object)
+    privilege_mask: u8,                 # PRIV_* bit field
+    with_grant_option: bool,            # Can re-grant to others
+    created_at: i64,
+
+    # MVCC metadata (24 bytes)
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id: u32,
+    expire_cmd_id: u32,
+}
+
+X GrantEntry {
+    F new(
+        grant_id: u64,
+        role_id: u64,
+        grantor_id: u64,
+        object_type: u8,
+        object_name: Str,
+        column_name: Str,
+        privilege_mask: u8,
+        with_grant_option: bool,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> GrantEntry {
+        GrantEntry {
+            grant_id,
+            role_id,
+            grantor_id,
+            object_type,
+            object_name,
+            column_name,
+            privilege_mask,
+            with_grant_option,
+            created_at: std/time.unix_timestamp(),
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Mark grant as revoked
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if grant is active
+    F is_active(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Clear expiration (rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Check if grant covers a specific privilege
+    F has_privilege(self, priv_type: u8) -> bool {
+        (self.privilege_mask & priv_type) != 0
+    }
+
+    # Check if grant applies to a specific column (or whole object)
+    F applies_to_column(self, col: &Str) -> bool {
+        self.column_name.len() == 0 || self.column_name == *col
+    }
+
+    # Serialize to ByteBuffer
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.grant_id);
+        buf.put_u64_le(self.role_id);
+        buf.put_u64_le(self.grantor_id);
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_i64_le(self.created_at);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+        buf.put_u8(self.object_type);
+        buf.put_u8(self.privilege_mask);
+        flags: u8 := mut 0;
+        I self.with_grant_option { flags = flags | 0x01; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_string(&self.object_name);
+        buf.put_string(&self.column_name);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<GrantEntry, VaisError> {
+        grant_id := mut buf.get_u64_le()?;
+        role_id := mut buf.get_u64_le()?;
+        grantor_id := mut buf.get_u64_le()?;
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+        object_type := mut buf.get_u8()?;
+        privilege_mask := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;  # reserved
+        object_name := mut buf.get_string()?;
+        column_name := mut buf.get_string()?;
+
+        Ok(GrantEntry {
+            grant_id, role_id, grantor_id,
+            object_type, object_name, column_name,
+            privilege_mask,
+            with_grant_option: (flags & 0x01) != 0,
+            created_at,
+            txn_id_create, txn_id_expire, cmd_id, expire_cmd_id,
+        })
+    }
+
+    # Serialize to standalone byte vector
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(256);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector
+    F from_bytes(data: &[u8]) -> Result<GrantEntry, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        GrantEntry.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# PolicyEntry — Row-Level Security policy
+# ============================================================================
+
+S PolicyEntry {
+    policy_id: u64,
+    policy_name: Str,
+    table_name: Str,                    # Table this policy applies to
+    role_name: Str,                     # Role (empty = all roles)
+    policy_type: u8,                    # POLICY_TYPE_* constant
+    cmd_scope: u8,                      # POLICY_CMD_* bitmask
+    using_expr: Str,                    # USING (expr) for SELECT/DELETE visibility
+    check_expr: Str,                    # WITH CHECK (expr) for INSERT/UPDATE validation
+    enabled: bool,
+    created_at: i64,
+    updated_at: i64,
+
+    # MVCC metadata (24 bytes)
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id: u32,
+    expire_cmd_id: u32,
+}
+
+X PolicyEntry {
+    F new(
+        policy_id: u64,
+        policy_name: Str,
+        table_name: Str,
+        role_name: Str,
+        policy_type: u8,
+        cmd_scope: u8,
+        using_expr: Str,
+        check_expr: Str,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> PolicyEntry {
+        now := mut std/time.unix_timestamp();
+        PolicyEntry {
+            policy_id,
+            policy_name,
+            table_name,
+            role_name,
+            policy_type,
+            cmd_scope,
+            using_expr,
+            check_expr,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Mark policy as dropped
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if policy is active
+    F is_active(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Clear expiration (rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Check if policy applies to a specific DML command type
+    F applies_to_cmd(self, cmd: u8) -> bool {
+        (self.cmd_scope & cmd) != 0
+    }
+
+    # Check if policy applies to a specific role
+    F applies_to_role(self, target_role: &Str) -> bool {
+        self.role_name.len() == 0 || self.role_name == *target_role
+    }
+
+    # Check if policy is permissive
+    F is_permissive(self) -> bool {
+        self.policy_type == POLICY_TYPE_PERMISSIVE
+    }
+
+    # Check if policy is restrictive
+    F is_restrictive(self) -> bool {
+        self.policy_type == POLICY_TYPE_RESTRICTIVE
+    }
+
+    # Serialize to ByteBuffer
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.policy_id);
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_i64_le(self.created_at);
+        buf.put_i64_le(self.updated_at);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+        buf.put_u8(self.policy_type);
+        buf.put_u8(self.cmd_scope);
+        flags: u8 := mut 0;
+        I self.enabled { flags = flags | 0x01; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_string(&self.policy_name);
+        buf.put_string(&self.table_name);
+        buf.put_string(&self.role_name);
+        buf.put_string(&self.using_expr);
+        buf.put_string(&self.check_expr);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<PolicyEntry, VaisError> {
+        policy_id := mut buf.get_u64_le()?;
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        updated_at := mut buf.get_i64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+        policy_type := mut buf.get_u8()?;
+        cmd_scope := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;  # reserved
+        policy_name := mut buf.get_string()?;
+        table_name := mut buf.get_string()?;
+        role_name := mut buf.get_string()?;
+        using_expr := mut buf.get_string()?;
+        check_expr := mut buf.get_string()?;
+
+        Ok(PolicyEntry {
+            policy_id, policy_name, table_name, role_name,
+            policy_type, cmd_scope, using_expr, check_expr,
+            enabled: (flags & 0x01) != 0,
+            created_at, updated_at,
+            txn_id_create, txn_id_expire, cmd_id, expire_cmd_id,
+        })
+    }
+
+    # Serialize to standalone byte vector
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(512);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector
+    F from_bytes(data: &[u8]) -> Result<PolicyEntry, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        PolicyEntry.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# AuditEntry — Audit log record (append-only with checksum chain)
+# ============================================================================
+
+S AuditEntry {
+    entry_id: u64,
+    timestamp: i64,                    # Unix timestamp
+    event_type: u8,                    # AUDIT_* constant
+    result: u8,                        # AUDIT_RESULT_* constant
+    user_id: u64,                      # User who performed the action
+    username: Str,                     # Denormalized for fast querying
+    client_addr: Str,                  # Client IP address
+    database_name: Str,                # Database name
+    object_name: Str,                  # Table/index/role name (if applicable)
+    statement: Str,                    # SQL statement (truncated for DML)
+    detail: Str,                       # Additional detail
+    prev_checksum: u64,                # FNV-1a hash of previous entry (chain)
+    checksum: u64,                     # FNV-1a hash of this entry (tamper detection)
+}
+
+X AuditEntry {
+    F new(
+        entry_id: u64,
+        event_type: u8,
+        result: u8,
+        user_id: u64,
+        username: Str,
+        client_addr: Str,
+        database_name: Str,
+        object_name: Str,
+        statement: Str,
+        detail: Str,
+        prev_checksum: u64,
+    ) -> AuditEntry {
+        entry := mut AuditEntry {
+            entry_id,
+            timestamp: std/time.unix_timestamp(),
+            event_type,
+            result,
+            user_id,
+            username,
+            client_addr,
+            database_name,
+            object_name,
+            statement,
+            detail,
+            prev_checksum,
+            checksum: 0,
+        };
+        entry.checksum = entry.compute_checksum();
+        entry
+    }
+
+    # Compute checksum for tamper detection
+    # Hash: entry_id + timestamp + event_type + user_id + statement + prev_checksum
+    F compute_checksum(self) -> u64 {
+        buf := mut ByteBuffer.new(256);
+        buf.put_u64_le(self.entry_id);
+        buf.put_i64_le(self.timestamp);
+        buf.put_u8(self.event_type);
+        buf.put_u8(self.result);
+        buf.put_u64_le(self.user_id);
+        buf.put_u64_le(self.prev_checksum);
+        buf.put_string(&self.username);
+        buf.put_string(&self.statement);
+        fnv1a_hash_bytes(buf.as_slice())
+    }
+
+    # Verify entry integrity
+    F verify_integrity(self) -> bool {
+        self.checksum == self.compute_checksum()
+    }
+
+    # Verify chain: prev_checksum must match the checksum of the previous entry
+    F verify_chain(self, prev_entry_checksum: u64) -> bool {
+        self.prev_checksum == prev_entry_checksum
+    }
+
+    # Serialize to ByteBuffer
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.entry_id);
+        buf.put_i64_le(self.timestamp);
+        buf.put_u64_le(self.user_id);
+        buf.put_u64_le(self.prev_checksum);
+        buf.put_u64_le(self.checksum);
+        buf.put_u8(self.event_type);
+        buf.put_u8(self.result);
+        buf.put_u16_le(0);  # reserved
+        buf.put_u32_le(0);  # reserved
+        buf.put_string(&self.username);
+        buf.put_string(&self.client_addr);
+        buf.put_string(&self.database_name);
+        buf.put_string(&self.object_name);
+        buf.put_string(&self.statement);
+        buf.put_string(&self.detail);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<AuditEntry, VaisError> {
+        entry_id := mut buf.get_u64_le()?;
+        timestamp := mut buf.get_i64_le()?;
+        user_id := mut buf.get_u64_le()?;
+        prev_checksum := mut buf.get_u64_le()?;
+        checksum := mut buf.get_u64_le()?;
+        event_type := mut buf.get_u8()?;
+        result := mut buf.get_u8()?;
+        buf.get_u16_le()?;  # reserved
+        buf.get_u32_le()?;  # reserved
+        username := mut buf.get_string()?;
+        client_addr := mut buf.get_string()?;
+        database_name := mut buf.get_string()?;
+        object_name := mut buf.get_string()?;
+        statement := mut buf.get_string()?;
+        detail := mut buf.get_string()?;
+
+        Ok(AuditEntry {
+            entry_id, timestamp, event_type, result,
+            user_id, username, client_addr,
+            database_name, object_name, statement, detail,
+            prev_checksum, checksum,
+        })
+    }
+
+    # Serialize to standalone byte vector
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(1024);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector
+    F from_bytes(data: &[u8]) -> Result<AuditEntry, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        AuditEntry.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# EncryptionKeyInfo — Encryption key metadata
+# ============================================================================
+
+S EncryptionKeyInfo {
+    key_id: u32,
+    algorithm: u8,                     # ENCRYPT_ALGO_* constant
+    kdf: u8,                           # KDF_* constant
+    key_hash: u64,                     # FNV-1a hash of key material (for verification)
+    created_at: i64,
+    rotated_at: i64,                   # 0 = never rotated
+    is_active: bool,
+}
+
+X EncryptionKeyInfo {
+    F new(key_id: u32, algorithm: u8, kdf: u8, key_hash: u64) -> EncryptionKeyInfo {
+        EncryptionKeyInfo {
+            key_id,
+            algorithm,
+            kdf,
+            key_hash,
+            created_at: std/time.unix_timestamp(),
+            rotated_at: 0,
+            is_active: true,
+        }
+    }
+
+    # Serialize (32 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u32_le(self.key_id);
+        buf.put_u8(self.algorithm);
+        buf.put_u8(self.kdf);
+        flags: u8 := mut 0;
+        I self.is_active { flags = flags | 0x01; }
+        buf.put_u8(flags);
+        buf.put_u8(0);  # reserved
+        buf.put_u64_le(self.key_hash);
+        buf.put_i64_le(self.created_at);
+        buf.put_i64_le(self.rotated_at);
+    }
+
+    # Deserialize (32 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<EncryptionKeyInfo, VaisError> {
+        key_id := mut buf.get_u32_le()?;
+        algorithm := mut buf.get_u8()?;
+        kdf := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        buf.get_u8()?;  # reserved
+        key_hash := mut buf.get_u64_le()?;
+        created_at := mut buf.get_i64_le()?;
+        rotated_at := mut buf.get_i64_le()?;
+
+        Ok(EncryptionKeyInfo {
+            key_id, algorithm, kdf, key_hash,
+            created_at, rotated_at,
+            is_active: (flags & 0x01) != 0,
+        })
+    }
+}
+
+# ============================================================================
+# SessionContext — Current session security context
+# (in-memory only, not serialized to disk)
+# ============================================================================
+
+S SessionContext {
+    user_id: u64,
+    username: Str,
+    is_superuser: bool,
+    active_roles: Vec<u64>,            # Effective roles (user's roles + inherited)
+    client_addr: Str,
+    database_name: Str,
+    connected_at: i64,
+}
+
+X SessionContext {
+    F new(
+        user_id: u64,
+        username: Str,
+        is_superuser: bool,
+        client_addr: Str,
+        database_name: Str,
+    ) -> SessionContext {
+        SessionContext {
+            user_id,
+            username,
+            is_superuser,
+            active_roles: Vec.new(),
+            client_addr,
+            database_name,
+            connected_at: std/time.unix_timestamp(),
+        }
+    }
+
+    # System context (for internal operations)
+    F system() -> SessionContext {
+        SessionContext {
+            user_id: SYSTEM_USER_ID,
+            username: "system",
+            is_superuser: true,
+            active_roles: Vec.new(),
+            client_addr: "local",
+            database_name: "",
+            connected_at: std/time.unix_timestamp(),
+        }
+    }
+
+    # Set effective roles after resolving role inheritance
+    F set_active_roles(mut self, roles: Vec<u64>) {
+        self.active_roles = roles;
+    }
+
+    # Check if session has a specific role
+    F has_role(self, role_id: u64) -> bool {
+        I self.is_superuser {
+            R true;  # Superuser has all roles
+        }
+        i: u64 := mut 0;
+        L i < self.active_roles.len() {
+            I self.active_roles[i] == role_id {
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    # current_user() SQL function support
+    F current_user(self) -> &Str {
+        &self.username
+    }
+
+    # current_user_tenant() SQL function support for RLS
+    # Returns the user_id as a string for policy evaluation
+    F current_user_id(self) -> u64 {
+        self.user_id
+    }
+}
+
+# ============================================================================
+# PrivilegeCheck — Result of a privilege check
+# ============================================================================
+
+S PrivilegeCheck {
+    allowed: bool,
+    checked_privilege: u8,             # PRIV_* constant that was checked
+    object_name: Str,
+    granting_role: Str,                # Which role provided the privilege (for audit)
+}
+
+X PrivilegeCheck {
+    F allowed(priv_type: u8, object: Str, via_role: Str) -> PrivilegeCheck {
+        PrivilegeCheck {
+            allowed: true,
+            checked_privilege: priv_type,
+            object_name: object,
+            granting_role: via_role,
+        }
+    }
+
+    F denied(priv_type: u8, object: Str) -> PrivilegeCheck {
+        PrivilegeCheck {
+            allowed: false,
+            checked_privilege: priv_type,
+            object_name: object,
+            granting_role: Str.new(),
+        }
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Convert privilege constant to human-readable name
+F privilege_name(priv_type: u8) -> Str {
+    M priv_type {
+        PRIV_SELECT => "SELECT",
+        PRIV_INSERT => "INSERT",
+        PRIV_UPDATE => "UPDATE",
+        PRIV_DELETE => "DELETE",
+        PRIV_CREATE => "CREATE",
+        PRIV_DROP => "DROP",
+        PRIV_ALTER => "ALTER",
+        PRIV_ALL => "ALL",
+        _ => "UNKNOWN",
+    }
+}
+
+# Parse privilege name to constant
+F parse_privilege(name: &Str) -> Result<u8, VaisError> {
+    I *name == "SELECT" { R Ok(PRIV_SELECT); }
+    I *name == "INSERT" { R Ok(PRIV_INSERT); }
+    I *name == "UPDATE" { R Ok(PRIV_UPDATE); }
+    I *name == "DELETE" { R Ok(PRIV_DELETE); }
+    I *name == "CREATE" { R Ok(PRIV_CREATE); }
+    I *name == "DROP" { R Ok(PRIV_DROP); }
+    I *name == "ALTER" { R Ok(PRIV_ALTER); }
+    I *name == "ALL" || *name == "ALL PRIVILEGES" { R Ok(PRIV_ALL); }
+    Err(err_invalid_privilege(name))
+}
+
+# Convert object type constant to human-readable name
+F object_type_name(obj_type: u8) -> Str {
+    M obj_type {
+        OBJ_TYPE_TABLE => "TABLE",
+        OBJ_TYPE_COLUMN => "COLUMN",
+        OBJ_TYPE_INDEX => "INDEX",
+        OBJ_TYPE_DATABASE => "DATABASE",
+        OBJ_TYPE_SCHEMA => "SCHEMA",
+        OBJ_TYPE_FUNCTION => "FUNCTION",
+        _ => "UNKNOWN",
+    }
+}
+
+# Convert audit event type to human-readable name
+F audit_event_name(event_type: u8) -> Str {
+    M event_type {
+        AUDIT_DDL => "DDL",
+        AUDIT_DML => "DML",
+        AUDIT_AUTH => "AUTH",
+        AUDIT_PRIVILEGE => "PRIVILEGE",
+        AUDIT_POLICY => "POLICY",
+        AUDIT_ADMIN => "ADMIN",
+        _ => "UNKNOWN",
+    }
+}
+
+# Validate username format
+F validate_username(username: &Str) -> Result<(), VaisError> {
+    I username.len() == 0 || username.len() > MAX_USERNAME_LENGTH as u64 {
+        R Err(err_invalid_username(username));
+    }
+    # Check: alphanumeric + underscore only
+    bytes := mut username.as_bytes();
+    i: u64 := mut 0;
+    L i < bytes.len() {
+        b := mut bytes[i];
+        is_valid := mut (b >= 0x61 && b <= 0x7A)   # a-z
+                 || (b >= 0x41 && b <= 0x5A)    # A-Z
+                 || (b >= 0x30 && b <= 0x39)    # 0-9
+                 || b == 0x5F;                   # underscore
+        I !is_valid {
+            R Err(err_invalid_username(username));
+        }
+        i = i + 1;
+    }
+    Ok(())
+}
+
+# Validate role name format (same rules as username)
+F validate_role_name(role_name: &Str) -> Result<(), VaisError> {
+    I role_name.len() == 0 || role_name.len() > MAX_ROLE_NAME_LENGTH as u64 {
+        R Err(err_invalid_role_name(role_name));
+    }
+    bytes := mut role_name.as_bytes();
+    i: u64 := mut 0;
+    L i < bytes.len() {
+        b := mut bytes[i];
+        is_valid := mut (b >= 0x61 && b <= 0x7A)
+                 || (b >= 0x41 && b <= 0x5A)
+                 || (b >= 0x30 && b <= 0x39)
+                 || b == 0x5F;
+        I !is_valid {
+            R Err(err_invalid_role_name(role_name));
+        }
+        i = i + 1;
+    }
+    Ok(())
+}
+
+# Validate password strength
+F validate_password(password: &Str, config: &SecurityConfig) -> Result<(), VaisError> {
+    I password.len() < config.password_min_length as u64 {
+        R Err(err_password_too_weak("too short"));
+    }
+    bytes := mut password.as_bytes();
+    has_upper := mut false;
+    has_digit := mut false;
+    has_special := mut false;
+    i: u64 := mut 0;
+    L i < bytes.len() {
+        b := mut bytes[i];
+        I b >= 0x41 && b <= 0x5A { has_upper = true; }
+        I b >= 0x30 && b <= 0x39 { has_digit = true; }
+        I (b >= 0x21 && b <= 0x2F) || (b >= 0x3A && b <= 0x40)
+          || (b >= 0x5B && b <= 0x60) || (b >= 0x7B && b <= 0x7E) {
+            has_special = true;
+        }
+        i = i + 1;
+    }
+    I config.password_require_uppercase && !has_upper {
+        R Err(err_password_too_weak("must contain uppercase letter"));
+    }
+    I config.password_require_digit && !has_digit {
+        R Err(err_password_too_weak("must contain digit"));
+    }
+    I config.password_require_special && !has_special {
+        R Err(err_password_too_weak("must contain special character"));
+    }
+    Ok(())
+}
+
+# Hash a byte slice using FNV-1a (re-exported for audit checksum chain)
+F fnv1a_hash_bytes(data: &[u8]) -> u64 {
+    storage/hash.fnv1a_hash_bytes(data)
+}

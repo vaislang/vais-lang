@@ -1,0 +1,788 @@
+# Wire Protocol Serialization
+# Binary message framing: [u8 type][u32 length][payload...]
+# Length includes itself (4 bytes) but NOT the type byte.
+# All multi-byte integers are little-endian.
+
+U std/bytes.ByteBuffer;
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/bytes.{write_string, read_string, write_bytes, read_bytes};
+U storage/error.VaisError;
+U server/types.{
+    MessageHeader,
+    MSG_TYPE_STARTUP, MSG_TYPE_AUTH_REQUEST, MSG_TYPE_AUTH_RESPONSE, MSG_TYPE_AUTH_OK,
+    MSG_TYPE_QUERY, MSG_TYPE_PARSE, MSG_TYPE_BIND, MSG_TYPE_EXECUTE,
+    MSG_TYPE_DESCRIBE, MSG_TYPE_CLOSE_STMT, MSG_TYPE_SYNC, MSG_TYPE_TERMINATE,
+    MSG_TYPE_RESULT, MSG_TYPE_ROW_DATA, MSG_TYPE_COMMAND_COMPLETE, MSG_TYPE_READY,
+    MSG_TYPE_ERROR, MSG_TYPE_NOTICE, MSG_TYPE_PARAM_DESC, MSG_TYPE_ROW_DESC,
+    MSG_TYPE_COPY_IN, MSG_TYPE_COPY_OUT, MSG_TYPE_COPY_DATA, MSG_TYPE_COPY_DONE,
+    MSG_TYPE_COPY_FAIL,
+    PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR,
+    StartupPayload, KeyValue, ColumnDesc, RowDescription, CommandComplete,
+    ErrorResponse, PreparedStmtInfo, BindParams, ParamValue,
+    ConnectionState, TransactionState,
+    err_protocol_error, err_invalid_message_type,
+};
+
+# ============================================================================
+# Message Header Serialization
+# ============================================================================
+
+# Write message header to buffer
+F write_header(buf: &mut ByteBuffer, msg_type: u8, payload_len: u32) {
+    buf.put_u8(msg_type);
+    buf.put_u32_le(payload_len + 4);  # length includes itself
+}
+
+# Read message header from buffer
+F read_header(buf: &ByteBuffer) -> Result<MessageHeader, VaisError> {
+    msg_type := mut buf.get_u8()?;
+    length := mut buf.get_u32_le()?;
+    Ok(MessageHeader.new(msg_type, length))
+}
+
+# ============================================================================
+# Startup & Authentication Messages
+# ============================================================================
+
+# Serialize StartupPayload → wire bytes
+F serialize_startup(payload: &StartupPayload) -> Vec<u8> {
+    buf := mut ByteBuffer.new(256);
+    # Type + length placeholder
+    buf.put_u8(MSG_TYPE_STARTUP);
+    buf.put_u32_le(0);  # placeholder, filled after
+
+    # Protocol version
+    buf.put_u16_le(payload.protocol_major);
+    buf.put_u16_le(payload.protocol_minor);
+
+    # Parameter count
+    buf.put_u32_le(payload.params.len() as u32);
+
+    # Key-value pairs
+    i: u64 := mut 0;
+    L i < payload.params.len() {
+        write_string(&buf, &payload.params[i].key);
+        write_string(&buf, &payload.params[i].value);
+        i += 1;
+    }
+
+    # Patch length field (total - 1 byte for type)
+    total := mut buf.to_vec().len() as u32;
+    payload_len := mut total - 1;
+    result := mut buf.to_vec();
+    # Overwrite bytes 1..5 with length (little-endian)
+    result[1] = (payload_len & 0xFF) as u8;
+    result[2] = ((payload_len >> 8) & 0xFF) as u8;
+    result[3] = ((payload_len >> 16) & 0xFF) as u8;
+    result[4] = ((payload_len >> 24) & 0xFF) as u8;
+    result
+}
+
+# Deserialize StartupPayload from wire bytes (after header)
+F deserialize_startup(buf: &ByteBuffer) -> Result<StartupPayload, VaisError> {
+    protocol_major := mut buf.get_u16_le()?;
+    protocol_minor := mut buf.get_u16_le()?;
+
+    param_count := mut buf.get_u32_le()? as u64;
+    params := mut Vec.with_capacity(param_count);
+
+    i: u64 := mut 0;
+    L i < param_count {
+        key := mut read_string(buf)?;
+        value := mut read_string(buf)?;
+        params.push(KeyValue.new(key, value));
+        i += 1;
+    }
+
+    Ok(StartupPayload {
+        protocol_major,
+        protocol_minor,
+        params,
+    })
+}
+
+# Serialize AuthRequest (server asks for credentials)
+# auth_method: 0=cleartext, 1=md5, 2=api_key, 3=token
+F serialize_auth_request(auth_method: u8) -> Vec<u8> {
+    buf := mut ByteBuffer.new(16);
+    write_header(&buf, MSG_TYPE_AUTH_REQUEST, 1);
+    buf.put_u8(auth_method);
+    buf.to_vec()
+}
+
+# Deserialize AuthRequest → auth_method
+F deserialize_auth_request(buf: &ByteBuffer) -> Result<u8, VaisError> {
+    buf.get_u8()
+}
+
+# Serialize AuthResponse (client sends credentials)
+F serialize_auth_response(credentials: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(128);
+    cred_bytes := mut credentials.as_bytes();
+    payload_len := mut 4 + cred_bytes.len() as u32;  # u32 string len + string data
+    write_header(&buf, MSG_TYPE_AUTH_RESPONSE, payload_len);
+    write_string(&buf, credentials);
+    buf.to_vec()
+}
+
+# Deserialize AuthResponse → credentials string
+F deserialize_auth_response(buf: &ByteBuffer) -> Result<Str, VaisError> {
+    read_string(buf)
+}
+
+# Serialize AuthOk (authentication successful)
+F serialize_auth_ok() -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    write_header(&buf, MSG_TYPE_AUTH_OK, 0);
+    buf.to_vec()
+}
+
+# ============================================================================
+# Query Messages (Simple Protocol)
+# ============================================================================
+
+# Serialize Query message (client → server)
+F serialize_query(sql: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(256);
+    sql_bytes := mut sql.as_bytes();
+    payload_len := mut 4 + sql_bytes.len() as u32;
+    write_header(&buf, MSG_TYPE_QUERY, payload_len);
+    write_string(&buf, sql);
+    buf.to_vec()
+}
+
+# Deserialize Query message → SQL string
+F deserialize_query(buf: &ByteBuffer) -> Result<Str, VaisError> {
+    read_string(buf)
+}
+
+# ============================================================================
+# Extended Query Protocol (Parse → Bind → Execute)
+# ============================================================================
+
+# Serialize Parse message (client → server)
+# stmt_name: prepared statement name (empty = unnamed)
+# query: SQL text with $1, $2... placeholders
+# param_types: type tags for parameters
+F serialize_parse(stmt_name: &Str, query: &Str, param_types: &Vec<u8>) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    # Calculate payload length
+    name_bytes := mut stmt_name.as_bytes();
+    query_bytes := mut query.as_bytes();
+    payload_len := mut (4 + name_bytes.len() + 4 + query_bytes.len() + 4 + param_types.len()) as u32;
+    write_header(&buf, MSG_TYPE_PARSE, payload_len);
+    write_string(&buf, stmt_name);
+    write_string(&buf, query);
+    # Param type count + types
+    buf.put_u32_le(param_types.len() as u32);
+    i: u64 := mut 0;
+    L i < param_types.len() {
+        buf.put_u8(param_types[i]);
+        i += 1;
+    }
+    buf.to_vec()
+}
+
+# Deserialize Parse message
+F deserialize_parse(buf: &ByteBuffer) -> Result<PreparedStmtInfo, VaisError> {
+    stmt_name := mut read_string(buf)?;
+    query := mut read_string(buf)?;
+    param_count := mut buf.get_u32_le()? as u64;
+    param_types := mut Vec.with_capacity(param_count);
+    i: u64 := mut 0;
+    L i < param_count {
+        param_types.push(buf.get_u8()?);
+        i += 1;
+    }
+    info := mut PreparedStmtInfo.new(stmt_name, query);
+    info = info.with_param_types(param_types);
+    Ok(info)
+}
+
+# Serialize Bind message (client → server)
+F serialize_bind(params: &BindParams) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    # Pre-calculate payload size
+    stmt_bytes := mut params.stmt_name.as_bytes();
+    portal_bytes := mut params.portal_name.as_bytes();
+    pcount := mut params.param_values.len();
+    param_data_size: u64 := mut 0;
+    j: u64 := mut 0;
+    L j < pcount {
+        # 1 byte null flag + 4 bytes data length + data
+        param_data_size = param_data_size + 1;
+        I !params.param_values[j].is_null() {
+            param_data_size = param_data_size + 4 + params.param_values[j].get_data().len();
+        }
+        j += 1;
+    }
+    payload_len := mut (4 + stmt_bytes.len() + 4 + portal_bytes.len() + 4 + param_data_size) as u32;
+
+    write_header(&buf, MSG_TYPE_BIND, payload_len);
+    write_string(&buf, &params.stmt_name);
+    write_string(&buf, &params.portal_name);
+    buf.put_u32_le(pcount as u32);
+
+    i: u64 := mut 0;
+    L i < pcount {
+        I params.param_values[i].is_null() {
+            buf.put_u8(1);  # null flag = 1
+        } E {
+            buf.put_u8(0);  # null flag = 0
+            write_bytes(&buf, params.param_values[i].get_data());
+        }
+        i += 1;
+    }
+    buf.to_vec()
+}
+
+# Deserialize Bind message
+F deserialize_bind(buf: &ByteBuffer) -> Result<BindParams, VaisError> {
+    stmt_name := mut read_string(buf)?;
+    portal_name := mut read_string(buf)?;
+    param_count := mut buf.get_u32_le()? as u64;
+    param_values := mut Vec.with_capacity(param_count);
+
+    i: u64 := mut 0;
+    L i < param_count {
+        null_flag := mut buf.get_u8()?;
+        I null_flag == 1 {
+            param_values.push(ParamValue.null());
+        } E {
+            data := mut read_bytes(buf)?;
+            param_values.push(ParamValue.from_bytes(data));
+        }
+        i += 1;
+    }
+
+    Ok(BindParams.new(stmt_name, portal_name, param_values))
+}
+
+# Serialize Execute message (client → server)
+# portal_name: which portal to execute
+# max_rows: 0 = no limit
+F serialize_execute(portal_name: &Str, max_rows: u32) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    portal_bytes := mut portal_name.as_bytes();
+    payload_len := mut (4 + portal_bytes.len() + 4) as u32;
+    write_header(&buf, MSG_TYPE_EXECUTE, payload_len);
+    write_string(&buf, portal_name);
+    buf.put_u32_le(max_rows);
+    buf.to_vec()
+}
+
+# Deserialize Execute message → (portal_name, max_rows)
+S ExecuteMsg {
+    portal_name: Str,
+    max_rows: u32,
+}
+
+F deserialize_execute(buf: &ByteBuffer) -> Result<ExecuteMsg, VaisError> {
+    portal_name := mut read_string(buf)?;
+    max_rows := mut buf.get_u32_le()?;
+    Ok(ExecuteMsg { portal_name, max_rows })
+}
+
+# Serialize Describe message (client → server)
+# describe_type: 'S' (0x53) for statement, 'P' (0x50) for portal
+F serialize_describe(describe_type: u8, name: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    name_bytes := mut name.as_bytes();
+    payload_len := mut (1 + 4 + name_bytes.len()) as u32;
+    write_header(&buf, MSG_TYPE_DESCRIBE, payload_len);
+    buf.put_u8(describe_type);
+    write_string(&buf, name);
+    buf.to_vec()
+}
+
+# Deserialize Describe message → (describe_type, name)
+S DescribeMsg {
+    describe_type: u8,  # 'S' or 'P'
+    name: Str,
+}
+
+F deserialize_describe(buf: &ByteBuffer) -> Result<DescribeMsg, VaisError> {
+    describe_type := mut buf.get_u8()?;
+    name := mut read_string(buf)?;
+    Ok(DescribeMsg { describe_type, name })
+}
+
+# Serialize CloseStmt message (client → server)
+# close_type: 'S' (0x53) for statement, 'P' (0x50) for portal
+F serialize_close_stmt(close_type: u8, name: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    name_bytes := mut name.as_bytes();
+    payload_len := mut (1 + 4 + name_bytes.len()) as u32;
+    write_header(&buf, MSG_TYPE_CLOSE_STMT, payload_len);
+    buf.put_u8(close_type);
+    write_string(&buf, name);
+    buf.to_vec()
+}
+
+# Deserialize CloseStmt message → (close_type, name)
+S CloseStmtMsg {
+    close_type: u8,
+    name: Str,
+}
+
+F deserialize_close_stmt(buf: &ByteBuffer) -> Result<CloseStmtMsg, VaisError> {
+    close_type := mut buf.get_u8()?;
+    name := mut read_string(buf)?;
+    Ok(CloseStmtMsg { close_type, name })
+}
+
+# Serialize Sync message (marks end of extended query sequence)
+F serialize_sync() -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    write_header(&buf, MSG_TYPE_SYNC, 0);
+    buf.to_vec()
+}
+
+# Serialize Terminate message (client disconnect)
+F serialize_terminate() -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    write_header(&buf, MSG_TYPE_TERMINATE, 0);
+    buf.to_vec()
+}
+
+# ============================================================================
+# Server Response Messages
+# ============================================================================
+
+# Serialize RowDescription (column metadata before result rows)
+F serialize_row_description(desc: &RowDescription) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    # Placeholder header
+    buf.put_u8(MSG_TYPE_ROW_DESC);
+    buf.put_u32_le(0);  # placeholder
+
+    buf.put_u16_le(desc.columns.len() as u16);
+
+    i: u64 := mut 0;
+    L i < desc.columns.len() {
+        col := mut &desc.columns[i];
+        write_string(&buf, &col.name);
+        buf.put_u32_le(col.table_oid);
+        buf.put_u16_le(col.column_index);
+        buf.put_u8(col.type_tag);
+        buf.put_u16_le(col.type_size as u16);
+        buf.put_u32_le(col.type_modifier as u32);
+        i += 1;
+    }
+
+    # Patch length
+    result := mut buf.to_vec();
+    total_len := mut result.len() as u32 - 1;
+    result[1] = (total_len & 0xFF) as u8;
+    result[2] = ((total_len >> 8) & 0xFF) as u8;
+    result[3] = ((total_len >> 16) & 0xFF) as u8;
+    result[4] = ((total_len >> 24) & 0xFF) as u8;
+    result
+}
+
+# Deserialize RowDescription
+F deserialize_row_description(buf: &ByteBuffer) -> Result<RowDescription, VaisError> {
+    col_count := mut buf.get_u16_le()? as u64;
+    columns := mut Vec.with_capacity(col_count);
+
+    i: u64 := mut 0;
+    L i < col_count {
+        name := mut read_string(buf)?;
+        table_oid := mut buf.get_u32_le()?;
+        column_index := mut buf.get_u16_le()?;
+        type_tag := mut buf.get_u8()?;
+        type_size := mut buf.get_u16_le()? as i16;
+        type_modifier := mut buf.get_u32_le()? as i32;
+
+        col := mut ColumnDesc.new(name, type_tag, type_size);
+        col = col.with_table_oid(table_oid);
+        col = col.with_column_index(column_index);
+        col = col.with_type_modifier(type_modifier);
+        columns.push(col);
+        i += 1;
+    }
+
+    Ok(RowDescription.new(columns))
+}
+
+# Serialize RowData (single row of data)
+# Each cell: [u8 null_flag][u32 data_len if not null][data bytes]
+F serialize_row_data(cells: &Vec<Option<Vec<u8>>>) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    buf.put_u8(MSG_TYPE_ROW_DATA);
+    buf.put_u32_le(0);  # placeholder
+
+    buf.put_u16_le(cells.len() as u16);
+
+    i: u64 := mut 0;
+    L i < cells.len() {
+        M &cells[i] {
+            Some(data) => {
+                buf.put_u8(0);  # not null
+                write_bytes(&buf, data);
+            },
+            None => {
+                buf.put_u8(1);  # null
+            },
+        }
+        i += 1;
+    }
+
+    # Patch length
+    result := mut buf.to_vec();
+    total_len := mut result.len() as u32 - 1;
+    result[1] = (total_len & 0xFF) as u8;
+    result[2] = ((total_len >> 8) & 0xFF) as u8;
+    result[3] = ((total_len >> 16) & 0xFF) as u8;
+    result[4] = ((total_len >> 24) & 0xFF) as u8;
+    result
+}
+
+# Deserialize RowData → Vec of cell data (None = NULL)
+F deserialize_row_data(buf: &ByteBuffer) -> Result<Vec<Option<Vec<u8>>>, VaisError> {
+    col_count := mut buf.get_u16_le()? as u64;
+    cells := mut Vec.with_capacity(col_count);
+
+    i: u64 := mut 0;
+    L i < col_count {
+        null_flag := mut buf.get_u8()?;
+        I null_flag == 1 {
+            cells.push(None);
+        } E {
+            data := mut read_bytes(buf)?;
+            cells.push(Some(data));
+        }
+        i += 1;
+    }
+
+    Ok(cells)
+}
+
+# Serialize CommandComplete (DML result tag)
+F serialize_command_complete(tag: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    tag_bytes := mut tag.as_bytes();
+    payload_len := mut (4 + tag_bytes.len()) as u32;
+    write_header(&buf, MSG_TYPE_COMMAND_COMPLETE, payload_len);
+    write_string(&buf, tag);
+    buf.to_vec()
+}
+
+# Deserialize CommandComplete → tag string
+F deserialize_command_complete(buf: &ByteBuffer) -> Result<Str, VaisError> {
+    read_string(buf)
+}
+
+# Serialize ReadyForQuery indicator
+# txn_state: 'I' (idle), 'T' (in transaction), 'E' (failed transaction)
+F serialize_ready(txn_state: &TransactionState) -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    write_header(&buf, MSG_TYPE_READY, 1);
+    state_byte: u8 := mut M txn_state {
+        TransactionState.Idle => 0x49,        # 'I'
+        TransactionState.InBlock => 0x54,     # 'T'
+        TransactionState.Failed => 0x45,      # 'E'
+    };
+    buf.put_u8(state_byte);
+    buf.to_vec()
+}
+
+# Deserialize ReadyForQuery → TransactionState
+F deserialize_ready(buf: &ByteBuffer) -> Result<TransactionState, VaisError> {
+    state_byte := mut buf.get_u8()?;
+    I state_byte == 0x49 {
+        Ok(TransactionState.Idle)
+    } E I state_byte == 0x54 {
+        Ok(TransactionState.InBlock)
+    } E I state_byte == 0x45 {
+        Ok(TransactionState.Failed)
+    } E {
+        Err(err_protocol_error("Invalid transaction state byte: {state_byte}"))
+    }
+}
+
+# ============================================================================
+# Error & Notice Messages
+# ============================================================================
+
+# Serialize ErrorResponse
+F serialize_error(err: &ErrorResponse) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    buf.put_u8(MSG_TYPE_ERROR);
+    buf.put_u32_le(0);  # placeholder
+
+    write_string(&buf, &err.severity);
+    write_string(&buf, &err.code);
+    write_string(&buf, &err.message);
+    write_string(&buf, &err.detail);
+    write_string(&buf, &err.hint);
+
+    # Patch length
+    result := mut buf.to_vec();
+    total_len := mut result.len() as u32 - 1;
+    result[1] = (total_len & 0xFF) as u8;
+    result[2] = ((total_len >> 8) & 0xFF) as u8;
+    result[3] = ((total_len >> 16) & 0xFF) as u8;
+    result[4] = ((total_len >> 24) & 0xFF) as u8;
+    result
+}
+
+# Deserialize ErrorResponse
+F deserialize_error(buf: &ByteBuffer) -> Result<ErrorResponse, VaisError> {
+    severity := mut read_string(buf)?;
+    code := mut read_string(buf)?;
+    message := mut read_string(buf)?;
+    detail := mut read_string(buf)?;
+    hint := mut read_string(buf)?;
+
+    err := mut ErrorResponse.new_error(code, message);
+    err.severity = severity;
+    err.detail = detail;
+    err.hint = hint;
+    Ok(err)
+}
+
+# Serialize Notice (same format as error, different type tag)
+F serialize_notice(notice: &ErrorResponse) -> Vec<u8> {
+    buf := mut ByteBuffer.new(512);
+    buf.put_u8(MSG_TYPE_NOTICE);
+    buf.put_u32_le(0);  # placeholder
+
+    write_string(&buf, &notice.severity);
+    write_string(&buf, &notice.code);
+    write_string(&buf, &notice.message);
+    write_string(&buf, &notice.detail);
+    write_string(&buf, &notice.hint);
+
+    # Patch length
+    result := mut buf.to_vec();
+    total_len := mut result.len() as u32 - 1;
+    result[1] = (total_len & 0xFF) as u8;
+    result[2] = ((total_len >> 8) & 0xFF) as u8;
+    result[3] = ((total_len >> 16) & 0xFF) as u8;
+    result[4] = ((total_len >> 24) & 0xFF) as u8;
+    result
+}
+
+# ============================================================================
+# Parameter Description
+# ============================================================================
+
+# Serialize ParamDescription (parameter types for prepared stmt)
+F serialize_param_desc(param_types: &Vec<u8>) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    payload_len := mut (2 + param_types.len()) as u32;
+    write_header(&buf, MSG_TYPE_PARAM_DESC, payload_len);
+    buf.put_u16_le(param_types.len() as u16);
+    i: u64 := mut 0;
+    L i < param_types.len() {
+        buf.put_u8(param_types[i]);
+        i += 1;
+    }
+    buf.to_vec()
+}
+
+# Deserialize ParamDescription → Vec of type tags
+F deserialize_param_desc(buf: &ByteBuffer) -> Result<Vec<u8>, VaisError> {
+    count := mut buf.get_u16_le()? as u64;
+    types := mut Vec.with_capacity(count);
+    i: u64 := mut 0;
+    L i < count {
+        types.push(buf.get_u8()?);
+        i += 1;
+    }
+    Ok(types)
+}
+
+# ============================================================================
+# COPY Protocol Messages
+# ============================================================================
+
+# Serialize CopyIn response (server tells client to start sending COPY data)
+# format: 0=text, 1=binary
+# col_formats: per-column format codes
+F serialize_copy_in(format: u8, col_formats: &Vec<u8>) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    payload_len := mut (1 + 2 + col_formats.len()) as u32;
+    write_header(&buf, MSG_TYPE_COPY_IN, payload_len);
+    buf.put_u8(format);
+    buf.put_u16_le(col_formats.len() as u16);
+    i: u64 := mut 0;
+    L i < col_formats.len() {
+        buf.put_u8(col_formats[i]);
+        i += 1;
+    }
+    buf.to_vec()
+}
+
+# Serialize CopyOut response (server tells client it will send COPY data)
+F serialize_copy_out(format: u8, col_formats: &Vec<u8>) -> Vec<u8> {
+    buf := mut ByteBuffer.new(64);
+    payload_len := mut (1 + 2 + col_formats.len()) as u32;
+    write_header(&buf, MSG_TYPE_COPY_OUT, payload_len);
+    buf.put_u8(format);
+    buf.put_u16_le(col_formats.len() as u16);
+    i: u64 := mut 0;
+    L i < col_formats.len() {
+        buf.put_u8(col_formats[i]);
+        i += 1;
+    }
+    buf.to_vec()
+}
+
+# Serialize CopyData (chunk of COPY data)
+F serialize_copy_data(data: &[u8]) -> Vec<u8> {
+    buf := mut ByteBuffer.new(data.len() as u64 + 16);
+    write_header(&buf, MSG_TYPE_COPY_DATA, data.len() as u32);
+    buf.put_bytes(data);
+    buf.to_vec()
+}
+
+# Deserialize CopyData → raw bytes
+F deserialize_copy_data(buf: &ByteBuffer, data_len: u64) -> Result<Vec<u8>, VaisError> {
+    buf.get_bytes(data_len)
+}
+
+# Serialize CopyDone (end of COPY data)
+F serialize_copy_done() -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    write_header(&buf, MSG_TYPE_COPY_DONE, 0);
+    buf.to_vec()
+}
+
+# Serialize CopyFail (client reports COPY error)
+F serialize_copy_fail(reason: &Str) -> Vec<u8> {
+    buf := mut ByteBuffer.new(128);
+    reason_bytes := mut reason.as_bytes();
+    payload_len := mut (4 + reason_bytes.len()) as u32;
+    write_header(&buf, MSG_TYPE_COPY_FAIL, payload_len);
+    write_string(&buf, reason);
+    buf.to_vec()
+}
+
+# Deserialize CopyFail → reason string
+F deserialize_copy_fail(buf: &ByteBuffer) -> Result<Str, VaisError> {
+    read_string(buf)
+}
+
+# ============================================================================
+# Message Framing — Read/Write from TCP stream
+# ============================================================================
+
+# Read a complete framed message from raw byte buffer.
+# Returns (msg_type, payload_bytes) or error if incomplete.
+# buf must contain at least 5 bytes (1 type + 4 length).
+F read_framed_message(data: &[u8]) -> Result<FramedMessage, VaisError> {
+    I data.len() < 5 {
+        R Err(err_protocol_error("Incomplete message header: need 5 bytes"));
+    }
+
+    msg_type := mut data[0];
+    length := mut (data[1] as u32) |
+              ((data[2] as u32) << 8) |
+              ((data[3] as u32) << 16) |
+              ((data[4] as u32) << 24);
+
+    # length includes the 4-byte length field itself
+    payload_len := mut length - 4;
+    total_len := mut 1 + length as u64;  # type byte + length value
+
+    I data.len() as u64 < total_len {
+        R Err(err_protocol_error("Incomplete message body"));
+    }
+
+    # Extract payload bytes
+    payload := mut Vec.with_capacity(payload_len as u64);
+    i: u64 := mut 5;
+    L i < total_len {
+        payload.push(data[i]);
+        i += 1;
+    }
+
+    Ok(FramedMessage {
+        msg_type,
+        payload,
+        total_wire_len: total_len as u32,
+    })
+}
+
+# Framed message parsed from wire
+S FramedMessage {
+    msg_type: u8,
+    payload: Vec<u8>,
+    total_wire_len: u32,  # total bytes consumed from input
+}
+
+X FramedMessage {
+    F new(msg_type: u8, payload: Vec<u8>, total_wire_len: u32) -> FramedMessage {
+        FramedMessage { msg_type, payload, total_wire_len }
+    }
+
+    # Create a ByteBuffer for reading the payload
+    F payload_reader(self) -> ByteBuffer {
+        ByteBuffer.from_slice(&self.payload)
+    }
+}
+
+# ============================================================================
+# Value Serialization Helpers (SqlValue ↔ wire bytes)
+# ============================================================================
+
+# Serialize i64 value to wire bytes
+F encode_int(value: i64) -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    buf.put_u64_le(value as u64);
+    buf.to_vec()
+}
+
+# Deserialize i64 value from wire bytes
+F decode_int(data: &[u8]) -> Result<i64, VaisError> {
+    buf := mut ByteBuffer.from_slice(data);
+    raw := mut buf.get_u64_le()?;
+    Ok(raw as i64)
+}
+
+# Serialize f64 value to wire bytes
+F encode_float(value: f64) -> Vec<u8> {
+    buf := mut ByteBuffer.new(8);
+    buf.put_u64_le(value as u64);  # bit-cast
+    buf.to_vec()
+}
+
+# Deserialize f64 value from wire bytes
+F decode_float(data: &[u8]) -> Result<f64, VaisError> {
+    buf := mut ByteBuffer.from_slice(data);
+    raw := mut buf.get_u64_le()?;
+    Ok(raw as f64)  # bit-cast
+}
+
+# Serialize bool value to wire bytes
+F encode_bool(value: bool) -> Vec<u8> {
+    buf := mut ByteBuffer.new(1);
+    I value {
+        buf.put_u8(1);
+    } E {
+        buf.put_u8(0);
+    }
+    buf.to_vec()
+}
+
+# Deserialize bool value from wire bytes
+F decode_bool(data: &[u8]) -> Result<bool, VaisError> {
+    I data.len() < 1 {
+        R Err(err_protocol_error("Cannot decode bool: empty data"));
+    }
+    Ok(data[0] != 0)
+}
+
+# Serialize string value to wire bytes (raw UTF-8, no length prefix)
+F encode_string(value: &Str) -> Vec<u8> {
+    value.as_bytes().to_vec()
+}
+
+# Deserialize string from wire bytes (raw UTF-8)
+F decode_string(data: &[u8]) -> Result<Str, VaisError> {
+    Str.from_utf8(data.to_vec())
+}

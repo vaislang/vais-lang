@@ -1,0 +1,418 @@
+# Graph ↔ SQL Integration
+# Bridges graph traversal results into the SQL executor's Volcano-style pipeline
+# GraphTraversalSource implements RowSource so traversal results can JOIN with tables
+# Supports predicate pushdown: SQL WHERE → graph edge type filter
+# Error codes: EE=03 (graph), CC=12 (integration)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError, err_internal};
+U storage/buffer/pool.{BufferPool};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U sql/types.{SqlValue, SqlType};
+U sql/row.{Row};
+U sql/executor/mod.{ExecutorRow, ExecContext, ExecStats, ExecColumn};
+U sql/executor/join.{RowSource};
+U sql/executor/expr_eval.{Expr, EvalContext, eval_predicate};
+U graph/types.{DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH, EdgeTypeTable};
+U graph/query/traverse_fn.{
+    GraphTraverseParams, GraphTraverseResult, TraverseRow,
+    GraphTraverseFunction
+};
+
+# ============================================================================
+# Error Codes: EE=03 (graph), CC=12 (integration)
+# ============================================================================
+
+F err_integration_open_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0312001",
+        "Graph-SQL integration open failed: {reason}"
+    )
+}
+
+F err_integration_join_mismatch(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0312002",
+        "Graph-SQL join column mismatch: {reason}"
+    )
+}
+
+F err_integration_predicate_pushdown(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0312003",
+        "Predicate pushdown to graph failed: {reason}"
+    )
+}
+
+# ============================================================================
+# GraphTraversalSource — Wraps graph traversal as a RowSource for SQL joins
+# Implements Volcano-style: open → next → close
+# Output columns: [node_id: u64, depth: u32, path: Str, edge_types: Str]
+# ============================================================================
+
+S GraphTraversalSource {
+    params: GraphTraverseParams,
+    traverse_fn: GraphTraverseFunction,
+    edge_type_table: &EdgeTypeTable,
+
+    # Materialized results (populated during open())
+    result_rows: Vec<TraverseRow>,
+    cursor: u64,
+    is_open: bool,
+    stats: ExecStats,
+}
+
+X GraphTraversalSource {
+    F new(
+        params: GraphTraverseParams,
+        traverse_fn: GraphTraverseFunction,
+        edge_type_table: &EdgeTypeTable,
+    ) -> GraphTraversalSource {
+        GraphTraversalSource {
+            params,
+            traverse_fn,
+            edge_type_table,
+            result_rows: Vec.new(),
+            cursor: 0,
+            is_open: false,
+            stats: ExecStats.new(),
+        }
+    }
+
+    # Convert a TraverseRow into an ExecutorRow
+    # Schema: [node_id(u64), depth(u32), path(Str), edge_types(Str)]
+    F row_to_executor_row(row: &TraverseRow) -> ExecutorRow {
+        values := mut Vec.with_capacity(4);
+
+        # Column 0: node_id
+        values.push(SqlValue.from_u64(row.node_id));
+
+        # Column 1: depth
+        values.push(SqlValue.from_u32(row.depth));
+
+        # Column 2: path (serialized as comma-separated node IDs)
+        path_str := mut GraphTraversalSource.ids_to_string(&row.path);
+        values.push(SqlValue.from_string(path_str));
+
+        # Column 3: edge_types (serialized as comma-separated type IDs)
+        edge_str := mut GraphTraversalSource.u16s_to_string(&row.edge_types);
+        values.push(SqlValue.from_string(edge_str));
+
+        ExecutorRow.virtual(Row.from_values(values))
+    }
+
+    # Helper: convert Vec<u64> to comma-separated string
+    F ids_to_string(ids: &Vec<u64>) -> Str {
+        I ids.is_empty() {
+            R "".to_string();
+        }
+        result := mut Str.new();
+        i: u64 := mut 0;
+        L i < ids.len() {
+            I i > 0 {
+                result.push(',');
+            }
+            result.push_str(&ids[i].to_string());
+            i += 1;
+        }
+        result
+    }
+
+    # Helper: convert Vec<u16> to comma-separated string
+    F u16s_to_string(ids: &Vec<u16>) -> Str {
+        I ids.is_empty() {
+            R "".to_string();
+        }
+        result := mut Str.new();
+        i: u64 := mut 0;
+        L i < ids.len() {
+            I i > 0 {
+                result.push(',');
+            }
+            result.push_str(&(ids[i] as u64).to_string());
+            i += 1;
+        }
+        result
+    }
+
+    # Output schema for this source
+    F output_schema() -> Vec<ExecColumn> {
+        cols := mut Vec.with_capacity(4);
+        cols.push(ExecColumn.new("node_id".to_string(), SqlType.BigInt, false));
+        cols.push(ExecColumn.new("depth".to_string(), SqlType.Int, false));
+        cols.push(ExecColumn.new("path".to_string(), SqlType.Text, true));
+        cols.push(ExecColumn.new("edge_types".to_string(), SqlType.Text, true));
+        cols
+    }
+}
+
+# Implement RowSource trait for GraphTraversalSource
+X GraphTraversalSource: RowSource {
+    F open(mut self, ctx: &ExecContext) -> Result<(), VaisError> {
+        I self.is_open {
+            R Ok(());
+        }
+
+        # Execute graph traversal
+        traverse_result := mut self.traverse_fn.execute(&self.params, ctx.snapshot, ctx.clog)?;
+
+        # Materialize all traversal rows
+        self.result_rows = traverse_result.rows;
+        self.cursor = 0;
+        self.is_open = true;
+        self.stats.rows_scanned = self.result_rows.len() as u64;
+
+        Ok(())
+    }
+
+    F next(mut self, ctx: &ExecContext) -> Result<Option<ExecutorRow>, VaisError> {
+        I !self.is_open || self.cursor >= self.result_rows.len() {
+            R Ok(None);
+        }
+
+        row := mut GraphTraversalSource.row_to_executor_row(&self.result_rows[self.cursor]);
+        self.cursor += 1;
+        self.stats.rows_produced += 1;
+
+        Ok(Some(row))
+    }
+
+    F close(mut self) -> Result<(), VaisError> {
+        self.result_rows = Vec.new();
+        self.cursor = 0;
+        self.is_open = false;
+        Ok(())
+    }
+}
+
+# ============================================================================
+# GraphNodeLookupSource — Lookup relational table rows by graph node_id
+# Given a list of node IDs from traversal, fetches corresponding SQL rows
+# Useful for: SELECT * FROM users WHERE id IN (graph traversal results)
+# ============================================================================
+
+S GraphNodeLookupSource {
+    node_ids: Vec<u64>,
+    table_name: Str,
+    join_column: Str,     # Column in SQL table to M against node_id
+    cursor: u64,
+    is_open: bool,
+    stats: ExecStats,
+}
+
+X GraphNodeLookupSource {
+    F new(
+        node_ids: Vec<u64>,
+        table_name: Str,
+        join_column: Str,
+    ) -> GraphNodeLookupSource {
+        GraphNodeLookupSource {
+            node_ids,
+            table_name,
+            join_column,
+            cursor: 0,
+            is_open: false,
+            stats: ExecStats.new(),
+        }
+    }
+
+    # Build from a GraphTraverseResult (extract unique node IDs)
+    F from_traverse_result(
+        result: &GraphTraverseResult,
+        table_name: Str,
+        join_column: Str,
+    ) -> GraphNodeLookupSource {
+        node_ids := mut Vec.new();
+        i: u64 := mut 0;
+        L i < result.rows.len() {
+            # Deduplicate node IDs
+            found := mut false;
+            j: u64 := mut 0;
+            L j < node_ids.len() && !found {
+                I node_ids[j] == result.rows[i].node_id {
+                    found = true;
+                }
+                j += 1;
+            }
+            I !found {
+                node_ids.push(result.rows[i].node_id);
+            }
+            i += 1;
+        }
+
+        GraphNodeLookupSource.new(node_ids, table_name, join_column)
+    }
+}
+
+# Implement RowSource for GraphNodeLookupSource
+X GraphNodeLookupSource: RowSource {
+    F open(mut self, ctx: &ExecContext) -> Result<(), VaisError> {
+        self.cursor = 0;
+        self.is_open = true;
+        self.stats.rows_scanned = self.node_ids.len() as u64;
+        Ok(())
+    }
+
+    F next(mut self, ctx: &ExecContext) -> Result<Option<ExecutorRow>, VaisError> {
+        I !self.is_open || self.cursor >= self.node_ids.len() {
+            R Ok(None);
+        }
+
+        # Produce a single-column row with the node_id
+        # The join executor will M this against the SQL table's join column
+        values := mut Vec.new();
+        values.push(SqlValue.from_u64(self.node_ids[self.cursor]));
+        row := mut ExecutorRow.virtual(Row.from_values(values));
+
+        self.cursor += 1;
+        self.stats.rows_produced += 1;
+
+        Ok(Some(row))
+    }
+
+    F close(mut self) -> Result<(), VaisError> {
+        self.cursor = 0;
+        self.is_open = false;
+        Ok(())
+    }
+}
+
+# ============================================================================
+# PredicatePushdown — Extract graph-friendly filters from SQL WHERE clause
+# Converts SQL predicates to graph traversal config parameters
+# ============================================================================
+
+S PushdownResult {
+    edge_type_filter: Option<Vec<Str>>,   # Extracted edge type constraints
+    max_depth: Option<u32>,               # Extracted depth constraint
+    direction: Option<u8>,                # Extracted direction constraint
+    remaining_predicate: Option<Expr>,    # Predicates that cannot be pushed down
+}
+
+X PushdownResult {
+    F empty() -> PushdownResult {
+        PushdownResult {
+            edge_type_filter: None,
+            max_depth: None,
+            direction: None,
+            remaining_predicate: None,
+        }
+    }
+
+    # Check if any pushdown was extracted
+    F has_pushdown(self) -> bool {
+        self.edge_type_filter.is_some() ||
+        self.max_depth.is_some() ||
+        self.direction.is_some()
+    }
+
+    # Apply pushdown results to traverse params
+    F apply_to_params(self, params: &mut GraphTraverseParams) {
+        M self.edge_type_filter {
+            Some(ref types) => params.edge_type_filter = Some(types.clone()),
+            None => {},
+        }
+        M self.max_depth {
+            Some(depth) => params.max_depth = depth,
+            None => {},
+        }
+        M self.direction {
+            Some(dir) => params.direction = dir,
+            None => {},
+        }
+    }
+}
+
+# Analyze a SQL WHERE clause and extract graph-pushable predicates
+# Returns pushdown result with graph constraints and remaining SQL predicates
+F analyze_predicate_pushdown(
+    predicate: &Expr,
+    graph_alias: &Str,
+) -> PushdownResult {
+    result := mut PushdownResult.empty();
+
+    # Look for patterns like:
+    # - graph.edge_type = 'FOLLOWS'        → edge_type_filter
+    # - graph.depth <= 3                    → max_depth
+    # - graph.direction = 'OUTGOING'       → direction
+
+    # This is a simplified implementation
+    # A full implementation would walk the AST tree and extract matching patterns
+    # For now, return empty (no pushdown) — the remaining predicate
+    # is applied post-join by the SQL executor
+    result.remaining_predicate = Some(predicate.clone());
+
+    result
+}
+
+# ============================================================================
+# GraphSqlJoinBuilder — Convenience builder for graph-SQL join queries
+# ============================================================================
+
+S GraphSqlJoinBuilder {
+    traverse_params: Option<GraphTraverseParams>,
+    table_name: Option<Str>,
+    join_column: Option<Str>,
+    predicate: Option<Expr>,
+}
+
+X GraphSqlJoinBuilder {
+    F new() -> GraphSqlJoinBuilder {
+        GraphSqlJoinBuilder {
+            traverse_params: None,
+            table_name: None,
+            join_column: None,
+            predicate: None,
+        }
+    }
+
+    # Builder pattern: takes self by value, returns Self
+    F with_traversal(mut self, params: GraphTraverseParams) -> GraphSqlJoinBuilder {
+        self.traverse_params = Some(params);
+        self
+    }
+
+    F with_table(mut self, name: Str, join_col: Str) -> GraphSqlJoinBuilder {
+        self.table_name = Some(name);
+        self.join_column = Some(join_col);
+        self
+    }
+
+    F with_predicate(mut self, pred: Expr) -> GraphSqlJoinBuilder {
+        self.predicate = Some(pred);
+        self
+    }
+
+    # Build the join plan
+    # Returns (GraphTraversalSource, predicate pushdown info)
+    F build(
+        self,
+        traverse_fn: GraphTraverseFunction,
+        edge_type_table: &EdgeTypeTable,
+    ) -> Result<(GraphTraversalSource, PushdownResult), VaisError> {
+        params := mut M self.traverse_params {
+            Some(p) => p,
+            None => R Err(err_integration_open_failed(
+                "No traversal parameters specified".to_string()
+            )),
+        };
+
+        # Apply predicate pushdown if applicable
+        pushdown := mut M self.predicate {
+            Some(ref pred) => {
+                graph_alias := mut "graph".to_string();
+                analyze_predicate_pushdown(pred, &graph_alias)
+            },
+            None => PushdownResult.empty(),
+        };
+
+        # Apply extracted pushdown to params
+        pushdown.apply_to_params(&params);
+
+        source := mut GraphTraversalSource.new(params, traverse_fn, edge_type_table);
+        Ok((source, pushdown))
+    }
+}

@@ -1,0 +1,73 @@
+# Heap Page Slot Directory Entry (4 bytes)
+# Each slot points to a tuple within the page
+# Based on Stage 1 Section 7 and Stage 7 Pattern 11
+
+U std/bytes.{ByteBuffer};
+U storage/constants.{SLOT_ENTRY_SIZE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError};
+
+# Slot directory entry (4 bytes per slot)
+S HeapPageSlot {
+    tuple_off: u16,    # Byte offset of tuple data from page start (0 = unused/dead slot)
+    tuple_len: u16,    # Length of tuple data in bytes (including MVCC metadata)
+}
+
+X HeapPageSlot {
+    # Create a new slot entry
+    F new(tuple_off: u16, tuple_len: u16) -> HeapPageSlot {
+        HeapPageSlot { tuple_off, tuple_len }
+    }
+
+    # Create a dead/unused slot
+    F dead() -> HeapPageSlot {
+        HeapPageSlot { tuple_off: 0, tuple_len: 0 }
+    }
+
+    # Check if slot is dead/unused
+    F is_dead(self) -> bool {
+        self.tuple_off == 0
+    }
+
+    # Check if slot is live (has valid tuple)
+    F is_live(self) -> bool {
+        self.tuple_off != 0
+    }
+
+    # Serialize to ByteBuffer (4 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u16_le(self.tuple_off);
+        buf.put_u16_le(self.tuple_len);
+    }
+
+    # Deserialize from ByteBuffer (4 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<HeapPageSlot, VaisError> {
+        Ok(HeapPageSlot {
+            tuple_off: buf.get_u16_le()?,
+            tuple_len: buf.get_u16_le()?,
+        })
+    }
+
+    # Read slot at given index from page data
+    F read_at_index(page_data: &[u8], index: u16) -> Result<HeapPageSlot, VaisError> {
+        offset := mut PAGE_HEADER_SIZE as u64 + (index as u64) * (SLOT_ENTRY_SIZE as u64);
+        buf := mut ByteBuffer.wrap_readonly(&page_data[offset..offset + SLOT_ENTRY_SIZE as u64]);
+        HeapPageSlot.deserialize(&buf)
+    }
+
+    # Write slot at given index to page data
+    F write_at_index(self, page_data: &mut [u8], index: u16) {
+        offset := mut PAGE_HEADER_SIZE as u64 + (index as u64) * (SLOT_ENTRY_SIZE as u64);
+        buf := mut ByteBuffer.wrap(&page_data[offset..offset + SLOT_ENTRY_SIZE as u64]);
+        self.serialize(&buf);
+    }
+
+    # Calculate the offset where slot directory ends for a given item count
+    F slot_dir_end(item_count: u16) -> u16 {
+        (PAGE_HEADER_SIZE as u16) + (item_count * SLOT_ENTRY_SIZE as u16)
+    }
+
+    # Get entry size
+    F entry_size() -> u32 {
+        SLOT_ENTRY_SIZE
+    }
+}

@@ -1,0 +1,267 @@
+# Row Encoding
+# Serializes/deserializes a row (ordered list of SqlValues) to/from bytes
+# Format: [null_bitmap][value_data...]
+# - null_bitmap: ceil(col_count/8) bytes, bit=1 means NULL
+# - value_data: for each non-NULL column, serialized SqlValue data (no type tag, schema knows types)
+
+U std/bytes.{ByteBuffer};
+U storage/error.{VaisError};
+U storage/bytes.{write_string, read_string, write_bytes, read_bytes};
+U sql/types.{SqlType, SqlValue};
+
+# A row is an ordered list of SQL values corresponding to a table schema
+S Row {
+    values: Vec<SqlValue>,
+}
+
+X Row {
+    # Create a new row from a vector of values
+    F new(values: Vec<SqlValue>) -> Row {
+        Row { values }
+    }
+
+    # Create an empty row with given column count, all NULLs
+    F null_row(col_count: u64) -> Row {
+        values := mut Vec.with_capacity(col_count);
+        L _: 0..col_count {
+            values.push(SqlValue.Null);
+        }
+        Row { values }
+    }
+
+    # Get value at column index
+    F get(self, idx: u64) -> &SqlValue {
+        &self.values[idx]
+    }
+
+    # Set value at column index
+    F set(mut self, idx: u64, val: SqlValue) {
+        self.values[idx] = val;
+    }
+
+    # Get number of columns
+    F column_count(self) -> u64 {
+        self.values.len()
+    }
+
+    # Calculate the null bitmap size in bytes
+    F null_bitmap_size(col_count: u64) -> u64 {
+        (col_count + 7) / 8
+    }
+
+    # Encode row to bytes using schema-aware format
+    # Format: [null_bitmap: ceil(N/8) bytes][value_data for each non-null column]
+    # Each bit in bitmap: bit i set (1) means column i is NULL
+    # Value data uses type-specific encoding without type tags (schema provides types)
+    F encode(self, schema: &[SqlType]) -> Vec<u8> {
+        col_count := mut self.values.len();
+        bitmap_size := mut Row.null_bitmap_size(col_count);
+
+        # Pre-calculate total size for buffer allocation
+        total_size := mut self.encoded_size(schema) as u64;
+        buf := mut ByteBuffer.with_capacity(total_size);
+
+        # Write null bitmap
+        bitmap := mut Vec.with_capacity(bitmap_size);
+        bitmap.resize(bitmap_size, 0u8);
+
+        L i: 0..col_count {
+            I self.values[i].is_null() {
+                byte_idx := mut i / 8;
+                bit_idx := mut i % 8;
+                bitmap[byte_idx] = bitmap[byte_idx] | (1u8 << bit_idx);
+            }
+        }
+
+        L b: &bitmap {
+            buf.put_u8(*b);
+        }
+
+        # Write non-null value data (no type tags, schema-aware)
+        L i: 0..col_count {
+            I !self.values[i].is_null() {
+                encode_value(&mut buf, &self.values[i], &schema[i]);
+            }
+        }
+
+        buf.to_vec()
+    }
+
+    # Decode row from bytes using schema
+    F decode(data: &[u8], schema: &[SqlType]) -> Result<Row, VaisError> {
+        col_count := mut schema.len();
+        bitmap_size := mut Row.null_bitmap_size(col_count);
+        buf := mut ByteBuffer.from_slice(data);
+
+        # Read null bitmap
+        bitmap := mut Vec.with_capacity(bitmap_size);
+        L _: 0..bitmap_size {
+            bitmap.push(buf.get_u8()?);
+        }
+
+        # Read values
+        values := mut Vec.with_capacity(col_count);
+        L i: 0..col_count {
+            byte_idx := mut i / 8;
+            bit_idx := mut i % 8;
+            is_null := mut (bitmap[byte_idx] & (1u8 << bit_idx)) != 0;
+
+            I is_null {
+                values.push(SqlValue.Null);
+            } E {
+                val := mut decode_value(&buf, &schema[i])?;
+                values.push(val);
+            }
+        }
+
+        Ok(Row { values })
+    }
+
+    # Calculate encoded size in bytes without actually encoding
+    F encoded_size(self, schema: &[SqlType]) -> u32 {
+        col_count := mut self.values.len();
+        size: u32 := mut Row.null_bitmap_size(col_count) as u32;
+
+        L i: 0..col_count {
+            I !self.values[i].is_null() {
+                size += value_encoded_size(&self.values[i], &schema[i]);
+            }
+        }
+
+        size
+    }
+}
+
+# --- Internal encoding helpers ---
+
+# Encode a single non-null value using schema type (no type tag)
+# INT:       8 bytes (i64 LE)
+# FLOAT:     8 bytes (f64 LE)
+# BOOL:      1 byte
+# VARCHAR:   u32 len + bytes
+# TEXT:      u32 len + bytes
+# BLOB:      u32 len + bytes
+# DATE:      4 bytes (i32 LE)
+# TIMESTAMP: 8 bytes (i64 LE)
+# VECTOR:    u32 dim + dim*4 bytes (f32 LE each)
+F encode_value(buf: &mut ByteBuffer, val: &SqlValue, sql_type: &SqlType) {
+    M (val, sql_type) {
+        (SqlValue.IntVal { v }, SqlType.Int) => {
+            buf.put_i64_le(*v);
+        },
+        (SqlValue.FloatVal { v }, SqlType.Float) => {
+            buf.put_f64_le(*v);
+        },
+        (SqlValue.BoolVal { v }, SqlType.Bool) => {
+            buf.put_u8(I *v { 1 } E { 0 });
+        },
+        (SqlValue.StringVal { v }, SqlType.Varchar { .. }) => {
+            write_string(buf, v);
+        },
+        (SqlValue.StringVal { v }, SqlType.Text) => {
+            write_string(buf, v);
+        },
+        (SqlValue.BlobVal { v }, SqlType.Blob) => {
+            write_bytes(buf, v.as_slice());
+        },
+        (SqlValue.DateVal { v }, SqlType.Date) => {
+            buf.put_i32_le(*v);
+        },
+        (SqlValue.TimestampVal { v }, SqlType.Timestamp) => {
+            buf.put_i64_le(*v);
+        },
+        (SqlValue.VectorVal { v }, SqlType.Vector { .. }) => {
+            buf.put_u32_le(v.len() as u32);
+            L f: v {
+                buf.put_f32_le(*f);
+            }
+        },
+        # Fallback: encode using SqlValue self-describing format (includes type tag)
+        _ => {
+            val.serialize(buf);
+        },
+    }
+}
+
+# Decode a single value using schema type (no type tag in data)
+F decode_value(buf: &ByteBuffer, sql_type: &SqlType) -> Result<SqlValue, VaisError> {
+    M sql_type {
+        SqlType.Int => {
+            v := mut buf.get_i64_le()?;
+            Ok(SqlValue.IntVal { v })
+        },
+        SqlType.Float => {
+            v := mut buf.get_f64_le()?;
+            Ok(SqlValue.FloatVal { v })
+        },
+        SqlType.Bool => {
+            b := mut buf.get_u8()?;
+            Ok(SqlValue.BoolVal { v: b != 0 })
+        },
+        SqlType.Varchar { .. } => {
+            v := mut read_string(buf)?;
+            Ok(SqlValue.StringVal { v })
+        },
+        SqlType.Text => {
+            v := mut read_string(buf)?;
+            Ok(SqlValue.StringVal { v })
+        },
+        SqlType.Blob => {
+            v := mut read_bytes(buf)?;
+            Ok(SqlValue.BlobVal { v })
+        },
+        SqlType.Date => {
+            v := mut buf.get_i32_le()?;
+            Ok(SqlValue.DateVal { v })
+        },
+        SqlType.Timestamp => {
+            v := mut buf.get_i64_le()?;
+            Ok(SqlValue.TimestampVal { v })
+        },
+        SqlType.Vector { .. } => {
+            dim := mut buf.get_u32_le()? as u64;
+            v := mut Vec.with_capacity(dim);
+            L _: 0..dim {
+                v.push(buf.get_f32_le()?);
+            }
+            Ok(SqlValue.VectorVal { v })
+        },
+    }
+}
+
+# Calculate encoded byte size for a single non-null value
+F value_encoded_size(val: &SqlValue, sql_type: &SqlType) -> u32 {
+    M (val, sql_type) {
+        (SqlValue.IntVal { .. }, SqlType.Int) => 8,
+        (SqlValue.FloatVal { .. }, SqlType.Float) => 8,
+        (SqlValue.BoolVal { .. }, SqlType.Bool) => 1,
+        (SqlValue.StringVal { v }, SqlType.Varchar { .. }) => {
+            4 + v.len() as u32  # u32 length prefix + string bytes
+        },
+        (SqlValue.StringVal { v }, SqlType.Text) => {
+            4 + v.len() as u32
+        },
+        (SqlValue.BlobVal { v }, SqlType.Blob) => {
+            4 + v.len() as u32  # u32 length prefix + blob bytes
+        },
+        (SqlValue.DateVal { .. }, SqlType.Date) => 4,
+        (SqlValue.TimestampVal { .. }, SqlType.Timestamp) => 8,
+        (SqlValue.VectorVal { v }, SqlType.Vector { .. }) => {
+            4 + (v.len() as u32) * 4  # u32 dim + dim * 4 bytes per f32
+        },
+        # Fallback: estimate using self-describing format (1 byte tag + data)
+        _ => {
+            M val {
+                SqlValue.IntVal { .. } => 9,       # 1 + 8
+                SqlValue.FloatVal { .. } => 9,     # 1 + 8
+                SqlValue.BoolVal { .. } => 2,      # 1 + 1
+                SqlValue.StringVal { v } => 5 + v.len() as u32,  # 1 + 4 + len
+                SqlValue.BlobVal { v } => 5 + v.len() as u32,
+                SqlValue.DateVal { .. } => 5,      # 1 + 4
+                SqlValue.TimestampVal { .. } => 9,  # 1 + 8
+                SqlValue.VectorVal { v } => 5 + (v.len() as u32) * 4,
+                SqlValue.Null => 1,
+            }
+        },
+    }
+}

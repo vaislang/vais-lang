@@ -1,0 +1,490 @@
+# filter.vais - Pre/Post Filter Integration for Vector Search
+# Combines vector similarity search (HNSW) with SQL predicate filtering
+# Supports three strategies: PreFilter, PostFilter, Hybrid (auto-select)
+#
+# Design:
+# - PreFilter: Evaluate SQL WHERE before HNSW search (bitmap of valid row IDs)
+# - PostFilter: Run HNSW search first, then apply SQL WHERE to results
+# - Hybrid: Auto-select based on estimated predicate selectivity
+
+U std/result.{Result, Ok, Err};
+U std/option.{Option, Some, None};
+U std/vec.Vec;
+U std/string.Str;
+U std/hashmap.{HashMap};
+U std/hashset.{HashSet};
+
+U storage/error.{VaisError, error_code};
+U sql/executor/mod.{ExecContext, ExecStats};
+U sql/executor/expr_eval.{eval_predicate, EvalContext};
+U sql/parser/ast.{Expr, BinOp};
+U sql/types.{SqlType, SqlValue};
+U sql/row.Row;
+U sql/catalog/schema.{TableInfo, ColumnInfo};
+U vector/search.{VectorSearchParams, VectorSearchRow, execute_vector_search};
+U storage/page/heap.HeapPage;
+U storage/txn/visibility.is_tuple_visible;
+U storage/constants.{FILE_ID_DATA, NULL_PAGE};
+
+# Error codes: EE=02 (vector), CC=03 (search), NNN=010-012
+# 02-03-010: Filter strategy error
+# 02-03-011: Pre-filter evaluation failed
+# 02-03-012: Post-filter evaluation failed
+
+# ============================================================================
+# Filter Strategy — determines when to apply SQL predicates
+# ============================================================================
+
+L FilterStrategy =
+    PreFilter |    # Scan table first, build bitmap, search HNSW with bitmap
+    PostFilter |   # HNSW search first, then filter results
+    Hybrid;        # Auto-select based on estimated selectivity
+
+# ============================================================================
+# Filter Configuration
+# ============================================================================
+
+S FilterConfig {
+    strategy: FilterStrategy,
+    selectivity_threshold: f32,  # Below this → pre-filter (default 0.01 = 1%)
+    post_filter_oversample: f32, # Extra oversample for post-filter (default 2.0)
+}
+
+X FilterConfig {
+    # Create default filter configuration
+    # - selectivity_threshold: 0.01 (1%) — very selective predicates use pre-filter
+    # - post_filter_oversample: 2.0 — fetch 2x results for post-filtering
+    F default() -> FilterConfig {
+        FilterConfig {
+            strategy: FilterStrategy.Hybrid,
+            selectivity_threshold: 0.01,
+            post_filter_oversample: 2.0,
+        }
+    }
+
+    # Override strategy explicitly (builder pattern: takes self by value, returns Self)
+    F with_strategy(mut self, strategy: FilterStrategy) -> FilterConfig {
+        self.strategy = strategy;
+        self
+    }
+
+    # Set selectivity threshold for hybrid mode
+    F with_selectivity_threshold(mut self, threshold: f32) -> FilterConfig {
+        self.selectivity_threshold = threshold;
+        self
+    }
+
+    # Set post-filter oversampling factor
+    F with_oversample(mut self, factor: f32) -> FilterConfig {
+        self.post_filter_oversample = factor;
+        self
+    }
+}
+
+# ============================================================================
+# Table Statistics — used for selectivity estimation
+# ============================================================================
+
+S TableStats {
+    row_count: u64,
+    distinct_counts: HashMap<Str, u64>,  # column_name -> distinct count
+}
+
+X TableStats {
+    F new(row_count: u64) -> TableStats {
+        TableStats {
+            row_count,
+            distinct_counts: HashMap.new(),
+        }
+    }
+
+    F add_distinct_count(mut self, column: Str, count: u64) {
+        self.distinct_counts.insert(column, count);
+    }
+
+    F get_distinct_count(self, column: &Str) -> Option<u64> {
+        self.distinct_counts.get(column).cloned()
+    }
+}
+
+# ============================================================================
+# Filtered Vector Search — main API
+# ============================================================================
+
+S FilteredVectorSearch {
+    search_params: VectorSearchParams,
+    predicate: Option<Expr>,     # SQL WHERE clause
+    config: FilterConfig,
+    ctx: &ExecContext,
+    stats: ExecStats,
+}
+
+X FilteredVectorSearch {
+    # Create new filtered vector search with default config
+    F new(
+        search_params: VectorSearchParams,
+        predicate: Option<Expr>,
+        ctx: &ExecContext
+    ) -> FilteredVectorSearch {
+        FilteredVectorSearch {
+            search_params,
+            predicate,
+            config: FilterConfig.default(),
+            ctx,
+            stats: ExecStats.new(),
+        }
+    }
+
+    # Override filter strategy (builder pattern: takes self by value, returns Self)
+    F with_strategy(mut self, strategy: FilterStrategy) -> FilteredVectorSearch {
+        self.config.strategy = strategy;
+        self
+    }
+
+    # Override filter configuration
+    F with_config(mut self, config: FilterConfig) -> FilteredVectorSearch {
+        self.config = config;
+        self
+    }
+
+    # Execute the filtered vector search
+    # Returns top-k results matching both vector similarity and predicate
+    F execute(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
+        # If no predicate, just run regular vector search
+        M &self.predicate {
+            None => {
+                R execute_vector_search(&self.search_params, self.ctx);
+            },
+            Some(_) => {
+                # Determine strategy and execute
+                M self.config.strategy {
+                    FilterStrategy.PreFilter => self.execute_pre_filter(),
+                    FilterStrategy.PostFilter => self.execute_post_filter(),
+                    FilterStrategy.Hybrid => self.execute_hybrid(),
+                }
+            }
+        }
+    }
+
+    # Get execution statistics
+    F get_stats(self) -> &ExecStats {
+        &self.stats
+    }
+
+    # ========================================================================
+    # Pre-Filter Strategy
+    # ========================================================================
+
+    # Pre-filter: scan table first, build bitmap of valid node_ids, then HNSW search
+    # Efficient when predicate is very selective (< 1% of rows match)
+    F execute_pre_filter(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
+        predicate := mut M &self.predicate {
+            Some(p) => p,
+            None => R execute_vector_search(&self.search_params, self.ctx),
+        };
+
+        # 1. Get table metadata
+        table_info := mut self.ctx.catalog.get_table(&self.search_params.table_name)
+            .ok_or(error_code(2, 3, 11, "Table not found for pre-filter"))?;
+
+        columns := mut self.ctx.catalog.get_columns(table_info.table_id)
+            .ok_or(error_code(2, 3, 11, "Columns not found"))?;
+
+        # 2. Build evaluation context
+        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
+
+        # 3. Scan table and build bitmap of valid node_ids
+        valid_node_ids := mut HashSet.new();
+        scanned_count := mut 0u64;
+
+        current_page_id := mut table_info.first_page_id;
+        L current_page_id != 0 && current_page_id != NULL_PAGE {
+            # Load heap page
+            frame_id := mut self.ctx.pool.fetch_page(FILE_ID_DATA, current_page_id)?;
+            page_data := mut self.ctx.pool.get_page(frame_id);
+            heap := mut HeapPage.from_page_data(page_data, self.ctx.pool.page_size)?;
+            next_page_id := mut heap.next_page_id();
+
+            # Scan all slots in this page
+            L slot_id: 0..heap.slot_count() {
+                scanned_count += 1;
+
+                # Get tuple data
+                M heap.get_slot(slot_id) {
+                    None => {},
+                    Some(tuple_data) => {
+                        # Check MVCC visibility
+                        M heap.get_mvcc_tuple(slot_id) {
+                            None => {},
+                            Some(mvcc_tuple) => {
+                                I is_tuple_visible(
+                                    mvcc_tuple,
+                                    self.ctx.txn_id,
+                                    0,
+                                    &self.ctx.snapshot,
+                                    self.ctx.catalog.get_clog()
+                                ) {
+                                    # Deserialize row
+                                    row := mut Row.decode(tuple_data, columns.iter().map(|c| c.data_type).collect().as_slice())?;
+
+                                    # Evaluate predicate
+                                    I eval_predicate(predicate, &row, &eval_ctx)? {
+                                        # Compute node_id from page_id and slot_id
+                                        node_id := mut ((current_page_id as u64) << 16) | (slot_id as u64);
+                                        valid_node_ids.insert(node_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.ctx.pool.unpin_page(frame_id, false);
+            current_page_id = next_page_id;
+        }
+
+        self.stats.add_scanned(scanned_count);
+
+        # 4. Execute vector search
+        search_results := mut execute_vector_search(&self.search_params, self.ctx)?;
+
+        # 5. Filter results against bitmap
+        filtered_results := mut Vec.new();
+        r_idx: u64 := mut 0;
+        L r_idx < search_results.len() && filtered_results.len() < self.search_params.top_k {
+            result := mut &search_results[r_idx];
+            I valid_node_ids.contains(&result.node_id) {
+                filtered_results.push(result.clone());
+            }
+            r_idx += 1;
+        }
+
+        self.stats.add_produced(filtered_results.len() as u64);
+
+        Ok(filtered_results)
+    }
+
+    # ========================================================================
+    # Post-Filter Strategy
+    # ========================================================================
+
+    # Post-filter: run HNSW search first with oversampling, then apply predicate
+    # Efficient when predicate is not very selective (most rows match)
+    F execute_post_filter(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
+        predicate := mut M &self.predicate {
+            Some(p) => p,
+            None => R execute_vector_search(&self.search_params, self.ctx),
+        };
+
+        # 1. Get table metadata for evaluation context
+        table_info := mut self.ctx.catalog.get_table(&self.search_params.table_name)
+            .ok_or(error_code(2, 3, 12, "Table not found for post-filter"))?;
+
+        columns := mut self.ctx.catalog.get_columns(table_info.table_id)
+            .ok_or(error_code(2, 3, 12, "Columns not found"))?;
+
+        # 2. Build evaluation context
+        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
+
+        # 3. Execute vector search with oversampling
+        oversample_k := mut (self.search_params.top_k as f32 * self.config.post_filter_oversample) as u64;
+        oversample_params := mut VectorSearchParams {
+            table_name: self.search_params.table_name.clone(),
+            column_name: self.search_params.column_name.clone(),
+            query_vector: self.search_params.query_vector.clone(),
+            top_k: oversample_k,
+            ef_search: self.search_params.ef_search,
+            index_id: self.search_params.index_id,
+            table_id: self.search_params.table_id,
+        };
+
+        search_results := mut execute_vector_search(&oversample_params, self.ctx)?;
+        self.stats.add_scanned(search_results.len() as u64);
+
+        # 4. Filter results by evaluating predicate
+        filtered_results := mut Vec.new();
+        r_idx: u64 := mut 0;
+        L r_idx < search_results.len() && filtered_results.len() < self.search_params.top_k {
+            result := mut &search_results[r_idx];
+            I eval_predicate(predicate, &result.row, &eval_ctx)? {
+                filtered_results.push(result.clone());
+            }
+            r_idx += 1;
+        }
+
+        self.stats.add_produced(filtered_results.len() as u64);
+
+        Ok(filtered_results)
+    }
+
+    # ========================================================================
+    # Hybrid Strategy
+    # ========================================================================
+
+    # Hybrid: estimate selectivity and choose pre-filter or post-filter
+    F execute_hybrid(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
+        predicate := mut M &self.predicate {
+            Some(p) => p,
+            None => R execute_vector_search(&self.search_params, self.ctx),
+        };
+
+        # 1. Get table statistics
+        table_info := mut self.ctx.catalog.get_table(&self.search_params.table_name)
+            .ok_or(error_code(2, 3, 10, "Table not found for hybrid strategy"))?;
+
+        table_stats := mut TableStats.new(table_info.row_count);
+
+        # 2. Estimate selectivity
+        selectivity := mut estimate_selectivity(predicate, &table_stats);
+
+        # 3. Choose strategy based on selectivity threshold
+        I selectivity < self.config.selectivity_threshold {
+            # Very selective → pre-filter
+            self.execute_pre_filter()
+        } E {
+            # Not very selective → post-filter
+            self.execute_post_filter()
+        }
+    }
+}
+
+# ============================================================================
+# Selectivity Estimation
+# ============================================================================
+
+# Estimate predicate selectivity (fraction of rows that match)
+# Returns value in range [0.0, 1.0]
+# Uses simple heuristics based on expression type
+F estimate_selectivity(predicate: &Expr, table_stats: &TableStats) -> f32 {
+    M predicate {
+        # Binary operations
+        Expr.BinaryOp { left, op, right } => {
+            M op {
+                BinOp.Eq => {
+                    # Equality: assume 1/distinct_count or default 0.1 (10%)
+                    estimate_equality_selectivity(left, right, table_stats)
+                },
+                BinOp.Neq => {
+                    # Not equal: 1 - equality selectivity
+                    1.0 - estimate_equality_selectivity(left, right, table_stats)
+                },
+                BinOp.Lt | BinOp.Le | BinOp.Gt | BinOp.Ge => {
+                    # Range comparison: assume 30% (conservative estimate)
+                    0.3
+                },
+                BinOp.And => {
+                    # AND: multiply selectivities
+                    left_sel := mut estimate_selectivity(left, table_stats);
+                    right_sel := mut estimate_selectivity(right, table_stats);
+                    left_sel * right_sel
+                },
+                BinOp.Or => {
+                    # OR: 1 - (1-s1) * (1-s2)
+                    left_sel := mut estimate_selectivity(left, table_stats);
+                    right_sel := mut estimate_selectivity(right, table_stats);
+                    1.0 - (1.0 - left_sel) * (1.0 - right_sel)
+                },
+                _ => 0.5,  # Default for arithmetic ops
+            }
+        },
+
+        # Unary operations
+        Expr.UnaryOp { op, operand } => {
+            M op {
+                UnaryOp.Not => {
+                    # NOT: 1 - selectivity
+                    1.0 - estimate_selectivity(operand, table_stats)
+                },
+                _ => 0.5,
+            }
+        },
+
+        # IS NULL
+        Expr.IsNull { expr: _, negated } => {
+            # Assume 5% NULL values
+            I *negated { 0.95 } E { 0.05 }
+        },
+
+        # BETWEEN
+        Expr.Between { expr: _, low: _, high: _, negated } => {
+            # Range: assume 20%
+            I *negated { 0.8 } E { 0.2 }
+        },
+
+        # IN list
+        Expr.InList { expr: _, list, negated } => {
+            # IN: selectivity = list_size / distinct_count
+            # Default heuristic: 0.1 per item, capped at 0.9
+            sel := mut (list.len() as f32) * 0.1;
+            I sel > 0.9 { sel = 0.9; }
+            I *negated { 1.0 - sel } E { sel }
+        },
+
+        # LIKE
+        Expr.Like { expr: _, pattern: _, negated } => {
+            # LIKE: assume 20% (conservative)
+            I *negated { 0.8 } E { 0.2 }
+        },
+
+        # Default for other expressions
+        _ => 0.5,
+    }
+}
+
+# Estimate equality selectivity for column = value
+F estimate_equality_selectivity(left: &Expr, right: &Expr, table_stats: &TableStats) -> f32 {
+    # Try to extract column name from left or right side
+    column_name: Option<Str> := mut None;
+
+    M left {
+        Expr.ColumnRef { table: _, column } => {
+            column_name = Some(column.clone());
+        },
+        _ => {}
+    }
+
+    I column_name.is_none() {
+        M right {
+            Expr.ColumnRef { table: _, column } => {
+                column_name = Some(column.clone());
+            },
+            _ => {}
+        }
+    }
+
+    M column_name {
+        Some(ref col) => {
+            # Use distinct count if available
+            M table_stats.get_distinct_count(col) {
+                Some(distinct_count) => {
+                    I distinct_count == 0 || table_stats.row_count == 0 {
+                        R 0.1;
+                    }
+                    sel := mut 1.0 / (distinct_count as f32);
+                    # Cap selectivity to avoid extreme values
+                    I sel < 0.001 { 0.001 } E I sel > 0.5 { 0.5 } E { sel }
+                },
+                None => 0.1,  # Default: assume 10%
+            }
+        },
+        None => 0.1,  # No column reference, default 10%
+    }
+}
+
+# ============================================================================
+# Helper: Evaluate Filter Against Row
+# ============================================================================
+
+# Evaluate a predicate expression against a row and return boolean result
+# Wraps eval_predicate from expr_eval module
+F evaluate_filter(
+    predicate: &Expr,
+    row: &Row,
+    eval_ctx: &EvalContext
+) -> Result<bool, VaisError> {
+    eval_predicate(predicate, row, eval_ctx)
+}
+
+# Public API: FilterStrategy, FilterConfig, TableStats,
+# FilteredVectorSearch, estimate_selectivity, evaluate_filter

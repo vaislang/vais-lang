@@ -1,0 +1,254 @@
+# Cross-reference Tracker
+# Detects and manages references between documents/chunks
+# Uses REFERENCES edges in the graph engine for cross-doc links
+# Supports explicit (user-created) and implicit (content-detected) references
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U rag/types.{
+    EDGE_TYPE_REFERENCES, EDGE_TYPE_RELATED_TO,
+    err_rag_chunk_not_found, err_rag_doc_not_found
+};
+U rag/context/helpers.{find_graph_node};
+
+# Reference type constants
+C REF_TYPE_EXPLICIT: u8 = 0;
+C REF_TYPE_CONTENT_SIMILARITY: u8 = 1;
+C REF_TYPE_KEYWORD_OVERLAP: u8 = 2;
+
+# ============================================================================
+# CrossReference — A link between two entities
+# ============================================================================
+
+S CrossReference {
+    ref_id: u64,
+    source_chunk_id: u64,           # Source chunk
+    target_chunk_id: u64,           # Target chunk (can be in different doc)
+    source_doc_id: u64,
+    target_doc_id: u64,
+    ref_type: u8,                   # 0=explicit, 1=content_similarity, 2=keyword_overlap
+    confidence: f64,                # [0, 1] confidence for implicit refs
+    label: Str,                     # Description of the reference
+    created_at: i64,
+}
+
+X CrossReference {
+    F new(ref_id: u64, src_chunk: u64, tgt_chunk: u64, ref_type: u8) -> CrossReference {
+        CrossReference {
+            ref_id,
+            source_chunk_id: src_chunk,
+            target_chunk_id: tgt_chunk,
+            source_doc_id: 0,
+            target_doc_id: 0,
+            ref_type,
+            confidence: 1.0,
+            label: Str.new(),
+            created_at: 0,
+        }
+    }
+
+    F with_docs(mut self, src_doc: u64, tgt_doc: u64) -> CrossReference {
+        self.source_doc_id = src_doc;
+        self.target_doc_id = tgt_doc;
+        self
+    }
+
+    F with_confidence(mut self, confidence: f64) -> CrossReference {
+        self.confidence = confidence;
+        self
+    }
+
+    F with_label(mut self, label: Str) -> CrossReference {
+        self.label = label;
+        self
+    }
+
+    F is_cross_document(self) -> bool {
+        self.source_doc_id != self.target_doc_id
+    }
+}
+
+# ============================================================================
+# CrossRefTracker — Manages cross-references
+# ============================================================================
+
+S CrossRefTracker {
+    references: Vec<CrossReference>,
+    next_ref_id: u64,
+}
+
+X CrossRefTracker {
+    F new() -> CrossRefTracker {
+        CrossRefTracker {
+            references: Vec.new(),
+            next_ref_id: 1,
+        }
+    }
+
+    ## Add an explicit reference between two chunks
+    F add_explicit_ref(
+        &mut self,
+        src_chunk: u64,
+        tgt_chunk: u64,
+        src_doc: u64,
+        tgt_doc: u64,
+        label: Str
+    ) -> u64 {
+        ref_id := mut self.next_ref_id;
+        self.next_ref_id = self.next_ref_id + 1;
+
+        cross_ref := mut CrossReference.new(ref_id, src_chunk, tgt_chunk, REF_TYPE_EXPLICIT);
+        cross_ref = cross_ref.with_docs(src_doc, tgt_doc);
+        cross_ref = cross_ref.with_label(label);
+
+        self.references.push(cross_ref);
+        ref_id
+    }
+
+    ## Add an implicit reference (detected via content)
+    F add_implicit_ref(
+        &mut self,
+        src_chunk: u64,
+        tgt_chunk: u64,
+        src_doc: u64,
+        tgt_doc: u64,
+        confidence: f64,
+        ref_type: u8
+    ) -> u64 {
+        ref_id := mut self.next_ref_id;
+        self.next_ref_id = self.next_ref_id + 1;
+
+        cross_ref := mut CrossReference.new(ref_id, src_chunk, tgt_chunk, ref_type);
+        cross_ref = cross_ref.with_docs(src_doc, tgt_doc);
+        cross_ref = cross_ref.with_confidence(confidence);
+
+        self.references.push(cross_ref);
+        ref_id
+    }
+
+    ## Get all references from a chunk
+    F get_refs_from(self, chunk_id: u64) -> Vec<&CrossReference> {
+        result := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+            I ref_item.source_chunk_id == chunk_id {
+                result.push(ref_item);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    ## Get all references to a chunk
+    F get_refs_to(self, chunk_id: u64) -> Vec<&CrossReference> {
+        result := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+            I ref_item.target_chunk_id == chunk_id {
+                result.push(ref_item);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    ## Get cross-document references for a doc
+    F get_cross_doc_refs(self, doc_id: u64) -> Vec<&CrossReference> {
+        result := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+            I (ref_item.source_doc_id == doc_id || ref_item.target_doc_id == doc_id)
+                && ref_item.is_cross_document() {
+                result.push(ref_item);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    ## Remove all references involving a chunk (on chunk deletion)
+    F remove_chunk_refs(mut self, chunk_id: u64) {
+        new_refs := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+            I ref_item.source_chunk_id != chunk_id && ref_item.target_chunk_id != chunk_id {
+                copy := mut CrossReference.new(
+                    ref_item.ref_id, ref_item.source_chunk_id,
+                    ref_item.target_chunk_id, ref_item.ref_type,
+                );
+                copy = copy.with_docs(ref_item.source_doc_id, ref_item.target_doc_id);
+                copy = copy.with_confidence(ref_item.confidence);
+                copy = copy.with_label(ref_item.label.clone());
+                new_refs.push(copy);
+            }
+            i = i + 1;
+        }
+        self.references = new_refs;
+    }
+
+    ## Remove all references for a document
+    F remove_doc_refs(mut self, doc_id: u64) {
+        new_refs := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+            I ref_item.source_doc_id != doc_id && ref_item.target_doc_id != doc_id {
+                copy := mut CrossReference.new(
+                    ref_item.ref_id, ref_item.source_chunk_id,
+                    ref_item.target_chunk_id, ref_item.ref_type,
+                );
+                copy = copy.with_docs(ref_item.source_doc_id, ref_item.target_doc_id);
+                copy = copy.with_confidence(ref_item.confidence);
+                copy = copy.with_label(ref_item.label.clone());
+                new_refs.push(copy);
+            }
+            i = i + 1;
+        }
+        self.references = new_refs;
+    }
+
+    ## Build graph edges for references (for GraphEngine)
+    ## Returns (src_graph_node_id, tgt_graph_node_id, edge_type) triples
+    F build_reference_edges(self, chunk_to_graph_node: &Vec<(u64, u64)>) -> Vec<(u64, u64, Str)> {
+        edges := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.references.len() as u32 {
+            ref_item := mut self.references.get(i as u64);
+
+            # Find source graph node
+            src_node_opt := mut find_graph_node(ref_item.source_chunk_id, chunk_to_graph_node);
+            tgt_node_opt := mut find_graph_node(ref_item.target_chunk_id, chunk_to_graph_node);
+
+            M src_node_opt {
+                Some(src_node) => {
+                    M tgt_node_opt {
+                        Some(tgt_node) => {
+                            edge_type := mut I ref_item.ref_type == REF_TYPE_EXPLICIT {
+                                EDGE_TYPE_REFERENCES
+                            } E {
+                                EDGE_TYPE_RELATED_TO
+                            };
+                            edges.push((src_node, tgt_node, edge_type));
+                        },
+                        None => {},
+                    }
+                },
+                None => {},
+            }
+
+            i = i + 1;
+        }
+        edges
+    }
+
+    ## Get reference count
+    F ref_count(self) -> u64 {
+        self.references.len() as u64
+    }
+}

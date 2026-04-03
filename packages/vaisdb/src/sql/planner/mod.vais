@@ -1,0 +1,1244 @@
+# SQL Query Planner
+# Converts AST (SelectQuery) into optimized execution plan (PlanNode)
+# Cost-based optimizer with index selection, join ordering, and predicate pushdown
+#
+# Architecture:
+# - PlanNode enum: logical plan nodes (SeqScan, IndexScan, Filter, Project, Join, Sort, Aggregate, etc.)
+# - Cost model: estimates I/O + CPU cost per operator using catalog statistics
+# - Index selection: chooses index scan vs table scan based on selectivity
+# - Join ordering: left-deep tree, smaller table on build side of hash join
+# - Predicate pushdown: pushes WHERE conditions to scan level
+
+U storage/error.{VaisError, err_internal};
+U storage/btree/key.{KeyRange};
+U sql/parser/ast.{SelectQuery, SelectItem, TableRef, JoinClause, JoinType, JoinCondition, Expr, BinOp, OrderByItem, SetOperation};
+U sql/catalog/manager.{CatalogManager};
+U sql/catalog/schema.{TableInfo, IndexInfo, ColumnInfo};
+U sql/types.{SqlType, SqlValue};
+
+# ============================================================================
+# Error Code Constants (EE=01 SQL Engine, CC=08 Planner)
+# ============================================================================
+
+C ERR_CODE_TABLE_NOT_FOUND_PLAN: Str = "VAIS-0108001";
+C ERR_CODE_COLUMN_NOT_FOUND_PLAN: Str = "VAIS-0108002";
+C ERR_CODE_INVALID_JOIN_CONDITION: Str = "VAIS-0108003";
+C ERR_CODE_COST_ESTIMATION_FAILED: Str = "VAIS-0108004";
+C ERR_CODE_PLAN_BUILD_FAILED: Str = "VAIS-0108005";
+
+# ============================================================================
+# Error Constructors
+# ============================================================================
+
+F err_table_not_found_plan(name: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_TABLE_NOT_FOUND_PLAN,
+        "Table '{name}' not found during planning"
+    )
+}
+
+F err_column_not_found_plan(name: Str, table: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_COLUMN_NOT_FOUND_PLAN,
+        "Column '{name}' not found in table '{table}' during planning"
+    )
+}
+
+F err_invalid_join_condition(reason: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_INVALID_JOIN_CONDITION,
+        "Invalid join condition: {reason}"
+    )
+}
+
+F err_cost_estimation_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_COST_ESTIMATION_FAILED,
+        "Cost estimation failed: {reason}"
+    )
+}
+
+F err_plan_build_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_PLAN_BUILD_FAILED,
+        "Plan build failed: {reason}"
+    )
+}
+
+# ============================================================================
+# Cost Estimation
+# ============================================================================
+
+# Cost estimate for a plan node
+# I/O cost: number of 8KB pages to read
+# CPU cost: relative CPU units (e.g., comparison count)
+# Row estimate: estimated output cardinality
+S CostEstimate {
+    io_cost: f64,
+    cpu_cost: f64,
+    row_estimate: u64,
+}
+
+X CostEstimate {
+    F new(io_cost: f64, cpu_cost: f64, row_estimate: u64) -> CostEstimate {
+        CostEstimate { io_cost, cpu_cost, row_estimate }
+    }
+
+    # Total cost (weighted sum of I/O and CPU)
+    # I/O is weighted more heavily (1.0 vs 0.1)
+    F total(self) -> f64 {
+        self.io_cost * 1.0 + self.cpu_cost * 0.1
+    }
+
+    # Add two cost estimates
+    F add(self, other: &CostEstimate) -> CostEstimate {
+        CostEstimate {
+            io_cost: self.io_cost + other.io_cost,
+            cpu_cost: self.cpu_cost + other.cpu_cost,
+            row_estimate: self.row_estimate,  # Keep first estimate as output
+        }
+    }
+}
+
+# ============================================================================
+# Plan Node Types
+# ============================================================================
+
+# Physical plan node representing a single operator in the execution plan
+L PlanNode =
+    # Table scan: sequential scan of all pages
+    SeqScan { table: Str, alias: Option<Str>, filter: Option<Expr> } |
+
+    # Index scan: B+Tree range scan with optional residual filter
+    IndexScan { table: Str, index: Str, key_range: KeyRange, residual: Option<Expr> } |
+
+    # Filter: apply predicate to input rows
+    Filter { input: Box<PlanNode>, predicate: Expr } |
+
+    # Project: select specific columns from input
+    Project { input: Box<PlanNode>, columns: Vec<ProjectColumn> } |
+
+    # Nested loop join: for each row from left, scan right
+    NestedLoopJoin { left: Box<PlanNode>, right: Box<PlanNode>, join_type: JoinType, condition: Option<Expr> } |
+
+    # Hash join: build hash table from left, probe with right
+    HashJoin { build: Box<PlanNode>, probe: Box<PlanNode>, join_type: JoinType, left_keys: Vec<u64>, right_keys: Vec<u64> } |
+
+    # Sort: order rows by given columns
+    Sort { input: Box<PlanNode>, order_by: Vec<OrderByItem> } |
+
+    # Aggregate: GROUP BY with aggregate functions
+    Aggregate { input: Box<PlanNode>, group_by: Vec<Expr>, aggregates: Vec<AggregateSpec>, having: Option<Expr> } |
+
+    # Limit: restrict number of output rows
+    Limit { input: Box<PlanNode>, limit: Option<u64>, offset: Option<u64> } |
+
+    # Distinct: remove duplicate rows
+    Distinct { input: Box<PlanNode> } |
+
+    # Window: window functions over partitions
+    Window { input: Box<PlanNode>, window_specs: Vec<WindowSpec> } |
+
+    # Values: constant row values (e.g., VALUES (1, 2), (3, 4))
+    Values { rows: Vec<Vec<Expr>> } |
+
+    # Empty: zero-row result
+    Empty;
+
+# Column projection specification
+S ProjectColumn {
+    expr: Expr,
+    alias: Option<Str>,
+}
+
+X ProjectColumn {
+    F new(expr: Expr) -> ProjectColumn {
+        ProjectColumn { expr, alias: None }
+    }
+
+    F with_alias(expr: Expr, alias: Str) -> ProjectColumn {
+        ProjectColumn { expr, alias: Some(alias) }
+    }
+}
+
+# Aggregate function specification
+S AggregateSpec {
+    func_name: Str,          # COUNT, SUM, AVG, MIN, MAX
+    arg_expr: Expr,          # Argument expression
+    is_distinct: bool,       # COUNT(DISTINCT col)
+}
+
+X AggregateSpec {
+    F new(func_name: Str, arg_expr: Expr) -> AggregateSpec {
+        AggregateSpec { func_name, arg_expr, is_distinct: false }
+    }
+
+    F with_distinct(func_name: Str, arg_expr: Expr) -> AggregateSpec {
+        AggregateSpec { func_name, arg_expr, is_distinct: true }
+    }
+}
+
+# Window function specification
+S WindowSpec {
+    func: Expr,              # Window function call
+    partition_by: Vec<Expr>, # PARTITION BY columns
+    order_by: Vec<OrderByItem>, # ORDER BY within window
+}
+
+X WindowSpec {
+    F new(func: Expr, partition_by: Vec<Expr>, order_by: Vec<OrderByItem>) -> WindowSpec {
+        WindowSpec { func, partition_by, order_by }
+    }
+}
+
+# ============================================================================
+# Table Statistics (from CatalogManager)
+# ============================================================================
+
+# Statistics for cost estimation
+S TableStats {
+    table_id: u32,
+    name: Str,
+    row_count: u64,
+    page_count: u32,
+    avg_row_size: u32,      # Bytes per row
+}
+
+X TableStats {
+    # Extract statistics from TableInfo
+    F from_table_info(info: &TableInfo) -> TableStats {
+        # Use row_count_estimate from TableInfo
+        row_count := mut info.row_count_estimate;
+        page_count := mut I row_count == 0 { 1 } E { (row_count / 50) as u32 };  # Assume ~50 rows per page
+        avg_row_size := mut 200;  # Default estimate: 200 bytes per row
+
+        TableStats {
+            table_id: info.table_id,
+            name: info.name.clone(),
+            row_count,
+            page_count,
+            avg_row_size,
+        }
+    }
+}
+
+# ============================================================================
+# Selectivity Estimation
+# ============================================================================
+
+# Default selectivity factors for predicates
+C SELECTIVITY_EQUALITY: f64 = 0.1;       # col = value
+C SELECTIVITY_RANGE: f64 = 0.3;          # col < value, col BETWEEN a AND b
+C SELECTIVITY_NO_STATS: f64 = 0.5;       # No information available
+C SELECTIVITY_LIKE: f64 = 0.2;           # col LIKE pattern
+C SELECTIVITY_IS_NULL: f64 = 0.05;       # col IS NULL
+
+# Estimate selectivity of a predicate expression
+# Returns a value between 0.0 (no rows) and 1.0 (all rows)
+F estimate_selectivity(expr: &Expr) -> f64 {
+    M expr {
+        # Binary comparisons
+        Expr.BinaryOp { left, op, right } => {
+            M op {
+                BinOp.Eq => SELECTIVITY_EQUALITY,
+                BinOp.Neq => 1.0 - SELECTIVITY_EQUALITY,
+                BinOp.Lt | BinOp.Le | BinOp.Gt | BinOp.Ge => SELECTIVITY_RANGE,
+                BinOp.And => {
+                    # Multiply selectivities for AND (assuming independence)
+                    left_sel := mut estimate_selectivity(left);
+                    right_sel := mut estimate_selectivity(right);
+                    left_sel * right_sel
+                },
+                BinOp.Or => {
+                    # P(A OR B) = P(A) + P(B) - P(A)*P(B)
+                    left_sel := mut estimate_selectivity(left);
+                    right_sel := mut estimate_selectivity(right);
+                    left_sel + right_sel - (left_sel * right_sel)
+                },
+                _ => SELECTIVITY_NO_STATS,
+            }
+        },
+
+        # IS NULL / IS NOT NULL
+        Expr.IsNull { expr, negated } => {
+            I *negated {
+                1.0 - SELECTIVITY_IS_NULL
+            } E {
+                SELECTIVITY_IS_NULL
+            }
+        },
+
+        # BETWEEN
+        Expr.Between { negated, .. } => {
+            I *negated {
+                1.0 - SELECTIVITY_RANGE
+            } E {
+                SELECTIVITY_RANGE
+            }
+        },
+
+        # IN list
+        Expr.InList { list, negated, .. } => {
+            sel := mut SELECTIVITY_EQUALITY * (list.len() as f64);
+            sel := mut I sel > 1.0 { 1.0 } E { sel };
+            I *negated { 1.0 - sel } E { sel }
+        },
+
+        # LIKE
+        Expr.Like { negated, .. } => {
+            I *negated {
+                1.0 - SELECTIVITY_LIKE
+            } E {
+                SELECTIVITY_LIKE
+            }
+        },
+
+        # Default
+        _ => SELECTIVITY_NO_STATS,
+    }
+}
+
+# ============================================================================
+# Plan Building — Top-Level Entry Point
+# ============================================================================
+
+# Build an optimized execution plan from a SELECT query
+# Returns a PlanNode representing the root of the execution plan
+F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    # Step 1: Plan the FROM clause (table scans and joins)
+    base_plan := mut M &query.from {
+        Some(ref table_refs) => {
+            plan_from_clause(table_refs, catalog)?
+        },
+        None => {
+            # No FROM clause → VALUES () or SELECT constants
+            PlanNode.Values { rows: Vec.new() }
+        },
+    };
+
+    # Step 2: Apply WHERE clause (predicate pushdown already done in plan_from_clause)
+    filtered_plan := mut M &query.where_clause {
+        Some(ref predicate) => {
+            # Try to push down to scans; if not possible, add Filter node
+            plan_where(base_plan, predicate, catalog)?
+        },
+        None => base_plan,
+    };
+
+    # Step 3: Apply GROUP BY and aggregates
+    grouped_plan := mut I query.group_by.len() > 0 || has_aggregates(&query.select_list) {
+        plan_aggregation(filtered_plan, &query.group_by, &query.select_list, &query.having, catalog)?
+    } E {
+        filtered_plan
+    };
+
+    # Step 4: Apply DISTINCT
+    distinct_plan := mut I query.distinct {
+        PlanNode.Distinct { input: Box.new(grouped_plan) }
+    } E {
+        grouped_plan
+    };
+
+    # Step 5: Apply ORDER BY
+    sorted_plan := mut I query.order_by.len() > 0 {
+        plan_order_by(distinct_plan, &query.order_by)?
+    } E {
+        distinct_plan
+    };
+
+    # Step 6: Apply LIMIT/OFFSET
+    limited_plan := mut plan_limit(sorted_plan, &query.limit, &query.offset)?;
+
+    # Step 7: Apply projection (SELECT list)
+    projected_plan := mut plan_projection(limited_plan, &query.select_list)?;
+
+    # Step 8: Apply set operations (UNION, INTERSECT, EXCEPT)
+    final_plan := mut M &query.set_op {
+        Some(ref set_op) => {
+            right_plan := mut build_plan(&set_op.right, catalog)?;
+            plan_set_operation(projected_plan, right_plan, set_op)?
+        },
+        None => projected_plan,
+    };
+
+    Ok(final_plan)
+}
+
+# ============================================================================
+# FROM Clause Planning
+# ============================================================================
+
+# Plan the FROM clause: table references and joins
+F plan_from_clause(table_refs: &[TableRef], catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    I table_refs.len() == 0 {
+        R Ok(PlanNode.Empty);
+    }
+
+    # Start with the first table
+    plan := mut plan_table_ref(&table_refs[0], catalog)?;
+
+    # Process remaining tables as implicit cross joins or explicit joins
+    L i: 1..table_refs.len() {
+        right_plan := mut plan_table_ref(&table_refs[i], catalog)?;
+
+        # Implicit cross join (comma-separated tables in FROM clause)
+        plan = PlanNode.NestedLoopJoin {
+            left: Box.new(plan),
+            right: Box.new(right_plan),
+            join_type: JoinType.Inner,
+            condition: None,
+        };
+    }
+
+    Ok(plan)
+}
+
+# Plan a single table reference (table, subquery, or join)
+F plan_table_ref(table_ref: &TableRef, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    M table_ref {
+        TableRef.Table { name, alias } => {
+            # Check table exists
+            M catalog.get_table(name) {
+                Some(_) => {
+                    # Start with sequential scan (index selection done in plan_where)
+                    Ok(PlanNode.SeqScan {
+                        table: name.clone(),
+                        alias: M alias {
+                            Some(ref a) => Some(a.clone()),
+                            None => None,
+                        },
+                        filter: None,
+                    })
+                },
+                None => Err(err_table_not_found_plan(name.clone())),
+            }
+        },
+
+        TableRef.Join { join } => {
+            plan_join(join, catalog)
+        },
+
+        TableRef.Subquery { query, alias } => {
+            # Recursively build plan for subquery
+            subquery_plan := mut build_plan(query, catalog)?;
+            # Wrap in a logical "SubqueryScan" node (represented as the plan itself with alias)
+            Ok(subquery_plan)
+        },
+
+        TableRef.CrossJoin { left, right } => {
+            left_plan := mut plan_table_ref(left, catalog)?;
+            right_plan := mut plan_table_ref(right, catalog)?;
+            Ok(PlanNode.NestedLoopJoin {
+                left: Box.new(left_plan),
+                right: Box.new(right_plan),
+                join_type: JoinType.Cross,
+                condition: None,
+            })
+        },
+    }
+}
+
+# Extract the effective table name (or alias) from a TableRef
+# Used for USING clause expansion to qualify column references
+F extract_table_name(table_ref: &TableRef) -> Option<Str> {
+    M table_ref {
+        TableRef.Table { name, alias } => {
+            M alias {
+                Some(a) => Some(a.clone()),
+                None => Some(name.clone()),
+            }
+        },
+        TableRef.Subquery { query, alias } => Some(alias.clone()),
+        TableRef.Join { join } => {
+            # For nested joins, use rightmost table's name
+            extract_table_name(&join.right)
+        },
+        TableRef.TableFunction { name, args, alias } => {
+            M alias {
+                Some(a) => Some(a.clone()),
+                None => Some(name.clone()),
+            }
+        },
+        _ => None,
+    }
+}
+
+# Plan a join (choose between nested loop join and hash join based on cost)
+F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    left_plan := mut plan_table_ref(&join.left, catalog)?;
+    right_plan := mut plan_table_ref(&join.right, catalog)?;
+
+    # Extract join condition
+    condition := mut M &join.condition {
+        JoinCondition.On { expr } => Some(expr.clone()),
+        JoinCondition.Using { columns } => {
+            # Convert USING into explicit ON condition
+            # USING (a, b) → ON left.a = right.a AND left.b = right.b
+            I columns.len() == 0 {
+                None
+            } E {
+                # Extract table names for left and right sides to qualify columns
+                left_table := mut extract_table_name(&join.left);
+                right_table := mut extract_table_name(&join.right);
+
+                # Build conjunction of equality conditions
+                on_expr: Option<Expr> := mut None;
+                L col: columns {
+                    eq := mut Expr.BinaryOp {
+                        left: Box.new(Expr.ColumnRef { table: left_table.clone(), column: col.clone() }),
+                        op: BinOp.Eq,
+                        right: Box.new(Expr.ColumnRef { table: right_table.clone(), column: col.clone() }),
+                    };
+                    on_expr = M on_expr {
+                        None => Some(eq),
+                        Some(prev) => Some(Expr.BinaryOp {
+                            left: Box.new(prev),
+                            op: BinOp.And,
+                            right: Box.new(eq),
+                        }),
+                    };
+                }
+                on_expr
+            }
+        },
+        JoinCondition.Natural => {
+            # Natural join: infer common columns from schema
+            # Simplified: treat as cross join for now
+            None
+        },
+    };
+
+    # Choose join algorithm based on cost estimation
+    left_cost := mut estimate_cost(&left_plan, catalog)?;
+    right_cost := mut estimate_cost(&right_plan, catalog)?;
+
+    # Decision heuristic:
+    # - If one side is small (< 1000 rows), use hash join with small side as build
+    # - If join has equi-join predicates, prefer hash join
+    # - Otherwise, use nested loop join
+    use_hash_join := mut false;
+    left_keys := mut Vec.new();
+    right_keys := mut Vec.new();
+
+    # Check if condition has equi-join predicates (e.g., a.x = b.y)
+    M &condition {
+        Some(ref expr) => {
+            (found_equi, lk, rk) := mut extract_equi_join_keys(expr);
+            I found_equi {
+                use_hash_join = true;
+                left_keys = lk;
+                right_keys = rk;
+            }
+        },
+        None => {},
+    }
+
+    I use_hash_join {
+        # Hash join: use smaller side as build input
+        I left_cost.row_estimate < right_cost.row_estimate {
+            Ok(PlanNode.HashJoin {
+                build: Box.new(left_plan),
+                probe: Box.new(right_plan),
+                join_type: join.join_type,
+                left_keys,
+                right_keys,
+            })
+        } E {
+            # Swap sides
+            Ok(PlanNode.HashJoin {
+                build: Box.new(right_plan),
+                probe: Box.new(left_plan),
+                join_type: join.join_type,
+                left_keys: right_keys,
+                right_keys: left_keys,
+            })
+        }
+    } E {
+        # Nested loop join
+        Ok(PlanNode.NestedLoopJoin {
+            left: Box.new(left_plan),
+            right: Box.new(right_plan),
+            join_type: join.join_type,
+            condition,
+        })
+    }
+}
+
+# Extract equi-join keys from a join condition
+# Returns (found_equi, left_keys, right_keys)
+# Keys are ordinal positions (0-based) of equi-join predicates found
+# For example: a.x = b.y AND a.z = b.w → ([0, 1], [0, 1])
+# The actual column name resolution to physical indices happens at execution time
+F extract_equi_join_keys(expr: &Expr) -> (bool, Vec<u64>, Vec<u64>) {
+    left_keys := mut Vec.new();
+    right_keys := mut Vec.new();
+
+    M expr {
+        Expr.BinaryOp { left, op, right } => {
+            M op {
+                BinOp.Eq => {
+                    # Check if both sides are column references
+                    is_left_col := mut M left.as_ref() {
+                        Expr.ColumnRef { table, column } => true,
+                        _ => false,
+                    };
+                    is_right_col := mut M right.as_ref() {
+                        Expr.ColumnRef { table, column } => true,
+                        _ => false,
+                    };
+
+                    I is_left_col && is_right_col {
+                        # Both sides are column refs — this is an equi-join predicate
+                        # Use ordinal index 0 for this single predicate
+                        left_keys.push(0);
+                        right_keys.push(0);
+                        R (true, left_keys, right_keys);
+                    }
+                },
+                BinOp.And => {
+                    # Recursively extract from both sides
+                    (l_found, l_lk, l_rk) := mut extract_equi_join_keys(left);
+                    (r_found, r_lk, r_rk) := mut extract_equi_join_keys(right);
+                    I l_found || r_found {
+                        # Merge keys, adjusting ordinals
+                        offset := mut l_lk.len();
+                        left_keys.extend(l_lk);
+                        right_keys.extend(l_rk);
+
+                        # Offset right-side keys
+                        i: u64 := mut 0;
+                        L i < r_lk.len() {
+                            left_keys.push(r_lk[i] + offset);
+                            i += 1;
+                        }
+                        i = 0;
+                        L i < r_rk.len() {
+                            right_keys.push(r_rk[i] + offset);
+                            i += 1;
+                        }
+                        R (true, left_keys, right_keys);
+                    }
+                },
+                _ => {},
+            }
+        },
+        _ => {},
+    }
+
+    (false, left_keys, right_keys)
+}
+
+# ============================================================================
+# WHERE Clause Planning (Predicate Pushdown + Index Selection)
+# ============================================================================
+
+# Plan WHERE clause: try to push predicates down to scan nodes
+F plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    # Check if input is a SeqScan node that can be converted to IndexScan
+    M &input {
+        PlanNode.SeqScan { table, alias, filter } => {
+            # Try to find an index that can satisfy this predicate
+            M catalog.get_table(table) {
+                Some(table_info) => {
+                    indexes := mut catalog.get_indexes_for_table(table_info.table_id);
+
+                    # Try to select an index for this predicate
+                    M select_index(table, &indexes, predicate) {
+                        Some((index_name, key_range, residual)) => {
+                            # Use index scan
+                            Ok(PlanNode.IndexScan {
+                                table: table.clone(),
+                                index: index_name,
+                                key_range,
+                                residual,
+                            })
+                        },
+                        None => {
+                            # No suitable index, push filter to SeqScan
+                            Ok(PlanNode.SeqScan {
+                                table: table.clone(),
+                                alias: alias.clone(),
+                                filter: Some(predicate.clone()),
+                            })
+                        },
+                    }
+                },
+                None => {
+                    # Table not found (shouldn't happen at this stage)
+                    Err(err_table_not_found_plan(table.clone()))
+                },
+            }
+        },
+
+        # For other node types, add a Filter node on top
+        _ => {
+            Ok(PlanNode.Filter {
+                input: Box.new(input),
+                predicate: predicate.clone(),
+            })
+        },
+    }
+}
+
+# Select an index for a given predicate
+# Returns (index_name, key_range, residual_filter)
+# residual_filter is the part of the predicate that cannot be satisfied by the index
+F select_index(table: &Str, indexes: &[&IndexInfo], predicate: &Expr) -> Option<(Str, KeyRange, Option<Expr>)> {
+    # For each index, check if the predicate can use it
+    L idx: indexes {
+        # Check if predicate references the indexed columns
+        M check_index_usable(idx, predicate) {
+            Some((key_range, residual)) => {
+                R Some((idx.name.clone(), key_range, residual));
+            },
+            None => {},
+        }
+    }
+
+    None
+}
+
+# Check if an index can be used for a predicate
+# Returns (key_range, residual_filter)
+F check_index_usable(index: &IndexInfo, predicate: &Expr) -> Option<(KeyRange, Option<Expr>)> {
+    # Simplified implementation: check if predicate is an equality or range on the first index column
+    M predicate {
+        Expr.BinaryOp { left, op, right } => {
+            M op {
+                BinOp.Eq => {
+                    # Check if left is a column reference matching the first index column
+                    M left {
+                        Expr.ColumnRef { table, column } => {
+                            I index.columns.len() > 0 && column == &index.columns[0] {
+                                # This is an equality predicate on the index column
+                                # Build a point key range
+                                key_range := mut KeyRange.point(Vec.new());  # Simplified: empty key
+                                R Some((key_range, None));
+                            }
+                        },
+                        _ => {},
+                    }
+                },
+                BinOp.Lt | BinOp.Le | BinOp.Gt | BinOp.Ge => {
+                    # Range predicate
+                    M left {
+                        Expr.ColumnRef { table, column } => {
+                            I index.columns.len() > 0 && column == &index.columns[0] {
+                                # Build a range key range
+                                key_range := mut KeyRange.all();  # Simplified
+                                R Some((key_range, None));
+                            }
+                        },
+                        _ => {},
+                    }
+                },
+                _ => {},
+            }
+        },
+        _ => {},
+    }
+
+    None
+}
+
+# ============================================================================
+# Aggregation Planning
+# ============================================================================
+
+# Plan GROUP BY and aggregate functions
+F plan_aggregation(
+    input: PlanNode,
+    group_by: &[Expr],
+    select_list: &[SelectItem],
+    having: &Option<Expr>,
+    catalog: &CatalogManager,
+) -> Result<PlanNode, VaisError> {
+    # Extract aggregate specs from SELECT list
+    aggregates := mut Vec.new();
+    L item: select_list {
+        M item {
+            SelectItem.Expr { expr, alias } => {
+                M extract_aggregate(expr) {
+                    Some(agg) => aggregates.push(agg),
+                    None => {},
+                }
+            },
+            _ => {},
+        }
+    }
+
+    Ok(PlanNode.Aggregate {
+        input: Box.new(input),
+        group_by: group_by.to_vec(),
+        aggregates,
+        having: M having {
+            Some(ref h) => Some(h.clone()),
+            None => None,
+        },
+    })
+}
+
+# Extract aggregate function from expression
+F extract_aggregate(expr: &Expr) -> Option<AggregateSpec> {
+    M expr {
+        Expr.FunctionCall { name, args, distinct } => {
+            upper := mut name.to_uppercase();
+            I upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" || upper == "MAX" {
+                I args.len() > 0 {
+                    R Some(AggregateSpec {
+                        func_name: upper,
+                        arg_expr: args[0].clone(),
+                        is_distinct: *distinct,
+                    });
+                }
+            }
+            None
+        },
+        _ => None,
+    }
+}
+
+# Check if SELECT list has any aggregate functions
+F has_aggregates(select_list: &[SelectItem]) -> bool {
+    L item: select_list {
+        M item {
+            SelectItem.Expr { expr, .. } => {
+                M extract_aggregate(expr) {
+                    Some(_) => R true,
+                    None => {},
+                }
+            },
+            _ => {},
+        }
+    }
+    false
+}
+
+# ============================================================================
+# ORDER BY Planning
+# ============================================================================
+
+# Plan ORDER BY clause
+F plan_order_by(input: PlanNode, order_by: &[OrderByItem]) -> Result<PlanNode, VaisError> {
+    Ok(PlanNode.Sort {
+        input: Box.new(input),
+        order_by: order_by.to_vec(),
+    })
+}
+
+# ============================================================================
+# LIMIT/OFFSET Planning
+# ============================================================================
+
+# Plan LIMIT and OFFSET
+F plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> Result<PlanNode, VaisError> {
+    # Extract constant integer values from limit/offset expressions
+    limit_val := mut M limit {
+        Some(ref expr) => {
+            M extract_constant_int(expr) {
+                Some(n) => Some(n as u64),
+                None => None,
+            }
+        },
+        None => None,
+    };
+
+    offset_val := mut M offset {
+        Some(ref expr) => {
+            M extract_constant_int(expr) {
+                Some(n) => Some(n as u64),
+                None => None,
+            }
+        },
+        None => None,
+    };
+
+    I limit_val.is_some() || offset_val.is_some() {
+        Ok(PlanNode.Limit {
+            input: Box.new(input),
+            limit: limit_val,
+            offset: offset_val,
+        })
+    } E {
+        Ok(input)
+    }
+}
+
+# Extract constant integer from expression
+F extract_constant_int(expr: &Expr) -> Option<i64> {
+    M expr {
+        Expr.Literal { value } => {
+            M value {
+                SqlValue.IntVal { v } => Some(*v),
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
+# ============================================================================
+# Projection Planning
+# ============================================================================
+
+# Plan SELECT list projection
+F plan_projection(input: PlanNode, select_list: &[SelectItem]) -> Result<PlanNode, VaisError> {
+    # Convert SELECT items to ProjectColumn specs
+    columns := mut Vec.new();
+    L item: select_list {
+        M item {
+            SelectItem.AllColumns => {
+                # SELECT * — pass through all columns
+                # In a real implementation, would expand to all table columns
+                # For now, treat as no-op projection
+                R Ok(input);
+            },
+            SelectItem.AllColumnsFrom { table } => {
+                # SELECT t.* — pass through all columns from table t
+                # Simplified: treat as no-op
+                R Ok(input);
+            },
+            SelectItem.Expr { expr, alias } => {
+                columns.push(ProjectColumn {
+                    expr: expr.clone(),
+                    alias: M alias {
+                        Some(ref a) => Some(a.clone()),
+                        None => None,
+                    },
+                });
+            },
+        }
+    }
+
+    I columns.len() > 0 {
+        Ok(PlanNode.Project {
+            input: Box.new(input),
+            columns,
+        })
+    } E {
+        Ok(input)
+    }
+}
+
+# ============================================================================
+# Set Operation Planning (UNION, INTERSECT, EXCEPT)
+# ============================================================================
+
+# Plan set operations
+F plan_set_operation(left: PlanNode, right: PlanNode, set_op: &SetOperation) -> Result<PlanNode, VaisError> {
+    # Simplified: not fully implemented in this version
+    # Would convert to UnionAll, Intersect, or Except nodes
+    Err(err_plan_build_failed("Set operations not yet implemented"))
+}
+
+# ============================================================================
+# Cost Estimation
+# ============================================================================
+
+# Estimate the cost of executing a plan node
+F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimate, VaisError> {
+    M node {
+        PlanNode.SeqScan { table, filter, .. } => {
+            M catalog.get_table(table) {
+                Some(table_info) => {
+                    stats := mut TableStats.from_table_info(table_info);
+
+                    # I/O cost: read all pages
+                    io_cost := mut stats.page_count as f64;
+
+                    # CPU cost: compare every row against filter
+                    cpu_cost := mut stats.row_count as f64;
+
+                    # Row estimate: apply selectivity
+                    row_estimate := mut M filter {
+                        Some(ref pred) => {
+                            sel := mut estimate_selectivity(pred);
+                            (stats.row_count as f64 * sel) as u64
+                        },
+                        None => stats.row_count,
+                    };
+
+                    Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
+                },
+                None => Err(err_table_not_found_plan(table.clone())),
+            }
+        },
+
+        PlanNode.IndexScan { table, index, key_range, residual } => {
+            M catalog.get_table(table) {
+                Some(table_info) => {
+                    stats := mut TableStats.from_table_info(table_info);
+
+                    # Index scan I/O cost: assume 10% of pages (estimate)
+                    io_cost := mut (stats.page_count as f64) * 0.1;
+
+                    # CPU cost: fewer comparisons
+                    cpu_cost := mut (stats.row_count as f64) * 0.1;
+
+                    # Row estimate: assume index is selective
+                    row_estimate := mut (stats.row_count as f64 * 0.1) as u64;
+
+                    # Apply residual filter selectivity
+                    M residual {
+                        Some(ref pred) => {
+                            sel := mut estimate_selectivity(pred);
+                            row_estimate = (row_estimate as f64 * sel) as u64;
+                        },
+                        None => {},
+                    }
+
+                    Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
+                },
+                None => Err(err_table_not_found_plan(table.clone())),
+            }
+        },
+
+        PlanNode.Filter { input, predicate } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Filter adds CPU cost but no I/O
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
+
+            # Apply selectivity to row estimate
+            sel := mut estimate_selectivity(predicate);
+            row_estimate := mut (input_cost.row_estimate as f64 * sel) as u64;
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
+        },
+
+        PlanNode.Project { input, columns } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Project adds minimal CPU cost
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64 * 0.1);
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
+        },
+
+        PlanNode.NestedLoopJoin { left, right, condition, .. } => {
+            left_cost := mut estimate_cost(left, catalog)?;
+            right_cost := mut estimate_cost(right, catalog)?;
+
+            # Nested loop: for each left row, scan all right rows
+            io_cost := mut left_cost.io_cost + (left_cost.row_estimate as f64) * right_cost.io_cost;
+            cpu_cost := mut left_cost.cpu_cost + (left_cost.row_estimate as f64) * right_cost.cpu_cost;
+
+            # Output rows: apply join selectivity
+            join_sel := mut M condition {
+                Some(ref pred) => estimate_selectivity(pred),
+                None => 1.0,  # Cross join: all combinations
+            };
+            row_estimate := mut ((left_cost.row_estimate as f64) * (right_cost.row_estimate as f64) * join_sel) as u64;
+
+            Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
+        },
+
+        PlanNode.HashJoin { build, probe, .. } => {
+            build_cost := mut estimate_cost(build, catalog)?;
+            probe_cost := mut estimate_cost(probe, catalog)?;
+
+            # Hash join: scan build once, scan probe once
+            io_cost := mut build_cost.io_cost + probe_cost.io_cost;
+
+            # CPU cost: build hash table + probe
+            cpu_cost := mut build_cost.cpu_cost + probe_cost.cpu_cost +
+                        (build_cost.row_estimate as f64) + (probe_cost.row_estimate as f64);
+
+            # Output rows: assume equi-join with selectivity 0.1
+            row_estimate := mut ((build_cost.row_estimate as f64) * (probe_cost.row_estimate as f64) * 0.1) as u64;
+
+            Ok(CostEstimate.new(io_cost, cpu_cost, row_estimate))
+        },
+
+        PlanNode.Sort { input, order_by } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Sort CPU cost: N log N comparisons
+            n := mut input_cost.row_estimate as f64;
+            cpu_cost := mut input_cost.cpu_cost + n * n.log2();
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
+        },
+
+        PlanNode.Aggregate { input, group_by, .. } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Aggregate CPU cost: hash-based aggregation
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
+
+            # Output rows: estimate number of groups
+            row_estimate := mut I group_by.len() > 0 {
+                # Estimate distinct groups as sqrt(N) (heuristic)
+                ((input_cost.row_estimate as f64).sqrt()) as u64
+            } E {
+                # No GROUP BY → single aggregate row
+                1
+            };
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
+        },
+
+        PlanNode.Limit { input, limit, offset } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Limit reduces output rows
+            row_estimate := mut input_cost.row_estimate;
+            M offset {
+                Some(off) => {
+                    I row_estimate > *off {
+                        row_estimate = row_estimate - *off;
+                    } E {
+                        row_estimate = 0;
+                    }
+                },
+                None => {},
+            }
+            M limit {
+                Some(lim) => {
+                    I row_estimate > *lim {
+                        row_estimate = *lim;
+                    }
+                },
+                None => {},
+            }
+
+            Ok(CostEstimate.new(input_cost.io_cost, input_cost.cpu_cost, row_estimate))
+        },
+
+        PlanNode.Distinct { input } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Distinct: hash-based deduplication
+            cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
+
+            # Output rows: estimate as sqrt(N) distinct values
+            row_estimate := mut ((input_cost.row_estimate as f64).sqrt()) as u64;
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
+        },
+
+        PlanNode.Window { input, .. } => {
+            input_cost := mut estimate_cost(input, catalog)?;
+
+            # Window functions: sort + scan
+            n := mut input_cost.row_estimate as f64;
+            cpu_cost := mut input_cost.cpu_cost + n * n.log2() + n;
+
+            Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, input_cost.row_estimate))
+        },
+
+        PlanNode.Values { rows } => {
+            # Constant values: no I/O, minimal CPU
+            Ok(CostEstimate.new(0.0, rows.len() as f64, rows.len() as u64))
+        },
+
+        PlanNode.Empty => {
+            Ok(CostEstimate.new(0.0, 0.0, 0))
+        },
+    }
+}
+
+# ============================================================================
+# Plan Printing (for EXPLAIN)
+# ============================================================================
+
+# Format a plan node as a human-readable string for EXPLAIN output
+F format_plan(node: &PlanNode, indent: u64) -> Str {
+    prefix := mut "  ".repeat(indent);
+
+    M node {
+        PlanNode.SeqScan { table, alias, filter } => {
+            s := mut "{prefix}SeqScan on {table}";
+            M alias {
+                Some(ref a) => { s = "{s} as {a}"; },
+                None => {},
+            }
+            M filter {
+                Some(ref f) => { s = "{s} (filter: <expr>)"; },
+                None => {},
+            }
+            s
+        },
+
+        PlanNode.IndexScan { table, index, residual, .. } => {
+            s := mut "{prefix}IndexScan on {table} using {index}";
+            M residual {
+                Some(ref r) => { s = "{s} (residual: <expr>)"; },
+                None => {},
+            }
+            s
+        },
+
+        PlanNode.Filter { input, predicate } => {
+            s := mut "{prefix}Filter\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Project { input, columns } => {
+            s := mut "{prefix}Project ({columns.len()} columns)\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.NestedLoopJoin { left, right, join_type, .. } => {
+            s := mut "{prefix}NestedLoopJoin ({join_type:?})\n";
+            s = "{s}{format_plan(left, indent + 1)}\n";
+            s = "{s}{format_plan(right, indent + 1)}"
+            s
+        },
+
+        PlanNode.HashJoin { build, probe, join_type, .. } => {
+            s := mut "{prefix}HashJoin ({join_type:?})\n";
+            s = "{s}{format_plan(build, indent + 1)}\n";
+            s = "{s}{format_plan(probe, indent + 1)}"
+            s
+        },
+
+        PlanNode.Sort { input, order_by } => {
+            s := mut "{prefix}Sort ({order_by.len()} keys)\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Aggregate { input, group_by, aggregates, .. } => {
+            s := mut "{prefix}Aggregate (groups: {group_by.len()}, aggs: {aggregates.len()})\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Limit { input, limit, offset } => {
+            s := mut "{prefix}Limit";
+            M limit {
+                Some(lim) => { s = "{s} {lim}"; },
+                None => {},
+            }
+            M offset {
+                Some(off) => { s = "{s} offset {off}"; },
+                None => {},
+            }
+            s = "{s}\n{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Distinct { input } => {
+            s := mut "{prefix}Distinct\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Window { input, window_specs } => {
+            s := mut "{prefix}Window ({window_specs.len()} specs)\n";
+            s = "{s}{format_plan(input, indent + 1)}"
+            s
+        },
+
+        PlanNode.Values { rows } => {
+            "{prefix}Values ({rows.len()} rows)"
+        },
+
+        PlanNode.Empty => {
+            "{prefix}Empty"
+        },
+    }
+}

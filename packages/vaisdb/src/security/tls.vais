@@ -1,0 +1,326 @@
+# TLS Connection Manager
+# Certificate-based TLS for TCP connections
+# Supports server certificates and optional client certificate authentication
+# Integrates with TCP accept loop for TLS handshake
+# Error codes: EE=09 (security), CC=08 (encryption/TLS)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/file.{read_file, file_exists};
+U storage/error.{VaisError, ErrorSeverity};
+U security/types.{
+    err_encryption_failed, err_invalid_encryption_config,
+};
+
+# ============================================================================
+# TLS Configuration
+# ============================================================================
+
+S TlsConfig {
+    enabled: bool,
+    cert_path: Str,                        # Server certificate file (PEM)
+    key_path: Str,                         # Server private key file (PEM)
+    ca_path: Str,                          # CA certificate file for client cert verification (PEM)
+    require_client_cert: bool,             # Require client certificate authentication
+    min_tls_version: TlsVersion,           # Minimum TLS version (default: TLS 1.2)
+}
+
+# TLS protocol version
+L TlsVersion = Tls12 | Tls13;
+
+X TlsConfig {
+    # Default: TLS disabled
+    F disabled() -> TlsConfig {
+        TlsConfig {
+            enabled: false,
+            cert_path: "",
+            key_path: "",
+            ca_path: "",
+            require_client_cert: false,
+            min_tls_version: TlsVersion.Tls12,
+        }
+    }
+
+    # Create with server certificate
+    F new(cert_path: Str, key_path: Str) -> TlsConfig {
+        enabled := mut cert_path.len() > 0 && key_path.len() > 0;
+        TlsConfig {
+            enabled,
+            cert_path,
+            key_path,
+            ca_path: "",
+            require_client_cert: false,
+            min_tls_version: TlsVersion.Tls12,
+        }
+    }
+
+    # Enable client certificate authentication
+    F with_client_cert_auth(mut self, ca_path: Str) -> TlsConfig {
+        self.ca_path = ca_path;
+        self.require_client_cert = true;
+        # Return self by move pattern (Vais builder)
+        TlsConfig {
+            enabled: self.enabled,
+            cert_path: self.cert_path.clone(),
+            key_path: self.key_path.clone(),
+            ca_path: self.ca_path.clone(),
+            require_client_cert: self.require_client_cert,
+            min_tls_version: self.min_tls_version,
+        }
+    }
+
+    # Set minimum TLS version
+    F with_min_version(mut self, version: TlsVersion) -> TlsConfig {
+        self.min_tls_version = version;
+        TlsConfig {
+            enabled: self.enabled,
+            cert_path: self.cert_path.clone(),
+            key_path: self.key_path.clone(),
+            ca_path: self.ca_path.clone(),
+            require_client_cert: self.require_client_cert,
+            min_tls_version: self.min_tls_version,
+        }
+    }
+
+    F is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    F requires_client_cert(self) -> bool {
+        self.require_client_cert
+    }
+}
+
+# ============================================================================
+# TlsManager — Manages TLS state for the server
+# ============================================================================
+
+S TlsManager {
+    config: TlsConfig,
+    server_cert: Vec<u8>,                  # Loaded server certificate (PEM bytes)
+    server_key: Vec<u8>,                   # Loaded server private key (PEM bytes)
+    ca_cert: Vec<u8>,                      # Loaded CA certificate (PEM bytes, for client auth)
+    initialized: bool,
+}
+
+X TlsManager {
+    # Create a disabled TLS manager (no encryption)
+    F disabled() -> TlsManager {
+        TlsManager {
+            config: TlsConfig.disabled(),
+            server_cert: Vec.new(),
+            server_key: Vec.new(),
+            ca_cert: Vec.new(),
+            initialized: false,
+        }
+    }
+
+    # Initialize TLS manager by loading certificates from disk
+    F init(config: TlsConfig) -> Result<TlsManager, VaisError> {
+        I !config.enabled {
+            R Ok(TlsManager.disabled());
+        }
+
+        # Validate certificate paths
+        I !file_exists(&config.cert_path) {
+            R Err(err_invalid_encryption_config(
+                "TLS certificate file not found: {config.cert_path}"
+            ));
+        }
+        I !file_exists(&config.key_path) {
+            R Err(err_invalid_encryption_config(
+                "TLS private key file not found: {config.key_path}"
+            ));
+        }
+
+        # Load certificate files
+        cert_data := mut read_file(&config.cert_path)?;
+        key_data := mut read_file(&config.key_path)?;
+
+        # Validate PEM format (basic check: starts with "-----BEGIN")
+        I !is_pem_format(&cert_data) {
+            R Err(err_invalid_encryption_config(
+                "TLS certificate is not in PEM format"
+            ));
+        }
+        I !is_pem_format(&key_data) {
+            R Err(err_invalid_encryption_config(
+                "TLS private key is not in PEM format"
+            ));
+        }
+
+        # Load CA certificate if client cert auth is enabled
+        ca_data := mut Vec.new();
+        I config.require_client_cert {
+            I config.ca_path.len() == 0 {
+                R Err(err_invalid_encryption_config(
+                    "Client certificate auth requires ca_path to be set"
+                ));
+            }
+            I !file_exists(&config.ca_path) {
+                R Err(err_invalid_encryption_config(
+                    "CA certificate file not found: {config.ca_path}"
+                ));
+            }
+            ca_data = read_file(&config.ca_path)?;
+            I !is_pem_format(&ca_data) {
+                R Err(err_invalid_encryption_config(
+                    "CA certificate is not in PEM format"
+                ));
+            }
+        }
+
+        Ok(TlsManager {
+            config,
+            server_cert: cert_data,
+            server_key: key_data,
+            ca_cert: ca_data,
+            initialized: true,
+        })
+    }
+
+    # Check if TLS is initialized and enabled
+    F is_enabled(self) -> bool {
+        self.initialized && self.config.enabled
+    }
+
+    # Get TLS version negotiation preference as wire byte
+    # 0x03,0x03 = TLS 1.2, 0x03,0x04 = TLS 1.3
+    F min_version_bytes(self) -> (u8, u8) {
+        M &self.config.min_tls_version {
+            TlsVersion.Tls12 => (0x03, 0x03),
+            TlsVersion.Tls13 => (0x03, 0x04),
+        }
+    }
+
+    # Perform TLS handshake on an accepted connection
+    # This is a placeholder for the actual TLS implementation
+    # Real implementation would use C FFI to OpenSSL/rustls
+    #
+    # Returns: TlsConnection wrapping the raw socket fd
+    F handshake(self, socket_fd: i32) -> Result<TlsConnection, VaisError> {
+        I !self.initialized {
+            R Err(err_encryption_failed("TLS not initialized"));
+        }
+
+        # Placeholder: in production, this would:
+        # 1. Create SSL context with loaded cert/key
+        # 2. Set SSL_CTX options (min version, cipher suites)
+        # 3. If client cert auth: SSL_CTX_set_verify(SSL_VERIFY_PEER)
+        # 4. Create SSL from context, SSL_set_fd(socket_fd)
+        # 5. SSL_accept() for server-side handshake
+        # 6. Return TlsConnection wrapping the SSL pointer
+
+        Ok(TlsConnection {
+            socket_fd,
+            is_tls: true,
+            client_cert_cn: Str.new(),
+        })
+    }
+
+    # Get loaded certificate info for diagnostics
+    F cert_info(self) -> Str {
+        I !self.initialized {
+            R "TLS disabled";
+        }
+        info := mut "TLS enabled, cert: {self.config.cert_path}";
+        I self.config.require_client_cert {
+            info = "{info}, client cert auth: required";
+        }
+        info
+    }
+
+    # Check if client certificate authentication is required
+    F requires_client_cert(self) -> bool {
+        self.config.require_client_cert
+    }
+}
+
+# ============================================================================
+# TlsConnection — Wraps a TLS-encrypted socket connection
+# ============================================================================
+
+S TlsConnection {
+    socket_fd: i32,
+    is_tls: bool,
+    client_cert_cn: Str,                   # Client certificate Common Name (if client cert auth)
+}
+
+X TlsConnection {
+    # Create a plain (non-TLS) connection wrapper
+    F plain(socket_fd: i32) -> TlsConnection {
+        TlsConnection {
+            socket_fd,
+            is_tls: false,
+            client_cert_cn: Str.new(),
+        }
+    }
+
+    # Check if this connection is TLS-encrypted
+    F is_encrypted(self) -> bool {
+        self.is_tls
+    }
+
+    # Get the client certificate Common Name (for client cert auth)
+    F client_cn(self) -> &Str {
+        &self.client_cert_cn
+    }
+
+    # Set the client cert CN after handshake
+    F set_client_cn(mut self, cn: Str) {
+        self.client_cert_cn = cn;
+    }
+
+    # Read data from the connection
+    # Placeholder: real implementation dispatches to SSL_read or plain read
+    F read(self, buf: &mut Vec<u8>, max_len: u64) -> Result<u64, VaisError> {
+        I self.is_tls {
+            # SSL_read(ssl, buf, max_len) via C FFI
+            # Placeholder: falls through to plain read
+        }
+        # Plain read: std/net.tcp_read(socket_fd, buf, max_len)
+        std/net.tcp_read(self.socket_fd, buf, max_len)
+    }
+
+    # Write data to the connection
+    # Placeholder: real implementation dispatches to SSL_write or plain write
+    F write(self, data: &[u8]) -> Result<u64, VaisError> {
+        I self.is_tls {
+            # SSL_write(ssl, data, data.len()) via C FFI
+            # Placeholder: falls through to plain write
+        }
+        # Plain write: std/net.tcp_write(socket_fd, data)
+        std/net.tcp_write(self.socket_fd, data)
+    }
+
+    # Close the connection
+    F close(mut self) -> Result<(), VaisError> {
+        I self.is_tls {
+            # SSL_shutdown(ssl) via C FFI
+        }
+        std/net.tcp_close(self.socket_fd)
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Check if data starts with PEM header
+F is_pem_format(data: &Vec<u8>) -> bool {
+    # PEM files start with "-----BEGIN"
+    prefix := mut "-----BEGIN";
+    prefix_bytes := mut prefix.as_bytes();
+    I data.len() < prefix_bytes.len() {
+        R false;
+    }
+    i: u64 := mut 0;
+    L i < prefix_bytes.len() {
+        I data[i] != prefix_bytes[i] {
+            R false;
+        }
+        i = i + 1;
+    }
+    true
+}

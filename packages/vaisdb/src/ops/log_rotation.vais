@@ -1,0 +1,216 @@
+# Production Operations — Log Rotation
+# Phase 9 Task 8: Size-based and time-based log file rotation
+# Provides: LogRotator for main log and slow query log files
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/file.{File, file_exists, file_size, rename_file, remove_file, read_dir};
+U std/sync.{Mutex};
+U storage/error.{VaisError};
+U ops/types.{
+    LogRotationConfig, LogRotationResult,
+    LOG_ROTATE_SIZE, LOG_ROTATE_TIME, LOG_ROTATE_BOTH,
+    err_log_rotation_failed,
+};
+
+# ============================================================================
+# LogRotator — Manages log file rotation
+# ============================================================================
+
+## Rotates log files based on size or time thresholds.
+## Maintains up to max_files rotated copies.
+## Naming: vaisdb.log -> vaisdb.log.1 -> vaisdb.log.2 -> ... -> (deleted)
+S LogRotator {
+    config: LogRotationConfig,
+    log_file_path: Str,              # Path to the active log file
+    last_rotation_time: i64,         # Epoch seconds of last rotation
+    lock: Mutex,                     # Serializes rotation operations
+}
+
+X LogRotator {
+    ## Create a new log rotator
+    F new(config: LogRotationConfig, log_file_path: Str, current_time: i64) -> LogRotator {
+        LogRotator {
+            config,
+            log_file_path,
+            last_rotation_time: current_time,
+            lock: Mutex.new(),
+        }
+    }
+
+    ## Check if rotation is needed based on current conditions
+    F needs_rotation(self, current_time: i64) -> Result<bool, VaisError> {
+        I !file_exists(&self.log_file_path) {
+            R Ok(false);
+        }
+
+        M self.config.mode {
+            0 => {
+                # LOG_ROTATE_SIZE: check file size
+                size := mut file_size(&self.log_file_path)?;
+                Ok(size >= self.config.max_size_bytes)
+            },
+            1 => {
+                # LOG_ROTATE_TIME: check time elapsed
+                elapsed := mut (current_time - self.last_rotation_time) as u32;
+                Ok(elapsed >= self.config.rotation_interval_sec)
+            },
+            2 => {
+                # LOG_ROTATE_BOTH: either condition triggers rotation
+                size := mut file_size(&self.log_file_path)?;
+                size_exceeded := mut size >= self.config.max_size_bytes;
+
+                elapsed := mut (current_time - self.last_rotation_time) as u32;
+                time_exceeded := mut elapsed >= self.config.rotation_interval_sec;
+
+                Ok(size_exceeded || time_exceeded)
+            },
+            _ => Ok(false),
+        }
+    }
+
+    ## Perform log rotation
+    ## Returns rotation result (whether rotation happened, file paths)
+    F rotate(mut self, current_time: i64) -> Result<LogRotationResult, VaisError> {
+        guard := mut self.lock.lock();
+        result := mut LogRotationResult.new();
+
+        I !file_exists(&self.log_file_path) {
+            R Ok(result);
+        }
+
+        # Check if rotation is actually needed
+        should_rotate := mut self.needs_rotation(current_time)?;
+        I !should_rotate {
+            R Ok(result);
+        }
+
+        # Step 1: Shift existing rotated files (N -> N+1)
+        # Delete the oldest if it exceeds max_files
+        deleted := mut self.shift_rotated_files()?;
+        result.files_deleted = deleted;
+
+        # Step 2: Rename current log to .1
+        rotated_path := mut "{self.log_file_path}.1";
+        rename_file(&self.log_file_path, &rotated_path)?;
+
+        result.rotated = true;
+        result.archived_file = rotated_path;
+        result.new_log_file = self.log_file_path.clone();
+
+        # Step 3: Update last rotation time
+        self.last_rotation_time = current_time;
+
+        Ok(result)
+    }
+
+    ## Rotate only if needed (convenience method combining check + rotate)
+    F rotate_if_needed(mut self, current_time: i64) -> Result<LogRotationResult, VaisError> {
+        should := mut self.needs_rotation(current_time)?;
+        I should {
+            self.rotate(current_time)
+        } E {
+            Ok(LogRotationResult.new())
+        }
+    }
+
+    # ========================================================================
+    # Internal Helpers
+    # ========================================================================
+
+    ## Shift rotated files: .1 -> .2, .2 -> .3, etc.
+    ## Delete files beyond max_files limit
+    ## Returns number of files deleted
+    F shift_rotated_files(self) -> Result<u32, VaisError> {
+        deleted: u32 := mut 0;
+        max := mut self.config.max_files;
+
+        # Work backwards from max to 1
+        i := mut max;
+        L i >= 1 {
+            old_path := mut "{self.log_file_path}.{i}";
+
+            I file_exists(&old_path) {
+                I i >= max {
+                    # Delete files at or beyond the limit
+                    remove_file(&old_path)?;
+                    deleted = deleted + 1;
+                } E {
+                    # Shift to next number
+                    new_num := mut i + 1;
+                    new_path := mut "{self.log_file_path}.{new_num}";
+                    rename_file(&old_path, &new_path)?;
+                }
+            }
+
+            I i == 0 {
+                # Prevent underflow; break out of loop
+                R Ok(deleted);
+            }
+            i = i - 1;
+        }
+
+        Ok(deleted)
+    }
+
+    ## Get list of all rotated log files (sorted by number)
+    F list_rotated_files(self) -> Vec<Str> {
+        files := mut Vec.new();
+        i: u32 := mut 1;
+        L i <= self.config.max_files {
+            path := mut "{self.log_file_path}.{i}";
+            I file_exists(&path) {
+                files.push(path);
+            }
+            i = i + 1;
+        }
+        files
+    }
+
+    ## Get total size of all log files (current + rotated)
+    F total_log_size(self) -> Result<u64, VaisError> {
+        total: u64 := mut 0;
+
+        # Current log file
+        I file_exists(&self.log_file_path) {
+            total = total + file_size(&self.log_file_path)?;
+        }
+
+        # Rotated files
+        rotated := mut self.list_rotated_files();
+        i: u64 := mut 0;
+        L i < rotated.len() {
+            total = total + file_size(&rotated[i])?;
+            i = i + 1;
+        }
+
+        Ok(total)
+    }
+
+    ## Clean up all rotated log files (keep only current)
+    F clean_rotated(mut self) -> Result<u32, VaisError> {
+        guard := mut self.lock.lock();
+        deleted: u32 := mut 0;
+        i: u32 := mut 1;
+        L i <= self.config.max_files {
+            path := mut "{self.log_file_path}.{i}";
+            I file_exists(&path) {
+                remove_file(&path)?;
+                deleted = deleted + 1;
+            }
+            i = i + 1;
+        }
+        Ok(deleted)
+    }
+
+    ## Get the configuration
+    F get_config(self) -> &LogRotationConfig {
+        &self.config
+    }
+
+    ## Update last rotation time (useful after manual rotation)
+    F set_last_rotation_time(mut self, time: i64) {
+        self.last_rotation_time = time;
+    }
+}

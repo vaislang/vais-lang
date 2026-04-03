@@ -1,0 +1,456 @@
+# MEMORY_SEARCH() SQL Function Executor
+# SQL interface: MEMORY_SEARCH(query_text, memory_type, session_id, top_k)
+# Searches agent memory entries using vector similarity + importance scoring
+# Volcano-style iterator: open → next → close
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+U rag/types.{
+    RagSearchResult, ScoredChunk, ENGINE_TAG_RAG,
+    MEMORY_TYPE_EPISODIC, MEMORY_TYPE_SEMANTIC,
+    MEMORY_TYPE_PROCEDURAL, MEMORY_TYPE_WORKING,
+    err_rag_engine_closed, err_rag_memory_not_found
+};
+U rag/memory/types.{MemoryEntry, ImportanceScorer};
+
+# ============================================================================
+# Error Codes: EE=08 (RAG), CC=08 (memory search)
+# ============================================================================
+
+F err_memory_search_failed(reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0808001",
+        "MEMORY_SEARCH failed: {reason}"
+    )
+}
+
+F err_memory_search_not_open() -> VaisError {
+    VaisError.new(
+        "VAIS-0808002",
+        "MEMORY_SEARCH executor not opened"
+    )
+}
+
+# ============================================================================
+# MemorySearchParams — Parameters parsed from MEMORY_SEARCH()
+# ============================================================================
+
+S MemorySearchParams {
+    query_text: Str,                # Search query
+    memory_type_filter: Option<u8>, # None=all types, Some(type)=specific type
+    session_id_filter: Option<u64>, # None=all sessions, Some(id)=specific session
+    top_k: u32,                     # Number of results
+    min_importance: f64,            # Minimum importance threshold (default 0.0)
+    include_expired: bool,          # Include TTL-expired entries (default false)
+    recency_boost: f64,             # Boost recent memories (default 0.3)
+    importance_weight: f64,         # Weight for importance in scoring (default 0.4)
+    similarity_weight: f64,         # Weight for vector similarity (default 0.6)
+}
+
+X MemorySearchParams {
+    F default(query_text: Str, top_k: u32) -> MemorySearchParams {
+        MemorySearchParams {
+            query_text,
+            memory_type_filter: None,
+            session_id_filter: None,
+            top_k,
+            min_importance: 0.0,
+            include_expired: false,
+            recency_boost: 0.3,
+            importance_weight: 0.4,
+            similarity_weight: 0.6,
+        }
+    }
+
+    F with_type_filter(mut self, memory_type: u8) -> MemorySearchParams {
+        self.memory_type_filter = Some(memory_type);
+        self
+    }
+
+    F with_session_filter(mut self, session_id: u64) -> MemorySearchParams {
+        self.session_id_filter = Some(session_id);
+        self
+    }
+
+    F with_min_importance(mut self, min: f64) -> MemorySearchParams {
+        self.min_importance = min;
+        self
+    }
+
+    ## Validate parameters
+    F validate(self) -> Result<(), VaisError> {
+        I self.query_text.is_empty() {
+            R Err(err_memory_search_failed(&"query_text is empty"));
+        }
+        I self.top_k == 0 {
+            R Err(err_memory_search_failed(&"top_k must be > 0"));
+        }
+        total := mut self.importance_weight + self.similarity_weight;
+        I total < 0.01 {
+            R Err(err_memory_search_failed(&"Weights sum to zero"));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# MemorySearchResult — Enriched memory search result
+# ============================================================================
+
+S MemorySearchResult {
+    memory_id: u64,
+    memory_type: u8,
+    content: Str,
+    score: f64,                     # Fused similarity + importance score
+    similarity_score: f64,          # Raw vector similarity
+    importance_score: f64,          # Decayed importance
+    recency_score: f64,             # Recency boost component
+    session_id: u64,
+    metadata: HashMap<Str, Str>,
+}
+
+X MemorySearchResult {
+    F new(memory_id: u64, memory_type: u8, content: Str, score: f64) -> MemorySearchResult {
+        MemorySearchResult {
+            memory_id,
+            memory_type,
+            content,
+            score,
+            similarity_score: 0.0,
+            importance_score: 0.0,
+            recency_score: 0.0,
+            session_id: 0,
+            metadata: HashMap.new(),
+        }
+    }
+
+    ## Convert to RagSearchResult for unified pipeline
+    F to_rag_result(self) -> RagSearchResult {
+        result := mut RagSearchResult.new(
+            self.memory_id, 0, self.score, self.content.clone()
+        );
+        result
+    }
+
+    ## Format memory type as string
+    F type_name(self) -> Str {
+        M self.memory_type {
+            0 => "episodic",
+            1 => "semantic",
+            2 => "procedural",
+            3 => "working",
+            _ => "unknown",
+        }
+    }
+}
+
+# ============================================================================
+# MemorySearchExecutor — Volcano-style executor for MEMORY_SEARCH()
+# ============================================================================
+
+S MemorySearchExecutor {
+    params: MemorySearchParams,
+    results: Vec<MemorySearchResult>,
+    cursor: u32,
+    is_open: bool,
+}
+
+X MemorySearchExecutor {
+    F new(params: MemorySearchParams) -> MemorySearchExecutor {
+        MemorySearchExecutor {
+            params,
+            results: Vec.new(),
+            cursor: 0,
+            is_open: false,
+        }
+    }
+
+    ## Open the executor — runs the memory search pipeline
+    ##
+    ## Pipeline:
+    ## 1. Filter memories by type, session, TTL
+    ## 2. Score by vector similarity (pre-computed, passed in)
+    ## 3. Score by importance (with decay)
+    ## 4. Score by recency
+    ## 5. Fuse scores: weight_sim * similarity + weight_imp * importance + recency_boost * recency
+    ## 6. Apply min_importance threshold
+    ## 7. Sort by fused score, take top_k
+    F open(
+        mut self,
+        memories: &Vec<MemoryEntry>,
+        similarity_scores: &Vec<(u64, f64)>,  # (memory_id, similarity_score)
+        current_time: i64,
+    ) -> Result<(), VaisError> {
+        self.params.validate()?;
+
+        candidates := mut Vec.new();
+
+        # Step 1: Filter memories
+        mi: u32 := mut 0;
+        L mi < memories.len() as u32 {
+            mem := mut memories.get(mi as u64);
+
+            # Type filter
+            skip_entry := mut false;
+            M self.params.memory_type_filter {
+                Some(t) => {
+                    I mem.memory_type != t {
+                        skip_entry = true;
+                    }
+                },
+                None => {},
+            }
+
+            # Session filter
+            I !skip_entry {
+                M self.params.session_id_filter {
+                    Some(sid) => {
+                        I mem.session_id != sid {
+                            skip_entry = true;
+                        }
+                    },
+                    None => {},
+                }
+            }
+
+            # TTL filter
+            I !skip_entry && !self.params.include_expired && mem.ttl_seconds > 0 {
+                expiry := mut mem.created_at + mem.ttl_seconds as i64;
+                I current_time > expiry {
+                    skip_entry = true;
+                }
+            }
+
+            I !skip_entry {
+                # Step 2: Get similarity score
+                sim_score := mut find_similarity(mem.memory_id, similarity_scores);
+
+                # Step 3: Get importance with decay
+                imp_score := mut mem.importance;
+                I current_time > mem.last_accessed {
+                    age_seconds := mut (current_time - mem.last_accessed) as f64;
+                    half_life: f64 := mut 604800.0;  # 7 days in seconds
+                    decay := mut power_of_half(age_seconds / half_life);
+                    imp_score = imp_score * decay;
+                }
+
+                # Step 4: Recency score (higher for more recent)
+                recency: f64 := mut 0.0;
+                I current_time > mem.created_at {
+                    age := mut (current_time - mem.created_at) as f64;
+                    max_age: f64 := mut 86400.0 * 30.0;  # 30 days
+                    I age < max_age {
+                        recency = 1.0 - (age / max_age);
+                    }
+                } E {
+                    recency = 1.0;
+                }
+
+                # Step 5: Fuse scores
+                fused := mut self.params.similarity_weight * sim_score
+                       + self.params.importance_weight * imp_score
+                       + self.params.recency_boost * recency;
+
+                # Step 6: Apply min_importance threshold
+                I imp_score >= self.params.min_importance {
+                    result := mut MemorySearchResult.new(
+                        mem.memory_id, mem.memory_type, mem.content.clone(), fused
+                    );
+                    result.similarity_score = sim_score;
+                    result.importance_score = imp_score;
+                    result.recency_score = recency;
+                    result.session_id = mem.session_id;
+                    candidates.push(result);
+                }
+            }
+
+            mi = mi + 1;
+        }
+
+        # Step 7: Sort by score descending
+        sort_memory_results_desc(&mut candidates);
+
+        # Take top_k
+        limit := mut I self.params.top_k < candidates.len() as u32 {
+            self.params.top_k
+        } E {
+            candidates.len() as u32
+        };
+
+        ri: u32 := mut 0;
+        L ri < limit {
+            self.results.push(MemorySearchResult.new(
+                candidates.get(ri as u64).memory_id,
+                candidates.get(ri as u64).memory_type,
+                candidates.get(ri as u64).content.clone(),
+                candidates.get(ri as u64).score,
+            ));
+            r := mut self.results.get_mut(self.results.len() as u32 - 1 as u64);
+            r.similarity_score = candidates.get(ri as u64).similarity_score;
+            r.importance_score = candidates.get(ri as u64).importance_score;
+            r.recency_score = candidates.get(ri as u64).recency_score;
+            r.session_id = candidates.get(ri as u64).session_id;
+            ri = ri + 1;
+        }
+
+        self.cursor = 0;
+        self.is_open = true;
+        Ok(())
+    }
+
+    ## Get the next result (Volcano iterator)
+    F next(mut self) -> Option<&MemorySearchResult> {
+        I !self.is_open {
+            R None;
+        }
+        I self.cursor >= self.results.len() as u32 {
+            R None;
+        }
+        result := mut self.results.get(self.cursor as u64);
+        self.cursor = self.cursor + 1;
+        Some(result)
+    }
+
+    ## Close the executor
+    F close(mut self) {
+        self.is_open = false;
+        self.results = Vec.new();
+        self.cursor = 0;
+    }
+
+    ## Get result count
+    F result_count(self) -> u32 {
+        self.results.len() as u32
+    }
+
+    ## Get all results
+    F get_results(self) -> &Vec<MemorySearchResult> {
+        &self.results
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+## Find similarity score for a memory_id in the lookup table
+F find_similarity(memory_id: u64, scores: &Vec<(u64, f64)>) -> f64 {
+    i: u32 := mut 0;
+    L i < scores.len() as u32 {
+        entry := mut scores.get(i as u64);
+        I entry.0 == memory_id {
+            R entry.1;
+        }
+        i = i + 1;
+    }
+    0.0
+}
+
+## Sort memory results by score descending — O(N log N) merge sort
+F sort_memory_results_desc(results: &mut Vec<MemorySearchResult>) {
+    n := mut results.len() as u32;
+    I n <= 1 {
+        R;
+    }
+    # Bottom-up merge sort on indices, then reorder via swap
+    indices := mut Vec.new();
+    aux := mut Vec.new();
+    i: u32 := mut 0;
+    L i < n {
+        indices.push(i);
+        aux.push(i);
+        i = i + 1;
+    }
+
+    width: u32 := mut 1;
+    L width < n {
+        left: u32 := mut 0;
+        L left < n {
+            mid := mut left + width;
+            I mid > n { mid = n; }
+            right := mut left + width * 2;
+            I right > n { right = n; }
+            li := mut left;
+            ri := mut mid;
+            k := mut left;
+            L k < right {
+                I li < mid && (ri >= right ||
+                    results.get(indices.get(li as u64) as u64).score >=
+                    results.get(indices.get(ri as u64) as u64).score) {
+                    aux.set(k as u64, indices.get(li as u64));
+                    li = li + 1;
+                } E {
+                    aux.set(k as u64, indices.get(ri as u64));
+                    ri = ri + 1;
+                }
+                k = k + 1;
+            }
+            left = left + width * 2;
+        }
+        c: u32 := mut 0;
+        L c < n {
+            indices.set(c as u64, aux.get(c as u64));
+            c = c + 1;
+        }
+        width = width * 2;
+    }
+
+    # Apply permutation via swap cycles
+    visited := mut Vec.new();
+    vi: u32 := mut 0;
+    L vi < n {
+        visited.push(false);
+        vi = vi + 1;
+    }
+    ci: u32 := mut 0;
+    L ci < n {
+        I !visited.get(ci as u64) && indices.get(ci as u64) != ci {
+            j := mut ci;
+            done := mut false;
+            L !done {
+                next := mut indices.get(j as u64);
+                I next == ci {
+                    visited.set(j as u64, true);
+                    done = true;
+                } E {
+                    results.swap(j as u64, next as u64);
+                    visited.set(j as u64, true);
+                    j = next;
+                }
+            }
+        }
+        ci = ci + 1;
+    }
+}
+
+## Approximate 2^(-x) = (1/2)^x for importance decay
+## Uses iterative halving for integer part + linear interpolation for fractional
+F power_of_half(x: f64) -> f64 {
+    I x <= 0.0 {
+        R 1.0;
+    }
+    I x > 30.0 {
+        R 0.0;  # Effectively zero after 30 half-lives
+    }
+
+    # Integer part: repeated halving
+    int_part := mut x as u32;
+    frac_part := mut x - int_part as f64;
+
+    result: f64 := mut 1.0;
+    k: u32 := mut 0;
+    L k < int_part {
+        result = result * 0.5;
+        k = k + 1;
+    }
+
+    # Fractional part: linear interpolation between 1.0 and 0.5
+    # This is an approximation: 2^(-f) ≈ 1 - f * 0.3069 (linear approx)
+    frac_decay := mut 1.0 - frac_part * 0.30685;  # ln(2) ≈ 0.30685 for small f
+    result = result * frac_decay;
+
+    result
+}

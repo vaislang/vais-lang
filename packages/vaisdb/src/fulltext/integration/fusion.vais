@@ -1,0 +1,235 @@
+# Score Fusion - Multiple result set fusion for hybrid search
+#
+# Supports:
+# - Weighted sum fusion with normalization
+# - Reciprocal Rank Fusion (RRF)
+
+U std/vec.Vec;
+U std/option.{Option, Some, None};
+
+# ScoredDoc - Document with relevance score
+S ScoredDoc {
+    doc_id: u64,
+    score: f64,
+}
+
+# ScoreFusionMethod - Strategy for combining multiple result sets
+L ScoreFusionMethod {
+    # Weighted sum of normalized scores
+    # Combined score = weight_a * norm_a + weight_b * norm_b
+    WeightedSum { weight_a: f64, weight_b: f64 },
+
+    # Reciprocal Rank Fusion
+    # Score = 1/(k + rank_i) across all result lists
+    # Default k=60 (proven effective in literature)
+    ReciprocalRankFusion { k: u32 },
+}
+
+X ScoredDoc {
+    # Create new scored document
+    F new(doc_id: u64, score: f64) -> ScoredDoc {
+        ScoredDoc { doc_id, score }
+    }
+}
+
+# Fuse two result sets using specified fusion method
+#
+# Returns combined results sorted by fused score (descending)
+F fuse_results(
+    method: &ScoreFusionMethod,
+    results_a: &Vec<ScoredDoc>,
+    results_b: &Vec<ScoredDoc>,
+) -> Vec<ScoredDoc> {
+    M method {
+        ScoreFusionMethod.WeightedSum { weight_a, weight_b } => {
+            fuse_weighted_sum(results_a, results_b, *weight_a, *weight_b)
+        },
+        ScoreFusionMethod.ReciprocalRankFusion { k } => {
+            fuse_rrf(results_a, results_b, *k)
+        },
+    }
+}
+
+# Weighted sum fusion with min-max normalization
+#
+# Process:
+# 1. Normalize each result set to [0,1] range
+# 2. For each unique doc_id, compute: weight_a * norm_a + weight_b * norm_b
+# 3. Sort by combined score descending
+F fuse_weighted_sum(
+    results_a: &Vec<ScoredDoc>,
+    results_b: &Vec<ScoredDoc>,
+    weight_a: f64,
+    weight_b: f64,
+) -> Vec<ScoredDoc> {
+    norm_a := mut normalize_scores(results_a);
+    norm_b := mut normalize_scores(results_b);
+
+    # Build combined result set
+    combined: Vec<ScoredDoc> := mut Vec.new();
+
+    # Process all docs from result set A
+    L i: 0..norm_a.len() {
+        doc_id := mut norm_a[i].doc_id;
+        score_a := mut norm_a[i].score;
+
+        # Find matching doc in result set B
+        score_b := mut 0.0;
+        L j: 0..norm_b.len() {
+            I norm_b[j].doc_id == doc_id {
+                score_b = norm_b[j].score;
+            }
+        }
+
+        fused_score := mut weight_a * score_a + weight_b * score_b;
+        combined.push(ScoredDoc.new(doc_id, fused_score));
+    }
+
+    # Add docs only in result set B
+    L i: 0..norm_b.len() {
+        doc_id := mut norm_b[i].doc_id;
+        found := mut false;
+
+        L j: 0..norm_a.len() {
+            I !found && norm_a[j].doc_id == doc_id {
+                found = true;
+            }
+        }
+
+        I !found {
+            fused_score := mut weight_b * norm_b[i].score;
+            combined.push(ScoredDoc.new(doc_id, fused_score));
+        }
+    }
+
+    sort_by_score_desc(&mut combined);
+    combined
+}
+
+# Reciprocal Rank Fusion (RRF)
+#
+# Formula: score = Σ 1/(k + rank_i)
+# - rank_i is position in result list (1-indexed)
+# - k is constant (typically 60)
+#
+# Advantages:
+# - No score normalization needed
+# - Robust to different scoring scales
+# - Good performance in multi-modal retrieval
+F fuse_rrf(
+    results_a: &Vec<ScoredDoc>,
+    results_b: &Vec<ScoredDoc>,
+    k: u32,
+) -> Vec<ScoredDoc> {
+    # Build map of doc_id -> RRF score
+    combined: Vec<ScoredDoc> := mut Vec.new();
+    k_f64 := mut k as f64;
+
+    # Process result set A
+    L i: 0..results_a.len() {
+        doc_id := mut results_a[i].doc_id;
+        rank := mut (i + 1) as f64;  # 1-indexed rank
+        rrf_contribution := mut 1.0 / (k_f64 + rank);
+
+        # Check if already in combined
+        found := mut false;
+        L j: 0..combined.len() {
+            I !found && combined[j].doc_id == doc_id {
+                combined[j].score += rrf_contribution;
+                found = true;
+            }
+        }
+
+        I !found {
+            combined.push(ScoredDoc.new(doc_id, rrf_contribution));
+        }
+    }
+
+    # Process result set B
+    L i: 0..results_b.len() {
+        doc_id := mut results_b[i].doc_id;
+        rank := mut (i + 1) as f64;  # 1-indexed rank
+        rrf_contribution := mut 1.0 / (k_f64 + rank);
+
+        # Check if already in combined
+        found := mut false;
+        L j: 0..combined.len() {
+            I !found && combined[j].doc_id == doc_id {
+                combined[j].score += rrf_contribution;
+                found = true;
+            }
+        }
+
+        I !found {
+            combined.push(ScoredDoc.new(doc_id, rrf_contribution));
+        }
+    }
+
+    sort_by_score_desc(&mut combined);
+    combined
+}
+
+# Normalize scores to [0,1] range using min-max normalization
+#
+# Formula: norm_score = (score - min) / (max - min)
+# Edge case: if max == min, all scores become 1.0
+F normalize_scores(results: &Vec<ScoredDoc>) -> Vec<ScoredDoc> {
+    I results.len() == 0 {
+        R Vec.new();
+    }
+
+    # Find min and max scores
+    min_score := mut results[0].score;
+    max_score := mut results[0].score;
+
+    L i: 1..results.len() {
+        score := mut results[i].score;
+        I score < min_score {
+            min_score = score;
+        }
+        I score > max_score {
+            max_score = score;
+        }
+    }
+
+    # Normalize
+    normalized: Vec<ScoredDoc> := mut Vec.new();
+    range := mut max_score - min_score;
+
+    I range < 0.000001 {
+        # All scores are essentially equal
+        L i: 0..results.len() {
+            normalized.push(ScoredDoc.new(results[i].doc_id, 1.0));
+        }
+    } E {
+        L i: 0..results.len() {
+            norm_score := mut (results[i].score - min_score) / range;
+            normalized.push(ScoredDoc.new(results[i].doc_id, norm_score));
+        }
+    }
+
+    normalized
+}
+
+# Sort results by score descending (selection sort)
+F sort_by_score_desc(results: &mut Vec<ScoredDoc>) {
+    n := mut results.len();
+
+    L i: 0..n {
+        max_idx := mut i;
+
+        # Find max score in remaining elements
+        L j: (i + 1)..n {
+            I results[j].score > results[max_idx].score {
+                max_idx = j;
+            }
+        }
+
+        # Swap if needed
+        I max_idx != i {
+            temp := mut results[i];
+            results[i] = results[max_idx];
+            results[max_idx] = temp;
+        }
+    }
+}

@@ -1,0 +1,611 @@
+# Vector Engine
+# HNSW index, quantization, similarity search
+# Entry point and high-level facade for vector operations
+
+# ============================================================================
+# Module exports
+# ============================================================================
+
+# Submodules (auto-discovered by filesystem)
+# distance, storage, search, filter, concurrency, hnsw, quantize
+
+# Distance metrics
+U distance.{DistanceMetric, DistanceComputer};
+
+# Vector storage
+U storage.{VectorStore, VectorPage, VectorPageHeader};
+
+# Search functionality
+U search.{VectorSearchExecutor, VectorSearchParams, VectorSearchRow};
+U storage.{HnswNodeStore};
+
+# Filtered search
+U filter.{FilteredVectorSearch, FilterStrategy, FilterConfig};
+
+# Concurrency control
+U concurrency.{ConcurrentHnswIndex, HnswLock, HnswReadGuard, HnswWriteGuard};
+
+# HNSW submodules
+U hnsw/types.{
+    HnswConfig, HnswMeta, HnswNode, HnswNeighbor, SearchCandidate, LayerRng,
+    INVALID_NODE_ID, DISTANCE_COSINE, DISTANCE_L2, DISTANCE_DOT_PRODUCT,
+    DEFAULT_M, DEFAULT_M_MAX_0, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH,
+};
+U hnsw/insert.{hnsw_insert, NodeStore};
+U hnsw/search.{knn_search, SearchResult, SearchResultEntry};
+U hnsw/delete.{hnsw_delete, mvcc_filtered_search, is_vector_visible, is_gc_ready};
+U hnsw/layer.{LayerManager, PinnedLayer};
+U hnsw/wal.{HnswWalManager};
+U hnsw/cow.{CowNeighborStore, EpochManager, CowNeighborList};
+U hnsw/bulk.{BulkLoader, BulkLoadConfig, BulkLoadResult};
+
+# Quantization
+U quantize/mod.{QuantizationManager, QuantizationStrategy};
+
+# Dependencies
+U std/option.{Option, Some, None};
+U std/vec.Vec;
+U std/string.Str;
+U storage/error.{VaisError, ErrorSeverity};
+U storage/buffer/pool.{BufferPool};
+U storage/page/allocator.{PageAllocator};
+U storage/page/freelist.{FreelistBitmap};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/constants.{FILE_ID_VECTORS, PAGE_TYPE_HNSW_META, NULL_PAGE};
+U sql/catalog/manager.{CatalogManager};
+U sql/catalog/schema.{IndexInfo, INDEX_TYPE_HNSW};
+U sql/types.{Expr};
+U sql/executor/mod.{ExecContext};
+
+# ============================================================================
+# Error Codes: EE=02 (vector), CC=10 (module), NNN=001-003
+# ============================================================================
+
+F err_vector_engine_closed() -> VaisError {
+    VaisError.new(
+        "VAIS-0210001",
+        "Vector engine is not open"
+    )
+}
+
+F err_vector_dim_mismatch(expected: u32, actual: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0210002",
+        "Vector dimension mismatch: expected {expected}, got {actual}"
+    )
+}
+
+F err_vector_index_creation_failed(detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0210003",
+        "Failed to create vector index: {detail}"
+    )
+}
+
+# ============================================================================
+# VectorEngine — High-level facade for all vector operations
+# ============================================================================
+
+# VectorEngine manages a single HNSW index instance
+# Integrates: storage, HNSW graph, quantization, WAL, concurrency, layers
+S VectorEngine {
+    config: HnswConfig,              # HNSW configuration (M, ef_construction, etc.)
+    meta: HnswMeta,                  # Metadata (entry_point, max_layer, node_count)
+    store: VectorStore,              # Raw vector data storage
+    node_store: HnswNodeStore,       # HNSW graph structure + NodeStore trait impl
+    distance_computer: DistanceComputer, # Distance metric computer
+    layer_mgr: LayerManager,         # Upper layer (1+) pinning manager
+    wal_mgr: HnswWalManager,         # WAL logging for HNSW operations
+    cow_store: CowNeighborStore,     # Copy-on-write neighbor lists (epoch-based)
+    quantization: QuantizationManager, # Quantization (scalar/PQ)
+    lock: HnswLock,                  # Concurrency control (RwLock)
+    index_id: u32,                   # Catalog index ID
+    is_open: bool,                   # Engine open state
+    pool: &BufferPool,               # Shared buffer pool
+    allocator: &PageAllocator,       # Shared page allocator
+    bitmap: &FreelistBitmap,         # Freelist bitmap (FILE_ID_VECTORS)
+    gcm: &GroupCommitManager,        # Shared group commit manager
+}
+
+X VectorEngine {
+    # ========================================================================
+    # Constructor — Create new vector engine instance
+    # ========================================================================
+
+    ## Create new VectorEngine instance (does not load from disk)
+    ## Call open() to load metadata and upper layers
+    F new(
+        config: HnswConfig,
+        index_id: u32,
+        pool: &BufferPool,
+        allocator: &PageAllocator,
+        bitmap: &FreelistBitmap,
+        gcm: &GroupCommitManager,
+    ) -> Result<VectorEngine, VaisError> {
+        # Validate configuration
+        I config.m == 0 || config.m_max_0 == 0 {
+            R Err(err_hnsw_invalid_config("M and M_max_0 must be > 0"));
+        }
+        I config.ef_construction < config.m {
+            R Err(err_hnsw_invalid_config("ef_construction must be >= M"));
+        }
+        I config.dim == 0 {
+            R Err(err_hnsw_invalid_config("dimension must be > 0"));
+        }
+
+        # Initialize metadata (empty index)
+        meta := mut HnswMeta.new(config.clone(), index_id);
+
+        # Initialize components
+        store := mut VectorStore.new(config.dim, pool, allocator, bitmap);
+        node_store := mut HnswNodeStore.new(&store);
+        distance_computer := mut DistanceComputer.new(config.metric);
+        layer_mgr := mut LayerManager.new(pool, allocator)?;
+        wal_mgr := mut HnswWalManager.new(gcm)?;
+        cow_store := mut CowNeighborStore.new()?;
+        quantization := mut QuantizationManager.new(config.quantization_strategy)?;
+        lock := mut HnswLock.new();
+
+        Ok(VectorEngine {
+            config,
+            meta,
+            store,
+            node_store,
+            distance_computer,
+            layer_mgr,
+            wal_mgr,
+            cow_store,
+            quantization,
+            lock,
+            index_id,
+            is_open: false,
+            pool,
+            allocator,
+            bitmap,
+            gcm,
+        })
+    }
+
+    # ========================================================================
+    # Lifecycle — Open/Close
+    # ========================================================================
+
+    ## Open engine: load meta page and upper layers from disk
+    F open(mut self) -> Result<(), VaisError> {
+        I self.is_open {
+            R Ok(());
+        }
+
+        # Load metadata page
+        meta_page_id := self.index_id;  # Meta page is first page of index
+        meta_data := self.pool.read_page(FILE_ID_VECTORS, meta_page_id)?;
+        self.meta = HnswMeta.deserialize(&meta_data)?;
+
+        # Validate meta matches config
+        I self.meta.dim != self.config.dim {
+            R Err(err_vector_dim_mismatch(self.config.dim, self.meta.dim));
+        }
+
+        # Load upper layers (layer 1+) into memory
+        L layer: 1..(self.meta.max_layer + 1) {
+            self.layer_mgr.pin_layer(layer, &self.meta, self.pool)?;
+        }
+
+        # Initialize quantization with stored vectors
+        self.quantization.initialize(&self.store)?;
+
+        self.is_open = true;
+        Ok(())
+    }
+
+    ## Close engine: flush dirty pages, release resources
+    F close(mut self) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Ok(());
+        }
+
+        # Flush metadata page
+        meta_buf := mut ByteBuffer.new();
+        self.meta.serialize(&mut meta_buf)?;
+        self.pool.write_page(FILE_ID_VECTORS, self.index_id, &meta_buf.to_vec())?;
+
+        # Unpin all upper layers
+        L layer: 1..(self.meta.max_layer + 1) {
+            self.layer_mgr.unpin_layer(layer)?;
+        }
+
+        # Flush all dirty pages
+        self.pool.flush_file(FILE_ID_VECTORS)?;
+
+        self.is_open = false;
+        Ok(())
+    }
+
+    # ========================================================================
+    # Index Management — Create/Drop
+    # ========================================================================
+
+    ## Create new HNSW index: allocate meta page, register in catalog
+    F create_index(
+        config: HnswConfig,
+        catalog: &mut CatalogManager,
+        pool: &BufferPool,
+        allocator: &PageAllocator,
+        gcm: &GroupCommitManager,
+        txn_id: u64,
+        index_name: Str,
+        table_id: u32,
+        column_id: u32,
+    ) -> Result<VectorEngine, VaisError> {
+        # Allocate metadata page
+        meta_page_id := allocator.allocate_page(FILE_ID_VECTORS)?;
+
+        # Register index in catalog
+        index_info := IndexInfo {
+            index_id: meta_page_id,
+            index_name: index_name.clone(),
+            table_id,
+            column_ids: vec![column_id],
+            index_type: INDEX_TYPE_HNSW,
+            is_unique: false,
+            is_primary: false,
+            root_page: meta_page_id,
+        };
+        catalog.create_index(index_info, txn_id)?;
+
+        # Create engine instance
+        engine := mut VectorEngine.new(config, meta_page_id, pool, allocator, gcm)?;
+
+        # Initialize metadata page
+        meta_buf := mut ByteBuffer.new();
+        engine.meta.serialize(&mut meta_buf)?;
+        pool.write_page(FILE_ID_VECTORS, meta_page_id, &meta_buf.to_vec())?;
+
+        # WAL-log index creation
+        engine.wal_mgr.log_index_created(
+            meta_page_id,
+            config.dim,
+            config.metric,
+            txn_id,
+        )?;
+
+        # Mark as open
+        engine.is_open = true;
+
+        Ok(engine)
+    }
+
+    ## Drop index: mark as deleted, release pages
+    F drop_index(mut self, catalog: &mut CatalogManager, txn_id: u64) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # WAL-log drop operation
+        self.wal_mgr.log_index_dropped(self.index_id, txn_id)?;
+
+        # Remove from catalog
+        catalog.drop_index(self.index_id, txn_id)?;
+
+        # Release all pages (meta + vector pages + layer pages)
+        # Meta page
+        self.allocator.free_page(FILE_ID_VECTORS, self.index_id)?;
+
+        # Vector pages
+        L page_id: self.store.get_all_page_ids() {
+            self.allocator.free_page(FILE_ID_VECTORS, page_id)?;
+        }
+
+        # Layer pages
+        L layer: 1..(self.meta.max_layer + 1) {
+            layer_page_ids := self.layer_mgr.get_page_ids_for_layer(layer)?;
+            L page_id: layer_page_ids {
+                self.allocator.free_page(FILE_ID_VECTORS, page_id)?;
+            }
+        }
+
+        # Close engine
+        self.close()?;
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Vector Operations — Insert/Delete
+    # ========================================================================
+
+    ## Insert vector: write to storage, insert into HNSW graph, WAL-log
+    ## Returns node_id (unique identifier for this vector)
+    F insert(
+        mut self,
+        vector: &[f32],
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<u64, VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # Validate dimension
+        I vector.len() != self.config.dim as u64 {
+            R Err(err_vector_dim_mismatch(
+                self.config.dim,
+                vector.len() as u32,
+            ));
+        }
+
+        # Acquire write lock
+        write_guard := mut self.lock.write_lock(txn_id)?;
+
+        # 1. Write vector to storage (allocate page space)
+        (vec_page_id, vec_offset) := mut self.store.write_vector(vector, txn_id, cmd_id)?;
+
+        # 2. Allocate node ID and create HnswNode
+        node_id := mut self.node_store.allocate_node_id();
+        rng := mut LayerRng.new(node_id);  # Seed with node_id for determinism
+        random_layer := mut rng.random_layer(self.config.m);
+        new_node := mut HnswNode.new(node_id, vec_page_id, vec_offset, random_layer, txn_id, cmd_id);
+
+        # 3. Insert into HNSW graph
+        self.meta = hnsw_insert(
+            new_node,
+            vector,
+            self.meta,
+            &self.config,
+            &self.node_store,
+            &self.distance_computer,
+            self.gcm,
+            txn_id,
+            cmd_id,
+        )?;
+
+        # 4. WAL-log insert operation
+        self.wal_mgr.log_insert(
+            self.index_id,
+            node_id,
+            vector,
+            txn_id,
+            cmd_id,
+        )?;
+
+        Ok(node_id)
+    }
+
+    ## Soft-delete vector: mark as deleted, WAL-log
+    ## Actual removal happens during GC
+    F delete(
+        mut self,
+        node_id: u64,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # Acquire write lock
+        write_guard := mut self.lock.write_lock(txn_id)?;
+
+        # Look up node to get vector page location
+        node := mut self.node_store.load_node(node_id)?;
+
+        # Soft-delete in storage (set txn_id_expire)
+        self.store.delete_vector(node.vector_page_id, node.vector_offset, txn_id, cmd_id)?;
+
+        # HNSW delete (mark as deleted, repair neighbor lists)
+        hnsw_delete(
+            node_id,
+            &self.meta,
+            &self.node_store,
+            txn_id,
+            cmd_id,
+            FILE_ID_VECTORS,
+            node.vector_page_id,
+        )?;
+
+        # WAL-log delete operation
+        self.wal_mgr.log_delete(
+            self.index_id,
+            node_id,
+            txn_id,
+            cmd_id,
+        )?;
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Search Operations
+    # ========================================================================
+
+    ## MVCC-filtered k-NN search
+    ## Returns top-k nearest neighbors visible to the snapshot
+    F search(
+        self,
+        query: &[f32],
+        k: u64,
+        ef_search: Option<u32>,
+        snapshot: &Snapshot,
+        clog: &Clog,
+    ) -> Result<SearchResult, VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # Validate dimension
+        I query.len() != self.config.dim as u64 {
+            R Err(err_vector_dim_mismatch(
+                self.config.dim,
+                query.len() as u32,
+            ));
+        }
+
+        # Acquire read lock
+        read_guard := mut self.lock.read_lock()?;
+
+        # Use provided ef_search or default
+        ef := M ef_search {
+            Some(val) => val,
+            None => self.config.ef_search,
+        };
+
+        # MVCC-filtered search
+        result := mut mvcc_filtered_search(
+            query,
+            k,
+            ef,
+            &self.meta,
+            &self.node_store,
+            &self.distance_computer,
+            snapshot,
+            clog,
+        )?;
+
+        Ok(result)
+    }
+
+    ## Filtered search: combines vector search with SQL WHERE predicate
+    ## Uses pre/post/hybrid filter strategy
+    F filtered_search(
+        self,
+        query: &[f32],
+        k: u64,
+        predicate: Option<Expr>,
+        ctx: &ExecContext,
+    ) -> Result<Vec<VectorSearchRow>, VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # Validate dimension
+        I query.len() != self.config.dim as u64 {
+            R Err(err_vector_dim_mismatch(
+                self.config.dim,
+                query.len() as u32,
+            ));
+        }
+
+        # If no predicate, use regular search
+        M predicate {
+            None => {
+                result := self.search(query, k, None, ctx.snapshot, ctx.clog)?;
+                # Convert SearchResult to VectorSearchRow
+                R self.materialize_search_result(result, ctx);
+            },
+            Some(expr) => {
+                # Use filtered search
+                filter_config := FilterConfig.default();
+                filtered_search := FilteredVectorSearch.new(
+                    self,
+                    filter_config,
+                    ctx,
+                )?;
+                R filtered_search.execute(query, k, expr);
+            },
+        }
+    }
+
+    # ========================================================================
+    # Bulk Loading
+    # ========================================================================
+
+    ## Bulk load vectors: efficient batch insertion
+    ## Bypasses WAL if config.bypass_wal = true (requires checkpoint after)
+    F bulk_load(
+        mut self,
+        vectors: &[&[f32]],
+        config: BulkLoadConfig,
+        txn_id: u64,
+    ) -> Result<BulkLoadResult, VaisError> {
+        I !self.is_open {
+            R Err(err_vector_engine_closed());
+        }
+
+        # Validate all vectors have same dimension
+        L vec: vectors {
+            I vec.len() != self.config.dim as u64 {
+                R Err(err_vector_dim_mismatch(
+                    self.config.dim,
+                    vec.len() as u32,
+                ));
+            }
+        }
+
+        # Acquire write lock
+        write_guard := mut self.lock.write_lock(txn_id)?;
+
+        # Create bulk loader
+        loader := mut BulkLoader.new(
+            &mut self.meta,
+            &self.config,
+            &mut self.store,
+            &mut self.layer_mgr,
+            &mut self.cow_store,
+            self.pool,
+            config,
+        )?;
+
+        # Execute bulk load
+        result := loader.load(vectors, txn_id)?;
+
+        # WAL-log bulk load (if not bypassed)
+        I !config.bypass_wal {
+            self.wal_mgr.log_bulk_load(
+                self.index_id,
+                vectors,
+                txn_id,
+            )?;
+        }
+
+        Ok(result)
+    }
+
+    # ========================================================================
+    # Metadata Access
+    # ========================================================================
+
+    ## Get current metadata (snapshot)
+    F get_meta(self) -> &HnswMeta {
+        &self.meta
+    }
+
+    ## Get current node count
+    F node_count(self) -> u64 {
+        self.meta.total_nodes
+    }
+
+    ## Check if engine is open
+    F is_open(self) -> bool {
+        self.is_open
+    }
+
+    # ========================================================================
+    # Internal Helpers
+    # ========================================================================
+
+    # Convert SearchResult to materialized VectorSearchRow
+    # Fetches full row data from heap pages
+    F materialize_search_result(
+        self,
+        result: SearchResult,
+        ctx: &ExecContext,
+    ) -> Result<Vec<VectorSearchRow>, VaisError> {
+        rows := mut Vec.new();
+
+        L entry: result.entries {
+            # Fetch original row from heap page
+            # node_id maps to TID (table row ID)
+            row := ctx.fetch_row_by_tid(entry.node_id)?;
+
+            rows.push(VectorSearchRow {
+                node_id: entry.node_id,
+                distance: entry.distance,
+                row,
+            });
+        }
+
+        Ok(rows)
+    }
+}

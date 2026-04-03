@@ -1,0 +1,521 @@
+# src/fulltext/ddl.vais
+# CREATE/DROP FULLTEXT INDEX DDL operations and incremental maintenance
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/constants.{FILE_ID_FULLTEXT, NULL_PAGE};
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U storage/page/allocator.{PageAllocator};
+U storage/wal/group_commit.{GroupCommitManager};
+U fulltext/types.{
+    FullTextConfig, FullTextMeta, PostingEntry,
+    DictEntry, err_fulltext_index_not_found
+};
+U storage/hash.{fnv1a_hash};
+U fulltext/tokenizer.{Tokenizer, TermFreqInfo};
+U fulltext/index/dictionary.{DictionaryIndex};
+U fulltext/index/posting.{PostingStore};
+
+# Result of building a full-text index
+S BuildResult {
+    docs_indexed: u32,
+    terms_created: u32,
+    total_tokens: u64,
+}
+
+X BuildResult {
+    # Create a new build result
+    F new(docs_indexed: u32, terms_created: u32, total_tokens: u64) -> BuildResult {
+        BuildResult {
+            docs_indexed: docs_indexed,
+            terms_created: terms_created,
+            total_tokens: total_tokens,
+        }
+    }
+
+    # Clone the build result
+    F clone(self) -> BuildResult {
+        BuildResult {
+            docs_indexed: self.docs_indexed,
+            terms_created: self.terms_created,
+            total_tokens: self.total_tokens,
+        }
+    }
+}
+
+# DDL operations for full-text indexes
+S FullTextDDL {
+    allocator: PageAllocator,
+    pool: BufferPool,
+}
+
+X FullTextDDL {
+    # Create a new full-text DDL handler
+    F new(allocator: PageAllocator, pool: BufferPool) -> FullTextDDL {
+        FullTextDDL {
+            allocator: allocator,
+            pool: pool,
+        }
+    }
+
+    # CREATE FULLTEXT INDEX
+    # Steps:
+    # 1. Allocate page for dictionary B+Tree root
+    # 2. Create FullTextMeta with default values
+    # 3. Register in catalog (returns index_id)
+    # 4. Trigger initial index build if table has existing rows
+    #
+    # Returns: index_id
+    # Note: Caller should log WAL record for DDL operation
+    F create_fulltext_index(
+        mut self,
+        table_id: u32,
+        column_id: u32,
+        config: FullTextConfig,
+        txn_id: u64,
+        cmd_id: u32,
+        gcm: &GroupCommitManager,
+    ) -> Result<u32, VaisError> {
+        # Step 1: Allocate dictionary B+Tree root page
+        M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+            Ok(dict_root_page) => {
+                # Step 2: Create FullTextMeta with default values
+                meta := mut FullTextMeta.new(
+                    table_id,
+                    column_id,
+                    dict_root_page,
+                    config.clone(),
+                );
+
+                # Step 3: Register in catalog
+                # Note: Actual catalog registration done by caller
+                # For now, we generate a synthetic index_id based on table_id and column_id
+                index_id := mut (table_id << 16) | (column_id as u32);
+
+                # Step 4: Initialize dictionary B+Tree root page
+                M self.pool.pin_page(FILE_ID_FULLTEXT, dict_root_page, txn_id) {
+                    Ok(mut page_guard) => {
+                        # Initialize as empty B+Tree leaf node
+                        # Format: [is_leaf: u8 = 1][num_keys: u16 = 0][...]
+                        page_data := mut page_guard.data_mut();
+                        page_data[0] = 1u8; # is_leaf
+                        page_data[1] = 0u8; # num_keys low byte
+                        page_data[2] = 0u8; # num_keys high byte
+
+                        page_guard.mark_dirty();
+                        self.pool.unpin_page(FILE_ID_FULLTEXT, dict_root_page);
+
+                        Ok(index_id)
+                    }
+                    Err(e) => {
+                        # Failed to initialize, free the allocated page
+                        M self.allocator.free_page(FILE_ID_FULLTEXT, dict_root_page, txn_id, cmd_id, gcm) {
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
+
+    # DROP FULLTEXT INDEX
+    # Steps:
+    # 1. Remove from catalog
+    # 2. Free all dictionary and posting list pages
+    #
+    # Note: Caller should log WAL record for DDL operation
+    F drop_fulltext_index(
+        mut self,
+        index_id: u32,
+        meta: &FullTextMeta,
+        txn_id: u64,
+        cmd_id: u32,
+        gcm: &GroupCommitManager,
+    ) -> Result<(), VaisError> {
+        # Step 1: Free dictionary B+Tree pages
+        # Note: In a full implementation, we would traverse the B+Tree and free all pages
+        # For simplicity, we free only the root page here
+        M self.allocator.free_page(FILE_ID_FULLTEXT, meta.dict_root_page, txn_id, cmd_id, gcm) {
+            Ok(_) => {}
+            Err(e) => {
+                R Err(e);
+            }
+        }
+
+        # Step 2: Free posting list pages
+        # Note: In a full implementation, we would iterate through all posting list chains
+        # and free each page. This requires catalog integration to track posting pages.
+        # For now, we assume posting pages are tracked elsewhere and will be garbage collected.
+
+        # Step 3: Remove from catalog
+        # Note: Actual catalog removal done by caller
+
+        Ok(())
+    }
+
+    # Build full-text index from a set of rows
+    # Steps:
+    # 1. Scan provided rows (doc_id, text_content)
+    # 2. Tokenize each row
+    # 3. Build posting lists for each term
+    # 4. Update dictionary and metadata
+    #
+    # Returns: BuildResult with statistics
+    # Note: Caller should log WAL records for index entries
+    F build_fulltext_index(
+        mut self,
+        index_id: u32,
+        meta: &FullTextMeta,
+        rows: &Vec<(u64, Str)>,
+        txn_id: u64,
+        cmd_id: u32,
+        gcm: &GroupCommitManager,
+    ) -> Result<BuildResult, VaisError> {
+        tokenizer := mut Tokenizer.new(meta.config.clone());
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
+        posting_store := mut PostingStore.new(self.allocator.clone());
+
+        docs_indexed := mut 0u32;
+        terms_created := mut 0u32;
+        total_tokens := mut 0u64;
+
+        # Step 1 & 2: Scan rows and tokenize
+        L row: rows {
+            doc_id := mut row.0;
+            text_content := mut &row.1;
+
+            # Tokenize the text
+            term_freqs := mut tokenizer.tokenize_with_freqs(text_content);
+
+            I !term_freqs.is_empty() {
+                doc_length := mut 0u32;
+                L tf_info: &term_freqs {
+                    doc_length += tf_info.freq;
+                }
+
+                # Step 3: Build posting lists for each term
+                L tf_info: term_freqs {
+                    term := mut &tf_info.term;
+                    term_freq := mut tf_info.freq;
+                    positions := mut &tf_info.positions;
+
+                    total_tokens += term_freq as u64;
+
+                    # Lookup or create dictionary entry
+                    M dict_index.lookup_term(term, &self.pool) {
+                        Ok(Some(dict_entry)) => {
+                            # Term exists, append to posting list
+                            posting_entry := mut PostingEntry.new(
+                                doc_id,
+                                meta.table_id,
+                                0u32, # row_tid (placeholder)
+                                term_freq,
+                                doc_length,
+                                txn_id,
+                                cmd_id,
+                            );
+
+                            term_hash := mut fnv1a_hash(term);
+                            M posting_store.append_entry(
+                                dict_entry.posting_head_page,
+                                &posting_entry,
+                                term_hash,
+                                txn_id,
+                                gcm,
+                                &self.pool,
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    R Err(e);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            # Term does not exist, create new dictionary entry
+                            # Allocate page for posting list head
+                            M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+                                Ok(posting_head_page) => {
+                                    # Insert term into dictionary
+                                    M dict_index.insert_term(
+                                        term,
+                                        posting_head_page,
+                                        txn_id,
+                                        gcm,
+                                        &self.pool,
+                                    ) {
+                                        Ok(_) => {
+                                            terms_created += 1;
+
+                                            # Create first posting entry
+                                            posting_entry := mut PostingEntry.new(
+                                                doc_id,
+                                                meta.table_id,
+                                                0u32, # row_tid (placeholder)
+                                                term_freq,
+                                                doc_length,
+                                                txn_id,
+                                                cmd_id,
+                                            );
+
+                                            term_hash := mut fnv1a_hash(term);
+                                            M posting_store.append_entry(
+                                                posting_head_page,
+                                                &posting_entry,
+                                                term_hash,
+                                                txn_id,
+                                                gcm,
+                                                &self.pool,
+                                            ) {
+                                                Ok(_) => {}
+                                                Err(e) => {
+                                                    R Err(e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            R Err(e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    R Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            R Err(e);
+                        }
+                    }
+                }
+            }
+
+            docs_indexed += 1;
+        }
+
+        Ok(BuildResult.new(docs_indexed, terms_created, total_tokens))
+    }
+}
+
+# Incremental index maintenance operations
+S IndexEntry {
+    allocator: PageAllocator,
+    pool: BufferPool,
+}
+
+X IndexEntry {
+    # Create a new index entry handler
+    F new(allocator: PageAllocator, pool: BufferPool) -> IndexEntry {
+        IndexEntry {
+            allocator: allocator,
+            pool: pool,
+        }
+    }
+
+    # Insert a row into the full-text index
+    # Called when a new row is inserted into the table
+    # Steps:
+    # 1. Tokenize text
+    # 2. For each term, lookup or create dictionary entry
+    # 3. Append posting entry to posting list
+    #
+    # Note: Caller should log WAL records for index entries
+    F on_insert_row(
+        mut self,
+        index_id: u32,
+        meta: &FullTextMeta,
+        doc_id: u64,
+        text: &Str,
+        table_id: u32,
+        row_tid: u32,
+        txn_id: u64,
+        cmd_id: u32,
+        gcm: &GroupCommitManager,
+    ) -> Result<(), VaisError> {
+        tokenizer := mut Tokenizer.new(meta.config.clone());
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
+        posting_store := mut PostingStore.new(self.allocator.clone());
+
+        # Step 1: Tokenize text
+        term_freqs := mut tokenizer.tokenize_with_freqs(text);
+
+        I term_freqs.is_empty() {
+            R Ok(());
+        }
+
+        doc_length := mut 0u32;
+        L tf_info: &term_freqs {
+            doc_length += tf_info.freq;
+        }
+
+        # Step 2 & 3: Process each term
+        L tf_info: term_freqs {
+            term := mut &tf_info.term;
+            term_freq := mut tf_info.freq;
+
+            # Lookup or create dictionary entry
+            M dict_index.lookup_term(term, &self.pool) {
+                Ok(Some(dict_entry)) => {
+                    # Term exists, append to posting list
+                    posting_entry := mut PostingEntry.new(
+                        doc_id,
+                        table_id,
+                        row_tid,
+                        term_freq,
+                        doc_length,
+                        txn_id,
+                        cmd_id,
+                    );
+
+                    term_hash := mut fnv1a_hash(term);
+                    M posting_store.append_entry(
+                        dict_entry.posting_head_page,
+                        &posting_entry,
+                        term_hash,
+                        txn_id,
+                        gcm,
+                        &self.pool,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            R Err(e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    # Term does not exist, create new dictionary entry
+                    M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+                        Ok(posting_head_page) => {
+                            M dict_index.insert_term(
+                                term,
+                                posting_head_page,
+                                txn_id,
+                                gcm,
+                                &self.pool,
+                            ) {
+                                Ok(_) => {
+                                    posting_entry := mut PostingEntry.new(
+                                        doc_id,
+                                        table_id,
+                                        row_tid,
+                                        term_freq,
+                                        doc_length,
+                                        txn_id,
+                                        cmd_id,
+                                    );
+
+                                    term_hash := mut fnv1a_hash(term);
+                                    M posting_store.append_entry(
+                                        posting_head_page,
+                                        &posting_entry,
+                                        term_hash,
+                                        txn_id,
+                                        gcm,
+                                        &self.pool,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            R Err(e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    R Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            R Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    R Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    # Delete a row from the full-text index
+    # Called when a row is deleted from the table
+    # Uses MVCC approach: marks posting entries as expired
+    # Steps:
+    # 1. Tokenize text (to find affected terms)
+    # 2. For each term, find posting entry with matching doc_id
+    # 3. Mark posting entry as expired (txn_id_expire = txn_id)
+    #
+    # Note: Caller should log WAL records for index deletions
+    # Note: Actual deletion is done via MVCC - posting entry remains but marked expired
+    F on_delete_row(
+        mut self,
+        index_id: u32,
+        meta: &FullTextMeta,
+        doc_id: u64,
+        text: &Str,
+        txn_id: u64,
+        cmd_id: u32,
+        gcm: &GroupCommitManager,
+    ) -> Result<(), VaisError> {
+        tokenizer := mut Tokenizer.new(meta.config.clone());
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
+        posting_store := mut PostingStore.new(self.allocator.clone());
+
+        # Step 1: Tokenize text to find affected terms
+        term_freqs := mut tokenizer.tokenize_with_freqs(text);
+
+        I term_freqs.is_empty() {
+            R Ok(());
+        }
+
+        # Step 2 & 3: Process each term
+        L tf_info: term_freqs {
+            term := mut &tf_info.term;
+
+            # Lookup dictionary entry
+            M dict_index.lookup_term(term, &self.pool) {
+                Ok(Some(dict_entry)) => {
+                    # Read posting list
+                    M posting_store.read_all_entries(dict_entry.posting_head_page, &self.pool) {
+                        Ok(postings) => {
+                            # Find posting entry with matching doc_id
+                            found_posting := mut false;
+                            L posting: postings {
+                                I !found_posting && posting.doc_id == doc_id {
+                                    # Mark as expired
+                                    # Note: Actual implementation would update the posting entry
+                                    # in the page to set txn_id_expire = txn_id
+                                    # For now, we acknowledge that this requires page-level update
+                                    # which should be done via posting_store.expire_entry()
+                                    # (not yet implemented in posting.vais)
+                                    found_posting = true;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            R Err(e);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    # Term not found, nothing to delete
+                }
+                Err(e) => {
+                    R Err(e);
+                }
+            }
+        }
+
+        # Note: Actual MVCC expiration logic (setting txn_id_expire) should be
+        # implemented in PostingStore.expire_entry(head_page, doc_id, txn_id)
+
+        Ok(())
+    }
+}

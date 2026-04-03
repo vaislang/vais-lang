@@ -1,0 +1,609 @@
+# src/vector/hnsw/search.vais
+# HNSW Top-K ANN Search Implementation
+# Phase 5.2.3 - Vector Search Engine
+#
+# Error codes: VE-EE-CC-NNN
+# - EE=02 (vector), CC=03 (search), NNN=001-003
+# - VE-02-03-001: Empty index (no entry point)
+# - VE-02-03-002: Invalid K parameter (K=0 or K > total nodes)
+# - VE-02-03-003: Search layer traversal failed
+
+U std/result.{Result, Ok, Err};
+U std/vec.Vec;
+U std/hashset.HashSet;
+# U std/string.String;  # Removed: Str is builtin
+U src/common/error.{VaisError, ErrorCategory};
+U src/vector/hnsw/types.{
+    HnswMeta,
+    HnswNode,
+    HnswNeighbor,
+    SearchCandidate,
+    INVALID_NODE_ID,
+};
+U src/vector/hnsw/distance.DistanceComputer;
+
+# ============================================================================
+# Public API Structs
+# ============================================================================
+
+S SearchResultEntry {
+    node_id: u64,
+    distance: f32,
+}
+
+X SearchResultEntry {
+    F new(node_id: u64, distance: f32) -> SearchResultEntry {
+        SearchResultEntry {
+            node_id: node_id,
+            distance: distance,
+        }
+    }
+}
+
+S SearchResult {
+    results: Vec<SearchResultEntry>,
+    nodes_visited: u64,
+    distance_computations: u64,
+}
+
+X SearchResult {
+    F new() -> SearchResult {
+        SearchResult {
+            results: Vec.new(),
+            nodes_visited: 0,
+            distance_computations: 0,
+        }
+    }
+
+    F with_capacity(k: u64) -> SearchResult {
+        SearchResult {
+            results: Vec.with_capacity(k),
+            nodes_visited: 0,
+            distance_computations: 0,
+        }
+    }
+
+    F add_result(mut self, entry: SearchResultEntry) {
+        self.results.push(entry);
+    }
+
+    F increment_visited(mut self) {
+        self.nodes_visited = self.nodes_visited + 1;
+    }
+
+    F increment_computations(mut self) {
+        self.distance_computations = self.distance_computations + 1;
+    }
+
+    F sort_by_distance(mut self) {
+        # Sort results by distance in ascending order (closest first)
+        self.results.sort_by(|a, b| {
+            I a.distance < b.distance {
+                -1
+            } E I a.distance > b.distance {
+                1
+            } E {
+                0
+            }
+        });
+    }
+
+    F truncate(mut self, k: u64) {
+        I self.results.len() > k {
+            self.results.truncate(k);
+        }
+    }
+}
+
+# ============================================================================
+# NodeStore Trait - Interface for retrieving nodes and vectors
+# ============================================================================
+
+T NodeStore {
+    F get_node(self, node_id: u64) -> Result<&HnswNode, VaisError>;
+    F get_vector(self, node_id: u64) -> Result<&[f32], VaisError>;
+}
+
+# ============================================================================
+# Priority Queue Implementation using sorted Vec
+# ============================================================================
+
+# MinHeap: sorted ascending, pop_min() removes front (smallest distance)
+S MinHeap {
+    candidates: Vec<SearchCandidate>,
+}
+
+X MinHeap {
+    F new() -> MinHeap {
+        MinHeap {
+            candidates: Vec.new(),
+        }
+    }
+
+    F with_capacity(capacity: u64) -> MinHeap {
+        MinHeap {
+            candidates: Vec.with_capacity(capacity),
+        }
+    }
+
+    # sift_up: after appending, bubble the last element up to restore min-heap property
+    F sift_up(mut self, start: u64) {
+        i := mut start;
+        done := mut false;
+        L i > 0 && !done {
+            parent := (i - 1) / 2;
+            I self.candidates[i].distance < self.candidates[parent].distance {
+                self.candidates.swap(i, parent);
+                i = parent;
+            } E {
+                done = true;
+            }
+        }
+    }
+
+    # sift_down: after replacing root, push the root element down to restore min-heap property
+    F sift_down(mut self, start: u64) {
+        i := mut start;
+        n := self.candidates.len();
+        done := mut false;
+        L !done {
+            left := 2 * i + 1;
+            right := 2 * i + 2;
+            smallest := mut i;
+
+            I left < n && self.candidates[left].distance < self.candidates[smallest].distance {
+                smallest = left;
+            }
+            I right < n && self.candidates[right].distance < self.candidates[smallest].distance {
+                smallest = right;
+            }
+
+            I smallest != i {
+                self.candidates.swap(i, smallest);
+                i = smallest;
+            } E {
+                done = true;
+            }
+        }
+    }
+
+    F push(mut self, candidate: SearchCandidate) {
+        # Append to end, then sift up to restore heap property — O(log n)
+        self.candidates.push(candidate);
+        last := self.candidates.len() - 1;
+        self.sift_up(last);
+    }
+
+    F pop_min(mut self) -> Option<SearchCandidate> {
+        I self.candidates.is_empty() {
+            Option.None
+        } E {
+            # Swap root with last element, pop last, then sift down root — O(log n)
+            last := self.candidates.len() - 1;
+            self.candidates.swap(0, last);
+            min_val := self.candidates.pop();
+            I !self.candidates.is_empty() {
+                self.sift_down(0);
+            }
+            Option.Some(min_val)
+        }
+    }
+
+    F is_empty(self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    F len(self) -> u64 {
+        self.candidates.len()
+    }
+}
+
+# MaxHeap: sorted descending, pop_max() removes front (largest distance)
+# peek_max() returns reference to front (largest distance)
+S MaxHeap {
+    candidates: Vec<SearchCandidate>,
+}
+
+X MaxHeap {
+    F new() -> MaxHeap {
+        MaxHeap {
+            candidates: Vec.new(),
+        }
+    }
+
+    F with_capacity(capacity: u64) -> MaxHeap {
+        MaxHeap {
+            candidates: Vec.with_capacity(capacity),
+        }
+    }
+
+    # sift_up: after appending, bubble the last element up to restore max-heap property
+    F sift_up(mut self, start: u64) {
+        i := mut start;
+        done := mut false;
+        L i > 0 && !done {
+            parent := (i - 1) / 2;
+            I self.candidates[i].distance > self.candidates[parent].distance {
+                self.candidates.swap(i, parent);
+                i = parent;
+            } E {
+                done = true;
+            }
+        }
+    }
+
+    # sift_down: after replacing root, push the root element down to restore max-heap property
+    F sift_down(mut self, start: u64) {
+        i := mut start;
+        n := self.candidates.len();
+        done := mut false;
+        L !done {
+            left := 2 * i + 1;
+            right := 2 * i + 2;
+            largest := mut i;
+
+            I left < n && self.candidates[left].distance > self.candidates[largest].distance {
+                largest = left;
+            }
+            I right < n && self.candidates[right].distance > self.candidates[largest].distance {
+                largest = right;
+            }
+
+            I largest != i {
+                self.candidates.swap(i, largest);
+                i = largest;
+            } E {
+                done = true;
+            }
+        }
+    }
+
+    F push(mut self, candidate: SearchCandidate) {
+        # Append to end, then sift up to restore heap property — O(log n)
+        self.candidates.push(candidate);
+        last := self.candidates.len() - 1;
+        self.sift_up(last);
+    }
+
+    F pop_max(mut self) -> Option<SearchCandidate> {
+        I self.candidates.is_empty() {
+            Option.None
+        } E {
+            # Swap root with last element, pop last, then sift down root — O(log n)
+            last := self.candidates.len() - 1;
+            self.candidates.swap(0, last);
+            max_val := self.candidates.pop();
+            I !self.candidates.is_empty() {
+                self.sift_down(0);
+            }
+            Option.Some(max_val)
+        }
+    }
+
+    F peek_max(self) -> Option<&SearchCandidate> {
+        I self.candidates.is_empty() {
+            Option.None
+        } E {
+            Option.Some(&self.candidates[0])
+        }
+    }
+
+    F is_empty(self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    F len(self) -> u64 {
+        self.candidates.len()
+    }
+
+    F to_vec(self) -> Vec<SearchCandidate> {
+        self.candidates
+    }
+}
+
+# ============================================================================
+# Search Layer - Beam search within a single HNSW layer
+# ============================================================================
+
+# search_layer_ef performs beam search at a specific layer with ef parameter.
+#
+# Algorithm:
+# 1. Initialize visited set, candidates (MinHeap), result (MaxHeap)
+# 2. Add entry points to visited, candidates, and result
+# 3. While candidates not empty:
+#    a. Pop closest candidate c from candidates
+#    b. If c.distance > farthest in result, break (can't improve)
+#    c. For each neighbor of c at this layer:
+#       - Skip if already visited or deleted
+#       - Compute distance to query
+#       - If closer than farthest in result OR result.len < ef:
+#         * Add to candidates and result
+#         * If result.len > ef, evict farthest
+# 4. Return result set
+F search_layer_ef(
+    query: &[f32],
+    entry_points: &[SearchCandidate],
+    ef: u32,
+    layer: u8,
+    store: &dyn NodeStore,
+    distance: &DistanceComputer,
+    mut stats: &mut SearchResult,
+) -> Result<Vec<SearchCandidate>, VaisError> {
+    visited: HashSet<u64> := mut HashSet.new();
+    candidates := mut MinHeap.with_capacity(ef as u64);
+    result := mut MaxHeap.with_capacity(ef as u64);
+
+    # Initialize with entry points
+    ep_idx: u64 := mut 0;
+    L ep_idx < entry_points.len() {
+        ep := mut &entry_points[ep_idx];
+        visited.insert(ep.node_id);
+        candidates.push(SearchCandidate.new(ep.node_id, ep.distance));
+        result.push(SearchCandidate.new(ep.node_id, ep.distance));
+        ep_idx = ep_idx + 1;
+    }
+
+    # Beam search loop
+    beam_done := mut false;
+    L !candidates.is_empty() && !beam_done {
+        c_opt := mut candidates.pop_min();
+        M c_opt {
+            Option.None => { beam_done = true; },
+            Option.Some(c) => {
+                # Check if we can still improve result set
+                should_stop := mut false;
+                f_opt := mut result.peek_max();
+                M f_opt {
+                    Option.Some(f) => {
+                        I c.distance > f.distance {
+                            should_stop = true;
+                        }
+                    },
+                    Option.None => {},
+                }
+
+                I !should_stop {
+                    # Get current node
+                    node := mut store.get_node(c.node_id)?;
+                    stats.increment_visited();
+
+                    # Get neighbors at this layer
+                    neighbors := mut node.get_neighbors(layer)?;
+
+                    # Explore each neighbor
+                    n_idx: u64 := mut 0;
+                    L n_idx < neighbors.len() {
+                        neighbor := mut &neighbors[n_idx];
+                        n_id := mut neighbor.node_id;
+
+                        # Skip if already visited
+                        I !visited.contains(&n_id) {
+                            visited.insert(n_id);
+
+                            # Get neighbor node and check if deleted
+                            n_node := mut store.get_node(n_id)?;
+                            I !n_node.is_deleted {
+                                # Compute distance to query
+                                n_vec := mut store.get_vector(n_id)?;
+                                dist_n := mut distance.compute(query, n_vec)?;
+                                stats.increment_computations();
+
+                                # Check if this neighbor should be added to result set
+                                should_add := mut false;
+                                f_dist_opt := mut result.peek_max();
+                                M f_dist_opt {
+                                    Option.Some(f_dist) => {
+                                        I dist_n < f_dist.distance || (result.len() as u32) < ef {
+                                            should_add = true;
+                                        }
+                                    },
+                                    Option.None => {
+                                        should_add = true;
+                                    },
+                                }
+
+                                I should_add {
+                                    new_candidate := mut SearchCandidate.new(n_id, dist_n);
+                                    candidates.push(SearchCandidate.new(n_id, dist_n));
+                                    result.push(new_candidate);
+
+                                    # Evict farthest if result set exceeds ef
+                                    I (result.len() as u32) > ef {
+                                        result.pop_max();
+                                    }
+                                }
+                            }
+                        }
+
+                        n_idx = n_idx + 1;
+                    }
+                } E {
+                    beam_done = true;
+                }
+            },
+        }
+    }
+
+    # Return result set as Vec
+    Ok(result.to_vec())
+}
+
+# ============================================================================
+# KNN Search - Main entry point for top-K ANN search
+# ============================================================================
+
+# knn_search performs top-K approximate nearest neighbor search through HNSW graph.
+#
+# Algorithm:
+# 1. Validate parameters (non-empty index, K > 0)
+# 2. Phase 1: Greedy descent from top layer to layer 1
+#    - At each layer, search with ef=1 to find single closest node
+#    - Use that node as entry point for next lower layer
+# 3. Phase 2: Beam search at layer 0 with ef_search
+#    - Explore neighborhood with ef_search candidates
+#    - Maintain top ef_search closest nodes
+# 4. Sort final candidates by distance, return top K
+#
+# Returns: SearchResult with up to K nearest neighbors, sorted by distance
+F knn_search(
+    query: &[f32],
+    k: u64,
+    ef_search: u32,
+    meta: &HnswMeta,
+    store: &dyn NodeStore,
+    distance: &DistanceComputer,
+) -> Result<SearchResult, VaisError> {
+    # Validate parameters
+    I meta.is_empty() {
+        err_msg := mut Str.from("Cannot search in empty HNSW index");
+        R Err(VaisError.new(
+            ErrorCategory.Vector,
+            "VE-02-03-001",
+            err_msg,
+        ));
+    }
+
+    I k == 0 || (k as u64) > meta.total_nodes {
+        err_msg := mut Str.from("Invalid K parameter: must be 0 < K <= total_nodes");
+        R Err(VaisError.new(
+            ErrorCategory.Vector,
+            "VE-02-03-002",
+            err_msg,
+        ));
+    }
+
+    # Initialize search result with statistics tracking
+    result := mut SearchResult.with_capacity(k);
+
+    # Get entry point
+    ep_id := mut meta.entry_point;
+    I ep_id == INVALID_NODE_ID {
+        err_msg := mut Str.from("Invalid entry point in HNSW meta");
+        R Err(VaisError.new(
+            ErrorCategory.Vector,
+            "VE-02-03-001",
+            err_msg,
+        ));
+    }
+
+    # Compute distance to entry point
+    ep_vec := mut store.get_vector(ep_id)?;
+    ep_dist := mut distance.compute(query, ep_vec)?;
+    result.increment_computations();
+
+    current_candidates := mut Vec.with_capacity(1);
+    current_candidates.push(SearchCandidate.new(ep_id, ep_dist));
+
+    # Phase 1: Greedy descent from max_layer down to layer 1
+    # At each upper layer, use ef=1 to find single closest node
+    lc := mut meta.max_layer;
+    L lc >= 1 {
+        layer_result := mut search_layer_ef(
+            query,
+            &current_candidates,
+            1,  # ef=1 for greedy descent
+            lc,
+            store,
+            distance,
+            &mut result,
+        )?;
+
+        I layer_result.is_empty() {
+            err_msg := mut Str.from("Search layer returned empty result during descent");
+            R Err(VaisError.new(
+                ErrorCategory.Vector,
+                "VE-02-03-003",
+                err_msg,
+            ));
+        }
+
+        # Use closest node as entry point for next layer
+        current_candidates.clear();
+        current_candidates.push(layer_result[0]);
+
+        lc = lc - 1;
+    }
+
+    # Phase 2: Beam search at layer 0 with ef_search
+    final_candidates := mut search_layer_ef(
+        query,
+        &current_candidates,
+        ef_search,
+        0,  # layer 0
+        store,
+        distance,
+        &mut result,
+    )?;
+
+    # Sort candidates by distance (ascending) and take top K
+    # Convert SearchCandidate to SearchResultEntry
+    idx: u64 := mut 0;
+    L idx < final_candidates.len() {
+        candidate := mut &final_candidates[idx];
+        result.add_result(SearchResultEntry.new(
+            candidate.node_id,
+            candidate.distance,
+        ));
+        idx = idx + 1;
+    }
+
+    result.sort_by_distance();
+    result.truncate(k);
+
+    Ok(result)
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# greedy_search_single performs greedy search to find single closest node at a layer.
+# Used during descent phase from top layer to layer 1.
+F greedy_search_single(
+    query: &[f32],
+    entry_point: u64,
+    layer: u8,
+    store: &dyn NodeStore,
+    distance: &DistanceComputer,
+    mut stats: &mut SearchResult,
+) -> Result<SearchCandidate, VaisError> {
+    ep_vec := mut store.get_vector(entry_point)?;
+    current_dist := mut distance.compute(query, ep_vec)?;
+    stats.increment_computations();
+
+    current_id := mut entry_point;
+    improved := mut true;
+
+    # Greedy descent: keep moving to closer neighbor until local minimum
+    L improved {
+        improved = false;
+        node := mut store.get_node(current_id)?;
+        stats.increment_visited();
+
+        neighbors := mut node.get_neighbors(layer)?;
+
+        n_idx: u64 := mut 0;
+        L n_idx < neighbors.len() {
+            neighbor := mut &neighbors[n_idx];
+            n_id := mut neighbor.node_id;
+
+            # Skip deleted nodes
+            n_node := mut store.get_node(n_id)?;
+            I !n_node.is_deleted {
+                n_vec := mut store.get_vector(n_id)?;
+                n_dist := mut distance.compute(query, n_vec)?;
+                stats.increment_computations();
+
+                I n_dist < current_dist {
+                    current_dist = n_dist;
+                    current_id = n_id;
+                    improved = true;
+                }
+            }
+
+            n_idx = n_idx + 1;
+        }
+    }
+
+    Ok(SearchCandidate.new(current_id, current_dist))
+}

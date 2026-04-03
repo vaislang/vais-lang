@@ -1,0 +1,929 @@
+# HNSW Graph Construction - Insert Algorithm
+# Based on Malkov & Yashunin 2018: "Efficient and robust approximate nearest neighbor search using HNSW"
+# Implements hierarchical graph construction with diversity-based neighbor selection
+#
+# Key algorithms:
+# - hnsw_insert(): Insert a new vector into the HNSW index
+# - search_layer(): Greedy beam search within a single layer
+# - select_neighbors_heuristic(): Neighbor selection with diversity constraint
+# - prune_connections(): Maintain degree bounds after insertion
+#
+# Error codes: VAIS-0202NNN (EE=02 vector, CC=02 insert)
+
+U std/bytes.{ByteBuffer};
+U std/hash.{HashSet};
+U storage/error.{VaisError};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{HNSW_INSERT_NODE, HNSW_UPDATE_EDGES};
+U storage/wal/record_vector.{HnswInsertNodePayload, HnswUpdateEdgesPayload};
+U vector/hnsw/types.{
+    HnswConfig, HnswMeta, HnswNode, HnswNeighbor, SearchCandidate,
+    LayerRng, INVALID_NODE_ID,
+};
+U vector/distance.{DistanceComputer, DistanceMetric};
+
+# ============================================================================
+# Error Codes
+# ============================================================================
+
+# Error: Node not found during search
+# Code: VAIS-0202001
+F err_node_not_found(node_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0202001",
+        "HNSW node {node_id} not found during insert"
+    )
+}
+
+# Error: Cannot load vector data
+# Code: VAIS-0202002
+F err_vector_load_failed(node_id: u64, detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0202002",
+        "Failed to load vector for node {node_id}: {detail}"
+    )
+}
+
+# Error: Insert failed (storage or WAL issue)
+# Code: VAIS-0202003
+F err_insert_failed(node_id: u64, detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0202003",
+        "HNSW insert failed for node {node_id}: {detail}"
+    )
+}
+
+# ============================================================================
+# Node Store Trait
+# ============================================================================
+
+# Abstract interface for loading nodes and vectors during insert.
+# Implementations must provide:
+# - load_node(): Retrieve HnswNode by ID
+# - load_vector(): Retrieve f32 vector by node ID
+# - store_node(): Persist node after modification
+# - allocate_node_id(): Generate unique node ID
+# - get_file_page(): Return (file_id, page_id) for a given node
+# - allocate_node_page(): Reserve a page for a node (for WAL-before-flush)
+#
+# This allows insert.vais to be storage-agnostic (e.g., in-memory for tests,
+# page manager for production).
+T NodeStore {
+    F load_node(self, node_id: u64) -> Result<HnswNode, VaisError>;
+    F load_vector(self, node_id: u64) -> Result<Vec<f32>, VaisError>;
+    F store_node(&mut self, node: HnswNode) -> Result<(), VaisError>;
+    F allocate_node_id(&mut self) -> u64;
+    F get_file_page(self, node_id: u64) -> Result<(u8, u32), VaisError>;
+    # Allocate a page for a new node without writing data yet.
+    # Returns (file_id, page_id) for use in WAL records before store_node().
+    F allocate_node_page(&mut self, node_id: u64) -> Result<(u8, u32), VaisError>;
+}
+
+# ============================================================================
+# Priority Queue Helpers (Min-Heap and Max-Heap using sorted Vec)
+# ============================================================================
+
+# Min-heap priority queue (smallest distance first)
+# Used for candidates during beam search
+S MinHeap {
+    items: Vec<SearchCandidate>,
+}
+
+X MinHeap {
+    F new() -> MinHeap {
+        MinHeap { items: Vec.new() }
+    }
+
+    F with_capacity(cap: u64) -> MinHeap {
+        MinHeap { items: Vec.with_capacity(cap) }
+    }
+
+    F push(mut self, candidate: SearchCandidate) {
+        self.items.push(candidate);
+        # Sift up: binary heap invariant (parent <= children)
+        i := mut self.items.len() - 1;
+        sifting := mut true;
+        L i > 0 && sifting {
+            parent_idx := mut (i - 1) / 2;
+            I self.items[i].distance < self.items[parent_idx].distance {
+                # Swap child with parent
+                tmp := mut self.items[i];
+                self.items[i] = self.items[parent_idx];
+                self.items[parent_idx] = tmp;
+                i = parent_idx;
+            } E {
+                sifting = false;
+            }
+        }
+    }
+
+    F pop(mut self) -> SearchCandidate {
+        last_idx := mut self.items.len() - 1;
+        # Swap root with last element
+        tmp := mut self.items[0];
+        self.items[0] = self.items[last_idx];
+        self.items[last_idx] = tmp;
+
+        # Remove last (was root)
+        result := mut self.items.remove(last_idx);
+
+        # Sift down from root
+        I self.items.len() > 0 {
+            i: u64 := mut 0;
+            sifting := mut true;
+            L sifting {
+                smallest := mut i;
+                left := mut 2 * i + 1;
+                right := mut 2 * i + 2;
+
+                I left < self.items.len() && self.items[left].distance < self.items[smallest].distance {
+                    smallest = left;
+                }
+                I right < self.items.len() && self.items[right].distance < self.items[smallest].distance {
+                    smallest = right;
+                }
+
+                I smallest != i {
+                    swap_tmp := mut self.items[i];
+                    self.items[i] = self.items[smallest];
+                    self.items[smallest] = swap_tmp;
+                    i = smallest;
+                } E {
+                    sifting = false;
+                }
+            }
+        }
+
+        result
+    }
+
+    F is_empty(self) -> bool {
+        self.items.len() == 0
+    }
+
+    F len(self) -> u64 {
+        self.items.len()
+    }
+
+    F peek(self) -> &SearchCandidate {
+        &self.items[0]
+    }
+}
+
+# Max-heap priority queue (largest distance first)
+# Used for tracking top-k results during beam search
+S MaxHeap {
+    items: Vec<SearchCandidate>,
+}
+
+X MaxHeap {
+    F new() -> MaxHeap {
+        MaxHeap { items: Vec.new() }
+    }
+
+    F with_capacity(cap: u64) -> MaxHeap {
+        MaxHeap { items: Vec.with_capacity(cap) }
+    }
+
+    F push(mut self, candidate: SearchCandidate) {
+        self.items.push(candidate);
+        # Sift up: binary heap invariant (parent >= children)
+        i := mut self.items.len() - 1;
+        sifting := mut true;
+        L i > 0 && sifting {
+            parent_idx := mut (i - 1) / 2;
+            I self.items[i].distance > self.items[parent_idx].distance {
+                # Swap child with parent
+                tmp := mut self.items[i];
+                self.items[i] = self.items[parent_idx];
+                self.items[parent_idx] = tmp;
+                i = parent_idx;
+            } E {
+                sifting = false;
+            }
+        }
+    }
+
+    F pop(mut self) -> SearchCandidate {
+        last_idx := mut self.items.len() - 1;
+        # Swap root with last element
+        tmp := mut self.items[0];
+        self.items[0] = self.items[last_idx];
+        self.items[last_idx] = tmp;
+
+        # Remove last (was root)
+        result := mut self.items.remove(last_idx);
+
+        # Sift down from root
+        I self.items.len() > 0 {
+            i: u64 := mut 0;
+            sifting := mut true;
+            L sifting {
+                largest := mut i;
+                left := mut 2 * i + 1;
+                right := mut 2 * i + 2;
+
+                I left < self.items.len() && self.items[left].distance > self.items[largest].distance {
+                    largest = left;
+                }
+                I right < self.items.len() && self.items[right].distance > self.items[largest].distance {
+                    largest = right;
+                }
+
+                I largest != i {
+                    swap_tmp := mut self.items[i];
+                    self.items[i] = self.items[largest];
+                    self.items[largest] = swap_tmp;
+                    i = largest;
+                } E {
+                    sifting = false;
+                }
+            }
+        }
+
+        result
+    }
+
+    F is_empty(self) -> bool {
+        self.items.len() == 0
+    }
+
+    F len(self) -> u64 {
+        self.items.len()
+    }
+
+    F peek(self) -> &SearchCandidate {
+        &self.items[0]
+    }
+}
+
+# ============================================================================
+# Search Layer (Greedy Beam Search)
+# ============================================================================
+
+# Greedy beam search within a single layer.
+# Returns ef closest neighbors to the query vector.
+#
+# Algorithm:
+# - Start from entry_point
+# - Maintain candidates (min-heap) and results (max-heap of size ef)
+# - Expand closest unvisited candidate
+# - Stop when all candidates are farther than worst result
+#
+# Parameters:
+# - query_vec: Query vector
+# - entry_point: Starting node ID for search
+# - ef: Beam width (number of results to return)
+# - layer: Layer to search within
+# - store: Node/vector storage
+# - distance_computer: Distance metric
+#
+# Returns: Vec<SearchCandidate> of ef closest neighbors
+F search_layer<S: NodeStore>(
+    query_vec: &[f32],
+    entry_point: u64,
+    ef: u32,
+    layer: u8,
+    store: &S,
+    distance_computer: &DistanceComputer
+) -> Result<Vec<SearchCandidate>, VaisError> {
+    # Handle invalid entry point
+    I entry_point == INVALID_NODE_ID {
+        R Ok(Vec.new());
+    }
+
+    # Load entry point vector and compute distance
+    ep_vec := mut store.load_vector(entry_point)?;
+    ep_dist := mut distance_computer.compute(query_vec, &ep_vec)?;
+
+    # Initialize visited set
+    visited := mut HashSet.new();
+    visited.insert(entry_point);
+
+    # Initialize candidates (min-heap: closest first)
+    candidates := mut MinHeap.with_capacity(ef as u64);
+    candidates.push(SearchCandidate.new(entry_point, ep_dist));
+
+    # Initialize results (max-heap: farthest first, keep best ef)
+    results := mut MaxHeap.with_capacity(ef as u64);
+    results.push(SearchCandidate.new(entry_point, ep_dist));
+
+    # Beam search loop
+    beam_done := mut false;
+    L !candidates.is_empty() && !beam_done {
+        # Get closest candidate
+        current_candidate := mut candidates.pop();
+        current_dist := mut current_candidate.distance;
+
+        # Check stopping condition: current is farther than worst result
+        should_stop := mut false;
+        I results.len() >= ef as u64 {
+            worst_result := mut results.peek();
+            I current_dist > worst_result.distance {
+                should_stop = true;
+            }
+        }
+
+        I should_stop {
+            beam_done = true;
+        } E {
+
+        # Load current node to get neighbors
+        current_node := mut store.load_node(current_candidate.node_id)?;
+        neighbors := mut current_node.get_neighbors(layer)?;
+
+        # Explore neighbors
+        i := mut 0;
+        L i < neighbors.len() {
+            neighbor := mut &neighbors[i];
+            neighbor_id := mut neighbor.node_id;
+
+            # Skip if already visited
+            I !visited.contains(neighbor_id) {
+                visited.insert(neighbor_id);
+
+                # Load neighbor vector and compute distance
+                neighbor_vec := mut store.load_vector(neighbor_id)?;
+                neighbor_dist := mut distance_computer.compute(query_vec, &neighbor_vec)?;
+
+                # Check if neighbor should be added to results
+                I results.len() < ef as u64 {
+                    # Results not full yet, add unconditionally
+                    candidates.push(SearchCandidate.new(neighbor_id, neighbor_dist));
+                    results.push(SearchCandidate.new(neighbor_id, neighbor_dist));
+                } E {
+                    # Results full, add only if better than worst
+                    worst_result := mut results.peek();
+                    I neighbor_dist < worst_result.distance {
+                        candidates.push(SearchCandidate.new(neighbor_id, neighbor_dist));
+                        results.push(SearchCandidate.new(neighbor_id, neighbor_dist));
+                        # Remove worst result (maintain size ef)
+                        results.pop();
+                    }
+                }
+            }
+
+            i += 1;
+        }
+        }
+    }
+
+    # Convert max-heap to sorted vector (closest first)
+    result_vec := mut Vec.with_capacity(results.len());
+    L !results.is_empty() {
+        result_vec.push(results.pop());
+    }
+
+    # Reverse to get closest-first order (max-heap pops largest first)
+    result_vec.reverse();
+
+    Ok(result_vec)
+}
+
+# ============================================================================
+# Neighbor Selection Heuristic (Diversity)
+# ============================================================================
+
+# Select M neighbors from candidates using diversity heuristic.
+# Prefers neighbors that are:
+# 1. Closer to query vector
+# 2. Not too close to already-selected neighbors (diversity)
+#
+# Algorithm:
+# - Sort candidates by distance to query
+# - For each candidate, check if it's closer to query than to any selected neighbor
+# - If yes, add to result
+# - If result not full after diversity pass, fill remaining from sorted list
+#
+# Parameters:
+# - query_vec: Query vector
+# - candidates: Candidate neighbors (SearchCandidate with distance to query)
+# - m: Number of neighbors to select
+# - layer: Current layer (unused, for future extensions)
+# - store: Node/vector storage
+# - distance_computer: Distance metric
+#
+# Returns: Vec<HnswNeighbor> of selected neighbors
+F select_neighbors_heuristic<S: NodeStore>(
+    query_vec: &[f32],
+    candidates: &[SearchCandidate],
+    m: u16,
+    layer: u8,
+    store: &S,
+    distance_computer: &DistanceComputer
+) -> Result<Vec<HnswNeighbor>, VaisError> {
+    # Handle empty or small candidate sets
+    I candidates.len() == 0 {
+        R Ok(Vec.new());
+    }
+
+    I candidates.len() <= m as u64 {
+        # All candidates fit within M, return all
+        result := mut Vec.with_capacity(candidates.len());
+        i := mut 0;
+        L i < candidates.len() {
+            result.push(HnswNeighbor.new(
+                candidates[i].node_id,
+                candidates[i].distance
+            ));
+            i += 1;
+        }
+        R Ok(result);
+    }
+
+    # Sort candidates by distance to query (ascending)
+    sorted := mut Vec.with_capacity(candidates.len());
+    i := mut 0;
+    L i < candidates.len() {
+        sorted.push(candidates[i]);
+        i += 1;
+    }
+
+    # Simple insertion sort (small m, fast for small arrays)
+    j := mut 1;
+    L j < sorted.len() {
+        key := mut sorted[j];
+        k := mut j;
+        L k > 0 && sorted[k - 1].distance > key.distance {
+            sorted[k] = sorted[k - 1];
+            k -= 1;
+        }
+        sorted[k] = key;
+        j += 1;
+    }
+
+    # Phase 1: Select diverse neighbors
+    result := mut Vec.with_capacity(m as u64);
+    result_vecs := mut Vec.with_capacity(m as u64);
+
+    idx := mut 0;
+    L idx < sorted.len() && result.len() < m as u64 {
+        candidate := mut &sorted[idx];
+        candidate_vec := mut store.load_vector(candidate.node_id)?;
+        candidate_dist_to_query := mut candidate.distance;
+
+        # Check diversity: is candidate closer to query than to any selected neighbor?
+        is_diverse := mut true;
+        r_idx := mut 0;
+        L r_idx < result.len() && is_diverse {
+            selected_vec := mut &result_vecs[r_idx];
+            dist_to_selected := mut distance_computer.compute(&candidate_vec, selected_vec)?;
+
+            # Diversity criterion: dist(candidate, selected) >= dist(candidate, query)
+            # If candidate is closer to a selected neighbor than to query, reject
+            I dist_to_selected < candidate_dist_to_query {
+                is_diverse = false;
+            }
+            r_idx += 1;
+        }
+
+        # If diverse, add to result
+        I is_diverse {
+            result.push(HnswNeighbor.new(candidate.node_id, candidate.distance));
+            result_vecs.push(candidate_vec);
+        }
+
+        idx += 1;
+    }
+
+    # Phase 2: If result not full, fill remaining from sorted list (without diversity check)
+    I result.len() < m as u64 {
+        idx2 := mut 0;
+        L idx2 < sorted.len() && result.len() < m as u64 {
+            candidate2 := mut &sorted[idx2];
+
+            # Check if already in result
+            already_added := mut false;
+            r_idx2 := mut 0;
+            L r_idx2 < result.len() && !already_added {
+                I result[r_idx2].node_id == candidate2.node_id {
+                    already_added = true;
+                }
+                r_idx2 += 1;
+            }
+
+            I !already_added {
+                result.push(HnswNeighbor.new(candidate2.node_id, candidate2.distance));
+            }
+
+            idx2 += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+# ============================================================================
+# Prune Connections (Maintain Degree Bounds)
+# ============================================================================
+
+# Prune a node's neighbors at a specific layer to maintain degree bound.
+# Called when a node's neighbor count exceeds M (or M_max_0 for layer 0).
+#
+# Uses select_neighbors_heuristic to choose best M neighbors from current list.
+#
+# Parameters:
+# - node: Node to prune
+# - layer: Layer to prune
+# - m_max: Maximum allowed neighbors
+# - store: Node/vector storage
+# - distance_computer: Distance metric
+#
+# Returns: Updated neighbor list
+F prune_connections<S: NodeStore>(
+    node: &HnswNode,
+    layer: u8,
+    m_max: u16,
+    store: &S,
+    distance_computer: &DistanceComputer
+) -> Result<Vec<HnswNeighbor>, VaisError> {
+    neighbors := mut node.get_neighbors(layer)?;
+
+    I neighbors.len() <= m_max as u64 {
+        # Already within bounds, no pruning needed
+        result := mut Vec.with_capacity(neighbors.len());
+        i := mut 0;
+        L i < neighbors.len() {
+            result.push(neighbors[i]);
+            i += 1;
+        }
+        R Ok(result);
+    }
+
+    # Load node's vector
+    node_vec := mut store.load_vector(node.node_id)?;
+
+    # Convert neighbors to SearchCandidates
+    candidates := mut Vec.with_capacity(neighbors.len());
+    i := mut 0;
+    L i < neighbors.len() {
+        candidates.push(SearchCandidate.new(
+            neighbors[i].node_id,
+            neighbors[i].distance
+        ));
+        i += 1;
+    }
+
+    # Select best M neighbors using heuristic
+    select_neighbors_heuristic(
+        &node_vec,
+        &candidates,
+        m_max,
+        layer,
+        store,
+        distance_computer
+    )
+}
+
+# ============================================================================
+# HNSW Insert (Main Algorithm)
+# ============================================================================
+
+# Insert a new vector into the HNSW index.
+# Implements the full insertion algorithm from Malkov & Yashunin 2018.
+#
+# Algorithm:
+# 1. Select random layer for new node
+# 2. Search from entry point down to layer+1 (greedy, ef=1)
+# 3. For each layer from min(layer, max_layer) down to 0:
+#    a. Beam search to find ef_construction neighbors
+#    b. Select M neighbors using diversity heuristic
+#    c. Connect new node to selected neighbors
+#    d. For each neighbor, prune connections if degree exceeds M
+# 4. If new layer > max_layer, update entry point
+# 5. Write WAL records before mutations
+#
+# Parameters:
+# - new_node: Pre-allocated HnswNode with node_id, layer, MVCC metadata
+# - query_vec: Vector to insert
+# - meta: HNSW index metadata (mutable, updated if new layer > max_layer)
+# - config: HNSW configuration
+# - store: Node/vector storage
+# - distance_computer: Distance metric
+# - gcm: Group commit manager for WAL
+# - txn_id: Transaction ID for WAL
+# - cmd_id: Command ID for WAL
+#
+# Returns: Updated HnswMeta
+F hnsw_insert<S: NodeStore>(
+    mut new_node: HnswNode,
+    query_vec: &[f32],
+    mut meta: HnswMeta,
+    config: &HnswConfig,
+    store: &mut S,
+    distance_computer: &DistanceComputer,
+    gcm: &mut GroupCommitManager,
+    txn_id: u64,
+    cmd_id: u32
+) -> Result<HnswMeta, VaisError> {
+    new_node_id := mut new_node.node_id;
+    new_layer := mut new_node.max_layer;
+
+    # Handle first insertion (empty index)
+    I meta.is_empty() {
+        # First node becomes entry point
+        meta.update_entry_point(new_node_id, new_layer);
+        meta.add_node();
+
+        # WAL-before-flush invariant: write WAL BEFORE storing node to pages.
+        # We allocate the page first (without flushing) to get file_id/page_id for the WAL record.
+        (file_id, page_id) := mut store.allocate_node_page(new_node_id)?;
+        write_insert_wal(
+            new_node_id,
+            new_layer,
+            &Vec.new(),
+            file_id,
+            page_id,
+            gcm,
+            txn_id
+        )?;
+
+        # Now safe to store node data to the page
+        store.store_node(new_node)?;
+
+        R Ok(meta);
+    }
+
+    # Phase 1: Search from entry point down to new_layer+1 (greedy, ef=1)
+    entry_point := mut meta.entry_point;
+    current_nearest := mut entry_point;
+
+    lc := mut meta.max_layer;
+    L lc > new_layer {
+        search_results := mut search_layer(
+            query_vec,
+            current_nearest,
+            1,  # ef=1 for greedy search
+            lc,
+            store,
+            distance_computer
+        )?;
+
+        I search_results.len() > 0 {
+            current_nearest = search_results[0].node_id;
+        }
+
+        lc -= 1;
+    }
+
+    # Phase 2: Insert into layers [min(new_layer, max_layer) .. 0]
+    insert_layer := mut I new_layer < meta.max_layer { new_layer } E { meta.max_layer };
+
+    layers_done := mut false;
+    L !layers_done {
+        # Beam search to find ef_construction neighbors
+        candidates := mut search_layer(
+            query_vec,
+            current_nearest,
+            config.ef_construction,
+            insert_layer,
+            store,
+            distance_computer
+        )?;
+
+        # Select M neighbors using diversity heuristic
+        m_max := mut I insert_layer == 0 { config.m_max_0 } E { config.m };
+        selected_neighbors := mut select_neighbors_heuristic(
+            query_vec,
+            &candidates,
+            m_max,
+            insert_layer,
+            store,
+            distance_computer
+        )?;
+
+        # Add selected neighbors to new node
+        i := mut 0;
+        L i < selected_neighbors.len() {
+            new_node.add_neighbor(insert_layer, selected_neighbors[i])?;
+            i += 1;
+        }
+
+        # Prune neighbors' connections if they exceed M
+        j := mut 0;
+        L j < selected_neighbors.len() {
+            neighbor_id := mut selected_neighbors[j].node_id;
+            neighbor_node := mut store.load_node(neighbor_id)?;
+
+            # Add bidirectional edge
+            dist_to_new := mut selected_neighbors[j].distance;
+            neighbor_node_mut := mut neighbor_node;
+            neighbor_node_mut.add_neighbor(
+                insert_layer,
+                HnswNeighbor.new(new_node_id, dist_to_new)
+            )?;
+
+            # Prune if exceeds M
+            neighbor_neighbors := mut neighbor_node_mut.get_neighbors(insert_layer)?;
+            I neighbor_neighbors.len() > m_max as u64 {
+                pruned_neighbors := mut prune_connections(
+                    &neighbor_node_mut,
+                    insert_layer,
+                    m_max,
+                    store,
+                    distance_computer
+                )?;
+
+                # Update neighbor's neighbor list
+                new_neighbor_list := mut neighbor_node_mut.get_neighbors_mut(insert_layer)?;
+                new_neighbor_list.clear();
+                k := mut 0;
+                L k < pruned_neighbors.len() {
+                    new_neighbor_list.push(pruned_neighbors[k]);
+                    k += 1;
+                }
+
+                # Write WAL for edge update
+                (neighbor_file_id, neighbor_page_id) := mut store.get_file_page(neighbor_id)?;
+                write_edge_update_wal(
+                    neighbor_id,
+                    insert_layer,
+                    neighbor_neighbors,
+                    &pruned_neighbors,
+                    neighbor_file_id,
+                    neighbor_page_id,
+                    gcm,
+                    txn_id
+                )?;
+            }
+
+            # Store updated neighbor node
+            store.store_node(neighbor_node_mut)?;
+
+            j += 1;
+        }
+
+        # Update current_nearest for next layer
+        I candidates.len() > 0 {
+            current_nearest = candidates[0].node_id;
+        }
+
+        # Stop at layer 0 (u8 underflow prevention)
+        I insert_layer == 0 {
+            layers_done = true;
+        } E {
+            insert_layer -= 1;
+        }
+    }
+
+    # Phase 3: Update entry point if new layer exceeds current max
+    I new_layer > meta.max_layer {
+        meta.update_entry_point(new_node_id, new_layer);
+    }
+
+    # Increment node count
+    meta.add_node();
+
+    # WAL-before-flush invariant: write WAL BEFORE storing node to pages.
+    # Collect neighbor info from the in-memory node before persisting.
+    (file_id, page_id) := mut store.allocate_node_page(new_node_id)?;
+    all_neighbors := mut Vec.new();
+    layer_idx := mut 0;
+    L layer_idx <= new_layer {
+        layer_neighbors := mut new_node.get_neighbors(layer_idx)?;
+        n_idx := mut 0;
+        L n_idx < layer_neighbors.len() {
+            all_neighbors.push((layer_neighbors[n_idx].node_id, layer_neighbors[n_idx].distance));
+            n_idx += 1;
+        }
+        layer_idx += 1;
+    }
+
+    write_insert_wal(
+        new_node_id,
+        new_layer,
+        &all_neighbors,
+        file_id,
+        page_id,
+        gcm,
+        txn_id
+    )?;
+
+    # Now safe to store node data to the allocated page
+    store.store_node(new_node)?;
+
+    Ok(meta)
+}
+
+# ============================================================================
+# WAL Helpers
+# ============================================================================
+
+# Write HNSW_INSERT_NODE WAL record
+F write_insert_wal(
+    node_id: u64,
+    layer: u8,
+    neighbors: &[(u64, f32)],
+    file_id: u8,
+    page_id: u32,
+    gcm: &mut GroupCommitManager,
+    txn_id: u64
+) -> Result<(), VaisError> {
+    wal_neighbors := mut Vec.with_capacity(neighbors.len());
+    i := mut 0;
+    L i < neighbors.len() {
+        wal_neighbors.push(neighbors[i]);
+        i += 1;
+    }
+
+    affected_pages := mut Vec.new();
+    affected_pages.push((file_id, page_id));
+
+    payload := mut HnswInsertNodePayload {
+        node_id,
+        layer,
+        neighbors: wal_neighbors,
+        file_id,
+        page_id,
+        affected_pages,
+    };
+
+    buf := mut ByteBuffer.with_capacity(256);
+    payload.serialize(&buf);
+
+    gcm.write_record(txn_id, HNSW_INSERT_NODE, 0x00, &buf.to_vec())?;
+
+    Ok(())
+}
+
+# Write HNSW_UPDATE_EDGES WAL record
+F write_edge_update_wal(
+    node_id: u64,
+    layer: u8,
+    old_neighbors: &[HnswNeighbor],
+    new_neighbors: &[HnswNeighbor],
+    file_id: u8,
+    page_id: u32,
+    gcm: &mut GroupCommitManager,
+    txn_id: u64
+) -> Result<(), VaisError> {
+    old_ids := mut Vec.with_capacity(old_neighbors.len());
+    i := mut 0;
+    L i < old_neighbors.len() {
+        old_ids.push(old_neighbors[i].node_id);
+        i += 1;
+    }
+
+    new_ids := mut Vec.with_capacity(new_neighbors.len());
+    j := mut 0;
+    L j < new_neighbors.len() {
+        new_ids.push(new_neighbors[j].node_id);
+        j += 1;
+    }
+
+    payload := mut HnswUpdateEdgesPayload {
+        node_id,
+        layer,
+        old_neighbors: old_ids,
+        new_neighbors: new_ids,
+        file_id,
+        page_id,
+    };
+
+    buf := mut ByteBuffer.with_capacity(256);
+    payload.serialize(&buf);
+
+    gcm.write_record(txn_id, HNSW_UPDATE_EDGES, 0x00, &buf.to_vec())?;
+
+    Ok(())
+}
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+#[test]
+F test_min_heap() {
+    heap := mut MinHeap.new();
+    heap.push(SearchCandidate.new(1, 5.0));
+    heap.push(SearchCandidate.new(2, 2.0));
+    heap.push(SearchCandidate.new(3, 8.0));
+
+    assert_eq!(heap.len(), 3);
+    assert_eq!(heap.peek().distance, 2.0);
+
+    first := mut heap.pop();
+    assert_eq!(first.node_id, 2);
+    assert_eq!(first.distance, 2.0);
+
+    second := mut heap.pop();
+    assert_eq!(second.distance, 5.0);
+}
+
+#[test]
+F test_max_heap() {
+    heap := mut MaxHeap.new();
+    heap.push(SearchCandidate.new(1, 5.0));
+    heap.push(SearchCandidate.new(2, 2.0));
+    heap.push(SearchCandidate.new(3, 8.0));
+
+    assert_eq!(heap.len(), 3);
+    assert_eq!(heap.peek().distance, 8.0);
+
+    first := mut heap.pop();
+    assert_eq!(first.node_id, 3);
+    assert_eq!(first.distance, 8.0);
+
+    second := mut heap.pop();
+    assert_eq!(second.distance, 5.0);
+}

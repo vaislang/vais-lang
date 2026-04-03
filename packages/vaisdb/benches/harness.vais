@@ -1,0 +1,868 @@
+# Benchmark Harness & Timing Utilities
+# Provides infrastructure for running, timing, and reporting benchmarks.
+#
+# Components:
+# - Timer: Nanosecond-precision timing using std/time
+# - StatsSummary: Statistical aggregation (min/max/avg/p50/p95/p99)
+# - BenchmarkResult: Per-benchmark result with ops/sec and memory
+# - BenchmarkHarness: Top-level runner with warmup/iteration/cooldown
+# - ResultFormatter: Text table output
+
+U std/time.{now_nanos, sleep_nanos};
+U std/vec.Vec;
+U std/string.Str;
+U std/math.{sqrt};
+
+# ============================================================================
+# Timer — Nanosecond-precision time measurement
+# ============================================================================
+
+# Timer measures elapsed wall-clock time in nanoseconds
+S Timer {
+    start_ns: u64,       # Start timestamp (nanos since epoch)
+    end_ns: u64,         # End timestamp (0 if still running)
+    is_running: bool,    # Whether the timer is currently active
+}
+
+X Timer {
+    # Create a new stopped timer
+    F new() -> Timer {
+        Timer {
+            start_ns: 0,
+            end_ns: 0,
+            is_running: false,
+        }
+    }
+
+    # Start the timer
+    F start(mut self) {
+        self.start_ns = now_nanos();
+        self.end_ns = 0;
+        self.is_running = true;
+    }
+
+    # Stop the timer and return elapsed nanoseconds
+    F stop(mut self) -> u64 {
+        self.end_ns = now_nanos();
+        self.is_running = false;
+        self.elapsed_ns()
+    }
+
+    # Get elapsed nanoseconds (works while running or after stop)
+    F elapsed_ns(self) -> u64 {
+        I self.is_running {
+            now_nanos() - self.start_ns
+        } E {
+            I self.end_ns >= self.start_ns {
+                self.end_ns - self.start_ns
+            } E {
+                0
+            }
+        }
+    }
+
+    # Get elapsed microseconds
+    F elapsed_us(self) -> u64 {
+        self.elapsed_ns() / 1000
+    }
+
+    # Get elapsed milliseconds
+    F elapsed_ms(self) -> u64 {
+        self.elapsed_ns() / 1_000_000
+    }
+
+    # Get elapsed seconds as f64
+    F elapsed_secs(self) -> f64 {
+        self.elapsed_ns() as f64 / 1_000_000_000.0
+    }
+
+    # Create and immediately start a timer
+    F start_new() -> Timer {
+        t := mut Timer.new();
+        t.start();
+        t
+    }
+}
+
+# ============================================================================
+# StatsSummary — Statistical aggregation of timing samples
+# ============================================================================
+
+# Aggregated statistics for a series of measurements
+S StatsSummary {
+    count: u64,          # Number of samples
+    min_ns: u64,         # Minimum value (nanoseconds)
+    max_ns: u64,         # Maximum value (nanoseconds)
+    sum_ns: u64,         # Sum of all values
+    avg_ns: f64,         # Arithmetic mean (nanoseconds)
+    median_ns: u64,      # p50 (nanoseconds)
+    p95_ns: u64,         # 95th percentile (nanoseconds)
+    p99_ns: u64,         # 99th percentile (nanoseconds)
+    stddev_ns: f64,      # Standard deviation (nanoseconds)
+}
+
+X StatsSummary {
+    # Compute statistics from a vector of nanosecond samples
+    # Samples are sorted in-place for percentile calculation
+    F from_samples(mut samples: Vec<u64>) -> StatsSummary {
+        n := mut samples.len();
+        I n == 0 {
+            R StatsSummary {
+                count: 0,
+                min_ns: 0,
+                max_ns: 0,
+                sum_ns: 0,
+                avg_ns: 0.0,
+                median_ns: 0,
+                p95_ns: 0,
+                p99_ns: 0,
+                stddev_ns: 0.0,
+            };
+        }
+
+        # Sort samples (insertion sort — fine for typical benchmark iteration counts)
+        i: u64 := mut 1;
+        W i < n {
+            key := mut samples[i];
+            j: i64 := mut i as i64 - 1;
+            W j >= 0 && samples[j as u64] > key {
+                samples[(j + 1) as u64] = samples[j as u64];
+                j -= 1;
+            }
+            samples[(j + 1) as u64] = key;
+            i += 1;
+        }
+
+        # Compute sum, min, max
+        sum: u64 := mut 0;
+        min_val := mut samples[0];
+        max_val := mut samples[0];
+        idx: u64 := mut 0;
+        W idx < n {
+            sum += samples[idx];
+            I samples[idx] < min_val { min_val = samples[idx]; }
+            I samples[idx] > max_val { max_val = samples[idx]; }
+            idx += 1;
+        }
+
+        avg := mut sum as f64 / n as f64;
+
+        # Compute standard deviation
+        variance_sum: f64 := mut 0.0;
+        idx = 0;
+        W idx < n {
+            diff := mut samples[idx] as f64 - avg;
+            variance_sum += diff * diff;
+            idx += 1;
+        }
+        stddev := mut sqrt(variance_sum / n as f64);
+
+        # Percentiles (using sorted samples)
+        median := mut samples[n / 2];
+        p95_idx := mut (n as f64 * 0.95) as u64;
+        I p95_idx >= n { p95_idx = n - 1; }
+        p99_idx := mut (n as f64 * 0.99) as u64;
+        I p99_idx >= n { p99_idx = n - 1; }
+
+        StatsSummary {
+            count: n,
+            min_ns: min_val,
+            max_ns: max_val,
+            sum_ns: sum,
+            avg_ns: avg,
+            median_ns: median,
+            p95_ns: samples[p95_idx],
+            p99_ns: samples[p99_idx],
+            stddev_ns: stddev,
+        }
+    }
+
+    # Average in microseconds
+    F avg_us(self) -> f64 {
+        self.avg_ns / 1000.0
+    }
+
+    # Average in milliseconds
+    F avg_ms(self) -> f64 {
+        self.avg_ns / 1_000_000.0
+    }
+
+    # p99 in milliseconds
+    F p99_ms(self) -> f64 {
+        self.p99_ns as f64 / 1_000_000.0
+    }
+
+    # p95 in milliseconds
+    F p95_ms(self) -> f64 {
+        self.p95_ns as f64 / 1_000_000.0
+    }
+}
+
+# ============================================================================
+# BenchmarkResult — Result of a single benchmark run
+# ============================================================================
+
+# Result of running a single benchmark
+S BenchmarkResult {
+    name: Str,                # Benchmark name
+    iterations: u64,          # Number of measured iterations
+    total_ns: u64,            # Total elapsed time (nanoseconds)
+    ops_per_sec: f64,         # Operations per second
+    ns_per_op: f64,           # Nanoseconds per operation
+    stats: StatsSummary,      # Per-iteration timing statistics
+    memory_bytes: u64,        # Approximate memory usage (0 if not measured)
+    warmup_iterations: u64,   # Number of warmup iterations (not included in stats)
+}
+
+X BenchmarkResult {
+    # Operations per second (convenience alias)
+    F throughput(self) -> f64 {
+        self.ops_per_sec
+    }
+
+    # Nanoseconds per operation (convenience alias)
+    F latency_ns(self) -> f64 {
+        self.ns_per_op
+    }
+
+    # Milliseconds per operation
+    F latency_ms(self) -> f64 {
+        self.ns_per_op / 1_000_000.0
+    }
+
+    # Format as a single summary line
+    F summary_line(self) -> Str {
+        result := mut Str.new();
+        result.push_str(&self.name);
+        result.push_str("  ");
+        result.push_str(&self.iterations.to_string());
+        result.push_str(" iters  ");
+
+        # Format ns/op
+        I self.ns_per_op >= 1_000_000.0 {
+            ms := mut (self.ns_per_op / 1_000_000.0 * 100.0) as u64;
+            result.push_str(&(ms / 100).to_string());
+            result.push_str(".");
+            frac := mut ms % 100;
+            I frac < 10 { result.push_str("0"); }
+            result.push_str(&frac.to_string());
+            result.push_str(" ms/op");
+        } E I self.ns_per_op >= 1000.0 {
+            us := mut (self.ns_per_op / 1000.0 * 100.0) as u64;
+            result.push_str(&(us / 100).to_string());
+            result.push_str(".");
+            frac := mut us % 100;
+            I frac < 10 { result.push_str("0"); }
+            result.push_str(&frac.to_string());
+            result.push_str(" us/op");
+        } E {
+            result.push_str(&(self.ns_per_op as u64).to_string());
+            result.push_str(" ns/op");
+        }
+
+        result.push_str("  ");
+        result.push_str(&format_ops_per_sec(self.ops_per_sec));
+        result.push_str(" ops/s");
+
+        result
+    }
+}
+
+# ============================================================================
+# BenchmarkConfig — Configuration for a benchmark run
+# ============================================================================
+
+# Configuration for how a benchmark should be executed
+S BenchmarkConfig {
+    warmup_iterations: u64,   # Number of warmup iterations (not timed)
+    iterations: u64,          # Number of measured iterations
+    cooldown_ms: u64,         # Cooldown time between warmup and measurement (ms)
+    name: Str,                # Benchmark name for reporting
+}
+
+X BenchmarkConfig {
+    # Create default config: 10 warmup, 100 iterations, 50ms cooldown
+    F default(name: Str) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: 10,
+            iterations: 100,
+            cooldown_ms: 50,
+            name,
+        }
+    }
+
+    # Create config for quick runs (fewer iterations)
+    F quick(name: Str) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: 3,
+            iterations: 20,
+            cooldown_ms: 10,
+            name,
+        }
+    }
+
+    # Create config for thorough benchmarks (more iterations)
+    F thorough(name: Str) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: 50,
+            iterations: 1000,
+            cooldown_ms: 100,
+            name,
+        }
+    }
+
+    # Builder: set warmup iterations
+    F with_warmup(self, warmup: u64) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: warmup,
+            iterations: self.iterations,
+            cooldown_ms: self.cooldown_ms,
+            name: self.name,
+        }
+    }
+
+    # Builder: set measured iterations
+    F with_iterations(self, iters: u64) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: self.warmup_iterations,
+            iterations: iters,
+            cooldown_ms: self.cooldown_ms,
+            name: self.name,
+        }
+    }
+
+    # Builder: set cooldown
+    F with_cooldown_ms(self, ms: u64) -> BenchmarkConfig {
+        BenchmarkConfig {
+            warmup_iterations: self.warmup_iterations,
+            iterations: self.iterations,
+            cooldown_ms: ms,
+            name: self.name,
+        }
+    }
+}
+
+# ============================================================================
+# BenchmarkHarness — Top-level benchmark runner
+# ============================================================================
+
+# BenchmarkHarness manages the execution of multiple benchmarks,
+# collecting results and producing formatted output.
+S BenchmarkHarness {
+    results: Vec<BenchmarkResult>,   # Collected results
+    suite_name: Str,                 # Name of the benchmark suite
+    suite_timer: Timer,              # Overall suite timer
+}
+
+X BenchmarkHarness {
+    # Create a new benchmark harness for a named suite
+    F new(suite_name: Str) -> BenchmarkHarness {
+        BenchmarkHarness {
+            results: Vec.new(),
+            suite_name,
+            suite_timer: Timer.new(),
+        }
+    }
+
+    # Start the suite timer
+    F start(mut self) {
+        self.suite_timer.start();
+    }
+
+    # Run a benchmark with a closure-like function pointer
+    # `bench_fn` is called once per iteration. It should perform the operation
+    # being benchmarked and return the number of operations completed (usually 1).
+    F run(
+        mut self,
+        config: &BenchmarkConfig,
+        setup_fn: F() -> (),
+        bench_fn: F() -> u64,
+        teardown_fn: F() -> (),
+    ) -> BenchmarkResult {
+        # Phase 1: Setup
+        setup_fn();
+
+        # Phase 2: Warmup (not timed)
+        wi: u64 := mut 0;
+        W wi < config.warmup_iterations {
+            bench_fn();
+            wi += 1;
+        }
+
+        # Phase 3: Cooldown
+        I config.cooldown_ms > 0 {
+            sleep_nanos(config.cooldown_ms * 1_000_000);
+        }
+
+        # Phase 4: Measured iterations
+        samples: Vec<u64> := mut Vec.new();
+        total_ops: u64 := mut 0;
+        overall_timer := mut Timer.start_new();
+
+        mi: u64 := mut 0;
+        W mi < config.iterations {
+            iter_timer := mut Timer.start_new();
+            ops := mut bench_fn();
+            elapsed := mut iter_timer.stop();
+            samples.push(elapsed);
+            total_ops += ops;
+            mi += 1;
+        }
+
+        total_ns := mut overall_timer.stop();
+
+        # Phase 5: Teardown
+        teardown_fn();
+
+        # Phase 6: Compute statistics
+        stats := mut StatsSummary.from_samples(mut samples);
+        ops_per_sec := mut I total_ns > 0 {
+            total_ops as f64 / (total_ns as f64 / 1_000_000_000.0)
+        } E {
+            0.0
+        };
+        ns_per_op := mut I total_ops > 0 {
+            total_ns as f64 / total_ops as f64
+        } E {
+            0.0
+        };
+
+        result := mut BenchmarkResult {
+            name: config.name.clone(),
+            iterations: config.iterations,
+            total_ns,
+            ops_per_sec,
+            ns_per_op,
+            stats,
+            memory_bytes: 0,
+            warmup_iterations: config.warmup_iterations,
+        };
+
+        self.results.push(result.clone());
+        result
+    }
+
+    # Run a simple benchmark (no setup/teardown)
+    F run_simple(
+        mut self,
+        config: &BenchmarkConfig,
+        bench_fn: F() -> u64,
+    ) -> BenchmarkResult {
+        self.run(config, || {}, bench_fn, || {})
+    }
+
+    # Run a benchmark that measures batch throughput
+    # `batch_fn` returns the number of operations completed in the batch
+    F run_batch(
+        mut self,
+        config: &BenchmarkConfig,
+        batch_size: u64,
+        setup_fn: F() -> (),
+        batch_fn: F(u64) -> u64,
+        teardown_fn: F() -> (),
+    ) -> BenchmarkResult {
+        # Setup
+        setup_fn();
+
+        # Warmup
+        wi: u64 := mut 0;
+        W wi < config.warmup_iterations {
+            batch_fn(batch_size);
+            wi += 1;
+        }
+
+        # Cooldown
+        I config.cooldown_ms > 0 {
+            sleep_nanos(config.cooldown_ms * 1_000_000);
+        }
+
+        # Measured iterations
+        samples: Vec<u64> := mut Vec.new();
+        total_ops: u64 := mut 0;
+        overall_timer := mut Timer.start_new();
+
+        mi: u64 := mut 0;
+        W mi < config.iterations {
+            iter_timer := mut Timer.start_new();
+            ops := mut batch_fn(batch_size);
+            elapsed := mut iter_timer.stop();
+            samples.push(elapsed);
+            total_ops += ops;
+            mi += 1;
+        }
+
+        total_ns := mut overall_timer.stop();
+
+        # Teardown
+        teardown_fn();
+
+        # Statistics
+        stats := mut StatsSummary.from_samples(mut samples);
+        ops_per_sec := mut I total_ns > 0 {
+            total_ops as f64 / (total_ns as f64 / 1_000_000_000.0)
+        } E {
+            0.0
+        };
+        ns_per_op := mut I total_ops > 0 {
+            total_ns as f64 / total_ops as f64
+        } E {
+            0.0
+        };
+
+        result := mut BenchmarkResult {
+            name: config.name.clone(),
+            iterations: config.iterations,
+            total_ns,
+            ops_per_sec,
+            ns_per_op,
+            stats,
+            memory_bytes: 0,
+            warmup_iterations: config.warmup_iterations,
+        };
+
+        self.results.push(result.clone());
+        result
+    }
+
+    # Get all collected results
+    F get_results(self) -> &Vec<BenchmarkResult> {
+        &self.results
+    }
+
+    # Get total suite elapsed time
+    F suite_elapsed_ms(self) -> u64 {
+        self.suite_timer.elapsed_ms()
+    }
+
+    # Format all results as a text report
+    F report(self) -> Str {
+        format_report(&self.suite_name, &self.results, self.suite_timer.elapsed_ms())
+    }
+
+    # Print the report to stdout
+    F print_report(self) {
+        report := mut self.report();
+        print(report);
+    }
+}
+
+# ============================================================================
+# ResultFormatter — Text table output
+# ============================================================================
+
+# Format a number with commas for readability (e.g., 1234567 → "1,234,567")
+F format_with_commas(n: u64) -> Str {
+    s := mut n.to_string();
+    len := mut s.len();
+    I len <= 3 {
+        R s;
+    }
+
+    result := mut Str.new();
+    i: u64 := mut 0;
+    W i < len {
+        remaining := mut len - i;
+        I i > 0 && remaining % 3 == 0 {
+            result.push_str(",");
+        }
+        result.push(s.char_at(i));
+        i += 1;
+    }
+    result
+}
+
+# Format ops/sec as human-readable string
+F format_ops_per_sec(ops: f64) -> Str {
+    I ops >= 1_000_000.0 {
+        m := mut (ops / 1_000_000.0 * 100.0) as u64;
+        whole := mut m / 100;
+        frac := mut m % 100;
+        result := mut whole.to_string();
+        result.push_str(".");
+        I frac < 10 { result.push_str("0"); }
+        result.push_str(&frac.to_string());
+        result.push_str("M");
+        result
+    } E I ops >= 1000.0 {
+        k := mut (ops / 1000.0 * 100.0) as u64;
+        whole := mut k / 100;
+        frac := mut k % 100;
+        result := mut whole.to_string();
+        result.push_str(".");
+        I frac < 10 { result.push_str("0"); }
+        result.push_str(&frac.to_string());
+        result.push_str("K");
+        result
+    } E {
+        n := mut (ops * 100.0) as u64;
+        whole := mut n / 100;
+        frac := mut n % 100;
+        result := mut whole.to_string();
+        result.push_str(".");
+        I frac < 10 { result.push_str("0"); }
+        result.push_str(&frac.to_string());
+        result
+    }
+}
+
+# Format nanoseconds as human-readable duration string
+F format_duration_ns(ns: u64) -> Str {
+    I ns >= 1_000_000_000 {
+        s := mut (ns / 1_000_000_000) as u64;
+        ms_rem := mut (ns % 1_000_000_000) / 1_000_000;
+        result := mut s.to_string();
+        result.push_str(".");
+        I ms_rem < 100 { result.push_str("0"); }
+        I ms_rem < 10 { result.push_str("0"); }
+        result.push_str(&ms_rem.to_string());
+        result.push_str("s");
+        result
+    } E I ns >= 1_000_000 {
+        ms := mut ns / 1_000_000;
+        us_rem := mut (ns % 1_000_000) / 1000;
+        result := mut ms.to_string();
+        result.push_str(".");
+        I us_rem < 100 { result.push_str("0"); }
+        I us_rem < 10 { result.push_str("0"); }
+        result.push_str(&us_rem.to_string());
+        result.push_str("ms");
+        result
+    } E I ns >= 1000 {
+        us := mut ns / 1000;
+        ns_rem := mut ns % 1000;
+        result := mut us.to_string();
+        result.push_str(".");
+        I ns_rem < 100 { result.push_str("0"); }
+        I ns_rem < 10 { result.push_str("0"); }
+        result.push_str(&ns_rem.to_string());
+        result.push_str("us");
+        result
+    } E {
+        result := mut ns.to_string();
+        result.push_str("ns");
+        result
+    }
+}
+
+# Format nanoseconds as f64 duration
+F format_duration_f64(ns: f64) -> Str {
+    format_duration_ns(ns as u64)
+}
+
+# Pad a string to a given width (right-aligned)
+F pad_right(s: &Str, width: u64) -> Str {
+    result := mut s.clone();
+    W result.len() < width {
+        result.push_str(" ");
+    }
+    result
+}
+
+# Pad a string to a given width (left-aligned, right-padded)
+F pad_left(s: &Str, width: u64) -> Str {
+    padding := mut Str.new();
+    needed := mut I width > s.len() { width - s.len() } E { 0 };
+    i: u64 := mut 0;
+    W i < needed {
+        padding.push_str(" ");
+        i += 1;
+    }
+    padding.push_str(s);
+    padding
+}
+
+# ============================================================================
+# Report Generation
+# ============================================================================
+
+# Generate a full benchmark report as formatted text table
+F format_report(suite_name: &Str, results: &Vec<BenchmarkResult>, total_ms: u64) -> Str {
+    output := mut Str.new();
+
+    # Header
+    output.push_str("==========================================================\n");
+    output.push_str("  VaisDB Benchmark Suite: ");
+    output.push_str(suite_name);
+    output.push_str("\n");
+    output.push_str("==========================================================\n\n");
+
+    # Column headers
+    output.push_str(
+        &pad_right(&Str.from("Benchmark"), 40)
+    );
+    output.push_str(
+        &pad_left(&Str.from("Iters"), 8)
+    );
+    output.push_str(
+        &pad_left(&Str.from("Avg"), 14)
+    );
+    output.push_str(
+        &pad_left(&Str.from("p50"), 14)
+    );
+    output.push_str(
+        &pad_left(&Str.from("p95"), 14)
+    );
+    output.push_str(
+        &pad_left(&Str.from("p99"), 14)
+    );
+    output.push_str(
+        &pad_left(&Str.from("ops/s"), 14)
+    );
+    output.push_str("\n");
+
+    # Separator line
+    output.push_str("----------------------------------------------------------");
+    output.push_str("------------------------------------------------------\n");
+
+    # Result rows
+    ri: u64 := mut 0;
+    W ri < results.len() {
+        r := mut &results[ri];
+
+        output.push_str(
+            &pad_right(&r.name, 40)
+        );
+        output.push_str(
+            &pad_left(&r.iterations.to_string(), 8)
+        );
+        output.push_str(
+            &pad_left(&format_duration_f64(r.stats.avg_ns), 14)
+        );
+        output.push_str(
+            &pad_left(&format_duration_ns(r.stats.median_ns), 14)
+        );
+        output.push_str(
+            &pad_left(&format_duration_ns(r.stats.p95_ns), 14)
+        );
+        output.push_str(
+            &pad_left(&format_duration_ns(r.stats.p99_ns), 14)
+        );
+        output.push_str(
+            &pad_left(&format_ops_per_sec(r.ops_per_sec), 14)
+        );
+        output.push_str("\n");
+
+        ri += 1;
+    }
+
+    # Footer
+    output.push_str("\n----------------------------------------------------------");
+    output.push_str("------------------------------------------------------\n");
+    output.push_str("  Total suite time: ");
+    output.push_str(&format_duration_ns(total_ms * 1_000_000));
+    output.push_str("  |  Benchmarks: ");
+    output.push_str(&results.len().to_string());
+    output.push_str("\n");
+    output.push_str("==========================================================\n");
+
+    output
+}
+
+# ============================================================================
+# Comparison Utilities
+# ============================================================================
+
+# Compare two benchmark results and return speedup factor
+F compare_results(baseline: &BenchmarkResult, candidate: &BenchmarkResult) -> f64 {
+    I baseline.ns_per_op <= 0.0 {
+        R 0.0;
+    }
+    baseline.ns_per_op / candidate.ns_per_op
+}
+
+# Format a comparison between baseline and candidate
+F format_comparison(baseline: &BenchmarkResult, candidate: &BenchmarkResult) -> Str {
+    speedup := mut compare_results(baseline, candidate);
+    result := mut Str.new();
+    result.push_str(&baseline.name);
+    result.push_str(" vs ");
+    result.push_str(&candidate.name);
+    result.push_str(": ");
+
+    I speedup >= 1.0 {
+        pct := mut ((speedup - 1.0) * 100.0) as u64;
+        result.push_str(&pct.to_string());
+        result.push_str("% faster");
+    } E {
+        pct := mut ((1.0 - speedup) * 100.0) as u64;
+        result.push_str(&pct.to_string());
+        result.push_str("% slower");
+    }
+    result
+}
+
+# ============================================================================
+# Data Generation Helpers (for benchmark setup)
+# ============================================================================
+
+# Generate a random-ish f32 vector of given dimension
+# Uses a simple LCG PRNG seeded by `seed` for reproducibility
+F generate_random_vector(dim: u32, seed: u64) -> Vec<f32> {
+    vec: Vec<f32> := mut Vec.new();
+    state := mut seed;
+    i: u32 := mut 0;
+    W i < dim {
+        # LCG: state = state * 6364136223846793005 + 1442695040888963407
+        state = state * 6364136223846793005 + 1442695040888963407;
+        # Map to [-1.0, 1.0]
+        val := mut ((state >> 33) as f64 / 2147483648.0 - 1.0) as f32;
+        vec.push(val);
+        i += 1;
+    }
+    vec
+}
+
+# Generate a batch of random vectors
+F generate_random_vectors(count: u64, dim: u32, base_seed: u64) -> Vec<Vec<f32>> {
+    vectors: Vec<Vec<f32>> := mut Vec.new();
+    i: u64 := mut 0;
+    W i < count {
+        vectors.push(generate_random_vector(dim, base_seed + i));
+        i += 1;
+    }
+    vectors
+}
+
+# Generate a random-ish byte key of given length
+F generate_random_key(len: u32, seed: u64) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.new();
+    state := mut seed;
+    i: u32 := mut 0;
+    W i < len {
+        state = state * 6364136223846793005 + 1442695040888963407;
+        byte := mut ((state >> 56) & 0xFF) as u8;
+        key.push(byte);
+        i += 1;
+    }
+    key
+}
+
+# Generate a random text document of approximately `word_count` words
+F generate_random_text(word_count: u32, seed: u64) -> Str {
+    # Vocabulary for generating documents
+    words: [Str] := mut [
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+        "database", "vector", "search", "graph", "index", "query", "table",
+        "column", "row", "page", "buffer", "transaction", "commit", "rollback",
+        "insert", "delete", "update", "select", "where", "join", "order",
+        "group", "having", "limit", "offset", "distinct", "aggregate",
+        "function", "procedure", "trigger", "constraint", "primary", "foreign",
+        "unique", "check", "default", "null", "not", "and", "between",
+        "like", "exists", "create", "drop", "alter", "truncate", "optimize",
+    ];
+    vocab_size := mut words.len();
+
+    text := mut Str.new();
+    state := mut seed;
+    i: u32 := mut 0;
+    W i < word_count {
+        I i > 0 {
+            text.push_str(" ");
+        }
+        state = state * 6364136223846793005 + 1442695040888963407;
+        word_idx := mut (state >> 33) % vocab_size as u64;
+        text.push_str(&words[word_idx]);
+        i += 1;
+    }
+    text
+}

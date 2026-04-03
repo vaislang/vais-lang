@@ -1,0 +1,506 @@
+# cow.vais - Copy-on-write neighbor lists with epoch-based reclamation
+#
+# Provides lock-free concurrent read access to HNSW neighbor lists while
+# allowing safe updates through copy-on-write semantics and epoch-based
+# memory reclamation.
+#
+# Key invariants:
+# - CowNeighborList is immutable after creation
+# - Readers pin an epoch to prevent premature reclamation
+# - Writers create new lists and retire old ones to the grace epoch
+# - Epochs advance when no readers remain in the oldest epoch
+
+U std/sync.{Mutex, AtomicU64, AtomicPtr};
+U std/hashmap.HashMap;
+U storage/error.{VaisError, ErrorCode};
+U vector/hnsw/types.HnswNeighbor;
+
+# Error codes: EE=02 (vector), CC=07 (concurrency), NNN=004-006
+C ERR_COW_NODE_NOT_FOUND: u32 = 0x02_07_004;
+C ERR_COW_INVALID_LAYER: u32 = 0x02_07_005;
+C ERR_COW_EPOCH_OVERFLOW: u32 = 0x02_07_006;
+
+C MAX_LAYERS: u64 = 16;
+
+# Immutable neighbor array shared between readers via reference counting
+S CowNeighborList {
+    neighbors: Vec<HnswNeighbor>,  # Immutable after creation
+    version: u64,                   # Monotonic version number
+}
+
+X CowNeighborList {
+    # Create new neighbor list with given neighbors and version
+    F new(neighbors: Vec<HnswNeighbor>, version: u64) -> CowNeighborList {
+        CowNeighborList {
+            neighbors: neighbors,
+            version: version,
+        }
+    }
+
+    # Get immutable slice of neighbors
+    F get(self) -> &[HnswNeighbor] {
+        &self.neighbors
+    }
+
+    # Get number of neighbors
+    F len(self) -> u64 {
+        self.neighbors.len()
+    }
+
+    # Get version number
+    F version(self) -> u64 {
+        self.version
+    }
+
+    # Create new list with added neighbor (copy-on-write)
+    F with_added(self, neighbor: HnswNeighbor, new_version: u64) -> CowNeighborList {
+        new_neighbors := mut Vec.with_capacity(self.neighbors.len() + 1);
+
+        # Copy existing neighbors
+        L n: &self.neighbors {
+            new_neighbors.push(*n);
+        }
+
+        # Add new neighbor
+        new_neighbors.push(neighbor);
+
+        CowNeighborList.new(new_neighbors, new_version)
+    }
+
+    # Create new list with removed neighbor (copy-on-write)
+    F with_removed(self, node_id: u64, new_version: u64) -> CowNeighborList {
+        new_neighbors := mut Vec.with_capacity(self.neighbors.len());
+
+        # Copy all neighbors except the one to remove
+        L n: &self.neighbors {
+            I n.node_id != node_id {
+                new_neighbors.push(*n);
+            }
+        }
+
+        CowNeighborList.new(new_neighbors, new_version)
+    }
+
+    # Create new list with replaced neighbors (copy-on-write)
+    F with_replaced(self, new_neighbors: Vec<HnswNeighbor>, new_version: u64) -> CowNeighborList {
+        CowNeighborList.new(new_neighbors, new_version)
+    }
+
+    # Clone the neighbor vector for retirement
+    F clone_neighbors(self) -> Vec<HnswNeighbor> {
+        cloned := mut Vec.with_capacity(self.neighbors.len());
+        L n: &self.neighbors {
+            cloned.push(*n);
+        }
+        cloned
+    }
+}
+
+# Per-node neighbor management with CoW
+S CowNodeNeighbors {
+    node_id: u64,
+    layers: Vec<CowNeighborList>,  # One CowNeighborList per layer
+}
+
+X CowNodeNeighbors {
+    # Create new node neighbors with empty lists for all layers
+    F new(node_id: u64, num_layers: u64) -> CowNodeNeighbors {
+        layers := mut Vec.with_capacity(num_layers);
+
+        L i: 0..num_layers {
+            layers.push(CowNeighborList.new(Vec.new(), 0));
+        }
+
+        CowNodeNeighbors {
+            node_id: node_id,
+            layers: layers,
+        }
+    }
+
+    # Get neighbor list for a specific layer
+    F get_layer(self, layer: u8) -> Option<&CowNeighborList> {
+        idx := layer as u64;
+        I idx < self.layers.len() {
+            Some(&self.layers[idx])
+        } E {
+            None
+        }
+    }
+
+    # Update neighbor list for a specific layer (returns old list for retirement)
+    F update_layer(&mut self, layer: u8, new_list: CowNeighborList) -> Option<Vec<HnswNeighbor>> {
+        idx := layer as u64;
+        I idx < self.layers.len() {
+            old_list := mut std.mem.replace(&mut self.layers[idx], new_list);
+            Some(old_list.clone_neighbors())
+        } E {
+            None
+        }
+    }
+
+    # Get number of layers
+    F num_layers(self) -> u64 {
+        self.layers.len()
+    }
+}
+
+# Epoch state for garbage collection
+L EpochState {
+    Current,      # Current epoch, writers retire to this epoch
+    Grace,        # Grace period, waiting for readers to finish
+    Reclaimable,  # Safe to reclaim, no readers can reference
+}
+
+# Epoch-based reclamation for safe memory management
+S EpochManager {
+    current_epoch: AtomicU64,                      # Current epoch number
+    reader_counts: [AtomicU64; 3],                 # Readers pinned per epoch slot (0, 1, 2)
+    garbage: [Mutex<Vec<Vec<HnswNeighbor>>>; 3],  # Old arrays pending reclamation per slot
+}
+
+X EpochManager {
+    # Create new epoch manager
+    F new() -> EpochManager {
+        EpochManager {
+            current_epoch: AtomicU64.new(0),
+            reader_counts: [
+                AtomicU64.new(0),
+                AtomicU64.new(0),
+                AtomicU64.new(0),
+            ],
+            garbage: [
+                Mutex.new(Vec.new()),
+                Mutex.new(Vec.new()),
+                Mutex.new(Vec.new()),
+            ],
+        }
+    }
+
+    # Get current epoch number
+    F current_epoch(self) -> u64 {
+        self.current_epoch.load(std.sync.Ordering.Acquire)
+    }
+
+    # Pin current epoch, preventing reclamation (returns guard)
+    F pin(self) -> EpochGuard {
+        epoch := self.current_epoch.load(std.sync.Ordering.Acquire);
+        slot := (epoch % 3) as u64;
+
+        # Increment reader count for this epoch slot
+        self.reader_counts[slot].fetch_add(1, std.sync.Ordering.AcqRel);
+
+        EpochGuard {
+            manager: self,
+            epoch: epoch,
+        }
+    }
+
+    # Unpin epoch when reader is done
+    F unpin(self, epoch: u64) {
+        slot := (epoch % 3) as u64;
+        self.reader_counts[slot].fetch_sub(1, std.sync.Ordering.AcqRel);
+    }
+
+    # Retire old neighbor list to grace epoch
+    F retire(self, old_list: Vec<HnswNeighbor>) {
+        epoch := self.current_epoch.load(std.sync.Ordering.Acquire);
+        slot := (epoch % 3) as u64;
+
+        garbage := mut self.garbage[slot].lock()!;
+        garbage.push(old_list);
+    }
+
+    # Try to advance epoch and reclaim garbage
+    # Returns number of arrays freed
+    F try_advance(self) -> u64 {
+        current := self.current_epoch.load(std.sync.Ordering.Acquire);
+
+        # Determine which slot would become reclaimable after advancement
+        # Current -> Grace -> Reclaimable
+        # If current is N, then (N-2) % 3 is reclaimable slot
+        reclaimable_slot := ((current + 1) % 3) as u64;
+
+        # Check if reclaimable slot has any readers
+        reader_count := self.reader_counts[reclaimable_slot].load(std.sync.Ordering.Acquire);
+
+        I reader_count == 0 {
+            # Safe to advance epoch and reclaim garbage
+            self.current_epoch.fetch_add(1, std.sync.Ordering.AcqRel);
+
+            # Reclaim garbage from the now-reclaimable slot
+            garbage := mut self.garbage[reclaimable_slot].lock()!;
+            freed_count := garbage.len();
+            garbage.clear();  # Vectors are dropped here
+
+            freed_count
+        } E {
+            # Cannot advance, readers still in reclaimable epoch
+            0
+        }
+    }
+
+    # Get total number of arrays pending reclamation
+    F pending_reclamation(self) -> u64 {
+        total := mut 0u64;
+
+        L i: 0..3 {
+            garbage := self.garbage[i].lock()!;
+            total += garbage.len();
+        }
+
+        total
+    }
+
+    # Get reader counts for debugging
+    F reader_counts(self) -> [u64; 3] {
+        [
+            self.reader_counts[0].load(std.sync.Ordering.Acquire),
+            self.reader_counts[1].load(std.sync.Ordering.Acquire),
+            self.reader_counts[2].load(std.sync.Ordering.Acquire),
+        ]
+    }
+}
+
+# RAII guard for epoch pinning
+S EpochGuard<'a> {
+    manager: &'a EpochManager,
+    epoch: u64,
+}
+
+I<'a> Drop for EpochGuard<'a> {
+    F drop(&mut self) {
+        self.manager.unpin(self.epoch);
+    }
+}
+
+I<'a> EpochGuard<'a> {
+    # Get the pinned epoch number
+    F epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
+# Combined: CoW neighbors + epoch reclamation
+S CowNeighborStore {
+    epoch_mgr: EpochManager,
+    neighbors: Mutex<HashMap<u64, CowNodeNeighbors>>,  # node_id -> per-node CoW neighbors
+    version_counter: AtomicU64,
+}
+
+X CowNeighborStore {
+    # Create new CoW neighbor store
+    F new() -> CowNeighborStore {
+        CowNeighborStore {
+            epoch_mgr: EpochManager.new(),
+            neighbors: Mutex.new(HashMap.new()),
+            version_counter: AtomicU64.new(0),
+        }
+    }
+
+    # Pin current epoch (readers must call this before reading neighbors)
+    F pin_epoch(self) -> EpochGuard {
+        self.epoch_mgr.pin()
+    }
+
+    # Get next version number
+    F next_version(self) -> u64 {
+        self.version_counter.fetch_add(1, std.sync.Ordering.AcqRel)
+    }
+
+    # Read neighbor list for a node and layer
+    # Caller must hold an EpochGuard while using the returned reference
+    F read_neighbors(self, node_id: u64, layer: u8) -> Result<Vec<HnswNeighbor>, VaisError> {
+        neighbors := self.neighbors.lock()!;
+
+        # Get node neighbors
+        node_neighbors := neighbors.get(&node_id).ok_or_else(|| {
+            VaisError.new(
+                ErrorCode.from_u32(ERR_COW_NODE_NOT_FOUND),
+                "Node not found in CoW neighbor store".to_string(),
+            )
+        })?;
+
+        # Get layer
+        layer_list := node_neighbors.get_layer(layer).ok_or_else(|| {
+            VaisError.new(
+                ErrorCode.from_u32(ERR_COW_INVALID_LAYER),
+                "Invalid layer index".to_string(),
+            )
+        })?;
+
+        # Clone neighbors for safe return
+        result := mut Vec.with_capacity(layer_list.len());
+        L n: layer_list.get() {
+            result.push(*n);
+        }
+
+        Ok(result)
+    }
+
+    # Update neighbor list for a node and layer
+    F update_neighbors(
+        &self,
+        node_id: u64,
+        layer: u8,
+        new_neighbors: Vec<HnswNeighbor>,
+    ) -> Result<(), VaisError> {
+        new_version := self.next_version();
+
+        neighbors := mut self.neighbors.lock()!;
+
+        # Get or create node neighbors
+        I !neighbors.contains_key(&node_id) {
+            neighbors.insert(node_id, CowNodeNeighbors.new(node_id, MAX_LAYERS));
+        }
+
+        node_neighbors := neighbors.get_mut(&node_id)!;
+
+        # Ensure layer exists
+        I layer as u64 >= node_neighbors.num_layers() {
+            R Err(VaisError.new(
+                ErrorCode.from_u32(ERR_COW_INVALID_LAYER),
+                "Layer index exceeds node layer count".to_string(),
+            ));
+        }
+
+        # Create new list with updated neighbors
+        new_list := CowNeighborList.new(new_neighbors, new_version);
+
+        # Update layer and retire old list
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                # Retire old neighbor array to epoch manager
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    # Add a neighbor to a node's layer
+    F add_neighbor(
+        &self,
+        node_id: u64,
+        layer: u8,
+        neighbor: HnswNeighbor,
+    ) -> Result<(), VaisError> {
+        new_version := self.next_version();
+
+        neighbors := mut self.neighbors.lock()!;
+
+        # Get or create node neighbors
+        I !neighbors.contains_key(&node_id) {
+            neighbors.insert(node_id, CowNodeNeighbors.new(node_id, MAX_LAYERS));
+        }
+
+        node_neighbors := neighbors.get_mut(&node_id)!;
+
+        # Get current layer list
+        current_list := node_neighbors.get_layer(layer).ok_or_else(|| {
+            VaisError.new(
+                ErrorCode.from_u32(ERR_COW_INVALID_LAYER),
+                "Invalid layer index".to_string(),
+            )
+        })?;
+
+        # Create new list with added neighbor
+        new_list := current_list.with_added(neighbor, new_version);
+
+        # Update layer and retire old list
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    # Remove a neighbor from a node's layer
+    F remove_neighbor(
+        &self,
+        node_id: u64,
+        layer: u8,
+        neighbor_id: u64,
+    ) -> Result<(), VaisError> {
+        new_version := self.next_version();
+
+        neighbors := mut self.neighbors.lock()!;
+
+        node_neighbors := neighbors.get_mut(&node_id).ok_or_else(|| {
+            VaisError.new(
+                ErrorCode.from_u32(ERR_COW_NODE_NOT_FOUND),
+                "Node not found in CoW neighbor store".to_string(),
+            )
+        })?;
+
+        # Get current layer list
+        current_list := node_neighbors.get_layer(layer).ok_or_else(|| {
+            VaisError.new(
+                ErrorCode.from_u32(ERR_COW_INVALID_LAYER),
+                "Invalid layer index".to_string(),
+            )
+        })?;
+
+        # Create new list with removed neighbor
+        new_list := current_list.with_removed(neighbor_id, new_version);
+
+        # Update layer and retire old list
+        M node_neighbors.update_layer(layer, new_list) {
+            Some(old_neighbors) => {
+                self.epoch_mgr.retire(old_neighbors);
+            },
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    # Try to advance epoch and reclaim garbage
+    # Returns number of arrays freed
+    F try_reclaim(self) -> u64 {
+        self.epoch_mgr.try_advance()
+    }
+
+    # Get number of arrays pending reclamation
+    F pending_reclamation(self) -> u64 {
+        self.epoch_mgr.pending_reclamation()
+    }
+
+    # Get current epoch number
+    F current_epoch(self) -> u64 {
+        self.epoch_mgr.current_epoch()
+    }
+
+    # Get statistics for debugging
+    F stats(self) -> CowNeighborStats {
+        neighbors := self.neighbors.lock()!;
+        reader_counts := self.epoch_mgr.reader_counts();
+
+        CowNeighborStats {
+            num_nodes: neighbors.len(),
+            current_epoch: self.epoch_mgr.current_epoch(),
+            pending_reclamation: self.epoch_mgr.pending_reclamation(),
+            reader_counts: reader_counts,
+            current_version: self.version_counter.load(std.sync.Ordering.Acquire),
+        }
+    }
+}
+
+# Statistics for debugging and monitoring
+S CowNeighborStats {
+    num_nodes: u64,           # Number of nodes tracked
+    current_epoch: u64,         # Current epoch number
+    pending_reclamation: u64, # Arrays waiting to be reclaimed
+    reader_counts: [u64; 3],    # Readers per epoch slot
+    current_version: u64,       # Current version number
+}
+
+X CowNeighborStats {
+    # Get total active readers across all epochs
+    F total_readers(self) -> u64 {
+        self.reader_counts[0] + self.reader_counts[1] + self.reader_counts[2]
+    }
+}

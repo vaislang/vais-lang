@@ -1,0 +1,296 @@
+# Full-Text Query Planning — Search Mode Detection and top_k Adjustment
+# Builds HybridPlanNode.FullTextScan with optimal search mode and result size
+#
+# Search Mode Detection:
+# - Quoted phrases ("exact match") → Phrase mode with slop=0
+# - Boolean operators (AND, OR, NOT) → Boolean mode
+# - Simple keywords → Simple BM25 mode
+#
+# top_k Adjustment:
+# - If followed by JOIN or UNION → increase top_k to ensure sufficient candidates
+# - If followed by LIMIT N → adjust top_k to min(top_k, N)
+# - If used in subquery → increase top_k for better recall
+#
+# Cost Model:
+# - Dictionary lookup: O(log D) per query term via B+Tree
+# - Posting list scan: O(avg_posting_length × query_terms)
+# - BM25 scoring: O(1) per (doc, term) pair
+# - Result sorting: O(N log top_k) via heap
+
+U storage/error.{VaisError};
+U sql/parser/ast.{Expr};
+U sql/planner/mod.{estimate_selectivity};
+U planner/types.{
+    HybridPlanNode, HybridCost, FullTextScanParams, FullTextSearchMode,
+    err_hybrid_plan_failed
+};
+U planner/cost_model.{FullTextStats, estimate_fulltext_scan_cost};
+
+# ============================================================================
+# Error Codes: EE=00 (common/planner), CC=08 (planner), DD=22 (fulltext_plan)
+# ============================================================================
+
+C ERR_CODE_FULLTEXT_PLAN_FAILED: Str = "VAIS-0008022";
+
+F err_fulltext_plan_failed(reason: Str) -> VaisError {
+    VaisError.new(ERR_CODE_FULLTEXT_PLAN_FAILED, "Full-text plan build failed: {reason}")
+}
+
+# ============================================================================
+# Search Mode Detection
+# ============================================================================
+
+# Analyze query text expression to detect search mode
+# This is a simplified heuristic; in practice, would need to evaluate the expression
+F detect_search_mode(query_text_expr: &Expr) -> FullTextSearchMode {
+    # For literal query strings, analyze the text
+    M query_text_expr {
+        Expr.Literal { value } => {
+            M value {
+                sql/types.SqlValue.StringVal { v } => {
+                    R detect_mode_from_text(v);
+                },
+                _ => {},
+            }
+        },
+        _ => {},
+    }
+
+    # Default: Simple mode
+    FullTextSearchMode.Simple
+}
+
+# Detect search mode from query text string
+F detect_mode_from_text(text: &Str) -> FullTextSearchMode {
+    # Check for quoted phrases
+    I text.contains("\"") {
+        # Quoted phrase detected → Phrase mode
+        # Count quotes to determine I it's a complete phrase
+        quote_count := mut text.chars().filter(|c| *c == '"').count();
+        I quote_count >= 2 {
+            # Complete phrase: use slop=0 for exact M R FullTextSearchMode.Phrase { slop: 0 };
+        }
+    }
+
+    # Check for boolean operators
+    upper := mut text.to_uppercase();
+    I upper.contains(" AND ") || upper.contains(" OR ") || upper.contains(" NOT ") {
+        # Boolean operators detected → Boolean mode
+        R FullTextSearchMode.Boolean;
+    }
+
+    # Check for proximity operators (e.g., "word1 NEAR word2")
+    I upper.contains(" NEAR ") || upper.contains("~") {
+        # Proximity search → Phrase mode with slop
+        R FullTextSearchMode.Phrase { slop: 5 };
+    }
+
+    # Default: Simple BM25 mode
+    FullTextSearchMode.Simple
+}
+
+# ============================================================================
+# top_k Adjustment
+# ============================================================================
+
+# Context for top_k adjustment
+L QueryContext {
+    Standalone,            # Query is standalone (no downstream ops)
+    BeforeJoin,            # Query is followed by JOIN
+    BeforeLimit { n: u64 }, # Query is followed by LIMIT N
+    InSubquery,            # Query is used in a subquery
+}
+
+# Adjust top_k based on query context
+F adjust_top_k(base_top_k: u32, context: QueryContext) -> u32 {
+    M context {
+        QueryContext.Standalone => {
+            # No adjustment needed
+            base_top_k
+        },
+        QueryContext.BeforeJoin => {
+            # Increase top_k to ensure sufficient candidates for join
+            # Multiply by 2 to improve recall
+            base_top_k * 2
+        },
+        QueryContext.BeforeLimit { n } => {
+            # Adjust top_k to M limit
+            # Use max to ensure at least some results
+            adjusted := mut I n < base_top_k as u64 {
+                n as u32
+            } E {
+                base_top_k
+            };
+            I adjusted < 10 {
+                10  # Minimum top_k
+            } E {
+                adjusted
+            }
+        },
+        QueryContext.InSubquery => {
+            # Increase top_k for better recall in subquery
+            base_top_k * 3
+        },
+    }
+}
+
+# ============================================================================
+# Predicate Pushdown
+# ============================================================================
+
+# Push predicates into FullTextScanParams.filter
+# Full-text predicates are already handled by the query_text_expr
+# This handles additional WHERE conditions (e.g., doc_date > '2020-01-01')
+F push_predicates(
+    params: FullTextScanParams,
+    where_clause: Option<Expr>,
+) -> FullTextScanParams {
+    M where_clause {
+        Some(ref expr) => {
+            # Merge with existing filter
+            merged_filter := mut M params.filter {
+                Some(existing) => {
+                    Some(Expr.BinaryOp {
+                        left: Box.new(existing),
+                        op: sql/parser/ast.BinOp.And,
+                        right: Box.new(expr.clone()),
+                    })
+                },
+                None => Some(expr.clone()),
+            };
+
+            FullTextScanParams {
+                table_name: params.table_name,
+                column_name: params.column_name,
+                query_text_expr: params.query_text_expr,
+                top_k: params.top_k,
+                search_mode: params.search_mode,
+                filter: merged_filter,
+            }
+        },
+        None => params,
+    }
+}
+
+# ============================================================================
+# Main Plan Builder
+# ============================================================================
+
+# Build a FullTextScan plan node from parameters and statistics
+#
+# Arguments:
+# - params: FullTextScanParams (table, column, query_text, top_k, etc.)
+# - stats: FullTextStats (from fulltext engine metadata)
+# - where_clause: Optional WHERE predicate from SQL query
+#
+# Returns:
+# - HybridPlanNode.FullTextScan with computed HybridCost and optimal search mode
+F build_fulltext_plan(
+    params: FullTextScanParams,
+    stats: &FullTextStats,
+    where_clause: Option<Expr>,
+) -> Result<HybridPlanNode, VaisError> {
+    # Step 1: Detect search mode from query text expression
+    detected_mode := mut detect_search_mode(&params.query_text_expr);
+
+    # Step 2: Use detected mode I params.search_mode is Simple (default)
+    final_mode := mut M params.search_mode {
+        FullTextSearchMode.Simple => detected_mode,
+        _ => params.search_mode,  # User explicitly specified mode
+    };
+
+    # Step 3: Adjust top_k based on query context
+    # For now, assume standalone context; in a full planner, would detect context from query tree
+    context := mut QueryContext.Standalone;
+    adjusted_top_k := mut adjust_top_k(params.top_k, context);
+
+    # Step 4: Push predicates into filter
+    params_with_mode := mut FullTextScanParams {
+        table_name: params.table_name,
+        column_name: params.column_name,
+        query_text_expr: params.query_text_expr,
+        top_k: adjusted_top_k,
+        search_mode: final_mode,
+        filter: params.filter,
+    };
+    final_params := mut push_predicates(params_with_mode, where_clause);
+
+    # Step 5: Estimate cost
+    cost := mut estimate_fulltext_scan_cost(&final_params, stats);
+
+    # Step 6: Build HybridPlanNode.FullTextScan
+    Ok(HybridPlanNode.FullTextScan {
+        params: final_params,
+        alias: None,
+        cost,
+    })
+}
+
+# ============================================================================
+# Helper — Build FullTextScan with Context
+# ============================================================================
+
+# Build a FullTextScan plan node with query context for top_k adjustment
+F build_fulltext_plan_with_context(
+    params: FullTextScanParams,
+    stats: &FullTextStats,
+    where_clause: Option<Expr>,
+    context: QueryContext,
+) -> Result<HybridPlanNode, VaisError> {
+    # Step 1: Detect search mode
+    detected_mode := mut detect_search_mode(&params.query_text_expr);
+    final_mode := mut M params.search_mode {
+        FullTextSearchMode.Simple => detected_mode,
+        _ => params.search_mode,
+    };
+
+    # Step 2: Adjust top_k based on context
+    adjusted_top_k := mut adjust_top_k(params.top_k, context);
+
+    # Step 3: Build params with mode and adjusted top_k
+    params_with_mode := mut FullTextScanParams {
+        table_name: params.table_name,
+        column_name: params.column_name,
+        query_text_expr: params.query_text_expr,
+        top_k: adjusted_top_k,
+        search_mode: final_mode,
+        filter: params.filter,
+    };
+    final_params := mut push_predicates(params_with_mode, where_clause);
+
+    # Step 4: Estimate cost
+    cost := mut estimate_fulltext_scan_cost(&final_params, stats);
+
+    # Step 5: Build node
+    Ok(HybridPlanNode.FullTextScan {
+        params: final_params,
+        alias: None,
+        cost,
+    })
+}
+
+# ============================================================================
+# Helper — Build FullTextScan with Alias
+# ============================================================================
+
+# Build a FullTextScan plan node with an alias (for subquery or JOIN)
+F build_fulltext_plan_with_alias(
+    params: FullTextScanParams,
+    stats: &FullTextStats,
+    where_clause: Option<Expr>,
+    alias: Str,
+) -> Result<HybridPlanNode, VaisError> {
+    node := mut build_fulltext_plan(params, stats, where_clause)?;
+
+    # Unwrap and re-wrap with alias
+    M node {
+        HybridPlanNode.FullTextScan { params, cost, .. } => {
+            Ok(HybridPlanNode.FullTextScan {
+                params,
+                alias: Some(alias),
+                cost,
+            })
+        },
+        _ => Err(err_fulltext_plan_failed("Expected FullTextScan node")),
+    }
+}

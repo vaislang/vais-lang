@@ -1,0 +1,309 @@
+# Graph Query Planning — BFS/DFS Selection and Edge Type Pushdown
+# Builds HybridPlanNode.GraphTraverse with optimal traversal algorithm and edge filters
+#
+# Traversal Algorithm Selection:
+# - BFS (Breadth-First Search): best for shortest-path queries, bounded depth, path enumeration
+# - DFS (Depth-First Search): best for exhaustive search, cycle detection, deep traversal
+#
+# Edge Type Pushdown:
+# - Extract edge type filters from SQL WHERE clause
+# - Push into GraphTraverseNodeParams.edge_type_filter to reduce traversal cost
+#
+# Cost Model:
+# - Estimated nodes visited = Σ(degree^i) for i=0..depth (geometric series)
+# - Edge type filter reduces effective degree: degree' = degree × (filtered_types / total_types)
+
+U storage/error.{VaisError};
+U sql/parser/ast.{Expr, BinOp};
+U sql/planner/mod.{estimate_selectivity};
+U planner/types.{
+    HybridPlanNode, HybridCost, GraphTraverseNodeParams,
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+    err_hybrid_plan_failed
+};
+U planner/cost_model.{GraphStats, estimate_graph_traverse_cost};
+
+# ============================================================================
+# Error Codes: EE=00 (common/planner), CC=08 (planner), DD=21 (graph_plan)
+# ============================================================================
+
+C ERR_CODE_GRAPH_PLAN_FAILED: Str = "VAIS-0008021";
+
+F err_graph_plan_failed(reason: Str) -> VaisError {
+    VaisError.new(ERR_CODE_GRAPH_PLAN_FAILED, "Graph plan build failed: {reason}")
+}
+
+# ============================================================================
+# Traversal Algorithm Selection
+# ============================================================================
+
+# Analyze query intent to choose BFS vs DFS
+L TraversalHint = PreferBFS | PreferDFS | NoPreference;
+
+# Detect traversal hint from query parameters
+F detect_traversal_hint(params: &GraphTraverseNodeParams) -> TraversalHint {
+    # Heuristics:
+    # - If max_depth is small (< 4), prefer BFS (bounded breadth search)
+    # - If return_paths is true and max_depth is small, prefer BFS (shortest paths)
+    # - If max_depth is large or unlimited, prefer DFS (deeper exploration)
+    # - If edge_type_filter is present, prefer DFS (filter early in deep traversal)
+
+    I params.max_depth > 0 && params.max_depth < 4 {
+        # Shallow traversal: BFS is efficient
+        I params.return_paths {
+            # Shortest path queries: BFS is optimal
+            TraversalHint.PreferBFS
+        } E {
+            TraversalHint.PreferBFS
+        }
+    } E I params.max_depth >= 6 || params.max_depth == 0 {
+        # Deep or unlimited traversal: DFS is better
+        TraversalHint.PreferDFS
+    } E {
+        # Medium depth: no strong preference
+        TraversalHint.NoPreference
+    }
+}
+
+# Apply traversal hint to decide use_dfs flag
+F apply_traversal_hint(hint: TraversalHint, current_use_dfs: bool) -> bool {
+    M hint {
+        TraversalHint.PreferBFS => false,
+        TraversalHint.PreferDFS => true,
+        TraversalHint.NoPreference => current_use_dfs,  # Keep user's choice
+    }
+}
+
+# ============================================================================
+# Edge Type Filter Pushdown
+# ============================================================================
+
+# Extract edge type filters from SQL WHERE clause
+# Examples:
+#   WHERE edge_type = 'FRIEND' → extract ["FRIEND"]
+#   WHERE edge_type IN ('FRIEND', 'COLLEAGUE') → extract ["FRIEND", "COLLEAGUE"]
+#   WHERE edge_type = 'FRIEND' AND node.age > 30 → extract ["FRIEND"], residual: node.age > 30
+F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Expr>) {
+    M where_clause {
+        # Single equality: edge_type = 'FRIEND'
+        Expr.BinaryOp { left, op, right } => {
+            M op {
+                BinOp.Eq => {
+                    M (left.as_ref(), right.as_ref()) {
+                        (Expr.ColumnRef { column, .. }, Expr.Literal { value }) => {
+                            I column == "edge_type" || column == "type" || column == "label" {
+                                # Extract edge type from literal
+                                M value {
+                                    sql/types.SqlValue.StringVal { v } => {
+                                        R (Some(vec![v.clone()]), None);
+                                    },
+                                    _ => {},
+                                }
+                            }
+                        },
+                        _ => {},
+                    }
+                },
+                BinOp.And => {
+                    # Conjunction: extract from both sides
+                    (left_types, left_residual) := mut extract_edge_type_filter(left);
+                    (right_types, right_residual) := mut extract_edge_type_filter(right);
+
+                    # Merge edge types
+                    merged_types := mut M (left_types, right_types) {
+                        (Some(mut lt), Some(rt)) => {
+                            lt.extend(rt);
+                            Some(lt)
+                        },
+                        (Some(lt), None) => Some(lt),
+                        (None, Some(rt)) => Some(rt),
+                        (None, None) => None,
+                    };
+
+                    # Merge residuals
+                    merged_residual := mut M (left_residual, right_residual) {
+                        (Some(lr), Some(rr)) => {
+                            Some(Expr.BinaryOp {
+                                left: Box.new(lr),
+                                op: BinOp.And,
+                                right: Box.new(rr),
+                            })
+                        },
+                        (Some(lr), None) => Some(lr),
+                        (None, Some(rr)) => Some(rr),
+                        (None, None) => None,
+                    };
+
+                    R (merged_types, merged_residual);
+                },
+                _ => {},
+            }
+        },
+
+        # IN list: edge_type IN ('FRIEND', 'COLLEAGUE')
+        Expr.InList { expr, list, negated } => {
+            M expr.as_ref() {
+                Expr.ColumnRef { column, .. } => {
+                    I column == "edge_type" || column == "type" || column == "label" {
+                        I !*negated {
+                            # Extract all edge types from IN list
+                            types := mut Vec.new();
+                            L item: list {
+                                M item {
+                                    Expr.Literal { value } => {
+                                        M value {
+                                            sql/types.SqlValue.StringVal { v } => {
+                                                types.push(v.clone());
+                                            },
+                                            _ => {},
+                                        }
+                                    },
+                                    _ => {},
+                                }
+                            }
+                            I types.len() > 0 {
+                                R (Some(types), None);
+                            }
+                        }
+                    }
+                },
+                _ => {},
+            }
+        },
+
+        _ => {},
+    }
+
+    # No edge type filter found: R all as residual
+    (None, Some(where_clause.clone()))
+}
+
+# ============================================================================
+# Predicate Pushdown
+# ============================================================================
+
+# Push predicates into GraphTraverseNodeParams.filter
+# Separate edge-level predicates (pushed into edge_type_filter) from node-level predicates (kept as filter)
+F push_predicates(
+    params: GraphTraverseNodeParams,
+    where_clause: Option<Expr>,
+) -> GraphTraverseNodeParams {
+    M where_clause {
+        Some(ref expr) => {
+            # Extract edge type filter
+            (edge_types, residual) := mut extract_edge_type_filter(expr);
+
+            # Merge edge types with existing filter
+            merged_edge_filter := mut M (params.edge_type_filter, edge_types) {
+                (Some(existing), Some(new_types)) => {
+                    combined := mut existing.clone();
+                    combined.extend(new_types);
+                    Some(combined)
+                },
+                (Some(existing), None) => Some(existing),
+                (None, Some(new_types)) => Some(new_types),
+                (None, None) => None,
+            };
+
+            # Merge residual with existing filter
+            merged_filter := mut M (params.filter, residual) {
+                (Some(existing), Some(new_residual)) => {
+                    Some(Expr.BinaryOp {
+                        left: Box.new(existing),
+                        op: BinOp.And,
+                        right: Box.new(new_residual),
+                    })
+                },
+                (Some(existing), None) => Some(existing),
+                (None, Some(new_residual)) => Some(new_residual),
+                (None, None) => None,
+            };
+
+            GraphTraverseNodeParams {
+                start_node_expr: params.start_node_expr,
+                max_depth: params.max_depth,
+                direction: params.direction,
+                edge_type_filter: merged_edge_filter,
+                return_paths: params.return_paths,
+                use_dfs: params.use_dfs,
+                filter: merged_filter,
+            }
+        },
+        None => params,
+    }
+}
+
+# ============================================================================
+# Main Plan Builder
+# ============================================================================
+
+# Build a GraphTraverse plan node from parameters and statistics
+#
+# Arguments:
+# - params: GraphTraverseNodeParams (start_node, max_depth, direction, etc.)
+# - stats: GraphStats (from graph engine metadata)
+# - where_clause: Optional WHERE predicate from SQL query
+#
+# Returns:
+# - HybridPlanNode.GraphTraverse with computed HybridCost and optimal traversal algorithm
+F build_graph_plan(
+    params: GraphTraverseNodeParams,
+    stats: &GraphStats,
+    where_clause: Option<Expr>,
+) -> Result<HybridPlanNode, VaisError> {
+    # Step 1: Push predicates (edge type filter and node filter)
+    params_with_filter := mut push_predicates(params, where_clause);
+
+    # Step 2: Detect traversal hint
+    hint := mut detect_traversal_hint(&params_with_filter);
+
+    # Step 3: Apply traversal hint to choose BFS vs DFS
+    final_use_dfs := mut apply_traversal_hint(hint, params_with_filter.use_dfs);
+
+    # Step 4: Build final params with traversal algorithm
+    final_params := mut GraphTraverseNodeParams {
+        start_node_expr: params_with_filter.start_node_expr,
+        max_depth: params_with_filter.max_depth,
+        direction: params_with_filter.direction,
+        edge_type_filter: params_with_filter.edge_type_filter,
+        return_paths: params_with_filter.return_paths,
+        use_dfs: final_use_dfs,
+        filter: params_with_filter.filter,
+    };
+
+    # Step 5: Estimate cost
+    cost := mut estimate_graph_traverse_cost(&final_params, stats);
+
+    # Step 6: Build HybridPlanNode.GraphTraverse
+    Ok(HybridPlanNode.GraphTraverse {
+        params: final_params,
+        alias: None,
+        cost,
+    })
+}
+
+# ============================================================================
+# Helper — Build GraphTraverse with Alias
+# ============================================================================
+
+# Build a GraphTraverse plan node with an alias (for subquery or JOIN)
+F build_graph_plan_with_alias(
+    params: GraphTraverseNodeParams,
+    stats: &GraphStats,
+    where_clause: Option<Expr>,
+    alias: Str,
+) -> Result<HybridPlanNode, VaisError> {
+    node := mut build_graph_plan(params, stats, where_clause)?;
+
+    # Unwrap and re-wrap with alias
+    M node {
+        HybridPlanNode.GraphTraverse { params, cost, .. } => {
+            Ok(HybridPlanNode.GraphTraverse {
+                params,
+                alias: Some(alias),
+                cost,
+            })
+        },
+        _ => Err(err_graph_plan_failed("Expected GraphTraverse node")),
+    }
+}

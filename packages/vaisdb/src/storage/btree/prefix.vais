@@ -1,0 +1,192 @@
+# B+Tree Prefix Compression
+# Reduces key storage by encoding only suffix relative to previous key
+# Based on Stage 1 Section 9 - prefix compression for leaf pages
+# Useful for sequential/monotonic keys (timestamps, auto-inc IDs)
+
+U storage/error.{VaisError, err_internal};
+U storage/btree/key.{common_prefix_length, strip_prefix, reconstruct_key};
+U std/bytes.{ByteBuffer};
+
+# Compressed key entry: prefix_len + suffix
+# On-disk format: [u16 prefix_len][u16 suffix_len][suffix bytes]
+S CompressedKey {
+    prefix_len: u16,     # Bytes shared with previous key
+    suffix: Vec<u8>,     # Remaining bytes after prefix
+}
+
+X CompressedKey {
+    F new(prefix_len: u16, suffix: Vec<u8>) -> CompressedKey {
+        CompressedKey { prefix_len, suffix }
+    }
+
+    # Serialized size
+    F serialized_size(self) -> u32 {
+        4 + self.suffix.len() as u32  # 2B prefix_len + 2B suffix_len + suffix
+    }
+
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u16_le(self.prefix_len);
+        buf.put_u16_le(self.suffix.len() as u16);
+        buf.put_bytes(&self.suffix);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<CompressedKey, VaisError> {
+        prefix_len := mut buf.get_u16_le()?;
+        suffix_len := mut buf.get_u16_le()?;
+        suffix := mut buf.get_bytes(suffix_len as u64)?;
+        Ok(CompressedKey { prefix_len, suffix })
+    }
+}
+
+# Compress a sorted sequence of keys using prefix compression
+# Returns compressed keys. First key has prefix_len = 0 (full key stored)
+F compress_keys(keys: &[&[u8]]) -> Vec<CompressedKey> {
+    compressed := mut Vec.with_capacity(keys.len());
+
+    I keys.is_empty() {
+        R compressed;
+    }
+
+    # First key is stored in full
+    compressed.push(CompressedKey.new(0, keys[0].to_vec()));
+
+    L i: 1..keys.len() {
+        (prefix_len, suffix) := mut strip_prefix(keys[i], keys[i - 1]);
+        compressed.push(CompressedKey.new(prefix_len, suffix));
+    }
+
+    compressed
+}
+
+# Decompress a sequence of compressed keys back to full keys
+F decompress_keys(compressed: &[CompressedKey]) -> Vec<Vec<u8>> {
+    keys := mut Vec.with_capacity(compressed.len());
+
+    I compressed.is_empty() {
+        R keys;
+    }
+
+    # First key is the full suffix (prefix_len = 0)
+    keys.push(compressed[0].suffix.clone());
+
+    L i: 1..compressed.len() {
+        prev_key := mut &keys[i - 1];
+        full_key := mut reconstruct_key(prev_key, compressed[i].prefix_len, &compressed[i].suffix);
+        keys.push(full_key);
+    }
+
+    keys
+}
+
+# Calculate the total compressed size for a set of sorted keys
+F compressed_total_size(keys: &[&[u8]]) -> u32 {
+    I keys.is_empty() {
+        R 0;
+    }
+
+    # First key: 4B header + full key
+    total: u32 := mut 4 + keys[0].len() as u32;
+
+    L i: 1..keys.len() {
+        prefix_len := mut common_prefix_length(keys[i], keys[i - 1]);
+        suffix_len := mut keys[i].len() - prefix_len;
+        total += 4 + suffix_len as u32;  # 4B header + suffix
+    }
+
+    total
+}
+
+# Calculate compression ratio (0.0 = no savings, 1.0 = all prefix)
+F compression_ratio(keys: &[&[u8]]) -> f64 {
+    I keys.is_empty() || keys.len() == 1 {
+        R 0.0;
+    }
+
+    original_size: u32 := mut 0;
+    L key: keys {
+        original_size += key.len() as u32;
+    }
+
+    comp_size := mut compressed_total_size(keys);
+    I original_size == 0 {
+        R 0.0;
+    }
+
+    1.0 - (comp_size as f64 / (original_size + keys.len() as u32 * 4) as f64)
+}
+
+# Find a key in compressed format at a given index
+# Requires decompressing from the beginning (or from last restart point)
+F decompress_key_at(compressed: &[CompressedKey], index: u64) -> Result<Vec<u8>, VaisError> {
+    I index >= compressed.len() {
+        R Err(err_internal("Key index out of bounds"));
+    }
+
+    current_key := mut compressed[0].suffix.clone();
+    L i: 1..=index {
+        current_key = reconstruct_key(&current_key, compressed[i].prefix_len, &compressed[i].suffix);
+    }
+
+    Ok(current_key)
+}
+
+# Restart point interval for prefix compression
+# Every N entries, store a full key (prefix_len = 0) to allow random access
+C RESTART_INTERVAL: u16 = 16;
+
+# Compress keys with periodic restart points for random access
+# Every RESTART_INTERVAL entries, a full key is stored
+F compress_keys_with_restarts(keys: &[&[u8]]) -> (Vec<CompressedKey>, Vec<u16>) {
+    compressed := mut Vec.with_capacity(keys.len());
+    restart_points := mut Vec.new();
+
+    I keys.is_empty() {
+        R (compressed, restart_points);
+    }
+
+    L i: 0..keys.len() {
+        I (i as u16) % RESTART_INTERVAL == 0 {
+            # Restart point: store full key
+            restart_points.push(i as u16);
+            compressed.push(CompressedKey.new(0, keys[i].to_vec()));
+        } E {
+            (prefix_len, suffix) := mut strip_prefix(keys[i], keys[i - 1]);
+            compressed.push(CompressedKey.new(prefix_len, suffix));
+        }
+    }
+
+    (compressed, restart_points)
+}
+
+# Decompress a key at an arbitrary index using restart points
+# Much faster than decompressing from the start for large pages
+F decompress_key_with_restarts(
+    compressed: &[CompressedKey],
+    restart_points: &[u16],
+    index: u64,
+) -> Result<Vec<u8>, VaisError> {
+    I index >= compressed.len() {
+        R Err(err_internal("Key index out of bounds"));
+    }
+
+    # Find the nearest restart point at or before index
+    restart_idx: u64 := mut 0;
+    found_restart := mut false;
+    L i: 0..restart_points.len() {
+        I !found_restart {
+            I restart_points[i] as u64 <= index {
+                restart_idx = restart_points[i] as u64;
+            } E {
+                found_restart = true;
+            }
+        }
+    }
+
+    # Decompress from restart point to target index
+    current_key := mut compressed[restart_idx].suffix.clone();
+    L i: (restart_idx + 1)..=index {
+        current_key = reconstruct_key(&current_key, compressed[i].prefix_len, &compressed[i].suffix);
+    }
+
+    Ok(current_key)
+}

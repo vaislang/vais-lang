@@ -1,0 +1,562 @@
+# Hybrid Query Planner — Statistics Collection
+# Gathers per-table and per-engine statistics for cost model estimation
+# Implements ANALYZE command for manual statistics refresh
+#
+# Components:
+# - TableColumnStats: per-column histograms, cardinality, null fraction
+# - StatisticsCollector: orchestrates stats gathering across all engines
+# - Sampling: reservoir sampling for histogram building on large tables
+# - ANALYZE integration: command executor for statistics refresh
+
+U storage/error.{VaisError, err_internal};
+U storage/buffer/pool.{BufferPool};
+U sql/catalog/manager.{CatalogManager};
+U sql/catalog/schema.{TableInfo, ColumnInfo, IndexInfo};
+U sql/planner/mod.{TableStats, CostEstimate};
+U sql/types.{SqlType, SqlValue};
+U planner/cost_model.{
+    VectorIndexStats, GraphStats, FullTextStats, HybridStats
+};
+
+# ============================================================================
+# Error Code Constants (EE=00 Common, CC=08 Planner, SubCC=03 Statistics)
+# ============================================================================
+
+C ERR_CODE_STATS_COLLECTION_FAILED: Str = "VAIS-0008030";
+C ERR_CODE_STATS_INVALID_SAMPLE_SIZE: Str = "VAIS-0008031";
+C ERR_CODE_STATS_HISTOGRAM_FAILED: Str = "VAIS-0008032";
+
+# ============================================================================
+# Error Constructors
+# ============================================================================
+
+F err_stats_collection_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_COLLECTION_FAILED,
+        "Statistics collection failed: {reason}"
+    )
+}
+
+F err_stats_invalid_sample_size(size: u64) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_INVALID_SAMPLE_SIZE,
+        "Invalid sample size: {size} (must be > 0)"
+    )
+}
+
+F err_stats_histogram_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_HISTOGRAM_FAILED,
+        "Histogram construction failed: {reason}"
+    )
+}
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Default sampling parameters
+C DEFAULT_SAMPLE_SIZE: u64 = 1000;
+C DEFAULT_HISTOGRAM_BUCKETS: u64 = 100;
+C MIN_ROWS_FOR_SAMPLING: u64 = 5000;  # Sample I table has > 5000 rows
+
+# ============================================================================
+# Per-Column Statistics
+# ============================================================================
+
+# Value distribution statistics for a single column
+S TableColumnStats {
+    table_name: Str,
+    column_name: Str,
+    n_distinct: u64,           # Estimated distinct values
+    null_fraction: f64,        # Fraction of NULL values (0.0 to 1.0)
+    histogram: Vec<SqlValue>,  # Equi-depth histogram boundary values
+    min_value: Option<SqlValue>,
+    max_value: Option<SqlValue>,
+    avg_width: u32,            # Average serialized size in bytes
+}
+
+X TableColumnStats {
+    F new(table_name: Str, column_name: Str) -> TableColumnStats {
+        TableColumnStats {
+            table_name,
+            column_name,
+            n_distinct: 0,
+            null_fraction: 0.0,
+            histogram: Vec.new(),
+            min_value: None,
+            max_value: None,
+            avg_width: 0,
+        }
+    }
+
+    # Estimate selectivity for equality predicate: col = value
+    # Uses histogram I available, otherwise 1/n_distinct
+    F estimate_equality_selectivity(self) -> f64 {
+        I self.n_distinct == 0 {
+            R 0.1;  # Fallback default
+        }
+        1.0 / (self.n_distinct as f64)
+    }
+
+    # Estimate selectivity for range predicate: col < value
+    # Uses histogram bucket interpolation
+    F estimate_range_selectivity(self, value: &SqlValue) -> f64 {
+        I self.histogram.len() == 0 {
+            R 0.3;  # Fallback default
+        }
+
+        # Binary search for bucket containing value
+        bucket_idx := mut 0u64;
+        found_bucket := mut false;
+        L i: 0..self.histogram.len() {
+            I !found_bucket {
+                M compare_values(value, &self.histogram[i]) {
+                    Ok(cmp) => {
+                        I cmp < 0 {
+                            bucket_idx = i;
+                            found_bucket = true;
+                        }
+                    },
+                    Err(_) => R 0.3,  # Cannot compare, use default
+                }
+            }
+        }
+
+        # Estimate selectivity based on bucket position
+        total_buckets := mut self.histogram.len();
+        I total_buckets == 0 { R 0.3; }
+        (bucket_idx as f64) / (total_buckets as f64)
+    }
+}
+
+# ============================================================================
+# Statistics Collection Configuration
+# ============================================================================
+
+S StatisticsConfig {
+    sample_size: u64,
+    histogram_buckets: u64,
+    force_full_scan: bool,  # If true, scan all rows (no sampling)
+}
+
+X StatisticsConfig {
+    F default() -> StatisticsConfig {
+        StatisticsConfig {
+            sample_size: DEFAULT_SAMPLE_SIZE,
+            histogram_buckets: DEFAULT_HISTOGRAM_BUCKETS,
+            force_full_scan: false,
+        }
+    }
+
+    F with_sample_size(mut self, size: u64) -> StatisticsConfig {
+        self.sample_size = size;
+        self
+    }
+
+    F with_histogram_buckets(mut self, buckets: u64) -> StatisticsConfig {
+        self.histogram_buckets = buckets;
+        self
+    }
+
+    F with_force_full_scan(mut self) -> StatisticsConfig {
+        self.force_full_scan = true;
+        self
+    }
+}
+
+# ============================================================================
+# ANALYZE Result
+# ============================================================================
+
+S AnalyzeResult {
+    table_name: Str,
+    stats: TableStats,
+    column_stats: Vec<TableColumnStats>,
+    elapsed_ms: u64,
+}
+
+X AnalyzeResult {
+    F new(table_name: Str, stats: TableStats, column_stats: Vec<TableColumnStats>, elapsed_ms: u64) -> AnalyzeResult {
+        AnalyzeResult {
+            table_name,
+            stats,
+            column_stats,
+            elapsed_ms,
+        }
+    }
+
+    F to_string(self) -> Str {
+        "ANALYZE {self.table_name}: {self.stats.row_count} rows, {self.column_stats.len()} columns, {self.elapsed_ms}ms"
+    }
+}
+
+# ============================================================================
+# Statistics Collector
+# ============================================================================
+
+S StatisticsCollector {
+    config: StatisticsConfig,
+}
+
+X StatisticsCollector {
+    # Create a new collector with default configuration
+    F new() -> StatisticsCollector {
+        StatisticsCollector {
+            config: StatisticsConfig.default(),
+        }
+    }
+
+    # Create with custom configuration
+    F with_config(config: StatisticsConfig) -> StatisticsCollector {
+        StatisticsCollector { config }
+    }
+
+    # ========================================================================
+    # Table-Level Statistics
+    # ========================================================================
+
+    # Collect basic table statistics: row count, page count, avg row size
+    # This is a simplified implementation that estimates from table metadata
+    F collect_table_stats(
+        self,
+        catalog: &CatalogManager,
+        pool: &BufferPool,
+        table_name: &Str
+    ) -> Result<TableStats, VaisError> {
+        # Lookup table in catalog
+        table_info := mut M catalog.get_table(table_name) {
+            Some(info) => info,
+            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+        };
+
+        # Use catalog metadata as base estimate
+        # In a full implementation, would scan heap pages for exact counts
+        Ok(TableStats.from_table_info(table_info))
+    }
+
+    # ========================================================================
+    # Column-Level Statistics
+    # ========================================================================
+
+    # Collect column statistics: distinct values, null fraction, histogram
+    # Uses reservoir sampling I table is large
+    F collect_column_stats(
+        self,
+        catalog: &CatalogManager,
+        pool: &BufferPool,
+        table_name: &Str,
+        column_name: &Str
+    ) -> Result<TableColumnStats, VaisError> {
+        # Get table metadata
+        table_info := mut M catalog.get_table(table_name) {
+            Some(info) => info,
+            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+        };
+
+        # Get column metadata
+        columns := mut catalog.get_columns(table_info.table_id);
+        column_info: Option<&ColumnInfo> := mut None;
+        L col: columns {
+            I column_info.is_none() && &col.name == column_name {
+                column_info = Some(col);
+            }
+        }
+        M column_info {
+            None => R Err(err_stats_collection_failed("Column '{column_name}' not found in '{table_name}'")),
+            Some(_) => {},
+        }
+
+        # Initialize column stats
+        stats := mut TableColumnStats.new(table_name.clone(), column_name.clone());
+
+        # Simplified implementation: use heuristics
+        # In a full implementation, would:
+        # 1. Sample rows using reservoir sampling
+        # 2. Build histogram from sampled values
+        # 3. Estimate distinct count using HyperLogLog or sampling
+
+        # Heuristic estimates
+        row_count := mut table_info.row_count_estimate;
+        I row_count > 0 {
+            stats.n_distinct = (row_count as f64).sqrt() as u64;  # sqrt(N) heuristic
+            I stats.n_distinct < 1 { stats.n_distinct = 1; }
+            stats.null_fraction = 0.05;  # Assume 5% nulls
+            stats.avg_width = 32;  # Assume 32 bytes average
+        }
+
+        Ok(stats)
+    }
+
+    # ========================================================================
+    # Vector Engine Statistics
+    # ========================================================================
+
+    # Collect vector index statistics from catalog metadata
+    # In a full implementation, would read HNSW meta page
+    F collect_vector_stats(
+        self,
+        catalog: &CatalogManager,
+        table_name: &Str,
+        column_name: &Str
+    ) -> Result<VectorIndexStats, VaisError> {
+        # Look up vector index in catalog
+        # Simplified: R default stats based on dimension
+        # In a full implementation, would:
+        # 1. Find vector index on (table_name, column_name)
+        # 2. Read HNSW meta page for actual stats
+        # 3. Parse HnswMeta structure
+
+        # For now, R heuristic default
+        dimension := mut 768u32;  # Common embedding dimension
+        Ok(VectorIndexStats.default(dimension))
+    }
+
+    # ========================================================================
+    # Graph Engine Statistics
+    # ========================================================================
+
+    # Collect graph statistics from graph metadata
+    # In a full implementation, would read graph meta page
+    F collect_graph_stats(
+        self,
+        catalog: &CatalogManager
+    ) -> Result<GraphStats, VaisError> {
+        # Simplified: R default stats
+        # In a full implementation, would:
+        # 1. Read graph meta page from graph.vdb
+        # 2. Parse GraphMeta structure
+        # 3. Calculate degree distribution I needed
+
+        Ok(GraphStats.default())
+    }
+
+    # ========================================================================
+    # Full-Text Engine Statistics
+    # ========================================================================
+
+    # Collect full-text statistics from fulltext metadata
+    # In a full implementation, would read fulltext meta page
+    F collect_fulltext_stats(
+        self,
+        catalog: &CatalogManager
+    ) -> Result<FullTextStats, VaisError> {
+        # Simplified: R default stats
+        # In a full implementation, would:
+        # 1. Read fulltext meta page from fulltext.vdb
+        # 2. Parse FullTextMeta structure
+        # 3. Calculate avg_posting_length and avg_doc_length
+
+        Ok(FullTextStats.default())
+    }
+
+    # ========================================================================
+    # Unified Statistics Collection
+    # ========================================================================
+
+    # Collect all statistics across all engines
+    F collect_all(
+        self,
+        catalog: &CatalogManager,
+        pool: &BufferPool
+    ) -> Result<HybridStats, VaisError> {
+        stats := mut HybridStats.new();
+
+        # Collect SQL table stats for all user tables
+        # In a full implementation, would iterate catalog.list_tables()
+        # For now, simplified version
+
+        # Collect vector stats (if any vector indexes exist)
+        M self.collect_vector_stats(catalog, &"embeddings", &"vector") {
+            Ok(vec_stats) => stats.vector_stats.push(vec_stats),
+            Err(_) => {},  # No vector index, skip
+        }
+
+        # Collect graph stats (if graph engine is active)
+        M self.collect_graph_stats(catalog) {
+            Ok(graph_stats) => stats.graph_stats = Some(graph_stats),
+            Err(_) => {},  # No graph engine, skip
+        }
+
+        # Collect fulltext stats (if fulltext engine is active)
+        M self.collect_fulltext_stats(catalog) {
+            Ok(ft_stats) => stats.fulltext_stats = Some(ft_stats),
+            Err(_) => {},  # No fulltext engine, skip
+        }
+
+        Ok(stats)
+    }
+
+    # ========================================================================
+    # ANALYZE Command
+    # ========================================================================
+
+    # Execute ANALYZE on a specific table
+    F analyze_table(
+        self,
+        catalog: &CatalogManager,
+        pool: &BufferPool,
+        table_name: &Str
+    ) -> Result<AnalyzeResult, VaisError> {
+        # Record start time
+        start_ms := mut current_time_millis();
+
+        # Collect table stats
+        table_stats := mut self.collect_table_stats(catalog, pool, table_name)?;
+
+        # Collect column stats for all columns
+        column_stats := mut Vec.new();
+        table_info := mut M catalog.get_table(table_name) {
+            Some(info) => info,
+            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+        };
+
+        columns := mut catalog.get_columns(table_info.table_id);
+        L col: columns {
+            M self.collect_column_stats(catalog, pool, table_name, &col.name) {
+                Ok(col_stats) => column_stats.push(col_stats),
+                Err(e) => {
+                    # Log warning but continue
+                },
+            }
+        }
+
+        # Record end time
+        elapsed_ms := mut current_time_millis() - start_ms;
+
+        Ok(AnalyzeResult.new(
+            table_name.clone(),
+            table_stats,
+            column_stats,
+            elapsed_ms
+        ))
+    }
+}
+
+# ============================================================================
+# Sampling Utilities
+# ============================================================================
+
+# Reservoir sampling: select sample_size rows uniformly at random from input
+# Uses FNV hash-based pseudo-random selection (no external RNG dependency)
+F reservoir_sample(rows: &Vec<SqlValue>, sample_size: u64, seed: u64) -> Vec<SqlValue> {
+    I sample_size == 0 || rows.len() == 0 {
+        R Vec.new();
+    }
+
+    reservoir: Vec<SqlValue> := mut Vec.new();
+    i: u64 := mut 0;
+
+    L val: rows.iter() {
+        I i < sample_size {
+            reservoir.push(val.clone());
+        } E {
+            # Replace with probability sample_size/i
+            rand := mut pseudo_random(seed, i as u64);
+            j := mut (rand as u64) % (i + 1);
+            I j < sample_size {
+                reservoir[j] = val.clone();
+            }
+        }
+        i += 1;
+    }
+
+    reservoir
+}
+
+# ============================================================================
+# Histogram Construction
+# ============================================================================
+
+# Build equi-depth histogram with given bucket count
+# Input: sorted sample of values
+# Output: bucket boundary values
+F build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlValue> {
+    I sorted_sample.len() == 0 || bucket_count == 0 {
+        R Vec.new();
+    }
+
+    boundaries := mut Vec.new();
+    sample_size := mut sorted_sample.len();
+    bucket_size := mut sample_size / bucket_count;
+
+    I bucket_size == 0 {
+        # Too few samples for requested buckets
+        R sorted_sample.clone();
+    }
+
+    L i: 1..bucket_count {
+        idx := mut i * bucket_size;
+        I idx < sample_size {
+            boundaries.push(sorted_sample[idx].clone());
+        }
+    }
+
+    boundaries
+}
+
+# ============================================================================
+# Pseudo-Random Number Generation (FNV-1a based)
+# ============================================================================
+
+# Generate pseudo-random u64 from seed and index
+# Uses FNV-1a hash followed by mixing for better distribution
+F pseudo_random(seed: u64, index: u64) -> u64 {
+    h := mut seed ^ index;
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h
+}
+
+# ============================================================================
+# Value Comparison Utilities
+# ============================================================================
+
+# Compare two SqlValue instances
+# Returns: Ok(-1) I a < b, Ok(0) I a == b, Ok(1) I a > b
+# Returns: Err I values are not comparable
+F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
+    M (a, b) {
+        (SqlValue.IntVal { v: va }, SqlValue.IntVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (SqlValue.FloatVal { v: va }, SqlValue.FloatVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (SqlValue.StringVal { v: va }, SqlValue.StringVal { v: vb }) => {
+            I va < vb { Ok(-1) }
+            E I va > vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (SqlValue.DateVal { v: va }, SqlValue.DateVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (SqlValue.TimestampVal { v: va }, SqlValue.TimestampVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (SqlValue.Null, SqlValue.Null) => Ok(0),
+        (SqlValue.Null, _) => Ok(-1),  # NULL sorts first
+        (_, SqlValue.Null) => Ok(1),
+        _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+    }
+}
+
+# ============================================================================
+# Time Utilities
+# ============================================================================
+
+# Get current time in milliseconds
+# FUTURE(std/time): Use std/time.now_millis() when available
+F current_time_millis() -> u64 {
+    0
+}

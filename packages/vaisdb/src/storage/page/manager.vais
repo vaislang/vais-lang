@@ -1,0 +1,221 @@
+# PageManager - Unified Page I/O Layer
+# Handles page read/write with checksum verification, type dispatching,
+# format version migration, and both mmap/buffered I/O modes
+# Based on Stage 1 Sections 1-11
+
+U std/file.{File};
+U std/sync.{Mutex};
+U storage/constants.{
+    PAGE_HEADER_SIZE, FILE_ID_DATA, FILE_ID_VECTORS,
+    FILE_ID_GRAPH, FILE_ID_FULLTEXT, FILE_ID_UNDO,
+};
+U storage/error.{
+    VaisError, err_page_corruption, err_io, err_internal,
+    err_checksum_mismatch,
+};
+U storage/page/header.{PageHeader};
+U storage/page/types.{page_type_name, is_valid_page_type};
+U storage/page/file_header.{file_name_for_id};
+U storage/checksum.{verify_page_checksum, calculate_page_checksum};
+U storage/io/buffered.{BufferedIO};
+U storage/io/mod.{IoMode};
+
+# PageManager provides unified page-level I/O across all data files
+S PageManager {
+    page_size: u32,
+    io_mode: IoMode,
+    # Per-file I/O handlers (indexed by file_id)
+    file_ios: Vec<BufferedIO>,
+    # Per-file mutexes for thread-safe page writes
+    file_locks: Vec<Mutex>,
+    # Format migration callback (if set, called on old-version pages)
+    migration_hook: Option<F(&mut [u8], u8) -> Result<(), VaisError>>,
+}
+
+X PageManager {
+    # Create a new PageManager with buffered I/O for all files
+    F new(files: Vec<File>, page_size: u32) -> PageManager {
+        file_ios := mut Vec.with_capacity(files.len());
+        file_locks := mut Vec.with_capacity(files.len());
+
+        L file: files {
+            file_ios.push(BufferedIO.new(file, page_size));
+            file_locks.push(Mutex.new());
+        }
+
+        PageManager {
+            page_size,
+            io_mode: IoMode.Buffered,
+            file_ios,
+            file_locks,
+            migration_hook: None,
+        }
+    }
+
+    # Read a page from disk with checksum verification
+    F read_page(self, file_id: u8, page_id: u32) -> Result<Vec<u8>, VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+
+        io := mut &self.file_ios[file_id as u64];
+        page_data := mut io.read_page(page_id)?;
+
+        # Verify checksum
+        I !verify_page_checksum(&page_data) {
+            R Err(err_checksum_mismatch(page_id, file_name_for_id(file_id)));
+        }
+
+        # Check format version and trigger migration if needed
+        header := mut PageHeader.read_from_page(&page_data)?;
+        I header.format_version < 1 {
+            R Err(err_page_corruption(page_id, header.page_type));
+        }
+
+        Ok(page_data)
+    }
+
+    # Read a page without checksum verification (for recovery)
+    F read_page_unchecked(self, file_id: u8, page_id: u32) -> Result<Vec<u8>, VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+
+        io := mut &self.file_ios[file_id as u64];
+        io.read_page(page_id)
+    }
+
+    # Write a page to disk (computes and sets checksum)
+    F write_page(mut self, file_id: u8, page_id: u32, page_data: &mut [u8]) -> Result<(), VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+
+        # Compute and embed checksum
+        PageHeader.update_checksum(page_data);
+
+        # Write with lock
+        lock := mut &self.file_locks[file_id as u64];
+        guard := mut lock.lock();
+        io := mut &self.file_ios[file_id as u64];
+        io.write_page(page_id, page_data)?;
+        drop(guard);
+
+        Ok(())
+    }
+
+    # Write a page and fsync (for critical pages like meta, WAL)
+    F write_page_sync(mut self, file_id: u8, page_id: u32, page_data: &mut [u8]) -> Result<(), VaisError> {
+        self.write_page(file_id, page_id, page_data)?;
+
+        io := mut &self.file_ios[file_id as u64];
+        io.sync()?;
+
+        Ok(())
+    }
+
+    # Read page header only (first 48 bytes)
+    F read_page_header(self, file_id: u8, page_id: u32) -> Result<PageHeader, VaisError> {
+        page_data := mut self.read_page(file_id, page_id)?;
+        PageHeader.read_from_page(&page_data)
+    }
+
+    # Allocate a new zeroed page (write zeros + header)
+    F allocate_page(mut self, file_id: u8, page_id: u32, page_type: u8, engine_tag: u8) -> Result<Vec<u8>, VaisError> {
+        page_data := mut Vec.with_capacity(self.page_size as u64);
+        page_data.resize(self.page_size as u64, 0u8);
+
+        header := mut PageHeader.new(page_id, page_type, engine_tag);
+        header.write_to_page(&page_data);
+        PageHeader.update_checksum(&page_data);
+
+        self.write_page(file_id, page_id, &page_data)?;
+
+        Ok(page_data)
+    }
+
+    # Read multiple contiguous pages (for read-ahead)
+    F read_pages(self, file_id: u8, start_page_id: u32, count: u32) -> Result<Vec<Vec<u8>>, VaisError> {
+        results := mut Vec.with_capacity(count as u64);
+        L i: 0..count {
+            page := mut self.read_page(file_id, start_page_id + i)?;
+            results.push(page);
+        }
+        Ok(results)
+    }
+
+    # Sync a specific file to disk
+    F sync_file(self, file_id: u8) -> Result<(), VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+        io := mut &self.file_ios[file_id as u64];
+        io.sync()
+    }
+
+    # Sync all files to disk
+    F sync_all(self) -> Result<(), VaisError> {
+        L io: &self.file_ios {
+            io.sync()?;
+        }
+        Ok(())
+    }
+
+    # Get page count for a file
+    F page_count(self, file_id: u8) -> Result<u32, VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+        io := mut &self.file_ios[file_id as u64];
+        io.page_count()
+    }
+
+    # Extend a file by N pages
+    F extend_file(mut self, file_id: u8, additional_pages: u32) -> Result<(), VaisError> {
+        I file_id as u64 >= self.file_ios.len() {
+            R Err(err_internal("Invalid file_id"));
+        }
+        lock := mut &self.file_locks[file_id as u64];
+        guard := mut lock.lock();
+        io := mut &self.file_ios[file_id as u64];
+        io.extend(additional_pages)?;
+        drop(guard);
+        Ok(())
+    }
+
+    # Verify checksum of a page already in memory
+    F verify_checksum(page_data: &[u8]) -> bool {
+        verify_page_checksum(page_data)
+    }
+
+    # Get page size
+    F get_page_size(self) -> u32 {
+        self.page_size
+    }
+
+    # Set format migration hook
+    F set_migration_hook(mut self, hook: F(&mut [u8], u8) -> Result<(), VaisError>) {
+        self.migration_hook = Some(hook);
+    }
+
+    # Check if a page needs format migration
+    F check_migration(mut self, page_data: &mut [u8]) -> Result<bool, VaisError> {
+        header := mut PageHeader.read_from_page(page_data)?;
+        I header.format_version < 1 {
+            I self.migration_hook.is_some() {
+                (self.migration_hook!)(page_data, header.format_version)?;
+                R Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    # Dispatch page to appropriate handler based on page_type
+    F dispatch_page_type(page_data: &[u8]) -> Result<u8, VaisError> {
+        header := mut PageHeader.read_from_page(page_data)?;
+        I !is_valid_page_type(header.page_type) {
+            R Err(err_page_corruption(header.page_id, header.page_type));
+        }
+        Ok(header.page_type)
+    }
+}

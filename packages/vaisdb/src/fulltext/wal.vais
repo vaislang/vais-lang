@@ -1,0 +1,465 @@
+# Full-Text WAL Integration
+# WAL-first write helpers for full-text engine operations
+# All mutations must write WAL before modifying pages
+# Uses GroupCommitManager for batched fsync
+# Error codes: EE=04 (fulltext), CC=09 (WAL)
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U storage/error.{VaisError};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{
+    POSTING_LIST_APPEND, POSTING_LIST_DELETE,
+    DICTIONARY_INSERT, DICTIONARY_DELETE,
+    TERM_FREQ_UPDATE
+};
+U storage/wal/record_fulltext.{
+    PostingListAppendPayload, PostingListDeletePayload,
+    DictionaryInsertPayload, DictionaryDeletePayload,
+    TermFreqUpdatePayload
+};
+U storage/page/types.{ENGINE_TAG_FULLTEXT};
+U storage/constants.{FILE_ID_FULLTEXT, PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE};
+U storage/buffer/pool.{BufferPool};
+U fulltext/types.{
+    PostingEntry, PostingPageHeader, POSTING_PAGE_HEADER_SIZE
+};
+
+# ============================================================================
+# FullTextWalManager — Coordinates WAL writes for full-text engine
+# ============================================================================
+
+S FullTextWalManager {
+    gcm: &GroupCommitManager,
+}
+
+X FullTextWalManager {
+    # Create new WAL manager with reference to GroupCommitManager
+    F new(gcm: &GroupCommitManager) -> FullTextWalManager {
+        FullTextWalManager { gcm }
+    }
+
+    # Log posting list append (WAL-first, before page mutation)
+    # Returns the assigned LSN
+    F log_posting_append(
+        mut self,
+        txn_id: u64,
+        term_hash: u64,
+        page_id: u32,
+        entry_bytes: &[u8],
+    ) -> Result<u64, VaisError> {
+        payload := mut PostingListAppendPayload {
+            term_hash,
+            page_id,
+            file_id: FILE_ID_FULLTEXT,
+            entry: entry_bytes.to_vec(),
+        };
+
+        buf := mut ByteBuffer.new(256);
+        payload.serialize(&buf);
+        payload_bytes := mut buf.to_vec();
+
+        self.gcm.write_record(txn_id, POSTING_LIST_APPEND, ENGINE_TAG_FULLTEXT, &payload_bytes)
+    }
+
+    # Log posting list delete (WAL-first, before page mutation)
+    F log_posting_delete(
+        mut self,
+        txn_id: u64,
+        term_hash: u64,
+        page_id: u32,
+        doc_id: u64,
+    ) -> Result<u64, VaisError> {
+        payload := mut PostingListDeletePayload {
+            term_hash,
+            page_id,
+            file_id: FILE_ID_FULLTEXT,
+            doc_id,
+        };
+
+        buf := mut ByteBuffer.new(64);
+        payload.serialize(&buf);
+        payload_bytes := mut buf.to_vec();
+
+        self.gcm.write_record(txn_id, POSTING_LIST_DELETE, ENGINE_TAG_FULLTEXT, &payload_bytes)
+    }
+
+    # Log dictionary insert (WAL-first, before page mutation)
+    F log_dict_insert(
+        mut self,
+        txn_id: u64,
+        term: &Str,
+        posting_head: u32,
+    ) -> Result<u64, VaisError> {
+        payload := mut DictionaryInsertPayload {
+            term: term.clone(),
+            posting_head_page: posting_head,
+        };
+
+        buf := mut ByteBuffer.new(128);
+        payload.serialize(&buf);
+        payload_bytes := mut buf.to_vec();
+
+        self.gcm.write_record(txn_id, DICTIONARY_INSERT, ENGINE_TAG_FULLTEXT, &payload_bytes)
+    }
+
+    # Log dictionary delete (WAL-first, before page mutation)
+    F log_dict_delete(
+        mut self,
+        txn_id: u64,
+        term: &Str,
+        old_posting_head: u32,
+    ) -> Result<u64, VaisError> {
+        payload := mut DictionaryDeletePayload {
+            term: term.clone(),
+            old_posting_head,
+        };
+
+        buf := mut ByteBuffer.new(128);
+        payload.serialize(&buf);
+        payload_bytes := mut buf.to_vec();
+
+        self.gcm.write_record(txn_id, DICTIONARY_DELETE, ENGINE_TAG_FULLTEXT, &payload_bytes)
+    }
+
+    # Log term frequency update (WAL-first, before page mutation)
+    F log_term_freq_update(
+        mut self,
+        txn_id: u64,
+        term_hash: u64,
+        doc_id: u64,
+        old_freq: u32,
+        new_freq: u32,
+    ) -> Result<u64, VaisError> {
+        payload := mut TermFreqUpdatePayload {
+            term_hash,
+            doc_id,
+            old_freq,
+            new_freq,
+        };
+
+        buf := mut ByteBuffer.new(64);
+        payload.serialize(&buf);
+        payload_bytes := mut buf.to_vec();
+
+        self.gcm.write_record(txn_id, TERM_FREQ_UPDATE, ENGINE_TAG_FULLTEXT, &payload_bytes)
+    }
+}
+
+# ============================================================================
+# Redo/Undo Handlers — Crash recovery for full-text operations
+# Called by the WAL recovery manager during startup
+# ============================================================================
+
+# Redo a posting list append (re-apply the page mutation)
+F redo_posting_append(
+    payload: &PostingListAppendPayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # During recovery: re-insert the posting entry into the posting list page
+    # Deserialize entry from payload and append to page
+    frame_id := mut pool.fetch_page(payload.file_id, payload.page_id)?;
+    page_data := mut pool.get_page_mut(frame_id);
+
+    # Read posting page header to get current entry count
+    buf := mut ByteBuffer.wrap_readonly(page_data);
+    buf.set_position(PAGE_HEADER_SIZE as u64);
+    pph := mut PostingPageHeader.deserialize(&buf)?;
+
+    # Calculate where to append the new entry
+    slot_dir_start := mut (PAGE_HEADER_SIZE + POSTING_PAGE_HEADER_SIZE) as u64;
+    new_entry_count := mut pph.entry_count + 1;
+    data_start := mut slot_dir_start + (new_entry_count as u64 * SLOT_ENTRY_SIZE as u64);
+
+    # Find current data end offset
+    data_offset: u16 := mut 0;
+    I pph.entry_count > 0 {
+        i: u16 := mut 0;
+        L i < pph.entry_count {
+            sp := mut slot_dir_start + (i as u64 * SLOT_ENTRY_SIZE as u64);
+            buf.set_position(sp);
+            offset := mut buf.get_u16_le()?;
+            length := mut buf.get_u16_le()?;
+            end := mut offset + length;
+            I end > data_offset {
+                data_offset = end;
+            }
+            i += 1;
+        }
+    }
+
+    # Write new slot entry
+    slot_pos := mut slot_dir_start + (pph.entry_count as u64 * SLOT_ENTRY_SIZE as u64);
+    write_buf := mut ByteBuffer.new(SLOT_ENTRY_SIZE as u64);
+    write_buf.put_u16_le(data_offset);
+    write_buf.put_u16_le(payload.entry.len() as u16);
+    slot_bytes := mut write_buf.to_vec();
+    j: u64 := mut 0;
+    L j < slot_bytes.len() {
+        page_data[slot_pos + j] = slot_bytes[j];
+        j += 1;
+    }
+
+    # Write entry data
+    entry_pos := mut data_start + data_offset as u64;
+    j = 0;
+    L j < payload.entry.len() {
+        page_data[entry_pos + j] = payload.entry[j];
+        j += 1;
+    }
+
+    # Update posting page header with incremented entry count
+    updated_pph := mut PostingPageHeader {
+        term_hash: pph.term_hash,
+        entry_count: new_entry_count,
+        next_posting_page: pph.next_posting_page,
+        flags: pph.flags,
+    };
+    pph_buf := mut ByteBuffer.new(POSTING_PAGE_HEADER_SIZE as u64);
+    updated_pph.serialize(&pph_buf);
+    pph_bytes := mut pph_buf.to_vec();
+    j = 0;
+    L j < pph_bytes.len() {
+        page_data[PAGE_HEADER_SIZE as u64 + j] = pph_bytes[j];
+        j += 1;
+    }
+
+    pool.unpin_page(frame_id, true);
+    Ok(())
+}
+
+# Undo a posting list append (remove the appended entry)
+F undo_posting_append(
+    payload: &PostingListAppendPayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # During rollback: remove the last appended entry from the posting list page
+    # Decrement entry count in the page header (slot directory remains but entry is inaccessible)
+    frame_id := mut pool.fetch_page(payload.file_id, payload.page_id)?;
+    page_data := mut pool.get_page_mut(frame_id);
+
+    # Read posting page header
+    buf := mut ByteBuffer.wrap_readonly(page_data);
+    buf.set_position(PAGE_HEADER_SIZE as u64);
+    pph := mut PostingPageHeader.deserialize(&buf)?;
+
+    # Decrement entry count (this effectively removes the last entry)
+    I pph.entry_count > 0 {
+        updated_pph := mut PostingPageHeader {
+            term_hash: pph.term_hash,
+            entry_count: pph.entry_count - 1,
+            next_posting_page: pph.next_posting_page,
+            flags: pph.flags,
+        };
+        pph_buf := mut ByteBuffer.new(POSTING_PAGE_HEADER_SIZE as u64);
+        updated_pph.serialize(&pph_buf);
+        pph_bytes := mut pph_buf.to_vec();
+        j: u64 := mut 0;
+        L j < pph_bytes.len() {
+            page_data[PAGE_HEADER_SIZE as u64 + j] = pph_bytes[j];
+            j += 1;
+        }
+    }
+
+    pool.unpin_page(frame_id, true);
+    Ok(())
+}
+
+# Redo a posting list delete (re-apply the expiration)
+F redo_posting_delete(
+    payload: &PostingListDeletePayload,
+    txn_id: u64,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # During recovery: re-mark the posting entry as expired
+    # Find the entry matching doc_id and set MVCC expiration fields
+    frame_id := mut pool.fetch_page(payload.file_id, payload.page_id)?;
+    page_data := mut pool.get_page_mut(frame_id);
+
+    buf := mut ByteBuffer.wrap_readonly(page_data);
+    buf.set_position(PAGE_HEADER_SIZE as u64);
+    pph := mut PostingPageHeader.deserialize(&buf)?;
+
+    # Scan posting entries to find matching doc_id
+    slot_dir_start := mut (PAGE_HEADER_SIZE + POSTING_PAGE_HEADER_SIZE) as u64;
+    data_start := mut slot_dir_start + (pph.entry_count as u64 * SLOT_ENTRY_SIZE as u64);
+
+    i: u16 := mut 0;
+    L i < pph.entry_count {
+        slot_pos := mut slot_dir_start + (i as u64 * SLOT_ENTRY_SIZE as u64);
+        buf.set_position(slot_pos);
+        offset := mut buf.get_u16_le()?;
+        length := mut buf.get_u16_le()?;
+
+        # Read entry to check doc_id
+        entry_pos := mut data_start + offset as u64;
+        buf.set_position(entry_pos);
+        entry_doc_id := mut buf.get_u64_le()?;
+
+        I entry_doc_id == payload.doc_id {
+            # Found the entry — deserialize fully, mark expired, write back
+            buf.set_position(entry_pos);
+            entry := mut PostingEntry.deserialize(&buf)?;
+
+            # Set expiration using the WAL header's txn_id (NOT term_hash)
+            entry.set_expired(txn_id, 0);
+
+            # Serialize back
+            entry_buf := mut ByteBuffer.new(entry.serialized_size() as u64);
+            entry.serialize(&entry_buf);
+            entry_bytes := mut entry_buf.to_vec();
+
+            j: u64 := mut 0;
+            L j < entry_bytes.len() {
+                page_data[entry_pos + j] = entry_bytes[j];
+                j += 1;
+            }
+
+            pool.unpin_page(frame_id, true);
+            R Ok(());
+        }
+
+        i += 1;
+    }
+
+    pool.unpin_page(frame_id, false);
+    Ok(())
+}
+
+# Undo a posting list delete (restore the entry)
+F undo_posting_delete(
+    payload: &PostingListDeletePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # During rollback: clear MVCC expiration from the posting entry
+    frame_id := mut pool.fetch_page(payload.file_id, payload.page_id)?;
+    page_data := mut pool.get_page_mut(frame_id);
+
+    buf := mut ByteBuffer.wrap_readonly(page_data);
+    buf.set_position(PAGE_HEADER_SIZE as u64);
+    pph := mut PostingPageHeader.deserialize(&buf)?;
+
+    slot_dir_start := mut (PAGE_HEADER_SIZE + POSTING_PAGE_HEADER_SIZE) as u64;
+    data_start := mut slot_dir_start + (pph.entry_count as u64 * SLOT_ENTRY_SIZE as u64);
+
+    i: u16 := mut 0;
+    L i < pph.entry_count {
+        slot_pos := mut slot_dir_start + (i as u64 * SLOT_ENTRY_SIZE as u64);
+        buf.set_position(slot_pos);
+        offset := mut buf.get_u16_le()?;
+        length := mut buf.get_u16_le()?;
+
+        entry_pos := mut data_start + offset as u64;
+        buf.set_position(entry_pos);
+        entry_doc_id := mut buf.get_u64_le()?;
+
+        I entry_doc_id == payload.doc_id {
+            buf.set_position(entry_pos);
+            entry := mut PostingEntry.deserialize(&buf)?;
+
+            # Clear expiration
+            entry.clear_expired();
+
+            # Write back
+            entry_buf := mut ByteBuffer.new(entry.serialized_size() as u64);
+            entry.serialize(&entry_buf);
+            entry_bytes := mut entry_buf.to_vec();
+
+            j: u64 := mut 0;
+            L j < entry_bytes.len() {
+                page_data[entry_pos + j] = entry_bytes[j];
+                j += 1;
+            }
+
+            pool.unpin_page(frame_id, true);
+            R Ok(());
+        }
+
+        i += 1;
+    }
+
+    pool.unpin_page(frame_id, false);
+    Ok(())
+}
+
+# Redo a dictionary insert (re-apply the dictionary entry)
+F redo_dict_insert(
+    payload: &DictionaryInsertPayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Dictionary operations require B+Tree integration for full redo
+    # During recovery, the B+Tree insert will be replayed through the tree's own redo path
+    # This handler validates the posting head page is accessible
+    I payload.posting_head_page != 0 {
+        frame_id := mut pool.fetch_page(FILE_ID_FULLTEXT, payload.posting_head_page)?;
+        pool.unpin_page(frame_id, false);
+    }
+    Ok(())
+}
+
+# Undo a dictionary insert (remove the inserted term)
+F undo_dict_insert(
+    payload: &DictionaryInsertPayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Dictionary operations require B+Tree integration for full undo
+    # The B+Tree delete will be handled by the tree's own undo mechanism
+    # This handler validates the posting head page is accessible
+    I payload.posting_head_page != 0 {
+        frame_id := mut pool.fetch_page(FILE_ID_FULLTEXT, payload.posting_head_page)?;
+        pool.unpin_page(frame_id, false);
+    }
+    Ok(())
+}
+
+# Redo a dictionary delete (re-apply the deletion)
+F redo_dict_delete(
+    payload: &DictionaryDeletePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Dictionary operations require B+Tree integration for full redo
+    # During recovery, the B+Tree delete will be replayed through the tree's own redo path
+    # This handler validates the old posting head page is accessible
+    I payload.old_posting_head != 0 {
+        frame_id := mut pool.fetch_page(FILE_ID_FULLTEXT, payload.old_posting_head)?;
+        pool.unpin_page(frame_id, false);
+    }
+    Ok(())
+}
+
+# Undo a dictionary delete (restore the deleted term)
+F undo_dict_delete(
+    payload: &DictionaryDeletePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Dictionary operations require B+Tree integration for full undo
+    # The B+Tree insert (restoration) will be handled by the tree's own undo mechanism
+    # This handler validates the old posting head page is accessible
+    I payload.old_posting_head != 0 {
+        frame_id := mut pool.fetch_page(FILE_ID_FULLTEXT, payload.old_posting_head)?;
+        pool.unpin_page(frame_id, false);
+    }
+    Ok(())
+}
+
+# Redo a term frequency update (re-apply the new frequency)
+F redo_term_freq_update(
+    payload: &TermFreqUpdatePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Term frequency is stored within PostingEntry (term_freq field)
+    # This is a no-op for now as freq updates are implicitly handled by posting append/delete
+    # In a full implementation, would scan posting list pages to find doc_id and update term_freq
+    Ok(())
+}
+
+# Undo a term frequency update (restore the old frequency)
+F undo_term_freq_update(
+    payload: &TermFreqUpdatePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Restore old term frequency value
+    # This is a no-op for now as freq updates are implicitly handled by posting append/delete
+    # In a full implementation, would scan posting list pages to find doc_id and restore old freq
+    Ok(())
+}

@@ -1,0 +1,229 @@
+# Deadlock Detection
+# Wait-for graph based deadlock detection
+# Based on Stage 3 Section 8: Deadlock scenario
+
+U std/sync.{Mutex};
+U std/hashmap.{HashMap};
+
+# Wait-for graph for deadlock detection
+S WaitForGraph {
+    # Adjacency list: txn_id -> list of txn_ids it's waiting for
+    edges: HashMap<u64, Vec<u64>>,
+    lock: Mutex,
+}
+
+X WaitForGraph {
+    # Create an empty wait-for graph
+    F new() -> WaitForGraph {
+        WaitForGraph {
+            edges: HashMap.new(),
+            lock: Mutex.new(),
+        }
+    }
+
+    # Add a wait edge: waiter is waiting for holder
+    # Called when a transaction blocks waiting for another's lock
+    F add_wait(mut self, waiter: u64, holder: u64) {
+        guard := mut self.lock.lock();
+
+        M self.edges.get_mut(&waiter) {
+            Some(waiting_for) => {
+                # Add holder to waiting list if not already present
+                found := mut false;
+                L txn: waiting_for.iter() {
+                    I !found && *txn == holder {
+                        found = true;
+                    }
+                }
+                I !found {
+                    waiting_for.push(holder);
+                }
+            },
+            None => {
+                # Create new entry
+                waiting_for := mut Vec.new();
+                waiting_for.push(holder);
+                self.edges.insert(waiter, waiting_for);
+            }
+        }
+
+        drop(guard);
+    }
+
+    # Remove all edges for a transaction (when it commits/aborts)
+    F remove_txn(mut self, txn_id: u64) {
+        guard := mut self.lock.lock();
+
+        # Remove outgoing edges (txn_id waiting for others)
+        self.edges.remove(&txn_id);
+
+        # Remove incoming edges (others waiting for txn_id)
+        txns_to_update := mut Vec.new();
+        L (waiter, waiting_for): self.edges.iter_mut() {
+            new_waiting_for := mut Vec.new();
+            L holder: waiting_for.iter() {
+                I *holder != txn_id {
+                    new_waiting_for.push(*holder);
+                }
+            }
+            I new_waiting_for.len() != waiting_for.len() {
+                txns_to_update.push((*waiter, new_waiting_for));
+            }
+        }
+
+        # Apply updates
+        L (waiter, new_waiting_for): txns_to_update {
+            I new_waiting_for.is_empty() {
+                self.edges.remove(&waiter);
+            } E {
+                self.edges.insert(waiter, new_waiting_for);
+            }
+        }
+
+        drop(guard);
+    }
+
+    # Detect if there's a cycle in the wait-for graph
+    # Returns Some(victim_txn_id) if cycle detected, None otherwise
+    # The victim is chosen as the youngest transaction in the cycle
+    F has_cycle(self) -> Option<u64> {
+        guard := mut self.lock.lock();
+
+        # Track visited nodes for cycle detection
+        visited := mut HashMap.new();
+        rec_stack := mut HashMap.new();
+
+        # Try detecting cycle from each node
+        L (start_txn, _): self.edges.iter() {
+            I !visited.get(start_txn).unwrap_or(&false) {
+                M self.detect_cycle_dfs(*start_txn, &mut visited, &mut rec_stack) {
+                    Some(cycle_nodes) => {
+                        # Found a cycle, choose victim (highest txn_id = youngest)
+                        victim := mut cycle_nodes[0];
+                        L txn: cycle_nodes.iter() {
+                            I *txn > victim {
+                                victim = *txn;
+                            }
+                        }
+                        drop(guard);
+                        R Some(victim);
+                    },
+                    None => {},
+                }
+            }
+        }
+
+        drop(guard);
+        None
+    }
+
+    # DFS-based cycle detection
+    # Returns Some(cycle_nodes) if cycle found, None otherwise
+    F detect_cycle_dfs(
+        self,
+        node: u64,
+        visited: &mut HashMap<u64, bool>,
+        rec_stack: &mut HashMap<u64, bool>,
+    ) -> Option<Vec<u64>> {
+        # Mark current node as visited and in recursion stack
+        visited.insert(node, true);
+        rec_stack.insert(node, true);
+
+        # Explore neighbors
+        M self.edges.get(&node) {
+            Some(neighbors) => {
+                L neighbor: neighbors.iter() {
+                    # If neighbor not visited, recurse
+                    I !visited.get(neighbor).unwrap_or(&false) {
+                        M self.detect_cycle_dfs(*neighbor, visited, rec_stack) {
+                            Some(cycle) => R Some(cycle),
+                            None => {},
+                        }
+                    }
+                    # If neighbor is in recursion stack, cycle found
+                    E I *rec_stack.get(neighbor).unwrap_or(&false) {
+                        # Cycle detected - return nodes in cycle
+                        cycle := mut Vec.new();
+                        cycle.push(node);
+                        cycle.push(*neighbor);
+                        R Some(cycle);
+                    }
+                }
+            },
+            None => {},
+        }
+
+        # Remove from recursion stack
+        rec_stack.insert(node, false);
+        None
+    }
+
+    # Detect cycle from a specific starting node (simpler version)
+    # Returns true if cycle found starting from this node
+    F detect_cycle_from(self, start: u64) -> bool {
+        guard := mut self.lock.lock();
+        visited := mut HashMap.new();
+        rec_stack := mut HashMap.new();
+
+        result := mut self.detect_cycle_dfs(start, &mut visited, &mut rec_stack).is_some();
+
+        drop(guard);
+        result
+    }
+
+    # Get all transactions a given transaction is waiting for
+    F get_waiting_for(self, txn_id: u64) -> Vec<u64> {
+        guard := mut self.lock.lock();
+        result := mut M self.edges.get(&txn_id) {
+            Some(waiting_for) => waiting_for.clone(),
+            None => Vec.new(),
+        };
+        drop(guard);
+        result
+    }
+
+    # Get all transactions waiting for a given transaction
+    F get_waiters(self, txn_id: u64) -> Vec<u64> {
+        guard := mut self.lock.lock();
+        waiters := mut Vec.new();
+
+        L (waiter, waiting_for): self.edges.iter() {
+            holder_found := mut false;
+            L holder: waiting_for.iter() {
+                I !holder_found && *holder == txn_id {
+                    waiters.push(*waiter);
+                    holder_found = true;
+                }
+            }
+        }
+
+        drop(guard);
+        waiters
+    }
+
+    # Get number of edges in the graph (for debugging)
+    F edge_count(self) -> u64 {
+        guard := mut self.lock.lock();
+        count := mut 0u64;
+        L (_, waiting_for): self.edges.iter() {
+            count += waiting_for.len();
+        }
+        drop(guard);
+        count
+    }
+
+    # Get number of transactions in the graph
+    F node_count(self) -> u64 {
+        guard := mut self.lock.lock();
+        count := mut self.edges.len();
+        drop(guard);
+        count
+    }
+
+    # Clear the entire graph (for testing)
+    F clear(mut self) {
+        guard := mut self.lock.lock();
+        self.edges.clear();
+        drop(guard);
+    }
+}

@@ -1,0 +1,208 @@
+# Graph Label Index
+# B+Tree-based index for fast label-based node lookup
+# Key format: encode_u16_be(label_id) + encode_u64_be(node_id) → TID
+# Enables efficient scanning of all nodes with a specific label
+
+U std/vec.Vec;
+U std/bytes.{ByteBuffer};
+U storage/constants.{FILE_ID_GRAPH, NULL_PAGE};
+U storage/error.{VaisError, err_internal};
+U storage/buffer/pool.{BufferPool};
+U storage/page/allocator.{PageAllocator};
+U storage/page/freelist.{FreelistBitmap};
+U storage/btree/tree.{BTree};
+U storage/btree/insert.{btree_insert};
+U storage/btree/delete.{btree_delete};
+U storage/btree/search.{search_lower_bound};
+U storage/btree/key.{encode_u64_key};
+U storage/btree/cursor.{BTreeCursor, ScanDirection};
+U storage/wal/group_commit.{GroupCommitManager};
+
+# Error codes: EE=03 (graph), CC=06 (label index)
+F err_label_index_corrupt(label_id: u16) -> VaisError {
+    VaisError.new(
+        "VAIS-0306001",
+        "Label index corrupted for label_id {label_id}"
+    )
+}
+
+F err_label_index_full() -> VaisError {
+    VaisError.new(
+        "VAIS-0306002",
+        "Label index is full"
+    )
+}
+
+# ============================================================================
+# LabelIndex — B+Tree wrapper for label-based node lookup
+# ============================================================================
+
+S LabelIndex {
+    tree: BTree,
+}
+
+X LabelIndex {
+    # Create new label index with given root page
+    F new(root_page_id: u32, file_id: u8, page_size: u32) -> LabelIndex {
+        LabelIndex {
+            tree: BTree.new(root_page_id, file_id, page_size),
+        }
+    }
+
+    # Insert a label for a node
+    # Key: [label_id (u16 BE)][node_id (u64 BE)] → TID (dummy, just for presence)
+    F insert_label(
+        mut self,
+        node_id: u64,
+        label_id: u16,
+        txn_id: u64,
+        gcm: &mut GroupCommitManager,
+        pool: &mut BufferPool,
+        allocator: &PageAllocator,
+    ) -> Result<(), VaisError> {
+        key := mut LabelIndex.encode_label_key(label_id, node_id);
+
+        # TID is not meaningful for label index, use page_id as dummy value
+        tid := mut (node_id & 0xFFFFFFFF) as u32;
+
+        # Insert into B+Tree
+        inserted := mut btree_insert(&self.tree, &key, tid, txn_id, gcm, pool)?;
+
+        I !inserted {
+            # Key already exists, this is fine (idempotent)
+            Ok(())
+        } E {
+            Ok(())
+        }
+    }
+
+    # Remove a label from a node
+    F remove_label(
+        mut self,
+        node_id: u64,
+        label_id: u16,
+        txn_id: u64,
+        gcm: &mut GroupCommitManager,
+        pool: &mut BufferPool,
+    ) -> Result<(), VaisError> {
+        key := mut LabelIndex.encode_label_key(label_id, node_id);
+
+        # Delete from B+Tree
+        btree_delete(&self.tree, &key, txn_id, gcm, pool)?;
+
+        Ok(())
+    }
+
+    # Scan all nodes with a specific label
+    # Returns vector of node_ids that have this label
+    F scan_by_label(
+        self,
+        label_id: u16,
+        pool: &mut BufferPool,
+    ) -> Result<Vec<u64>, VaisError> {
+        results := mut Vec.new();
+
+        # Create prefix key for the label (start of range)
+        prefix_key := mut LabelIndex.encode_label_prefix(label_id);
+
+        # Create end key (next label_id)
+        next_label := mut label_id + 1;
+        end_key := mut LabelIndex.encode_label_prefix(next_label);
+
+        # Range scan: [prefix_key, end_key)
+        entries := mut self.tree.range_scan(&prefix_key, &end_key, pool)?;
+
+        # Extract node_ids from keys
+        i: u64 := mut 0;
+        L i < entries.len() {
+            key := mut &entries[i].0;
+            M LabelIndex.decode_label_key(key) {
+                Some((mut decoded_label_id, mut node_id)) => {
+                    I decoded_label_id == label_id {
+                        results.push(node_id);
+                    }
+                },
+                None => {
+                    # Corrupted key, skip
+                },
+            }
+            i += 1;
+        }
+
+        Ok(results)
+    }
+
+    # Check if a node has a specific label (point lookup)
+    F has_label(
+        self,
+        node_id: u64,
+        label_id: u16,
+        pool: &mut BufferPool,
+    ) -> Result<bool, VaisError> {
+        key := mut LabelIndex.encode_label_key(label_id, node_id);
+
+        M self.tree.search(&key, pool)? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    # Encode composite key: [label_id (u16 BE)][node_id (u64 BE)]
+    F encode_label_key(label_id: u16, node_id: u64) -> Vec<u8> {
+        key := mut Vec.with_capacity(10);
+
+        # Encode label_id as big-endian u16
+        key.push(((label_id >> 8) & 0xFF) as u8);
+        key.push((label_id & 0xFF) as u8);
+
+        # Encode node_id as big-endian u64
+        node_bytes := mut encode_u64_key(node_id);
+        i: u64 := mut 0;
+        L i < node_bytes.len() {
+            key.push(node_bytes[i]);
+            i += 1;
+        }
+
+        key
+    }
+
+    # Encode label prefix key: [label_id (u16 BE)] for range scan start
+    F encode_label_prefix(label_id: u16) -> Vec<u8> {
+        key := mut Vec.with_capacity(2);
+        key.push(((label_id >> 8) & 0xFF) as u8);
+        key.push((label_id & 0xFF) as u8);
+        key
+    }
+
+    # Decode composite key back to (label_id, node_id)
+    F decode_label_key(key: &[u8]) -> Option<(u16, u64)> {
+        I key.len() < 10 {
+            R None;
+        }
+
+        # Decode label_id (big-endian u16)
+        label_id := mut ((key[0] as u16) << 8) | (key[1] as u16);
+
+        # Decode node_id (big-endian u64)
+        node_id: u64 := mut 0;
+        node_id |= (key[2] as u64) << 56;
+        node_id |= (key[3] as u64) << 48;
+        node_id |= (key[4] as u64) << 40;
+        node_id |= (key[5] as u64) << 32;
+        node_id |= (key[6] as u64) << 24;
+        node_id |= (key[7] as u64) << 16;
+        node_id |= (key[8] as u64) << 8;
+        node_id |= key[9] as u64;
+
+        Some((label_id, node_id))
+    }
+
+    # Get underlying B+Tree (for advanced operations)
+    F get_tree(self) -> &BTree {
+        &self.tree
+    }
+
+    F get_tree_mut(mut self) -> &mut BTree {
+        &self.tree
+    }
+}

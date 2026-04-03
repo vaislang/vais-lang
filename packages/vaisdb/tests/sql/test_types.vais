@@ -1,0 +1,814 @@
+# Phase 11: SQL Type System & Row Encoding Unit Tests
+# Tests: SqlType, SqlValue (arithmetic, comparison, logic, casting, LIKE, BETWEEN, IN),
+#         Row encoding/decoding, aggregate helpers, coerce_types, order_by_compare
+
+U std/test.{assert_eq, assert_ne, assert_true, assert_false, describe, it};
+U std/result
+U std/bytes.{ByteBuffer};
+
+U sql/types.{
+    SqlType, SqlValue,
+    TYPE_TAG_NULL, TYPE_TAG_INT, TYPE_TAG_FLOAT, TYPE_TAG_BOOL,
+    TYPE_TAG_VARCHAR, TYPE_TAG_TEXT, TYPE_TAG_BLOB, TYPE_TAG_DATE,
+    TYPE_TAG_TIMESTAMP, TYPE_TAG_VECTOR,
+    agg_count_value, agg_sum, agg_avg_accumulate, agg_avg_finalize,
+    agg_min, agg_max,
+    group_key_hash, order_by_compare, coerce_types,
+    like_match_internal,
+};
+U sql/row.{Row};
+
+# ============================================================================
+# SqlType
+# ============================================================================
+
+describe("SqlType") {
+    it("should return correct type_id for each type") {
+        assert_eq(SqlType.Int.type_id(), TYPE_TAG_INT);
+        assert_eq(SqlType.Float.type_id(), TYPE_TAG_FLOAT);
+        assert_eq(SqlType.Bool.type_id(), TYPE_TAG_BOOL);
+        assert_eq(SqlType.Varchar { max_len: 255 }.type_id(), TYPE_TAG_VARCHAR);
+        assert_eq(SqlType.Text.type_id(), TYPE_TAG_TEXT);
+        assert_eq(SqlType.Blob.type_id(), TYPE_TAG_BLOB);
+        assert_eq(SqlType.Date.type_id(), TYPE_TAG_DATE);
+        assert_eq(SqlType.Timestamp.type_id(), TYPE_TAG_TIMESTAMP);
+        assert_eq(SqlType.Vector { dim: 128 }.type_id(), TYPE_TAG_VECTOR);
+    }
+
+    it("should round-trip from_type_id") {
+        int_type := mut SqlType.from_type_id(1)!;
+        assert_eq(int_type.type_id(), TYPE_TAG_INT);
+
+        float_type := mut SqlType.from_type_id(2)!;
+        assert_eq(float_type.type_id(), TYPE_TAG_FLOAT);
+
+        bool_type := mut SqlType.from_type_id(3)!;
+        assert_eq(bool_type.type_id(), TYPE_TAG_BOOL);
+    }
+
+    it("should reject invalid type_id") {
+        result := mut SqlType.from_type_id(99);
+        assert_true(result.is_err());
+    }
+
+    it("should report is_numeric correctly") {
+        assert_true(SqlType.Int.is_numeric());
+        assert_true(SqlType.Float.is_numeric());
+        assert_false(SqlType.Bool.is_numeric());
+        assert_false(SqlType.Text.is_numeric());
+        assert_false(SqlType.Vector { dim: 3 }.is_numeric());
+    }
+
+    it("should report is_string correctly") {
+        assert_true(SqlType.Text.is_string());
+        assert_true(SqlType.Varchar { max_len: 100 }.is_string());
+        assert_false(SqlType.Int.is_string());
+        assert_false(SqlType.Bool.is_string());
+    }
+
+    it("should check is_compatible across types") {
+        # Numeric cross-compatibility
+        assert_true(SqlType.Int.is_compatible(&SqlType.Float));
+        assert_true(SqlType.Float.is_compatible(&SqlType.Int));
+
+        # String cross-compatibility
+        assert_true(SqlType.Varchar { max_len: 50 }.is_compatible(&SqlType.Text));
+        assert_true(SqlType.Text.is_compatible(&SqlType.Varchar { max_len: 100 }));
+
+        # Date/Timestamp cross-compatibility
+        assert_true(SqlType.Date.is_compatible(&SqlType.Timestamp));
+        assert_true(SqlType.Timestamp.is_compatible(&SqlType.Date));
+
+        # Vector compatibility (dimension wildcard)
+        assert_true(SqlType.Vector { dim: 128 }.is_compatible(&SqlType.Vector { dim: 128 }));
+        assert_true(SqlType.Vector { dim: 0 }.is_compatible(&SqlType.Vector { dim: 128 }));
+        assert_false(SqlType.Vector { dim: 128 }.is_compatible(&SqlType.Vector { dim: 256 }));
+
+        # Incompatible pairs
+        assert_false(SqlType.Int.is_compatible(&SqlType.Text));
+        assert_false(SqlType.Bool.is_compatible(&SqlType.Date));
+    }
+
+    it("should return correct default values") {
+        int_def := mut SqlType.Int.default_value();
+        M int_def { SqlValue.IntVal { v } => { assert_eq(v, 0); }, _ => panic!("Expected IntVal(0)") }
+
+        float_def := mut SqlType.Float.default_value();
+        M float_def { SqlValue.FloatVal { v } => { assert_approx(v, 0.0, 0.001); }, _ => panic!("Expected FloatVal(0.0)") }
+
+        bool_def := mut SqlType.Bool.default_value();
+        M bool_def { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("Expected BoolVal(false)") }
+    }
+
+    it("should serialize/deserialize round-trip") {
+        types := mut [
+            SqlType.Int,
+            SqlType.Float,
+            SqlType.Bool,
+            SqlType.Varchar { max_len: 200 },
+            SqlType.Text,
+            SqlType.Blob,
+            SqlType.Date,
+            SqlType.Timestamp,
+            SqlType.Vector { dim: 384 },
+        ];
+
+        L ty: &types {
+            buf := mut ByteBuffer.new();
+            ty.serialize(&buf);
+            read_buf := mut ByteBuffer.from_buf(&buf);
+            restored := mut SqlType.deserialize(&read_buf)!;
+            assert_eq(restored.type_id(), ty.type_id());
+        }
+    }
+
+    it("should display human-readable names") {
+        assert_eq(SqlType.Int.name(), "INT");
+        assert_eq(SqlType.Float.name(), "FLOAT");
+        assert_eq(SqlType.Varchar { max_len: 50 }.name(), "VARCHAR(50)");
+        assert_eq(SqlType.Vector { dim: 128 }.name(), "VECTOR(128)");
+    }
+}
+
+# ============================================================================
+# SqlValue — Basic Operations
+# ============================================================================
+
+describe("SqlValue Basic") {
+    it("should detect NULL correctly") {
+        assert_true(SqlValue.Null.is_null());
+        assert_false(SqlValue.IntVal { v: 42 }.is_null());
+        assert_false(SqlValue.StringVal { v: "" }.is_null());
+    }
+
+    it("should infer types correctly") {
+        assert_eq(SqlValue.IntVal { v: 1 }.get_type().type_id(), TYPE_TAG_INT);
+        assert_eq(SqlValue.FloatVal { v: 1.0 }.get_type().type_id(), TYPE_TAG_FLOAT);
+        assert_eq(SqlValue.BoolVal { v: true }.get_type().type_id(), TYPE_TAG_BOOL);
+        assert_eq(SqlValue.StringVal { v: "hi" }.get_type().type_id(), TYPE_TAG_TEXT);
+        assert_eq(SqlValue.DateVal { v: 100 }.get_type().type_id(), TYPE_TAG_DATE);
+        assert_eq(SqlValue.TimestampVal { v: 1000 }.get_type().type_id(), TYPE_TAG_TIMESTAMP);
+    }
+
+    it("should display values as strings") {
+        assert_eq(SqlValue.Null.to_string(), "NULL");
+        assert_eq(SqlValue.IntVal { v: 42 }.to_string(), "42");
+        assert_eq(SqlValue.BoolVal { v: true }.to_string(), "TRUE");
+        assert_eq(SqlValue.BoolVal { v: false }.to_string(), "FALSE");
+        assert_eq(SqlValue.StringVal { v: "hello" }.to_string(), "'hello'");
+    }
+}
+
+# ============================================================================
+# SqlValue — Comparison
+# ============================================================================
+
+describe("SqlValue Comparison") {
+    it("should compare integers") {
+        a := mut SqlValue.IntVal { v: 10 };
+        b := mut SqlValue.IntVal { v: 20 };
+        c := mut SqlValue.IntVal { v: 10 };
+
+        assert_eq(a.compare(&b)!, -1);
+        assert_eq(b.compare(&a)!, 1);
+        assert_eq(a.compare(&c)!, 0);
+    }
+
+    it("should compare floats") {
+        a := mut SqlValue.FloatVal { v: 1.5 };
+        b := mut SqlValue.FloatVal { v: 2.5 };
+        assert_eq(a.compare(&b)!, -1);
+        assert_eq(b.compare(&a)!, 1);
+    }
+
+    it("should cross-compare INT and FLOAT") {
+        int_val := mut SqlValue.IntVal { v: 5 };
+        float_val := mut SqlValue.FloatVal { v: 5.0 };
+        assert_eq(int_val.compare(&float_val)!, 0);
+
+        float_larger := mut SqlValue.FloatVal { v: 5.5 };
+        assert_eq(int_val.compare(&float_larger)!, -1);
+    }
+
+    it("should compare strings lexicographically") {
+        a := mut SqlValue.StringVal { v: "apple" };
+        b := mut SqlValue.StringVal { v: "banana" };
+        assert_eq(a.compare(&b)!, -1);
+        assert_eq(b.compare(&a)!, 1);
+    }
+
+    it("should compare dates") {
+        a := mut SqlValue.DateVal { v: 100 };
+        b := mut SqlValue.DateVal { v: 200 };
+        assert_eq(a.compare(&b)!, -1);
+    }
+
+    it("should cross-compare DATE and TIMESTAMP") {
+        # 1 day = 86400000000 microseconds
+        date_val := mut SqlValue.DateVal { v: 1 };
+        ts_val := mut SqlValue.TimestampVal { v: 86400_000_000 };
+        assert_eq(date_val.compare(&ts_val)!, 0);
+    }
+
+    it("should error on NULL comparison") {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.IntVal { v: 1 };
+        assert_true(a.compare(&b).is_err());
+        assert_true(b.compare(&a).is_err());
+    }
+
+    it("should error on incompatible type comparison") {
+        a := mut SqlValue.IntVal { v: 1 };
+        b := mut SqlValue.BoolVal { v: true };
+        assert_true(a.compare(&b).is_err());
+    }
+}
+
+# ============================================================================
+# SqlValue — Arithmetic
+# ============================================================================
+
+describe("SqlValue Arithmetic") {
+    it("should add integers") {
+        a := mut SqlValue.IntVal { v: 10 };
+        b := mut SqlValue.IntVal { v: 20 };
+        result := mut a.add(&b)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 30); }, _ => panic!("Expected IntVal(30)") }
+    }
+
+    it("should add INT + FLOAT -> FLOAT") {
+        a := mut SqlValue.IntVal { v: 5 };
+        b := mut SqlValue.FloatVal { v: 2.5 };
+        result := mut a.add(&b)!;
+        M result { SqlValue.FloatVal { v } => assert_true(v > 7.4 && v < 7.6), _ => panic!("Expected FloatVal") }
+    }
+
+    it("should subtract integers") {
+        a := mut SqlValue.IntVal { v: 30 };
+        b := mut SqlValue.IntVal { v: 10 };
+        result := mut a.sub(&b)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 20); }, _ => panic!("Expected IntVal(20)") }
+    }
+
+    it("should multiply integers") {
+        a := mut SqlValue.IntVal { v: 6 };
+        b := mut SqlValue.IntVal { v: 7 };
+        result := mut a.mul(&b)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 42); }, _ => panic!("Expected IntVal(42)") }
+    }
+
+    it("should divide integers (truncating)") {
+        a := mut SqlValue.IntVal { v: 7 };
+        b := mut SqlValue.IntVal { v: 2 };
+        result := mut a.div(&b)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 3); }, _ => panic!("Expected IntVal(3)") }
+    }
+
+    it("should error on division by zero (INT)") {
+        a := mut SqlValue.IntVal { v: 10 };
+        b := mut SqlValue.IntVal { v: 0 };
+        assert_true(a.div(&b).is_err());
+    }
+
+    it("should error on division by zero (FLOAT)") {
+        a := mut SqlValue.FloatVal { v: 10.0 };
+        b := mut SqlValue.FloatVal { v: 0.0 };
+        assert_true(a.div(&b).is_err());
+    }
+
+    it("should negate values") {
+        pos := mut SqlValue.IntVal { v: 42 };
+        neg := mut pos.negate()!;
+        M neg { SqlValue.IntVal { v } => { assert_eq(v, 0 - 42); }, _ => panic!("Expected IntVal(-42)") }
+
+        fpos := mut SqlValue.FloatVal { v: 3.14 };
+        fneg := mut fpos.negate()!;
+        M fneg { SqlValue.FloatVal { v } => assert_true(v < -3.13 && v > -3.15), _ => panic!("Expected FloatVal") }
+    }
+
+    it("should propagate NULL in arithmetic") {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.IntVal { v: 5 };
+        result := mut a.add(&b)!;
+        assert_true(result.is_null());
+
+        result2 := mut b.add(&a)!;
+        assert_true(result2.is_null());
+    }
+
+    it("should error on incompatible arithmetic") {
+        a := mut SqlValue.IntVal { v: 1 };
+        b := mut SqlValue.StringVal { v: "hello" };
+        assert_true(a.add(&b).is_err());
+    }
+}
+
+# ============================================================================
+# SqlValue — Boolean Logic (3-valued NULL propagation)
+# ============================================================================
+
+describe("SqlValue Boolean Logic") {
+    it("should AND correctly") {
+        t := mut SqlValue.BoolVal { v: true };
+        f := mut SqlValue.BoolVal { v: false };
+        n := mut SqlValue.Null;
+
+        # TRUE AND TRUE = TRUE
+        M t.and_bool(&t) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("AND failed") }
+        # TRUE AND FALSE = FALSE
+        M t.and_bool(&f) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("AND failed") }
+        # FALSE AND NULL = FALSE  (short-circuit)
+        M f.and_bool(&n) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("AND failed") }
+        # NULL AND FALSE = FALSE
+        M n.and_bool(&f) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("AND failed") }
+        # TRUE AND NULL = NULL
+        assert_true(t.and_bool(&n).is_null());
+        # NULL AND NULL = NULL
+        assert_true(n.and_bool(&n).is_null());
+    }
+
+    it("should OR correctly") {
+        t := mut SqlValue.BoolVal { v: true };
+        f := mut SqlValue.BoolVal { v: false };
+        n := mut SqlValue.Null;
+
+        # FALSE OR FALSE = FALSE
+        M f.or_bool(&f) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("OR failed") }
+        # TRUE OR NULL = TRUE  (short-circuit)
+        M t.or_bool(&n) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("OR failed") }
+        # NULL OR TRUE = TRUE
+        M n.or_bool(&t) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("OR failed") }
+        # FALSE OR NULL = NULL
+        assert_true(f.or_bool(&n).is_null());
+        # NULL OR NULL = NULL
+        assert_true(n.or_bool(&n).is_null());
+    }
+
+    it("should NOT correctly") {
+        t := mut SqlValue.BoolVal { v: true };
+        f := mut SqlValue.BoolVal { v: false };
+        n := mut SqlValue.Null;
+
+        M t.not_bool() { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("NOT failed") }
+        M f.not_bool() { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("NOT failed") }
+        assert_true(n.not_bool().is_null());
+    }
+}
+
+# ============================================================================
+# SqlValue — Equality & NULL-safe
+# ============================================================================
+
+describe("SqlValue Equality") {
+    it("should return NULL for NULL = NULL") {
+        a := mut SqlValue.Null;
+        assert_true(a.equals(&a).is_null());
+    }
+
+    it("should return NULL for NULL = value") {
+        n := mut SqlValue.Null;
+        v := mut SqlValue.IntVal { v: 1 };
+        assert_true(n.equals(&v).is_null());
+    }
+
+    it("should return true for equal values") {
+        a := mut SqlValue.IntVal { v: 42 };
+        b := mut SqlValue.IntVal { v: 42 };
+        M a.equals(&b) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("equals failed") }
+    }
+
+    it("should support IS DISTINCT FROM") {
+        n := mut SqlValue.Null;
+        v1 := mut SqlValue.IntVal { v: 1 };
+        v2 := mut SqlValue.IntVal { v: 2 };
+
+        # NULL IS DISTINCT FROM NULL -> false
+        M n.is_distinct_from(&n) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("distinct failed") }
+        # NULL IS DISTINCT FROM 1 -> true
+        M n.is_distinct_from(&v1) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("distinct failed") }
+        # 1 IS DISTINCT FROM 1 -> false
+        M v1.is_distinct_from(&v1) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("distinct failed") }
+        # 1 IS DISTINCT FROM 2 -> true
+        M v1.is_distinct_from(&v2) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("distinct failed") }
+    }
+
+    it("should support NULL-safe equals") {
+        n := mut SqlValue.Null;
+        v := mut SqlValue.IntVal { v: 1 };
+
+        # NULL IS NOT DISTINCT FROM NULL -> true
+        M n.null_safe_equals(&n) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("nse failed") }
+        # NULL IS NOT DISTINCT FROM 1 -> false
+        M n.null_safe_equals(&v) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("nse failed") }
+    }
+}
+
+# ============================================================================
+# SqlValue — BETWEEN, IN, LIKE
+# ============================================================================
+
+describe("SqlValue BETWEEN") {
+    it("should check value in range") {
+        val := mut SqlValue.IntVal { v: 5 };
+        lo := mut SqlValue.IntVal { v: 1 };
+        hi := mut SqlValue.IntVal { v: 10 };
+        M val.between(&lo, &hi) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("between failed") }
+    }
+
+    it("should check value at boundary") {
+        val := mut SqlValue.IntVal { v: 10 };
+        lo := mut SqlValue.IntVal { v: 1 };
+        hi := mut SqlValue.IntVal { v: 10 };
+        M val.between(&lo, &hi) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("between boundary") }
+    }
+
+    it("should check value outside range") {
+        val := mut SqlValue.IntVal { v: 15 };
+        lo := mut SqlValue.IntVal { v: 1 };
+        hi := mut SqlValue.IntVal { v: 10 };
+        M val.between(&lo, &hi) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("between outside") }
+    }
+
+    it("should return NULL if any operand is NULL") {
+        val := mut SqlValue.Null;
+        lo := mut SqlValue.IntVal { v: 1 };
+        hi := mut SqlValue.IntVal { v: 10 };
+        assert_true(val.between(&lo, &hi).is_null());
+    }
+}
+
+describe("SqlValue IN") {
+    it("should find value in list") {
+        val := mut SqlValue.IntVal { v: 3 };
+        list := mut [
+            SqlValue.IntVal { v: 1 },
+            SqlValue.IntVal { v: 2 },
+            SqlValue.IntVal { v: 3 },
+        ];
+        M val.in_list(&list) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("IN failed") }
+    }
+
+    it("should not find value not in list") {
+        val := mut SqlValue.IntVal { v: 5 };
+        list := mut [
+            SqlValue.IntVal { v: 1 },
+            SqlValue.IntVal { v: 2 },
+            SqlValue.IntVal { v: 3 },
+        ];
+        M val.in_list(&list) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("IN failed") }
+    }
+
+    it("should return NULL if list contains NULL and no match") {
+        val := mut SqlValue.IntVal { v: 5 };
+        list := mut [
+            SqlValue.IntVal { v: 1 },
+            SqlValue.Null,
+            SqlValue.IntVal { v: 3 },
+        ];
+        assert_true(val.in_list(&list).is_null());
+    }
+}
+
+describe("SqlValue LIKE") {
+    it("should match exact string") {
+        val := mut SqlValue.StringVal { v: "hello" };
+        pat := mut SqlValue.StringVal { v: "hello" };
+        M val.like_match(&pat) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("LIKE exact") }
+    }
+
+    it("should match % wildcard") {
+        val := mut SqlValue.StringVal { v: "hello world" };
+        pat := mut SqlValue.StringVal { v: "hello%" };
+        M val.like_match(&pat) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("LIKE %") }
+    }
+
+    it("should match underscore wildcard") {
+        val := mut SqlValue.StringVal { v: "hello" };
+        pat := mut SqlValue.StringVal { v: "hell_" };
+        M val.like_match(&pat) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("LIKE _") }
+    }
+
+    it("should match complex pattern") {
+        val := mut SqlValue.StringVal { v: "abcdef" };
+        pat := mut SqlValue.StringVal { v: "%cd%" };
+        M val.like_match(&pat) { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("LIKE complex") }
+    }
+
+    it("should not match non-matching pattern") {
+        val := mut SqlValue.StringVal { v: "hello" };
+        pat := mut SqlValue.StringVal { v: "world%" };
+        M val.like_match(&pat) { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("LIKE no match") }
+    }
+
+    it("should return NULL if either operand is NULL") {
+        val := mut SqlValue.Null;
+        pat := mut SqlValue.StringVal { v: "%" };
+        assert_true(val.like_match(&pat).is_null());
+    }
+}
+
+# ============================================================================
+# SqlValue — Type Casting
+# ============================================================================
+
+describe("SqlValue Casting") {
+    it("should cast INT to FLOAT") {
+        val := mut SqlValue.IntVal { v: 42 };
+        result := mut val.cast_to(&SqlType.Float)!;
+        M result { SqlValue.FloatVal { v } => assert_true(v > 41.9 && v < 42.1), _ => panic!("cast") }
+    }
+
+    it("should cast FLOAT to INT (truncation)") {
+        val := mut SqlValue.FloatVal { v: 3.7 };
+        result := mut val.cast_to(&SqlType.Int)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 3); }, _ => panic!("cast") }
+    }
+
+    it("should cast BOOL to INT") {
+        t := mut SqlValue.BoolVal { v: true };
+        result := mut t.cast_to(&SqlType.Int)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 1); }, _ => panic!("cast") }
+
+        f := mut SqlValue.BoolVal { v: false };
+        result2 := mut f.cast_to(&SqlType.Int)!;
+        M result2 { SqlValue.IntVal { v } => { assert_eq(v, 0); }, _ => panic!("cast") }
+    }
+
+    it("should cast INT to BOOL") {
+        zero := mut SqlValue.IntVal { v: 0 };
+        result := mut zero.cast_to(&SqlType.Bool)!;
+        M result { SqlValue.BoolVal { v } => { assert_false(I v { 1 } E { 0 }); }, _ => panic!("cast") }
+
+        nonzero := mut SqlValue.IntVal { v: 42 };
+        result2 := mut nonzero.cast_to(&SqlType.Bool)!;
+        M result2 { SqlValue.BoolVal { v } => { assert_true(I v { 1 } E { 0 }); }, _ => panic!("cast") }
+    }
+
+    it("should cast DATE to TIMESTAMP") {
+        date := mut SqlValue.DateVal { v: 1 };
+        result := mut date.cast_to(&SqlType.Timestamp)!;
+        M result {
+            SqlValue.TimestampVal { v } => { assert_eq(v, 86400_000_000); },
+            _ => panic!("DATE to TIMESTAMP cast"),
+        }
+    }
+
+    it("should cast TIMESTAMP to DATE") {
+        ts := mut SqlValue.TimestampVal { v: 172800_000_000 };  # 2 days
+        result := mut ts.cast_to(&SqlType.Date)!;
+        M result { SqlValue.DateVal { v } => { assert_eq(v, 2); }, _ => panic!("TIMESTAMP to DATE cast") }
+    }
+
+    it("should cast INT to TEXT") {
+        val := mut SqlValue.IntVal { v: 42 };
+        result := mut val.cast_to(&SqlType.Text)!;
+        M result { SqlValue.StringVal { v } => assert_eq(v, "42"), _ => panic!("INT to TEXT cast") }
+    }
+
+    it("should cast STRING to INT") {
+        val := mut SqlValue.StringVal { v: "123" };
+        result := mut val.cast_to(&SqlType.Int)!;
+        M result { SqlValue.IntVal { v } => { assert_eq(v, 123); }, _ => panic!("STRING to INT cast") }
+    }
+
+    it("should error on invalid STRING to INT") {
+        val := mut SqlValue.StringVal { v: "abc" };
+        assert_true(val.cast_to(&SqlType.Int).is_err());
+    }
+
+    it("should cast NULL to any type producing NULL") {
+        null_val := mut SqlValue.Null;
+        result := mut null_val.cast_to(&SqlType.Int)!;
+        assert_true(result.is_null());
+    }
+}
+
+# ============================================================================
+# SqlValue — Serialization
+# ============================================================================
+
+describe("SqlValue Serialization") {
+    it("should round-trip all value types") {
+        values := mut [
+            SqlValue.Null,
+            SqlValue.IntVal { v: -999 },
+            SqlValue.FloatVal { v: 3.14 },
+            SqlValue.BoolVal { v: true },
+            SqlValue.BoolVal { v: false },
+            SqlValue.StringVal { v: "test" },
+            SqlValue.BlobVal { v: vec![1u8, 2, 3] },
+            SqlValue.DateVal { v: 365 },
+            SqlValue.TimestampVal { v: 1000000 },
+            SqlValue.VectorVal { v: vec![1.0f32, 2.0, 3.0] },
+        ];
+
+        L val: &values {
+            buf := mut ByteBuffer.new();
+            val.serialize(&buf);
+            read_buf := mut ByteBuffer.from_buf(&buf);
+            restored := mut SqlValue.deserialize(&read_buf)!;
+
+            # Compare type tags
+            I !val.is_null() && !restored.is_null() {
+                assert_eq(val.get_type().type_id(), restored.get_type().type_id());
+            }
+        }
+    }
+}
+
+# ============================================================================
+# Row Encoding
+# ============================================================================
+
+describe("Row Encoding") {
+    it("should encode and decode a simple row") {
+        schema := mut [SqlType.Int, SqlType.Text, SqlType.Float];
+        values: Vec<SqlValue> := mut Vec.new();
+        values.push(SqlValue.IntVal { v: 42 });
+        values.push(SqlValue.StringVal { v: "hello" });
+        values.push(SqlValue.FloatVal { v: 3.14 });
+        row := mut Row.new(values);
+
+        encoded := mut row.encode(&schema);
+        decoded := mut Row.decode(&encoded, &schema)!;
+
+        assert_eq(decoded.column_count(), 3);
+        M decoded.get(0) { SqlValue.IntVal { v } => { assert_eq(v, 42); }, _ => panic!("decode col 0") }
+        M decoded.get(2) { SqlValue.FloatVal { v } => assert_true(*v > 3.13 && *v < 3.15), _ => panic!("decode col 2") }
+    }
+
+    it("should handle NULL columns correctly") {
+        schema := mut [SqlType.Int, SqlType.Text, SqlType.Int];
+        values: Vec<SqlValue> := mut Vec.new();
+        values.push(SqlValue.IntVal { v: 1 });
+        values.push(SqlValue.Null);
+        values.push(SqlValue.IntVal { v: 3 });
+        row := mut Row.new(values);
+
+        encoded := mut row.encode(&schema);
+        decoded := mut Row.decode(&encoded, &schema)!;
+
+        assert_false(decoded.get(0).is_null());
+        assert_true(decoded.get(1).is_null());
+        assert_false(decoded.get(2).is_null());
+    }
+
+    it("should handle all-NULL row") {
+        schema := mut [SqlType.Int, SqlType.Float, SqlType.Text];
+        row := mut Row.null_row(3);
+
+        encoded := mut row.encode(&schema);
+        decoded := mut Row.decode(&encoded, &schema)!;
+
+        assert_true(decoded.get(0).is_null());
+        assert_true(decoded.get(1).is_null());
+        assert_true(decoded.get(2).is_null());
+    }
+
+    it("should handle Vector columns") {
+        schema := mut [SqlType.Int, SqlType.Vector { dim: 3 }];
+        values := mut Vec.new();
+        values.push(SqlValue.IntVal { v: 1 });
+        values.push(SqlValue.VectorVal { v: Vec.new() });
+        row := mut Row.new(values);
+
+        encoded := mut row.encode(&schema);
+        decoded := mut Row.decode(&encoded, &schema)!;
+
+        assert_eq(decoded.column_count(), 2);
+    }
+}
+
+# ============================================================================
+# Aggregate Helpers
+# ============================================================================
+
+describe("Aggregate Helpers") {
+    it("should count non-NULL values") {
+        assert_true(agg_count_value(&SqlValue.IntVal { v: 1 }));
+        assert_false(agg_count_value(&SqlValue.Null));
+    }
+
+    it("should compute SUM skipping NULLs") {
+        acc: Option<SqlValue> := mut None;
+        acc = agg_sum(&acc, &SqlValue.IntVal { v: 10 })!;
+        acc = agg_sum(&acc, &SqlValue.Null)!;
+        acc = agg_sum(&acc, &SqlValue.IntVal { v: 20 })!;
+
+        M acc {
+            Some(SqlValue.IntVal { v }) => { assert_eq(v, 30); },
+            _ => panic!("SUM failed"),
+        }
+    }
+
+    it("should return None for SUM of all NULLs") {
+        acc: Option<SqlValue> := mut None;
+        acc = agg_sum(&acc, &SqlValue.Null)!;
+        acc = agg_sum(&acc, &SqlValue.Null)!;
+        assert_true(acc.is_none());
+    }
+
+    it("should compute MIN correctly") {
+        acc: Option<SqlValue> := mut None;
+        acc = agg_min(&acc, &SqlValue.IntVal { v: 30 })!;
+        acc = agg_min(&acc, &SqlValue.IntVal { v: 10 })!;
+        acc = agg_min(&acc, &SqlValue.IntVal { v: 20 })!;
+
+        M acc {
+            Some(SqlValue.IntVal { v }) => { assert_eq(v, 10); },
+            _ => panic!("MIN failed"),
+        }
+    }
+
+    it("should compute MAX correctly") {
+        acc: Option<SqlValue> := mut None;
+        acc = agg_max(&acc, &SqlValue.IntVal { v: 10 })!;
+        acc = agg_max(&acc, &SqlValue.IntVal { v: 30 })!;
+        acc = agg_max(&acc, &SqlValue.IntVal { v: 20 })!;
+
+        M acc {
+            Some(SqlValue.IntVal { v }) => { assert_eq(v, 30); },
+            _ => panic!("MAX failed"),
+        }
+    }
+
+    # AVG test skipped — agg_avg_accumulate returns tuple which Vais doesn't support natively
+    # TODO: re-enable when agg_avg_accumulate is refactored to return a struct
+}
+
+# ============================================================================
+# order_by_compare
+# ============================================================================
+
+describe("order_by_compare") {
+    it("should sort ascending by default") {
+        a := mut SqlValue.IntVal { v: 1 };
+        b := mut SqlValue.IntVal { v: 2 };
+        assert_eq(order_by_compare(&a, &b, true, None), -1);
+        assert_eq(order_by_compare(&b, &a, true, None), 1);
+    }
+
+    it("should sort descending") {
+        a := mut SqlValue.IntVal { v: 1 };
+        b := mut SqlValue.IntVal { v: 2 };
+        assert_eq(order_by_compare(&a, &b, false, None), 1);  # reversed
+    }
+
+    it("should handle NULLS LAST in ASC (default)") {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.IntVal { v: 1 };
+        # Default for ASC: NULLS LAST -> NULL comes after non-NULL
+        assert_eq(order_by_compare(&a, &b, true, None), 1);
+    }
+
+    it("should handle NULLS FIRST explicitly") {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.IntVal { v: 1 };
+        assert_eq(order_by_compare(&a, &b, true, Some(true)), -1);
+    }
+}
+
+# ============================================================================
+# coerce_types
+# ============================================================================
+
+describe("coerce_types") {
+    # coerce_types tests skipped — returns tuple (SqlValue, SqlValue) which Vais doesn't support natively
+    # TODO: re-enable when coerce_types is refactored to return a struct
+}
+
+# ============================================================================
+# LIKE Internal
+# ============================================================================
+
+describe("like_match_internal") {
+    it("should match empty pattern to empty string") {
+        assert_true(like_match_internal(&"", &""));
+    }
+
+    it("should match % to any string") {
+        assert_true(like_match_internal(&"anything", &"%"));
+    }
+
+    it("should match prefix%") {
+        assert_true(like_match_internal(&"hello world", &"hello%"));
+        assert_false(like_match_internal(&"world hello", &"hello%"));
+    }
+
+    it("should match %suffix") {
+        assert_true(like_match_internal(&"hello world", &"%world"));
+        assert_false(like_match_internal(&"hello world", &"%xyz"));
+    }
+
+    it("should match ___ for exactly 3 chars") {
+        assert_true(like_match_internal(&"abc", &"___"));
+        assert_false(like_match_internal(&"ab", &"___"));
+        assert_false(like_match_internal(&"abcd", &"___"));
+    }
+
+    it("should handle complex patterns") {
+        assert_true(like_match_internal(&"abcdef", &"a%d_f"));
+        assert_true(like_match_internal(&"test123test", &"test%test"));
+        assert_false(like_match_internal(&"test123", &"test%test"));
+    }
+}

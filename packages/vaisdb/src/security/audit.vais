@@ -1,0 +1,378 @@
+# Audit Logger
+# Append-only audit log with configurable event types (DDL, Auth, DML)
+# Checksum chain for tamper detection (FNV-1a hash chain)
+# Each entry references the previous entry's checksum
+# Error codes: EE=09 (security), CC=05 (corruption)
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U storage/hash.{fnv1a_hash};
+U security/types.{
+    SecurityConfig, SecurityMeta, AuditEntry, SessionContext,
+    AUDIT_DDL, AUDIT_DML, AUDIT_AUTH, AUDIT_PRIVILEGE,
+    AUDIT_POLICY, AUDIT_ADMIN,
+    AUDIT_RESULT_SUCCESS, AUDIT_RESULT_FAILURE, AUDIT_RESULT_DENIED,
+    audit_event_name,
+    err_audit_log_tampered, err_security_engine_closed,
+};
+
+# ============================================================================
+# AuditLogger — Manages append-only audit log
+# ============================================================================
+
+S AuditLogger {
+    entries: Vec<AuditEntry>,              # In-memory buffer of recent entries
+    last_checksum: u64,                    # Checksum of the last entry (chain head)
+    enabled: bool,                         # Master enable flag
+    audit_dml: bool,                       # Whether to audit DML operations
+    max_buffer_size: u64,                  # Max entries to keep in memory before flush
+}
+
+X AuditLogger {
+    # Create a disabled audit logger
+    F disabled() -> AuditLogger {
+        AuditLogger {
+            entries: Vec.new(),
+            last_checksum: 0,
+            enabled: false,
+            audit_dml: false,
+            max_buffer_size: 1000,
+        }
+    }
+
+    # Create from SecurityConfig
+    F from_config(config: &SecurityConfig) -> AuditLogger {
+        AuditLogger {
+            entries: Vec.new(),
+            last_checksum: 0,
+            enabled: config.enable_audit,
+            audit_dml: config.audit_dml,
+            max_buffer_size: 1000,
+        }
+    }
+
+    # Initialize with last known checksum (loaded from SecurityMeta at startup)
+    F with_last_checksum(mut self, checksum: u64) -> AuditLogger {
+        self.last_checksum = checksum;
+        AuditLogger {
+            entries: self.entries.clone(),
+            last_checksum: self.last_checksum,
+            enabled: self.enabled,
+            audit_dml: self.audit_dml,
+            max_buffer_size: self.max_buffer_size,
+        }
+    }
+
+    # ========================================================================
+    # Logging Functions
+    # ========================================================================
+
+    # Log a DDL event (CREATE, ALTER, DROP table/index/user/role)
+    F log_ddl_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        statement: &Str,
+        object_name: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled {
+            R Ok(());
+        }
+        self.append_entry(
+            meta, session, AUDIT_DDL, result,
+            object_name, statement, "",
+        )
+    }
+
+    # Log an authentication event (login, logout, auth failure)
+    F log_auth_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        event_detail: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled {
+            R Ok(());
+        }
+        self.append_entry(
+            meta, session, AUDIT_AUTH, result,
+            "", "", event_detail,
+        )
+    }
+
+    # Log a DML event (SELECT, INSERT, UPDATE, DELETE)
+    # Only logged when audit_dml is enabled (can be verbose)
+    F log_dml_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        statement: &Str,
+        table_name: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled || !self.audit_dml {
+            R Ok(());
+        }
+        # Truncate DML statement for audit (limit to 512 chars)
+        truncated := mut truncate_statement(statement, 512);
+        self.append_entry(
+            meta, session, AUDIT_DML, result,
+            table_name, &truncated, "",
+        )
+    }
+
+    # Log a privilege change event (GRANT, REVOKE)
+    F log_privilege_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        statement: &Str,
+        object_name: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled {
+            R Ok(());
+        }
+        self.append_entry(
+            meta, session, AUDIT_PRIVILEGE, result,
+            object_name, statement, "",
+        )
+    }
+
+    # Log a policy change event (CREATE/ALTER/DROP POLICY)
+    F log_policy_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        statement: &Str,
+        policy_name: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled {
+            R Ok(());
+        }
+        self.append_entry(
+            meta, session, AUDIT_POLICY, result,
+            policy_name, statement, "",
+        )
+    }
+
+    # Log an administrative event (VACUUM, REINDEX, CONFIG, KEY_ROTATE)
+    F log_admin_event(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        operation: &Str,
+        detail: &Str,
+        result: u8,
+    ) -> Result<(), VaisError> {
+        I !self.enabled {
+            R Ok(());
+        }
+        self.append_entry(
+            meta, session, AUDIT_ADMIN, result,
+            "", operation, detail,
+        )
+    }
+
+    # ========================================================================
+    # Core append (all log_*_event methods delegate here)
+    # ========================================================================
+
+    F append_entry(
+        mut self,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        event_type: u8,
+        result: u8,
+        object_name: &Str,
+        statement: &Str,
+        detail: &Str,
+    ) -> Result<(), VaisError> {
+        entry_id := mut meta.alloc_audit_id();
+        entry := mut AuditEntry.new(
+            entry_id,
+            event_type,
+            result,
+            session.user_id,
+            session.username.clone(),
+            session.client_addr.clone(),
+            session.database_name.clone(),
+            object_name.clone(),
+            statement.clone(),
+            detail.clone(),
+            self.last_checksum,
+        );
+
+        # Verify the entry's self-checksum
+        I !entry.verify_integrity() {
+            R Err(err_audit_log_tampered(entry_id));
+        }
+
+        # Update chain head
+        self.last_checksum = entry.checksum;
+        meta.audit_entry_count = meta.audit_entry_count + 1;
+
+        # Buffer the entry
+        self.entries.push(entry);
+
+        # Auto-flush if buffer is full
+        I self.entries.len() >= self.max_buffer_size {
+            # In a full implementation, this would flush to disk
+            # For now, just keep entries in memory
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Integrity Verification
+    # ========================================================================
+
+    # Verify the entire in-memory audit log chain
+    # Returns Ok(()) if chain is intact, Err with tampered entry ID if broken
+    F verify_chain(self) -> Result<(), VaisError> {
+        I self.entries.len() == 0 {
+            R Ok(());
+        }
+
+        i: u64 := mut 0;
+        expected_prev_checksum: u64 := mut 0;
+
+        # The first entry's prev_checksum should match the starting chain value
+        # (which was 0 at creation or loaded from the previous batch)
+
+        L i < self.entries.len() {
+            entry := mut &self.entries[i];
+
+            # Verify entry self-integrity
+            I !entry.verify_integrity() {
+                R Err(err_audit_log_tampered(entry.entry_id));
+            }
+
+            # Verify chain linkage (skip first entry if we don't know the initial checksum)
+            I i > 0 {
+                prev_entry := mut &self.entries[i - 1];
+                I !entry.verify_chain(prev_entry.checksum) {
+                    R Err(err_audit_log_tampered(entry.entry_id));
+                }
+            }
+
+            i = i + 1;
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Query / Access
+    # ========================================================================
+
+    # Get all buffered audit entries
+    F get_entries(self) -> &Vec<AuditEntry> {
+        &self.entries
+    }
+
+    # Get the number of buffered entries
+    F entry_count(self) -> u64 {
+        self.entries.len()
+    }
+
+    # Get the last checksum in the chain
+    F last_checksum(self) -> u64 {
+        self.last_checksum
+    }
+
+    # Get entries for a specific event type
+    F get_entries_by_type(self, event_type: u8) -> Vec<&AuditEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.entries.len() {
+            I self.entries[i].event_type == event_type {
+                result.push(&self.entries[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Get entries for a specific user
+    F get_entries_by_user(self, username: &Str) -> Vec<&AuditEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.entries.len() {
+            I self.entries[i].username == *username {
+                result.push(&self.entries[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Get entries within a time range
+    F get_entries_by_time(self, start: i64, end: i64) -> Vec<&AuditEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.entries.len() {
+            I self.entries[i].timestamp >= start && self.entries[i].timestamp <= end {
+                result.push(&self.entries[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Get failure entries only
+    F get_failures(self) -> Vec<&AuditEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.entries.len() {
+            I self.entries[i].result == AUDIT_RESULT_FAILURE
+                || self.entries[i].result == AUDIT_RESULT_DENIED {
+                result.push(&self.entries[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Clear in-memory buffer (after flushing to disk)
+    F clear_buffer(mut self) {
+        self.entries.clear();
+    }
+
+    # Check if audit is enabled
+    F is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    # Check if DML auditing is enabled
+    F is_dml_audit_enabled(self) -> bool {
+        self.audit_dml
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Truncate a SQL statement to max_len characters
+F truncate_statement(stmt: &Str, max_len: u64) -> Str {
+    I stmt.len() <= max_len {
+        R stmt.clone();
+    }
+    bytes := mut stmt.as_bytes();
+    result := mut Str.with_capacity(max_len + 3);
+    i: u64 := mut 0;
+    L i < max_len {
+        result.push_byte(bytes[i]);
+        i = i + 1;
+    }
+    result.push_str("...");
+    result
+}

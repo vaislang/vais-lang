@@ -1,0 +1,207 @@
+# Full-Text + SQL Integration
+#
+# Provides RowSource adapter for joining full-text search results
+# with SQL executor using the Volcano iterator pattern.
+
+U std/vec.Vec;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U sql/types.{SqlValue, SqlType};
+U sql/row.{Row};
+U sql/executor/mod.{ExecutorRow};
+U fulltext/search/match_fn.{FullTextMatchResult};
+
+# FullTextRowSource - Adapter for SQL executor integration
+#
+# Converts full-text search results into SQL rows that can be joined
+# with other tables or used in SQL queries.
+#
+# Row schema: (doc_id: u64, score: f64, table_id: u32, row_tid: u32)
+S FullTextRowSource {
+    results: Vec<FullTextMatchResult>,
+    cursor: u64,
+    is_open: bool,
+}
+
+X FullTextRowSource {
+    # Create new row source from search results
+    F new(results: Vec<FullTextMatchResult>) -> FullTextRowSource {
+        FullTextRowSource {
+            results,
+            cursor: 0,
+            is_open: false,
+        }
+    }
+
+    # Volcano interface: open the iterator
+    F open(mut self) {
+        self.cursor = 0;
+        self.is_open = true;
+    }
+
+    # Volcano interface: get next row
+    #
+    # Returns ExecutorRow with schema:
+    # - Column 0: doc_id (u64) → SqlValue.BigInt
+    # - Column 1: score (f64) → SqlValue.Float
+    # - Column 2: table_id (u32) → SqlValue.Int
+    # - Column 3: row_tid (u32) → SqlValue.Int
+    F next(mut self) -> Option<ExecutorRow> {
+        I !self.is_open || self.cursor >= self.results.len() {
+            R None;
+        }
+
+        result := mut &self.results[self.cursor];
+        self.cursor += 1;
+
+        # Convert FullTextMatchResult to ExecutorRow
+        Some(self.convert_to_row(result))
+    }
+
+    # Volcano interface: close the iterator
+    F close(mut self) {
+        self.is_open = false;
+    }
+
+    # Convert FullTextMatchResult to ExecutorRow
+    F convert_to_row(self, result: &FullTextMatchResult) -> ExecutorRow {
+        values: Vec<SqlValue> := mut Vec.new();
+
+        # Column 0: doc_id (u64)
+        values.push(SqlValue.BigInt(result.doc_id as i64));
+
+        # Column 1: score (f64)
+        values.push(SqlValue.Float(result.score));
+
+        # Column 2: table_id (u32)
+        values.push(SqlValue.Int(result.table_id as i32));
+
+        # Column 3: row_tid (u32)
+        values.push(SqlValue.Int(result.row_tid as i32));
+
+        row := mut Row.new(values);
+
+        # Return virtual row (no physical page location)
+        ExecutorRow.virtual(row)
+    }
+
+    # Get current cursor position
+    F cursor_position(self) -> u64 {
+        self.cursor
+    }
+
+    # Get total result count
+    F result_count(self) -> u64 {
+        self.results.len()
+    }
+
+    # Check if iterator is open
+    F is_open(self) -> bool {
+        self.is_open
+    }
+
+    # Reset the iterator
+    F reset(mut self) {
+        self.cursor = 0;
+    }
+}
+
+# Filter full-text results by predicate function
+#
+# Allows applying SQL WHERE clauses to full-text results
+# before joining with other tables.
+#
+# Example:
+# - Filter by minimum score: filter_by_predicate(results, |r| r.score >= 0.5)
+# - Filter by table_id: filter_by_predicate(results, |r| r.table_id == 42)
+F filter_by_predicate(
+    results: &Vec<FullTextMatchResult>,
+    predicate_fn: fn(&FullTextMatchResult) -> bool,
+) -> Vec<FullTextMatchResult> {
+    filtered: Vec<FullTextMatchResult> := mut Vec.new();
+
+    L i: 0..results.len() {
+        I predicate_fn(&results[i]) {
+            filtered.push(results[i].clone());
+        }
+    }
+
+    filtered
+}
+
+# Filter by minimum score threshold
+F filter_by_min_score(
+    results: &Vec<FullTextMatchResult>,
+    min_score: f64,
+) -> Vec<FullTextMatchResult> {
+    filtered: Vec<FullTextMatchResult> := mut Vec.new();
+
+    L i: 0..results.len() {
+        I results[i].score >= min_score {
+            filtered.push(results[i].clone());
+        }
+    }
+
+    filtered
+}
+
+# Filter by table_id
+F filter_by_table(
+    results: &Vec<FullTextMatchResult>,
+    table_id: u32,
+) -> Vec<FullTextMatchResult> {
+    filtered: Vec<FullTextMatchResult> := mut Vec.new();
+
+    L i: 0..results.len() {
+        I results[i].table_id == table_id {
+            filtered.push(results[i].clone());
+        }
+    }
+
+    filtered
+}
+
+# Sort results by score descending
+F sort_by_score_desc(results: &mut Vec<FullTextMatchResult>) {
+    n := mut results.len();
+
+    # Selection sort descending
+    L i: 0..n {
+        max_idx := mut i;
+
+        # Find max score in remaining elements
+        L j: (i + 1)..n {
+            I results[j].score > results[max_idx].score {
+                max_idx = j;
+            }
+        }
+
+        # Swap if needed
+        I max_idx != i {
+            temp := mut results[i].clone();
+            results[i] = results[max_idx].clone();
+            results[max_idx] = temp;
+        }
+    }
+}
+
+# Example SQL integration usage:
+#
+# # Execute full-text search
+# executor := mut FullTextMatchExecutor.new(index_id, "machine learning", 100);
+# executor.execute_search(meta, config, dict_index, posting_store, snapshot, clog, pool)?;
+#
+# # Create row source
+# row_source := mut FullTextRowSource.new(executor.results);
+#
+# # Use in SQL executor pipeline
+# row_source.open();
+# while let Some(row) = row_source.next() {
+#     # Join with other tables or apply predicates
+#     process_row(row);
+# }
+# row_source.close();
+#
+# # Or filter before creating row source
+# filtered := mut filter_by_min_score(&executor.results, 0.5);
+# row_source := mut FullTextRowSource.new(filtered);

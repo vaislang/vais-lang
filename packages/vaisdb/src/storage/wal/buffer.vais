@@ -1,0 +1,94 @@
+# WAL Write Buffer
+# In-memory buffer for batching WAL writes before flush to disk
+# Based on Stage 2: WAL Design - Group Commit
+# Default buffer size: 16MB for throughput optimization
+
+U storage/error.{VaisError, err_wal_buffer_full};
+U storage/constants.{DEFAULT_WAL_BUFFER_SIZE};
+U std/bytes.{ByteBuffer};
+
+# WAL Write Buffer for group commit batching
+S WalBuffer {
+    data: Vec<u8>,           # Raw byte buffer
+    write_pos: u32,          # Current write position
+    max_size: u32,           # Maximum buffer size
+    record_count: u32,       # Number of records in buffer
+}
+
+X WalBuffer {
+    # Create a new WAL buffer with default size (16MB)
+    F new() -> WalBuffer {
+        WalBuffer.with_size(DEFAULT_WAL_BUFFER_SIZE)
+    }
+
+    # Create a WAL buffer with specific size
+    F with_size(max_size: u32) -> WalBuffer {
+        data := mut Vec.with_capacity(max_size as u64);
+        data.resize(max_size as u64, 0u8);
+        WalBuffer {
+            data,
+            write_pos: 0,
+            max_size,
+            record_count: 0,
+        }
+    }
+
+    # Append a serialized WAL record to the buffer
+    # Returns the offset where the record was written
+    F append(mut self, record_data: &[u8]) -> Result<u32, VaisError> {
+        record_len := mut record_data.len() as u32;
+        I self.write_pos + record_len > self.max_size {
+            R Err(err_wal_buffer_full(self.write_pos, record_len));
+        }
+
+        offset := mut self.write_pos;
+        L i: 0..record_data.len() {
+            self.data[self.write_pos as u64 + i] = record_data[i];
+        }
+        self.write_pos += record_len;
+        self.record_count += 1;
+
+        Ok(offset)
+    }
+
+    # Get current buffer size (bytes written)
+    F size(self) -> u32 {
+        self.write_pos
+    }
+
+    # Check if buffer is full or nearly full
+    F is_full(self) -> bool {
+        self.write_pos >= self.max_size
+    }
+
+    # Check if buffer can fit a record of given size
+    F can_fit(self, record_size: u32) -> bool {
+        self.write_pos + record_size <= self.max_size
+    }
+
+    # Get buffer contents as a slice (only the written portion)
+    F contents(self) -> &[u8] {
+        &self.data[0..self.write_pos as u64]
+    }
+
+    # Get number of records in buffer
+    F record_count(self) -> u32 {
+        self.record_count
+    }
+
+    # Check if buffer is empty
+    F is_empty(self) -> bool {
+        self.write_pos == 0
+    }
+
+    # Clear buffer for reuse
+    F clear(mut self) {
+        self.write_pos = 0;
+        self.record_count = 0;
+    }
+
+    # Get remaining capacity
+    F remaining(self) -> u32 {
+        self.max_size - self.write_pos
+    }
+}

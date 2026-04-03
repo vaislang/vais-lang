@@ -1,0 +1,554 @@
+# Window Functions Executor
+# Supports ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX over windows
+# Materialization-based approach: collect all rows, partition, sort, compute window values
+# Error codes: EE=01 (SQL), CC=06 (Window), NNN=001-005
+
+U std/hashmap.{HashMap};
+U std/result.Result;
+U std/option.Option;
+U std/vec.Vec;
+U std/str.Str;
+
+U storage/error.VaisError;
+U sql/types.{SqlValue, SqlType, agg_sum, agg_avg_accumulate, agg_avg_finalize, agg_min, agg_max, agg_count_value, group_key_hash, order_by_compare};
+U sql/row.Row;
+U sql/parser/ast.{OrderByItem, Expr};
+U sql/executor/mod.{ExecutorRow, ExecStats};
+U sql/executor/expr_eval.{eval_expr, EvalContext};
+
+# ============================================================================
+# WindowExecutor - Computes window function values over partitions
+# ============================================================================
+
+# Window function specification
+S WindowSpec {
+    func_expr: Expr,             # The window function (e.g., FunctionCall for SUM, ROW_NUMBER)
+    partition_by: Vec<Expr>,     # PARTITION BY expressions
+    order_by: Vec<OrderByItem>,  # ORDER BY within partition
+    result_col_idx: u64,       # Index in output schema where this window result goes
+}
+
+X WindowSpec {
+    F new(func_expr: Expr, partition_by: Vec<Expr>, order_by: Vec<OrderByItem>, result_col_idx: u64) -> WindowSpec {
+        WindowSpec {
+            func_expr,
+            partition_by,
+            order_by,
+            result_col_idx,
+        }
+    }
+}
+
+# Single partition of rows with the same partition key
+S Partition {
+    key_values: Vec<SqlValue>,  # Partition key values
+    rows: Vec<Row>,             # All rows in this partition (sorted by ORDER BY)
+}
+
+X Partition {
+    F new(key_values: Vec<SqlValue>) -> Partition {
+        Partition {
+            key_values,
+            rows: Vec.new(),
+        }
+    }
+}
+
+# Main window executor
+S WindowExecutor {
+    input: Box<dyn Executor>,
+    window_specs: Vec<WindowSpec>,  # Multiple window functions can be computed
+    eval_ctx: EvalContext,
+    materialized: Option<Vec<Row>>,  # Final augmented rows with window function results
+    cursor: u64,
+    stats: ExecStats,
+}
+
+X WindowExecutor {
+    F new(input: Box<dyn Executor>, window_specs: Vec<WindowSpec>, eval_ctx: EvalContext) -> WindowExecutor {
+        WindowExecutor {
+            input,
+            window_specs,
+            eval_ctx,
+            materialized: Option.None,
+            cursor: 0,
+            stats: ExecStats.new(),
+        }
+    }
+
+    F open(mut self) -> Result<(), VaisError> {
+        self.input.open()?;
+
+        # Step 1: Materialize all input rows
+        input_rows := mut Vec.new();
+        has_more := mut true;
+        L has_more {
+            M self.input.next()? {
+                Option.Some(exec_row) => {
+                    self.stats.add_scanned(1);
+                    input_rows.push(exec_row.get_row().clone());
+                },
+                Option.None => { has_more = false; },
+            }
+        }
+
+        # Step 2: Process each window function specification
+        augmented_rows := mut input_rows.clone();
+
+        L spec: &self.window_specs {
+            # Step 2a: Partition rows by partition key
+            partitions := mut self.partition_rows(&input_rows, &spec.partition_by)?;
+
+            # Step 2b: Sort each partition by ORDER BY
+            L partition: partitions.values_mut() {
+                self.sort_partition(&spec.order_by, partition);
+            }
+
+            # Step 2c: Compute window function values for each partition
+            window_values := mut self.compute_window_values(&partitions, spec)?;
+
+            # Step 2d: Augment rows with computed window values
+            augmented_rows = self.augment_rows_with_window_values(augmented_rows, &window_values);
+        }
+
+        # Step 3: Store augmented rows for iteration
+        self.materialized = Option.Some(augmented_rows);
+        self.cursor = 0;
+
+        Result.Ok(())
+    }
+
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+        M &self.materialized {
+            Option.None => {
+                Result.Err(VaisError.new("VAIS-E0106001", "WindowExecutor not opened"))
+            },
+            Option.Some(rows) => {
+                I self.cursor >= rows.len() {
+                    Result.Ok(Option.None)
+                } E {
+                    row := mut &rows[self.cursor];
+                    self.cursor += 1;
+                    self.stats.add_produced();
+                    Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
+                }
+            },
+        }
+    }
+
+    F close(mut self) -> Result<(), VaisError> {
+        self.materialized = Option.None;
+        self.cursor = 0;
+        self.input.close()?;
+        Result.Ok(())
+    }
+
+    F stats(self) -> &ExecStats {
+        &self.stats
+    }
+
+    # Partition rows into groups based on partition_by expressions
+    F partition_rows(
+        self,
+        rows: &Vec<Row>,
+        partition_exprs: &Vec<Expr>,
+    ) -> Result<HashMap<u64, Partition>, VaisError> {
+        partitions: HashMap<u64, Partition> := mut HashMap.new();
+
+        L row: rows {
+            # Evaluate partition key
+            key_values := mut Vec.new();
+            L expr: partition_exprs {
+                val := mut eval_expr(expr, row, &self.eval_ctx)?;
+                key_values.push(val);
+            }
+
+            # Hash partition key (if empty, all rows go to same partition)
+            hash := mut I key_values.is_empty() {
+                0  # No PARTITION BY: single partition
+            } E {
+                group_key_hash(&key_values)
+            };
+
+            # Get or create partition
+            I !partitions.contains_key(&hash) {
+                partitions.insert(hash, Partition.new(key_values.clone()));
+            }
+            partition := mut partitions.get_mut(&hash)!;
+
+            # Add row to partition
+            partition.rows.push(row.clone());
+        }
+
+        Result.Ok(partitions)
+    }
+
+    # Sort rows within a partition by ORDER BY clause
+    F sort_partition(self, order_items: &Vec<OrderByItem>, partition: mut Partition) {
+        I order_items.is_empty() {
+            R;  # No ORDER BY, keep original order
+        }
+
+        partition.rows.sort_by(|a, b| self.compare_rows(a, b, order_items));
+    }
+
+    # Compare two rows using multi-key ORDER BY
+    F compare_rows(self, a: &Row, b: &Row, order_items: &Vec<OrderByItem>) -> i32 {
+        L item: order_items {
+            # Evaluate sort key for both rows
+            val_a := mut M eval_expr(&item.expr, a, &self.eval_ctx) {
+                Result.Ok(v) => v,
+                Result.Err(_) => SqlValue.Null,  # Treat eval errors as NULL
+            };
+
+            val_b := mut M eval_expr(&item.expr, b, &self.eval_ctx) {
+                Result.Ok(v) => v,
+                Result.Err(_) => SqlValue.Null,
+            };
+
+            # Determine nulls_first (default: NULLS LAST for ASC, NULLS FIRST for DESC)
+            nulls_first := mut M item.nulls_first {
+                Option.Some(nf) => nf,
+                Option.None => !item.asc,
+            };
+
+            cmp := mut order_by_compare(&val_a, &val_b, item.asc, Option.Some(nulls_first));
+            I cmp != 0 {
+                R cmp;
+            }
+        }
+
+        0  # All keys equal
+    }
+
+    # Compute window function values for all partitions
+    # Returns a Vec<SqlValue> with one value per original input row
+    F compute_window_values(
+        self,
+        partitions: &HashMap<u64, Partition>,
+        spec: &WindowSpec,
+    ) -> Result<Vec<SqlValue>, VaisError> {
+        all_values := mut Vec.new();
+
+        L (_, partition): partitions {
+            partition_values := mut self.compute_partition_window_values(partition, spec)?;
+            all_values.extend(partition_values);
+        }
+
+        Result.Ok(all_values)
+    }
+
+    # Compute window function values for a single partition
+    F compute_partition_window_values(
+        self,
+        partition: &Partition,
+        spec: &WindowSpec,
+    ) -> Result<Vec<SqlValue>, VaisError> {
+        values := mut Vec.with_capacity(partition.rows.len());
+
+        # Determine window function type
+        M &spec.func_expr {
+            Expr.FunctionCall { name, args, .. } => {
+                M name.to_uppercase().as_str() {
+                    "ROW_NUMBER" => {
+                        # ROW_NUMBER: sequential number within partition
+                        L i: 0..partition.rows.len() {
+                            values.push(SqlValue.IntVal { v: (i + 1) as i64 });
+                        }
+                    },
+                    "RANK" => {
+                        # RANK: rank with gaps (ties get same rank, next rank skips)
+                        values = self.compute_rank(partition, spec, false)?;
+                    },
+                    "DENSE_RANK" => {
+                        # DENSE_RANK: rank without gaps
+                        values = self.compute_rank(partition, spec, true)?;
+                    },
+                    "SUM" => {
+                        # SUM(expr) OVER (...): running/partition sum
+                        values = self.compute_aggregate_window(partition, spec, "SUM", args)?;
+                    },
+                    "AVG" => {
+                        # AVG(expr) OVER (...): running/partition average
+                        values = self.compute_aggregate_window(partition, spec, "AVG", args)?;
+                    },
+                    "COUNT" => {
+                        # COUNT(expr) OVER (...): running/partition count
+                        values = self.compute_aggregate_window(partition, spec, "COUNT", args)?;
+                    },
+                    "MIN" => {
+                        # MIN(expr) OVER (...): partition min
+                        values = self.compute_aggregate_window(partition, spec, "MIN", args)?;
+                    },
+                    "MAX" => {
+                        # MAX(expr) OVER (...): partition max
+                        values = self.compute_aggregate_window(partition, spec, "MAX", args)?;
+                    },
+                    _ => {
+                        R Result.Err(VaisError.new(
+                            "VAIS-E0106002",
+                            "Unknown window function: {name}"
+                        ));
+                    },
+                }
+            },
+            _ => {
+                R Result.Err(VaisError.new(
+                    "VAIS-E0106003",
+                    "Invalid window specification: expected FunctionCall"
+                ));
+            },
+        }
+
+        Result.Ok(values)
+    }
+
+    # Compute RANK or DENSE_RANK values
+    F compute_rank(
+        self,
+        partition: &Partition,
+        spec: &WindowSpec,
+        dense: bool,
+    ) -> Result<Vec<SqlValue>, VaisError> {
+        values := mut Vec.with_capacity(partition.rows.len());
+        current_rank := mut 1i64;
+        dense_rank := mut 1i64;
+        prev_sort_key: Option<Vec<SqlValue>> := mut Option.None;
+
+        L i: 0..partition.rows.len() {
+            row := mut &partition.rows[i];
+
+            # Evaluate ORDER BY expressions to get sort key
+            sort_key := mut Vec.new();
+            L order_item: &spec.order_by {
+                val := mut eval_expr(&order_item.expr, row, &self.eval_ctx)?;
+                sort_key.push(val);
+            }
+
+            # Check if sort key changed (tie detection)
+            is_tie := mut M &prev_sort_key {
+                Option.None => false,  # First row, no tie
+                Option.Some(prev_key) => {
+                    # Compare all sort key values
+                    same := mut true;
+                    L j: 0..sort_key.len() {
+                        I same {
+                            M sort_key[j].compare(&prev_key[j]) {
+                                Result.Ok(0) => {},  # Equal, continue
+                                _ => {
+                                    same = false;
+                                },
+                            }
+                        }
+                    }
+                    same
+                },
+            };
+
+            I !is_tie && i > 0 {
+                # Sort key changed, update ranks
+                I dense {
+                    dense_rank += 1;
+                } E {
+                    current_rank = (i + 1) as i64;
+                }
+            }
+
+            # Assign rank
+            rank_value := mut I dense { dense_rank } E { current_rank };
+            values.push(SqlValue.IntVal { v: rank_value });
+
+            # Remember this sort key for next iteration
+            prev_sort_key = Option.Some(sort_key);
+        }
+
+        Result.Ok(values)
+    }
+
+    # Compute aggregate window functions (SUM, AVG, COUNT, MIN, MAX)
+    F compute_aggregate_window(
+        self,
+        partition: &Partition,
+        spec: &WindowSpec,
+        func_name: &str,
+        args: &Vec<Expr>,
+    ) -> Result<Vec<SqlValue>, VaisError> {
+        values := mut Vec.with_capacity(partition.rows.len());
+
+        # For running aggregates, we accumulate values row-by-row
+        # For partition-wide aggregates (no ORDER BY), compute once and reuse
+        has_order_by := mut !spec.order_by.is_empty();
+
+        I has_order_by {
+            # Running aggregate: accumulate as we go
+            M func_name {
+                "SUM" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_sum(&acc, &arg_val)?;
+                        result := mut M &acc {
+                            Option.Some(v) => v.clone(),
+                            Option.None => SqlValue.Null,
+                        };
+                        values.push(result);
+                    }
+                },
+                "AVG" => {
+                    sum: Option<SqlValue> := mut Option.None;
+                    count := mut 0u64;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        result_tuple := mut agg_avg_accumulate(&sum, &count, &arg_val)?;
+                        sum = result_tuple.0;
+                        count = result_tuple.1;
+                        avg := mut agg_avg_finalize(&sum, count)?;
+                        values.push(avg);
+                    }
+                },
+                "COUNT" => {
+                    count := mut 0u64;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        I agg_count_value(&arg_val) {
+                            count += 1;
+                        }
+                        values.push(SqlValue.IntVal { v: count as i64 });
+                    }
+                },
+                "MIN" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_min(&acc, &arg_val)?;
+                        result := mut M &acc {
+                            Option.Some(v) => v.clone(),
+                            Option.None => SqlValue.Null,
+                        };
+                        values.push(result);
+                    }
+                },
+                "MAX" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_max(&acc, &arg_val)?;
+                        result := mut M &acc {
+                            Option.Some(v) => v.clone(),
+                            Option.None => SqlValue.Null,
+                        };
+                        values.push(result);
+                    }
+                },
+                _ => {
+                    R Result.Err(VaisError.new(
+                        "VAIS-E0106002",
+                        "Unknown aggregate function: {func_name}"
+                    ));
+                },
+            }
+        } E {
+            # Partition-wide aggregate: compute once, replicate to all rows
+            final_value := mut M func_name {
+                "SUM" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_sum(&acc, &arg_val)?;
+                    }
+                    M acc {
+                        Option.Some(v) => v,
+                        Option.None => SqlValue.Null,
+                    }
+                },
+                "AVG" => {
+                    sum: Option<SqlValue> := mut Option.None;
+                    count := mut 0u64;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        result_tuple := mut agg_avg_accumulate(&sum, &count, &arg_val)?;
+                        sum = result_tuple.0;
+                        count = result_tuple.1;
+                    }
+                    agg_avg_finalize(&sum, count)?
+                },
+                "COUNT" => {
+                    count := mut 0u64;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        I agg_count_value(&arg_val) {
+                            count += 1;
+                        }
+                    }
+                    SqlValue.IntVal { v: count as i64 }
+                },
+                "MIN" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_min(&acc, &arg_val)?;
+                    }
+                    M acc {
+                        Option.Some(v) => v,
+                        Option.None => SqlValue.Null,
+                    }
+                },
+                "MAX" => {
+                    acc: Option<SqlValue> := mut Option.None;
+                    L row: &partition.rows {
+                        arg_val := mut self.eval_agg_arg(&args, row)?;
+                        acc = agg_max(&acc, &arg_val)?;
+                    }
+                    M acc {
+                        Option.Some(v) => v,
+                        Option.None => SqlValue.Null,
+                    }
+                },
+                _ => {
+                    R Result.Err(VaisError.new(
+                        "VAIS-E0106002",
+                        "Unknown aggregate function: {func_name}"
+                    ));
+                },
+            };
+
+            # Replicate final value to all rows
+            L _: 0..partition.rows.len() {
+                values.push(final_value.clone());
+            }
+        }
+
+        Result.Ok(values)
+    }
+
+    # Evaluate aggregate argument expression (handle COUNT(*) specially)
+    F eval_agg_arg(self, args: &Vec<Expr>, row: &Row) -> Result<SqlValue, VaisError> {
+        I args.is_empty() {
+            # COUNT(*) case
+            Result.Ok(SqlValue.IntVal { v: 1 })
+        } E {
+            M &args[0] {
+                Expr.Star => Result.Ok(SqlValue.IntVal { v: 1 }),  # COUNT(*)
+                _ => eval_expr(&args[0], row, &self.eval_ctx),
+            }
+        }
+    }
+
+    # Augment rows with computed window values (append as new column)
+    F augment_rows_with_window_values(
+        self,
+        rows: Vec<Row>,
+        window_values: &Vec<SqlValue>,
+    ) -> Vec<Row> {
+        augmented := mut Vec.with_capacity(rows.len());
+
+        L i: 0..rows.len() {
+            row := mut &rows[i];
+            new_values := mut row.values.clone();
+            new_values.push(window_values[i].clone());
+            augmented.push(Row.new(new_values));
+        }
+
+        augmented
+    }
+}

@@ -1,0 +1,180 @@
+# SQL Executor Framework
+# Volcano-style iterator model: open → next → close
+# Each executor node produces rows one at a time via next()
+# Predicate pushdown is supported via optional filter expressions
+
+U storage/error.{VaisError};
+U sql/types.{SqlValue};
+U sql/row.{Row};
+
+# ============================================================================
+# Executor Result — a single row produced by an executor node
+# ============================================================================
+
+# ExecutorRow wraps a Row with optional provenance info (table alias, page/slot)
+S ExecutorRow {
+    row: Row,
+    table_alias: Option<Str>,     # Source table alias (for multi-table queries)
+    page_id: u32,                 # Heap page where this row lives (for UPDATE/DELETE)
+    slot_id: u16,                 # Slot within heap page (for UPDATE/DELETE)
+}
+
+X ExecutorRow {
+    # Create from a Row with physical location
+    F new(row: Row, page_id: u32, slot_id: u16) -> ExecutorRow {
+        ExecutorRow {
+            row,
+            table_alias: None,
+            page_id,
+            slot_id,
+        }
+    }
+
+    # Create with table alias
+    F with_alias(row: Row, alias: Str, page_id: u32, slot_id: u16) -> ExecutorRow {
+        ExecutorRow {
+            row,
+            table_alias: Some(alias),
+            page_id,
+            slot_id,
+        }
+    }
+
+    # Create a virtual row (no physical location — e.g. from join/aggregation)
+    F virtual(row: Row) -> ExecutorRow {
+        ExecutorRow {
+            row,
+            table_alias: None,
+            page_id: 0,
+            slot_id: 0,
+        }
+    }
+
+    # Get reference to the row
+    F get_row(self) -> &Row {
+        &self.row
+    }
+
+    # Get value at column index
+    F get(self, idx: u64) -> &SqlValue {
+        self.row.get(idx)
+    }
+
+    # Get column count
+    F column_count(self) -> u64 {
+        self.row.column_count()
+    }
+}
+
+# ============================================================================
+# ExecContext — shared execution state passed to all executor nodes
+# ============================================================================
+
+U storage/buffer/pool.{BufferPool};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/wal/group_commit.{GroupCommitManager};
+U sql/catalog/manager.{CatalogManager};
+
+S ExecContext {
+    pool: &mut BufferPool,
+    snapshot: &Snapshot,
+    clog: &Clog,
+    gcm: &mut GroupCommitManager,
+    catalog: &CatalogManager,
+    txn_id: u64,
+    cmd_id: u32,
+}
+
+X ExecContext {
+    F new(
+        pool: &mut BufferPool,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        gcm: &mut GroupCommitManager,
+        catalog: &CatalogManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> ExecContext {
+        ExecContext {
+            pool,
+            snapshot,
+            clog,
+            gcm,
+            catalog,
+            txn_id,
+            cmd_id,
+        }
+    }
+}
+
+# ============================================================================
+# Column metadata for executor output schema
+# ============================================================================
+
+S ExecColumn {
+    name: Str,
+    table: Option<Str>,
+    data_type: SqlType,
+    nullable: bool,
+}
+
+U sql/types.{SqlType};
+
+X ExecColumn {
+    F new(name: Str, data_type: SqlType, nullable: bool) -> ExecColumn {
+        ExecColumn {
+            name,
+            table: None,
+            data_type,
+            nullable,
+        }
+    }
+
+    F with_table(name: Str, table: Str, data_type: SqlType, nullable: bool) -> ExecColumn {
+        ExecColumn {
+            name,
+            table: Some(table),
+            data_type,
+            nullable,
+        }
+    }
+}
+
+# ============================================================================
+# Executor Statistics — for EXPLAIN ANALYZE
+# ============================================================================
+
+S ExecStats {
+    rows_produced: u64,
+    rows_scanned: u64,
+    pages_read: u64,
+    filter_rejected: u64,
+}
+
+X ExecStats {
+    F new() -> ExecStats {
+        ExecStats {
+            rows_produced: 0,
+            rows_scanned: 0,
+            pages_read: 0,
+            filter_rejected: 0,
+        }
+    }
+
+    F add_scanned(mut self, count: u64) {
+        self.rows_scanned += count;
+    }
+
+    F add_produced(mut self) {
+        self.rows_produced += 1;
+    }
+
+    F add_page_read(mut self) {
+        self.pages_read += 1;
+    }
+
+    F add_rejected(mut self) {
+        self.filter_rejected += 1;
+    }
+}

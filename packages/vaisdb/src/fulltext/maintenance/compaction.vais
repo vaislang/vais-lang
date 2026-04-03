@@ -1,0 +1,292 @@
+# PostingListCompactor — background posting list compaction and garbage collection
+#
+# Removes expired posting entries that are no longer visible to any transaction
+# (txn_id_expire != 0 AND txn_id_expire < low_water_mark), rewrites remaining
+# entries into compact pages, and reclaims disk space.
+
+U std/vec.Vec;
+U storage/constants.{FILE_ID_FULLTEXT, INVALID_TXN_ID, NULL_PAGE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U storage/page/allocator.{PageAllocator};
+U storage/wal/group_commit.{GroupCommitManager};
+U fulltext/types.{PostingEntry, PostingPageHeader, POSTING_PAGE_HEADER_SIZE};
+U storage/hash.{fnv1a_hash};
+U fulltext/index/posting.{PostingStore};
+
+# Result of compacting a single posting list
+S CompactionResult {
+    entries_before: u64,
+    entries_after: u64,
+    entries_removed: u64,
+    pages_before: u32,
+    pages_after: u32,
+    pages_freed: u32,
+    bytes_reclaimed: u64,
+}
+
+X CompactionResult {
+    # Create empty result
+    F new() -> CompactionResult {
+        CompactionResult {
+            entries_before: 0,
+            entries_after: 0,
+            entries_removed: 0,
+            pages_before: 0,
+            pages_after: 0,
+            pages_freed: 0,
+            bytes_reclaimed: 0,
+        }
+    }
+}
+
+# Aggregate statistics for compacting all posting lists
+S CompactionStats {
+    lists_processed: u64,
+    lists_compacted: u64,       # Lists that actually removed entries
+    total_entries_removed: u64,
+    total_pages_freed: u32,
+    total_bytes_reclaimed: u64,
+}
+
+X CompactionStats {
+    # Create empty stats
+    F new() -> CompactionStats {
+        CompactionStats {
+            lists_processed: 0,
+            lists_compacted: 0,
+            total_entries_removed: 0,
+            total_pages_freed: 0,
+            total_bytes_reclaimed: 0,
+        }
+    }
+
+    # Add a compaction result to aggregate stats
+    F add_result(mut self, result: &CompactionResult) {
+        self.lists_processed = self.lists_processed + 1;
+
+        removed := mut result.entries_removed;
+        M removed > 0 {
+            self.lists_compacted = self.lists_compacted + 1;
+        };
+
+        self.total_entries_removed = self.total_entries_removed + removed;
+        self.total_pages_freed = self.total_pages_freed + result.pages_freed;
+        self.total_bytes_reclaimed = self.total_bytes_reclaimed + result.bytes_reclaimed;
+    }
+}
+
+# Background compactor for posting lists
+S PostingListCompactor {
+    page_size: u32,
+    pool: BufferPool,
+    allocator: PageAllocator,
+    max_pages_per_second: u32,  # I/O throttling limit (0 = no limit)
+    pages_accessed: u32,         # Track pages for throttling
+}
+
+X PostingListCompactor {
+    # Create new compactor with I/O throttling
+    F new(
+        page_size: u32,
+        pool: BufferPool,
+        allocator: PageAllocator,
+        max_pages_per_second: u32,
+    ) -> PostingListCompactor {
+        PostingListCompactor {
+            page_size: page_size,
+            pool: pool,
+            allocator: allocator,
+            max_pages_per_second: max_pages_per_second,
+            pages_accessed: 0,
+        }
+    }
+
+    # Compact a single posting list, removing garbage entries
+    #
+    # Algorithm:
+    # 1. Read all entries in posting list page chain
+    # 2. Filter out entries where txn_id_expire != 0 AND txn_id_expire < low_water_mark
+    # 3. If no entries removed, return early
+    # 4. Rewrite remaining entries into fresh pages
+    # 5. Update page chain (free old pages, link new pages)
+    # 6. Return CompactionResult stats
+    F compact_posting_list(
+        mut self,
+        term_hash: u64,
+        head_page_id: u32,
+        low_water_mark: u64,
+        posting_store: &PostingStore,
+        gcm: &GroupCommitManager,
+    ) -> Result<CompactionResult, VaisError> {
+        result := mut CompactionResult.new();
+
+        # Step 1: Read all entries in the posting list
+        entries := mut posting_store.read_all_entries(head_page_id)?;
+        result.entries_before = entries.len() as u64;
+
+        # Count pages in old chain (estimate from entries)
+        result.pages_before = self.estimate_pages_needed(&entries);
+
+        # Step 2: Filter out garbage entries
+        # An entry is garbage if it was expired AND the expiring txn is old enough
+        live_entries := mut Vec.new();
+        L removed_count: u64 := mut 0;
+
+        L i: u64 := mut 0;
+        n := mut entries.len();
+        L i < n {
+            entry := mut &entries[i];
+
+            # Check if entry is garbage
+            is_garbage := mut entry.txn_id_expire != 0 && entry.txn_id_expire < low_water_mark;
+
+            M is_garbage {
+                removed_count = removed_count + 1;
+            } E {
+                live_entries.push(entry.clone());
+            };
+
+            i = i + 1;
+        };
+
+        result.entries_removed = removed_count;
+        result.entries_after = live_entries.len() as u64;
+
+        # Step 3: Early return if no work needed
+        M removed_count == 0 {
+            # No garbage to collect
+            R Ok(result);
+        };
+
+        # Step 4: Rewrite remaining entries into fresh pages
+        new_head := mut self.rewrite_posting_list(
+            term_hash,
+            &live_entries,
+            posting_store,
+            gcm,
+        )?;
+
+        result.pages_after = self.estimate_pages_needed(&live_entries);
+
+        # Step 5: Free old page chain
+        freed := mut posting_store.free_posting_chain(head_page_id)?;
+        result.pages_freed = freed;
+
+        # Calculate bytes reclaimed
+        result.bytes_reclaimed = (freed as u64) * (self.page_size as u64);
+
+        # Track I/O for throttling
+        self.pages_accessed = self.pages_accessed + result.pages_before + result.pages_after;
+
+        R Ok(result);
+    }
+
+    # Compact all posting lists in the dictionary
+    #
+    # Iterates through all posting lists, compacts each one, and aggregates statistics.
+    # Respects I/O throttling by tracking pages accessed per second.
+    F compact_all(
+        mut self,
+        dict_entries: &Vec<(u64, u32)>,  # Vec of (term_hash, head_page_id)
+        low_water_mark: u64,
+        posting_store: &PostingStore,
+        gcm: &GroupCommitManager,
+    ) -> Result<CompactionStats, VaisError> {
+        stats := mut CompactionStats.new();
+
+        L i: u64 := mut 0;
+        n := mut dict_entries.len();
+
+        L i < n {
+            entry := mut &dict_entries[i];
+            term_hash := mut entry.0;
+            head_page_id := mut entry.1;
+
+            # Compact this posting list
+            result := mut self.compact_posting_list(
+                term_hash,
+                head_page_id,
+                low_water_mark,
+                posting_store,
+                gcm,
+            )?;
+
+            # Aggregate stats
+            stats.add_result(&result);
+
+            # I/O throttling check
+            M self.max_pages_per_second > 0 {
+                M self.pages_accessed >= self.max_pages_per_second {
+                    # FUTURE(std/time): Sleep for I/O throttling; currently resets counter
+                    self.pages_accessed = 0;
+                };
+            };
+
+            i = i + 1;
+        };
+
+        R Ok(stats);
+    }
+
+    # Rewrite live entries into a fresh page chain
+    #
+    # Allocates new pages and appends all live entries, creating a compact posting list.
+    F rewrite_posting_list(
+        mut self,
+        term_hash: u64,
+        live_entries: &Vec<PostingEntry>,
+        posting_store: &PostingStore,
+        gcm: &GroupCommitManager,
+    ) -> Result<u32, VaisError> {
+        # Allocate first page
+        head_page_id := mut self.allocator.allocate_page(FILE_ID_FULLTEXT)?;
+
+        # Initialize as posting page
+        posting_store.init_posting_page(head_page_id, term_hash, gcm)?;
+
+        # Append all live entries
+        # PostingStore will handle page chaining automatically if entries don't fit
+        L i: u64 := mut 0;
+        n := mut live_entries.len();
+
+        L i < n {
+            entry := mut &live_entries[i];
+
+            # Append entry (posting_store handles overflow pages)
+            # We use the original txn_id from the entry
+            posting_store.append_entry(
+                head_page_id,
+                entry,
+                term_hash,
+                entry.txn_id_create,
+                gcm,
+            )?;
+
+            i = i + 1;
+        };
+
+        R Ok(head_page_id);
+    }
+
+    # Estimate number of pages needed for a set of entries
+    #
+    # Rough estimate based on average entry size.
+    F estimate_pages_needed(self, entries: &Vec<PostingEntry>) -> u32 {
+        M entries.len() == 0 {
+            R 0;
+        };
+
+        # Average entry size: 32B fixed + ~4 positions * 4B each = ~48B
+        L avg_entry_size: u32 = 48;
+        usable_space := mut self.page_size - POSTING_PAGE_HEADER_SIZE;
+        entries_per_page := mut usable_space / avg_entry_size;
+
+        M entries_per_page == 0 {
+            R entries.len() as u32;  # Fallback
+        };
+
+        pages := mut (entries.len() as u32 + entries_per_page - 1) / entries_per_page;
+        R pages;
+    }
+}

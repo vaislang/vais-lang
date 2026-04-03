@@ -1,0 +1,313 @@
+# Posting List Compression
+# Variable-byte (VByte) encoding for doc_id deltas
+# Delta encoding for sorted doc_id lists to reduce storage
+
+U std/vec.Vec;
+U std/bytes.{ByteBuffer};
+U storage/error.{VaisError};
+
+# ============================================================================
+# VByte Encoding — Variable-byte encoding for unsigned integers
+# Each byte uses 7 bits for data, MSB = continuation flag (0 = last byte)
+# ============================================================================
+
+# Encode a u64 value using variable-byte encoding
+F vbyte_encode(value: u64) -> Vec<u8> {
+    result := mut Vec.new();
+    v := mut value;
+
+    I v == 0 {
+        result.push(0);
+        R result;
+    }
+
+    L v > 0 {
+        byte := mut (v & 0x7F) as u8;
+        v = v >> 7;
+        I v > 0 {
+            byte = byte | 0x80;  # Set continuation bit
+        }
+        result.push(byte);
+    }
+
+    result
+}
+
+# Decode a u64 value from variable-byte encoding
+# Returns (decoded_value, bytes_consumed)
+F vbyte_decode(data: &[u8], start: u64) -> Result<(u64, u64), VaisError> {
+    value: u64 := mut 0;
+    shift: u32 := mut 0;
+    pos := mut start;
+
+    decoding := mut true;
+    L decoding {
+        I pos >= data.len() {
+            R Err(VaisError.new(
+                "VAIS-0405003",
+                "VByte decode: unexpected end of data"
+            ));
+        }
+
+        byte := mut data[pos];
+        value = value | (((byte & 0x7F) as u64) << shift);
+        pos += 1;
+
+        I (byte & 0x80) == 0 {
+            # Last byte
+            decoding = false;
+        } E {
+            shift += 7;
+            I shift > 63 {
+                R Err(VaisError.new(
+                    "VAIS-0405004",
+                    "VByte decode: value overflow (more than 10 bytes)"
+                ));
+            }
+        }
+    }
+
+    Ok((value, pos - start))
+}
+
+# ============================================================================
+# Delta Encoding — Encode sorted doc_id lists as deltas
+# ============================================================================
+
+# Delta-encode a sorted list of doc_ids using VByte
+# Input: sorted doc_ids [10, 15, 23, 30]
+# Deltas: [10, 5, 8, 7]
+# Output: VByte-encoded deltas
+F delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
+    result := mut Vec.new();
+
+    I doc_ids.is_empty() {
+        R result;
+    }
+
+    # Encode count
+    count_bytes := mut vbyte_encode(doc_ids.len() as u64);
+    i: u64 := mut 0;
+    L i < count_bytes.len() {
+        result.push(count_bytes[i]);
+        i += 1;
+    }
+
+    # Encode first doc_id as absolute value
+    first_bytes := mut vbyte_encode(doc_ids[0]);
+    i = 0;
+    L i < first_bytes.len() {
+        result.push(first_bytes[i]);
+        i += 1;
+    }
+
+    # Encode subsequent doc_ids as deltas
+    idx: u64 := mut 1;
+    L idx < doc_ids.len() {
+        delta := mut doc_ids[idx] - doc_ids[idx - 1];
+        delta_bytes := mut vbyte_encode(delta);
+        i = 0;
+        L i < delta_bytes.len() {
+            result.push(delta_bytes[i]);
+            i += 1;
+        }
+        idx += 1;
+    }
+
+    result
+}
+
+# Delta-decode VByte-encoded doc_ids back to sorted list
+F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
+    result := mut Vec.new();
+
+    I data.is_empty() {
+        R Ok(result);
+    }
+
+    pos: u64 := mut 0;
+
+    # Decode count
+    (count, consumed) := mut vbyte_decode(data, pos)?;
+    pos += consumed;
+
+    I count == 0 {
+        R Ok(result);
+    }
+
+    # Decode first doc_id (absolute)
+    (first_id, consumed) := mut vbyte_decode(data, pos)?;
+    pos += consumed;
+    result.push(first_id);
+
+    # Decode deltas
+    i: u64 := mut 1;
+    L i < count {
+        (delta, consumed) := mut vbyte_decode(data, pos)?;
+        pos += consumed;
+        prev := mut result[result.len() - 1];
+        result.push(prev + delta);
+        i += 1;
+    }
+
+    Ok(result)
+}
+
+# ============================================================================
+# Compressed Posting List — Encode/decode full posting entries
+# Compressed format: delta-encoded doc_ids + packed term_freqs + packed positions
+# ============================================================================
+
+# Encode a list of PostingEntry into compressed bytes
+# Entries must be sorted by doc_id
+# Format: [delta_encoded_doc_ids][vbyte_term_freqs][position_data]
+F encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
+    result := mut Vec.new();
+
+    I entries.is_empty() {
+        # Write count = 0
+        result.push(0);
+        R result;
+    }
+
+    # Extract doc_ids for delta encoding
+    doc_ids := mut Vec.with_capacity(entries.len());
+    i: u64 := mut 0;
+    L i < entries.len() {
+        doc_ids.push(entries[i].doc_id);
+        i += 1;
+    }
+
+    # Delta-encode doc_ids
+    encoded_ids := mut delta_encode_doc_ids(&doc_ids);
+    i = 0;
+    L i < encoded_ids.len() {
+        result.push(encoded_ids[i]);
+        i += 1;
+    }
+
+    # VByte-encode term frequencies
+    i = 0;
+    L i < entries.len() {
+        freq_bytes := mut vbyte_encode(entries[i].term_freq as u64);
+        j: u64 := mut 0;
+        L j < freq_bytes.len() {
+            result.push(freq_bytes[j]);
+            j += 1;
+        }
+        i += 1;
+    }
+
+    # Encode positions (VByte count + delta-encoded positions per entry)
+    i = 0;
+    L i < entries.len() {
+        pos_count := mut vbyte_encode(entries[i].positions.len() as u64);
+        j: u64 := mut 0;
+        L j < pos_count.len() {
+            result.push(pos_count[j]);
+            j += 1;
+        }
+
+        # Delta-encode positions within each entry
+        I !entries[i].positions.is_empty() {
+            first := mut vbyte_encode(entries[i].positions[0] as u64);
+            j = 0;
+            L j < first.len() {
+                result.push(first[j]);
+                j += 1;
+            }
+
+            k: u64 := mut 1;
+            L k < entries[i].positions.len() {
+                delta := mut entries[i].positions[k] - entries[i].positions[k - 1];
+                d_bytes := mut vbyte_encode(delta as u64);
+                j = 0;
+                L j < d_bytes.len() {
+                    result.push(d_bytes[j]);
+                    j += 1;
+                }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
+# Decode compressed posting list back to entries
+F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError> {
+    result := mut Vec.new();
+    pos: u64 := mut 0;
+
+    I data.is_empty() || data[0] == 0 {
+        R Ok(result);
+    }
+
+    # Decode doc_ids
+    doc_ids := mut delta_decode_doc_ids(data)?;
+    # Re-compute pos by re-parsing to find where doc_ids end
+    (count, consumed) := mut vbyte_decode(data, 0)?;
+    pos = consumed;
+    prev: u64 := mut 0;
+    i: u64 := mut 0;
+    L i < count {
+        (val, consumed) := mut vbyte_decode(data, pos)?;
+        pos += consumed;
+        I i == 0 { prev = val; } E { prev += val; }
+        i += 1;
+    }
+
+    # Decode term frequencies
+    freqs := mut Vec.with_capacity(doc_ids.len());
+    i = 0;
+    L i < count {
+        (freq, consumed) := mut vbyte_decode(data, pos)?;
+        pos += consumed;
+        freqs.push(freq as u32);
+        i += 1;
+    }
+
+    # Decode positions
+    i = 0;
+    L i < count {
+        (pos_count, consumed) := mut vbyte_decode(data, pos)?;
+        pos += consumed;
+
+        positions := mut Vec.with_capacity(pos_count as u64);
+        I pos_count > 0 {
+            (first_pos, consumed) := mut vbyte_decode(data, pos)?;
+            pos += consumed;
+            positions.push(first_pos as u32);
+
+            j: u64 := mut 1;
+            L j < pos_count {
+                (delta, consumed) := mut vbyte_decode(data, pos)?;
+                pos += consumed;
+                prev_pos := mut positions[positions.len() - 1];
+                positions.push(prev_pos + delta as u32);
+                j += 1;
+            }
+        }
+
+        result.push(PostingEntryCompact {
+            doc_id: doc_ids[i as u64],
+            term_freq: freqs[i as u64],
+            positions,
+        });
+        i += 1;
+    }
+
+    Ok(result)
+}
+
+# ============================================================================
+# PostingEntryCompact — Compact posting entry without MVCC (for compression)
+# MVCC metadata is stored separately in the page-level PostingEntry
+# ============================================================================
+
+S PostingEntryCompact {
+    doc_id: u64,
+    term_freq: u32,
+    positions: Vec<u32>,
+}

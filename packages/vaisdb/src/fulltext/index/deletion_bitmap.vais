@@ -1,0 +1,556 @@
+# src/fulltext/index/deletion_bitmap.vais
+# VaisDB Full-Text Engine - Deletion Bitmap for Posting Lists
+# Per-posting-list bitmap tracking deleted entries for fast skip optimization
+# Design from stage3-mvcc-strategy.md Section 5
+
+U std/vec.Vec;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError, ErrorCategory, error_code};
+U storage/constants.{INVALID_TXN_ID};
+U fulltext/types.{PostingEntry};
+U storage/txn/snapshot.Snapshot;
+U storage/txn/clog.CommitLog;
+
+# Error codes: EE=04 (fulltext), CC=08 (deletion bitmap)
+C ERROR_BITMAP_DOC_ID_OUT_OF_RANGE: u32 = error_code(4, 8, 1);  # 04-08-001
+
+###############################################################################
+# DeletionBitmap - Per-posting-list deletion tracking
+###############################################################################
+
+# Deletion bitmap for posting list entries
+# Design:
+# - Each u64 covers 64 doc_ids (1 bit per doc_id)
+# - Bit set = entry marked as deleted (fast skip)
+# - Reconciled with MVCC during GC (merge_with_mvcc)
+# - Permanently removes entries below low_water_mark during compaction
+S DeletionBitmap {
+    # Bitmap storage: each u64 covers 64 doc_ids
+    # Index i covers doc_ids [i*64, (i+1)*64)
+    words: Vec<u64>,
+
+    # Maximum doc_id this bitmap currently covers
+    # Used to determine if expansion is needed
+    max_doc_id: u64,
+}
+
+X DeletionBitmap {
+    # Create new empty deletion bitmap
+    F new() -> DeletionBitmap {
+        DeletionBitmap {
+            words: Vec.new(),
+            max_doc_id: 0,
+        }
+    }
+
+    # Create bitmap with initial capacity for doc_ids up to max_doc_id
+    F with_capacity(max_doc_id: u64) -> DeletionBitmap {
+        word_count := ((max_doc_id + 63) / 64) as u64;
+        words := mut Vec.with_capacity(word_count);
+
+        # Initialize all words to 0 (no deletions)
+        i: u64 := mut 0;
+        L i < word_count {
+            words.push(0);
+            i += 1;
+        }
+
+        DeletionBitmap {
+            words,
+            max_doc_id,
+        }
+    }
+
+    # Mark entry as deleted
+    # Fast operation: set bit to 1
+    F set_deleted(mut self, doc_id: u64) -> Result<(), VaisError> {
+        # Ensure bitmap is large enough
+        self.ensure_capacity(doc_id)?;
+
+        word_index := (doc_id / 64) as u64;
+        bit_offset := (doc_id % 64) as u32;
+
+        # Set bit to 1
+        self.words[word_index] |= 1u64 << bit_offset;
+
+        Ok(())
+    }
+
+    # Check if entry is deleted
+    # Fast check: test bit value
+    F is_deleted(self, doc_id: u64) -> bool {
+        I doc_id > self.max_doc_id {
+            R false;  # Beyond bitmap range = not deleted
+        }
+
+        word_index := (doc_id / 64) as u64;
+        bit_offset := (doc_id % 64) as u32;
+
+        I word_index >= self.words.len() {
+            R false;
+        }
+
+        # Test bit value
+        (self.words[word_index] & (1u64 << bit_offset)) != 0
+    }
+
+    # Clear deleted mark (for rollback)
+    F clear_deleted(mut self, doc_id: u64) -> Result<(), VaisError> {
+        I doc_id > self.max_doc_id {
+            R Ok(());  # Beyond range, nothing to clear
+        }
+
+        word_index := (doc_id / 64) as u64;
+        bit_offset := (doc_id % 64) as u32;
+
+        I word_index >= self.words.len() {
+            R Ok(());
+        }
+
+        # Clear bit to 0
+        self.words[word_index] &= !(1u64 << bit_offset);
+
+        Ok(())
+    }
+
+    # Merge bitmap with MVCC state
+    # Reconcile bitmap with transaction visibility
+    # For each marked entry:
+    # - If txn_id_expire is committed below snapshot, mark as deleted
+    # - If txn_id_expire is uncommitted or above snapshot, clear deletion mark
+    F merge_with_mvcc(
+        mut self,
+        entries: &Vec<PostingEntry>,
+        snapshot: &Snapshot,
+        clog: &CommitLog,
+    ) -> Result<(), VaisError> {
+        i: u64 := mut 0;
+        L i < entries.len() {
+            entry := &entries[i];
+
+            # Check if entry is marked in bitmap
+            I self.is_deleted(entry.doc_id) {
+                # Verify against MVCC state
+                I entry.txn_id_expire == INVALID_TXN_ID {
+                    # Entry is not actually expired, clear bitmap mark
+                    self.clear_deleted(entry.doc_id)?;
+                } E {
+                    # Check if expiring transaction is committed
+                    I clog.is_aborted(entry.txn_id_expire) {
+                        # Aborted expiration, clear bitmap mark
+                        self.clear_deleted(entry.doc_id)?;
+                    } E I !clog.is_committed(entry.txn_id_expire) {
+                        # Uncommitted expiration, clear bitmap mark
+                        self.clear_deleted(entry.doc_id)?;
+                    }
+                    # Otherwise: committed expiration, keep bitmap mark
+                }
+            } E {
+                # Entry not marked in bitmap, check if it should be
+                I entry.txn_id_expire != INVALID_TXN_ID {
+                    # Entry is expired, check if committed
+                    I !clog.is_aborted(entry.txn_id_expire)
+                        && clog.is_committed(entry.txn_id_expire) {
+                        # Committed deletion, mark in bitmap
+                        self.set_deleted(entry.doc_id)?;
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    # Compact bitmap: permanently remove entries below low_water_mark
+    # Returns list of doc_ids that are safe to physically remove
+    # These are entries where:
+    # - Marked as deleted in bitmap
+    # - txn_id_expire < low_water_mark (no active txn can see them)
+    F compact(
+        mut self,
+        entries: &Vec<PostingEntry>,
+        low_water_mark: u64,
+    ) -> Result<Vec<u64>, VaisError> {
+        to_remove := mut Vec.new();
+
+        i: u64 := mut 0;
+        L i < entries.len() {
+            entry := &entries[i];
+
+            # Check if entry is marked as deleted
+            I self.is_deleted(entry.doc_id) {
+                # Check if safe to remove (below low_water_mark)
+                I entry.txn_id_expire != INVALID_TXN_ID
+                    && entry.txn_id_expire < low_water_mark {
+                    # Safe to physically remove
+                    to_remove.push(entry.doc_id);
+
+                    # Clear bitmap mark (entry will be removed)
+                    self.clear_deleted(entry.doc_id)?;
+                }
+            }
+
+            i += 1;
+        }
+
+        Ok(to_remove)
+    }
+
+    # Count total deleted entries (marked bits)
+    F deleted_count(self) -> u64 {
+        count: u64 := mut 0;
+        i: u64 := mut 0;
+        L i < self.words.len() {
+            # Count set bits in word using Brian Kernighan's algorithm
+            word := mut self.words[i];
+            L word != 0 {
+                word &= word - 1;  # Clear lowest set bit
+                count += 1;
+            }
+            i += 1;
+        }
+        count
+    }
+
+    # Get bitmap memory usage in bytes
+    F memory_usage(self) -> u64 {
+        self.words.len() * 8  # 8 bytes per u64
+    }
+
+    # Clear all deletion marks
+    F clear_all(mut self) {
+        i: u64 := mut 0;
+        L i < self.words.len() {
+            self.words[i] = 0;
+            i += 1;
+        }
+    }
+
+    # Ensure bitmap has capacity for doc_id
+    # Expands bitmap if needed
+    F ensure_capacity(mut self, doc_id: u64) -> Result<(), VaisError> {
+        I doc_id <= self.max_doc_id {
+            R Ok(());  # Already have capacity
+        }
+
+        # Calculate new capacity (round up to next 64-doc boundary)
+        new_max := ((doc_id + 63) / 64) * 64;
+        new_word_count := (new_max / 64) as u64;
+        old_word_count := self.words.len();
+
+        # Expand words vector
+        i := mut old_word_count;
+        L i < new_word_count {
+            self.words.push(0);
+            i += 1;
+        }
+
+        self.max_doc_id = new_max - 1;
+        Ok(())
+    }
+
+    # Serialize bitmap to byte vector
+    # Format: max_doc_id(8) + word_count(4) + words(8 each)
+    F to_bytes(self) -> Vec<u8> {
+        size := 8 + 4 + (self.words.len() * 8);
+        buf := mut Vec.with_capacity(size);
+
+        # Serialize max_doc_id (8 bytes)
+        buf.extend_from_slice(&self.max_doc_id.to_le_bytes());
+
+        # Serialize word count (4 bytes)
+        buf.extend_from_slice(&(self.words.len() as u32).to_le_bytes());
+
+        # Serialize words (8 bytes each)
+        i: u64 := mut 0;
+        L i < self.words.len() {
+            buf.extend_from_slice(&self.words[i].to_le_bytes());
+            i += 1;
+        }
+
+        buf
+    }
+
+    # Deserialize bitmap from byte vector
+    F from_bytes(data: &[u8]) -> Result<DeletionBitmap, VaisError> {
+        I data.len() < 12 {
+            R Err(VaisError {
+                code: error_code(4, 8, 2),  # 04-08-002: invalid bitmap data
+                message: "Deletion bitmap data too short".to_string(),
+                category: ErrorCategory.Corruption,
+            });
+        }
+
+        # Deserialize max_doc_id (8 bytes)
+        max_doc_id_bytes: [u8; 8] := mut [0; 8];
+        max_doc_id_bytes.copy_from_slice(&data[0..8]);
+        max_doc_id := u64.from_le_bytes(max_doc_id_bytes);
+
+        # Deserialize word count (4 bytes)
+        word_count_bytes: [u8; 4] := mut [0; 4];
+        word_count_bytes.copy_from_slice(&data[8..12]);
+        word_count := u32.from_le_bytes(word_count_bytes) as u64;
+
+        # Verify data length
+        expected_len := 12 + (word_count * 8);
+        I data.len() < expected_len {
+            R Err(VaisError {
+                code: error_code(4, 8, 2),
+                message: "Deletion bitmap data truncated".to_string(),
+                category: ErrorCategory.Corruption,
+            });
+        }
+
+        # Deserialize words
+        words := mut Vec.with_capacity(word_count);
+        i: u64 := mut 0;
+        L i < word_count {
+            offset := 12 + (i * 8);
+            word_bytes: [u8; 8] := mut [0; 8];
+            word_bytes.copy_from_slice(&data[offset..offset+8]);
+            words.push(u64.from_le_bytes(word_bytes));
+            i += 1;
+        }
+
+        Ok(DeletionBitmap {
+            words,
+            max_doc_id,
+        })
+    }
+
+    # Check if bitmap is empty (no deletions)
+    F is_empty(self) -> bool {
+        i: u64 := mut 0;
+        L i < self.words.len() {
+            I self.words[i] != 0 {
+                R false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    # Get all deleted doc_ids (for debugging/testing)
+    F get_deleted_doc_ids(self) -> Vec<u64> {
+        result := mut Vec.new();
+
+        word_idx: u64 := mut 0;
+        L word_idx < self.words.len() {
+            word := self.words[word_idx];
+            I word != 0 {
+                # Check each bit in this word
+                bit_idx: u32 := mut 0;
+                L bit_idx < 64 {
+                    I (word & (1u64 << bit_idx)) != 0 {
+                        doc_id := (word_idx as u64 * 64) + (bit_idx as u64);
+                        I doc_id <= self.max_doc_id {
+                            result.push(doc_id);
+                        }
+                    }
+                    bit_idx += 1;
+                }
+            }
+            word_idx += 1;
+        }
+
+        result
+    }
+}
+
+###############################################################################
+# Helper Functions - MVCC Visibility Integration
+###############################################################################
+
+# Filter posting entries using deletion bitmap + MVCC visibility
+# This is the fast path during search:
+# - First check deletion bitmap (cheap bit test)
+# - If not deleted in bitmap, do full MVCC visibility check
+# Returns only visible entries
+F filter_visible_entries(
+    entries: &Vec<PostingEntry>,
+    bitmap: &DeletionBitmap,
+    snapshot: &Snapshot,
+    clog: &CommitLog,
+) -> Vec<PostingEntry> {
+    result := mut Vec.with_capacity(entries.len());
+
+    i: u64 := mut 0;
+    L i < entries.len() {
+        entry := &entries[i];
+
+        # Fast skip if marked in deletion bitmap
+        I !bitmap.is_deleted(entry.doc_id) {
+            # Full MVCC visibility check
+            I is_entry_visible(entry, snapshot, clog) {
+                result.push(entry.clone());
+            }
+        }
+
+        i += 1;
+    }
+
+    result
+}
+
+# Check if posting entry is visible to snapshot
+# Matches tuple visibility logic from stage3-mvcc-strategy.md
+F is_entry_visible(
+    entry: &PostingEntry,
+    snapshot: &Snapshot,
+    clog: &CommitLog,
+) -> bool {
+    # Fast-path: check if creating transaction was aborted
+    I clog.is_aborted(entry.txn_id_create) {
+        R false;
+    }
+
+    created_by := entry.txn_id_create;
+    expired_by := entry.txn_id_expire;
+
+    # If expiring txn was aborted, treat as not expired
+    expired_by_effective := I expired_by != INVALID_TXN_ID && !clog.is_aborted(expired_by) {
+        expired_by
+    } E {
+        INVALID_TXN_ID
+    };
+
+    # Case 1: Created by current transaction — use cmd_id for same-txn visibility
+    I created_by == snapshot.current_txn {
+        I entry.cmd_id >= snapshot.current_cmd_id {
+            R false;  # Created by later command in same txn
+        }
+        I expired_by_effective == INVALID_TXN_ID {
+            R true;
+        }
+        I expired_by_effective == snapshot.current_txn {
+            R entry.expire_cmd_id > snapshot.current_cmd_id;
+        }
+        R true;
+    }
+
+    # Case 2: Created by committed transaction visible to this snapshot
+    I !is_committed_before(created_by, snapshot, clog) {
+        R false;  # Creator not yet committed
+    }
+
+    # Case 3: Check expiration
+    I expired_by_effective == INVALID_TXN_ID {
+        R true;  # Not expired
+    }
+    I expired_by_effective == snapshot.current_txn {
+        R entry.expire_cmd_id > snapshot.current_cmd_id;
+    }
+    I !is_committed_before(expired_by_effective, snapshot, clog) {
+        R true;  # Expirer not yet committed = still visible
+    }
+
+    false  # Expired by committed transaction
+}
+
+# Check if transaction committed before snapshot
+F is_committed_before(txn_id: u64, snapshot: &Snapshot, clog: &CommitLog) -> bool {
+    I txn_id > snapshot.txn_id {
+        R false;  # Started after snapshot
+    }
+
+    I snapshot.active_txns.contains(&txn_id) {
+        R false;  # Was active when snapshot taken
+    }
+
+    # Must be committed (aborted case handled by caller)
+    clog.is_committed(txn_id)
+}
+
+###############################################################################
+# Tests
+###############################################################################
+
+#[cfg(test)]
+mod tests {
+    U super.*
+
+    #[test]
+    F test_deletion_bitmap_basic() {
+        bitmap := mut DeletionBitmap.new();
+
+        # Mark some entries as deleted
+        bitmap.set_deleted(10)!;
+        bitmap.set_deleted(50)!;
+        bitmap.set_deleted(100)!;
+
+        # Check deleted status
+        assert!(bitmap.is_deleted(10));
+        assert!(bitmap.is_deleted(50));
+        assert!(bitmap.is_deleted(100));
+        assert!(!bitmap.is_deleted(20));
+        assert!(!bitmap.is_deleted(99));
+
+        # Count deletions
+        assert_eq!(bitmap.deleted_count(), 3);
+    }
+
+    #[test]
+    F test_deletion_bitmap_clear() {
+        bitmap := mut DeletionBitmap.new();
+
+        bitmap.set_deleted(10)!;
+        bitmap.set_deleted(50)!;
+
+        # Clear one deletion
+        bitmap.clear_deleted(10)!;
+
+        assert!(!bitmap.is_deleted(10));
+        assert!(bitmap.is_deleted(50));
+        assert_eq!(bitmap.deleted_count(), 1);
+    }
+
+    #[test]
+    F test_deletion_bitmap_serialization() {
+        bitmap := mut DeletionBitmap.with_capacity(200);
+
+        bitmap.set_deleted(10)!;
+        bitmap.set_deleted(150)!;
+
+        # Serialize
+        bytes := bitmap.to_bytes();
+
+        # Deserialize
+        restored := DeletionBitmap.from_bytes(&bytes)!;
+
+        assert!(restored.is_deleted(10));
+        assert!(restored.is_deleted(150));
+        assert!(!restored.is_deleted(50));
+        assert_eq!(restored.deleted_count(), 2);
+    }
+
+    #[test]
+    F test_deletion_bitmap_capacity_expansion() {
+        bitmap := mut DeletionBitmap.new();
+
+        # Mark entries beyond initial capacity
+        bitmap.set_deleted(1000)!;
+        bitmap.set_deleted(5000)!;
+
+        assert!(bitmap.is_deleted(1000));
+        assert!(bitmap.is_deleted(5000));
+        assert!(!bitmap.is_deleted(3000));
+    }
+
+    #[test]
+    F test_deletion_bitmap_get_deleted_ids() {
+        bitmap := mut DeletionBitmap.new();
+
+        bitmap.set_deleted(5)!;
+        bitmap.set_deleted(10)!;
+        bitmap.set_deleted(15)!;
+
+        deleted_ids := bitmap.get_deleted_doc_ids();
+
+        assert_eq!(deleted_ids.len(), 3);
+        assert!(deleted_ids.contains(&5));
+        assert!(deleted_ids.contains(&10));
+        assert!(deleted_ids.contains(&15));
+    }
+}

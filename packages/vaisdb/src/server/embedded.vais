@@ -1,0 +1,304 @@
+# src/server/embedded.vais
+# VaisDB Embedded Mode - SQLite-like library mode for in-process database usage
+#
+# Design:
+# - Single-threaded in-process database
+# - File locking prevents concurrent access across processes
+# - No network overhead, direct function calls
+# - Memory budget configurable, defaults to auto-detection
+# - Page size immutable after database creation
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/result.{Result, Ok, Err};
+U storage/error.{VaisError, ErrorSeverity};
+
+# Configuration for embedded database instance
+S EmbeddedConfig {
+    data_dir: Str,           # Directory containing .vaisdb files (default "./data")
+    page_size: u32,          # Page size in bytes (default 8192, immutable after creation)
+    memory_budget: u64,      # Memory budget in bytes (default 0 = auto)
+    wal_sync_mode: Str,      # WAL sync mode: "fsync", "fdatasync", "none" (default "fsync")
+    query_timeout_sec: u32,  # Query timeout in seconds (default 30)
+}
+
+X EmbeddedConfig {
+    # Create default configuration
+    F default() -> EmbeddedConfig {
+        EmbeddedConfig {
+            data_dir: "./data",
+            page_size: 8192,
+            memory_budget: 0,
+            wal_sync_mode: "fsync",
+            query_timeout_sec: 30,
+        }
+    }
+
+    # Builder: set data directory
+    F with_data_dir(mut self, dir: Str) -> Self {
+        self.data_dir = dir;
+        self
+    }
+
+    # Builder: set page size (must be called before database creation)
+    F with_page_size(mut self, size: u32) -> Self {
+        self.page_size = size;
+        self
+    }
+
+    # Builder: set memory budget (0 = auto)
+    F with_memory_budget(mut self, budget: u64) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    # Builder: set WAL sync mode
+    F with_wal_sync_mode(mut self, mode: Str) -> Self {
+        self.wal_sync_mode = mode;
+        self
+    }
+
+    # Builder: set query timeout
+    F with_query_timeout(mut self, timeout_sec: u32) -> Self {
+        self.query_timeout_sec = timeout_sec;
+        self
+    }
+
+    # Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        # Validate page size (must be power of 2, between 512 and 65536)
+        I self.page_size < 512 || self.page_size > 65536 {
+            R Err(VaisError.new(
+                "VAIS-0609004",
+                "Invalid page_size: must be between 512 and 65536"
+            ).with_hint("Use a power of 2 (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)"));
+        }
+
+        # Check if page_size is power of 2
+        I (self.page_size & (self.page_size - 1)) != 0 {
+            R Err(VaisError.new(
+                "VAIS-0609005",
+                "Invalid page_size: must be a power of 2"
+            ).with_hint("Use 512, 1024, 2048, 4096, 8192, 16384, 32768, or 65536"));
+        }
+
+        # Validate WAL sync mode
+        I self.wal_sync_mode != "fsync" && self.wal_sync_mode != "fdatasync" && self.wal_sync_mode != "none" {
+            R Err(VaisError.new(
+                "VAIS-0609006",
+                "Invalid wal_sync_mode: must be 'fsync', 'fdatasync', or 'none'"
+            ).with_hint("Use 'fsync' for maximum durability, 'none' for maximum performance"));
+        }
+
+        # Validate query timeout
+        I self.query_timeout_sec == 0 {
+            R Err(VaisError.new(
+                "VAIS-0609007",
+                "Invalid query_timeout_sec: must be greater than 0"
+            ).with_hint("Set to a reasonable timeout like 30 seconds"));
+        }
+
+        # Validate data_dir is not empty
+        I self.data_dir.len() == 0 {
+            R Err(VaisError.new(
+                "VAIS-0609008",
+                "Invalid data_dir: cannot be empty"
+            ).with_hint("Set data_dir to a valid directory path"));
+        }
+
+        R Ok(());
+    }
+}
+
+# Column metadata for query results
+S EmbeddedColumn {
+    name: Str,       # Column name
+    type_name: Str,  # Type name: "INT", "TEXT", "FLOAT", "BOOL", "BLOB", "VECTOR", etc.
+}
+
+X EmbeddedColumn {
+    # Create a new column descriptor
+    F new(name: Str, type_name: Str) -> EmbeddedColumn {
+        EmbeddedColumn {
+            name: name,
+            type_name: type_name,
+        }
+    }
+
+    # Get column name
+    F get_name(self) -> &Str {
+        &self.name
+    }
+
+    # Get type name
+    F get_type_name(self) -> &Str {
+        &self.type_name
+    }
+}
+
+# Query result set (all values converted to strings for simplicity)
+S EmbeddedResult {
+    columns: Vec<EmbeddedColumn>,          # Column metadata
+    rows: Vec<Vec<Option<Str>>>,           # Row data (None = NULL)
+}
+
+X EmbeddedResult {
+    # Create empty result set
+    F new(columns: Vec<EmbeddedColumn>) -> EmbeddedResult {
+        EmbeddedResult {
+            columns: columns,
+            rows: Vec.new(),
+        }
+    }
+
+    # Add a row to the result set
+    F add_row(mut self, row: Vec<Option<Str>>) -> () {
+        self.rows.push(row);
+    }
+
+    # Get number of columns
+    F column_count(self) -> u64 {
+        self.columns.len()
+    }
+
+    # Get number of rows
+    F row_count(self) -> u64 {
+        self.rows.len()
+    }
+
+    # Get column metadata
+    F get_columns(self) -> &Vec<EmbeddedColumn> {
+        &self.columns
+    }
+
+    # Get all rows
+    F get_rows(self) -> &Vec<Vec<Option<Str>>> {
+        &self.rows
+    }
+
+    # Get a specific row (returns None if out of bounds)
+    F get_row(self, index: u64) -> Option<&Vec<Option<Str>>> {
+        I index < self.rows.len() {
+            R Some(&self.rows[index]);
+        }
+        R None;
+    }
+}
+
+# Embedded database instance (SQLite-like library mode)
+S EmbeddedDatabase {
+    data_dir: Str,           # Directory containing .vaisdb files
+    is_open: bool,           # Connection state
+    config: EmbeddedConfig,  # Configuration
+}
+
+X EmbeddedDatabase {
+    # Open or create an embedded database
+    # FUTURE(std/file): Implement actual file I/O, directory creation, file locking, storage init
+    F open(config: EmbeddedConfig) -> Result<EmbeddedDatabase, VaisError> {
+        # Validate configuration
+        config.validate()?;
+
+        # Placeholder: set state without actual file operations
+        db := mut EmbeddedDatabase {
+            data_dir: config.data_dir.clone(),
+            is_open: true,
+            config: config,
+        };
+
+        R Ok(db);
+    }
+
+    # Close the database
+    F close(mut self) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_embedded_not_open());
+        }
+
+        # FUTURE(std/file): Flush buffer pool, checkpoint WAL, release file lock, close handles
+        self.is_open = false;
+        R Ok(());
+    }
+
+    # Execute a query and return result set
+    # FUTURE(integration): Parse SQL -> plan query -> execute plan -> convert to EmbeddedResult
+    F query(mut self, sql: &Str) -> Result<EmbeddedResult, VaisError> {
+        I !self.is_open {
+            R Err(err_embedded_not_open());
+        }
+
+        # Placeholder: return empty result
+        columns := mut Vec.new();
+        columns.push(EmbeddedColumn.new("placeholder", "TEXT"));
+        R Ok(EmbeddedResult.new(columns));
+    }
+
+    # Execute a statement (INSERT/UPDATE/DELETE) and return affected rows
+    # FUTURE(integration): Parse SQL -> plan query -> execute plan -> return row count
+    F execute(mut self, sql: &Str) -> Result<u64, VaisError> {
+        I !self.is_open {
+            R Err(err_embedded_not_open());
+        }
+
+        # Placeholder: return 0
+        R Ok(0);
+    }
+
+    # Check if database is open
+    F is_open(self) -> bool {
+        self.is_open
+    }
+
+    # Get data directory
+    F get_data_dir(self) -> &Str {
+        &self.data_dir
+    }
+
+    # Get configuration
+    F get_config(self) -> &EmbeddedConfig {
+        &self.config
+    }
+}
+
+# File locking functions
+
+# Acquire exclusive file lock on data directory
+# FUTURE(std/file.flock): Open .vaisdb.lock, call flock(LOCK_EX | LOCK_NB)
+F acquire_file_lock(data_dir: &Str) -> Result<(), VaisError> {
+    # Placeholder: always succeed
+    R Ok(());
+}
+
+# Release file lock on data directory
+# FUTURE(std/file.flock): Call flock(LOCK_UN), close .vaisdb.lock
+F release_file_lock(data_dir: &Str) -> Result<(), VaisError> {
+    # Placeholder: always succeed
+    R Ok(());
+}
+
+# Error functions
+
+# Error: database already open
+F err_embedded_already_open(dir: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0609001",
+        "Embedded database already open"
+    ).with_hint("Close the existing database before opening a new one")
+}
+
+# Error: database not open
+F err_embedded_not_open() -> VaisError {
+    VaisError.new(
+        "VAIS-0609002",
+        "Embedded database is not open"
+    ).with_hint("Call EmbeddedDatabase.open() before executing queries")
+}
+
+# Error: failed to acquire file lock
+F err_embedded_lock_failed(dir: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0609003",
+        "Failed to acquire file lock on database"
+    ).with_hint("Another process may have the database open")
+}

@@ -1,0 +1,505 @@
+# SQL Injection Defense & Error Sanitization
+# InputSanitizer: validates identifiers and escapes string literals
+# ErrorSanitizer: removes internal schema/path/stack info from client-facing errors
+# Enforces prepared statements at protocol level (advisory warnings)
+# Error codes: EE=09 (security), CC=01 (validation)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+
+# ============================================================================
+# InputSanitizer — SQL injection prevention
+# ============================================================================
+
+S InputSanitizer {}
+
+X InputSanitizer {
+    F new() -> InputSanitizer {
+        InputSanitizer {}
+    }
+
+    # Validate a SQL identifier (table, column, schema name)
+    # Rules: 1-128 chars, starts with letter or underscore,
+    #        contains only alphanumeric, underscore, no SQL keywords as bare identifiers
+    # Returns Ok(()) if valid, Err with message if invalid
+    F validate_identifier(self, name: &Str) -> Result<(), VaisError> {
+        I name.len() == 0 {
+            R Err(VaisError.new(
+                "VAIS-0901010",
+                "Empty identifier is not allowed"
+            ));
+        }
+        I name.len() > 128 {
+            R Err(VaisError.new(
+                "VAIS-0901011",
+                "Identifier exceeds maximum length of 128 characters"
+            ));
+        }
+
+        bytes := mut name.as_bytes();
+
+        # First character must be letter or underscore
+        first := mut bytes[0];
+        first_valid := mut (first >= 0x61 && first <= 0x7A)   # a-z
+                    || (first >= 0x41 && first <= 0x5A)    # A-Z
+                    || first == 0x5F;                       # _
+        I !first_valid {
+            R Err(VaisError.new(
+                "VAIS-0901012",
+                "Identifier must start with a letter or underscore: '{name}'"
+            ));
+        }
+
+        # Remaining characters: alphanumeric + underscore
+        i: u64 := mut 1;
+        L i < bytes.len() {
+            b := mut bytes[i];
+            is_valid := mut (b >= 0x61 && b <= 0x7A)
+                     || (b >= 0x41 && b <= 0x5A)
+                     || (b >= 0x30 && b <= 0x39)
+                     || b == 0x5F;
+            I !is_valid {
+                R Err(VaisError.new(
+                    "VAIS-0901013",
+                    "Identifier contains invalid character at position {i}: '{name}'"
+                ));
+            }
+            i = i + 1;
+        }
+
+        # Check for dangerous SQL keywords used as bare identifiers
+        upper := mut to_upper(name);
+        I is_reserved_keyword(&upper) {
+            R Err(VaisError.new(
+                "VAIS-0901014",
+                "Reserved keyword '{name}' cannot be used as an identifier without quoting"
+            ).with_hint("Use double-quotes: \"{name}\""));
+        }
+
+        Ok(())
+    }
+
+    # Escape a string literal for safe inclusion in SQL
+    # Doubles single quotes: ' -> ''
+    # Removes null bytes (0x00)
+    # Escapes backslash: \ -> \\
+    F escape_string_literal(self, value: &Str) -> Str {
+        bytes := mut value.as_bytes();
+        result := mut Str.with_capacity(bytes.len() * 2);
+        i: u64 := mut 0;
+        L i < bytes.len() {
+            b := mut bytes[i];
+            I b == 0x27 {
+                # Single quote -> double single quote
+                result.push_byte(0x27);
+                result.push_byte(0x27);
+            } E I b == 0x5C {
+                # Backslash -> double backslash
+                result.push_byte(0x5C);
+                result.push_byte(0x5C);
+            } E I b == 0x00 {
+                # Strip null bytes (potential injection vector)
+            } E {
+                result.push_byte(b);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Check if a string literal contains potential injection patterns
+    # Returns true if suspicious patterns detected
+    F has_injection_patterns(self, value: &Str) -> bool {
+        bytes := mut value.as_bytes();
+        len := mut bytes.len();
+
+        # Check for common SQL injection patterns
+        # 1. Unmatched quotes
+        quote_count: u64 := mut 0;
+        i: u64 := mut 0;
+        L i < len {
+            I bytes[i] == 0x27 {
+                quote_count = quote_count + 1;
+            }
+            i = i + 1;
+        }
+        I quote_count % 2 != 0 {
+            R true;  # Odd number of quotes is suspicious
+        }
+
+        # 2. SQL comment markers (-- or /* or */)
+        I contains_pattern(bytes, "--") {
+            R true;
+        }
+        I contains_pattern(bytes, "/*") {
+            R true;
+        }
+        I contains_pattern(bytes, "*/") {
+            R true;
+        }
+
+        # 3. Semicolons (statement terminator / stacking)
+        j: u64 := mut 0;
+        L j < len {
+            I bytes[j] == 0x3B {
+                R true;
+            }
+            j = j + 1;
+        }
+
+        # 4. UNION keyword pattern (case-insensitive)
+        I contains_pattern_ci(bytes, "union") {
+            R true;
+        }
+
+        false
+    }
+
+    # Warn about non-prepared-statement query usage
+    # Returns a warning message string (empty if prepared statement)
+    F check_prepared_statement_usage(self, is_prepared: bool) -> Option<Str> {
+        I !is_prepared {
+            Some("WARNING: Using non-parameterized queries is discouraged. Use prepared statements for security.")
+        } E {
+            None
+        }
+    }
+}
+
+# ============================================================================
+# ErrorSanitizer — Remove internal info from client-facing errors
+# ============================================================================
+
+S ErrorSanitizer {}
+
+X ErrorSanitizer {
+    F new() -> ErrorSanitizer {
+        ErrorSanitizer {}
+    }
+
+    # Sanitize an error message for client consumption
+    # Removes: file paths, stack traces, internal schema details, page IDs
+    F sanitize_error(self, err: &VaisError) -> VaisError {
+        clean_message := mut sanitize_message(&err.message);
+        clean_detail := mut sanitize_message(&err.detail);
+        clean_hint := mut err.hint.clone();  # Hints are safe (user-facing by design)
+
+        result := mut VaisError.new(
+            err.code.clone(),
+            clean_message,
+        );
+        I clean_detail.len() > 0 {
+            result = result.with_detail(clean_detail);
+        }
+        I clean_hint.len() > 0 {
+            result = result.with_hint(clean_hint);
+        }
+        I err.is_fatal() {
+            result = result.with_severity(storage/error.ErrorSeverity.Fatal);
+        }
+        result
+    }
+
+    # Sanitize a full error message, replacing internal details with generic text
+    F sanitize_for_client(self, message: &Str) -> Str {
+        sanitize_message(message)
+    }
+}
+
+# ============================================================================
+# Internal Helper Functions
+# ============================================================================
+
+# Sanitize a message string by removing internal information
+F sanitize_message(message: &Str) -> Str {
+    result := mut message.clone();
+
+    # 1. Remove file paths (anything matching /path/to/file.vais:line)
+    result = redact_file_paths(&result);
+
+    # 2. Remove page/slot/offset references (page 12345, slot 67, offset 0x...)
+    result = redact_page_references(&result);
+
+    # 3. Remove internal struct names and memory addresses
+    result = redact_internal_names(&result);
+
+    result
+}
+
+# Redact file paths from error messages
+# Matches patterns like: /some/path/file.vais:123 or src/module/file.vais
+F redact_file_paths(msg: &Str) -> Str {
+    bytes := mut msg.as_bytes();
+    result := mut Str.with_capacity(bytes.len());
+    i: u64 := mut 0;
+    in_path := mut false;
+    path_start: u64 := mut 0;
+
+    L i < bytes.len() {
+        # Detect start of a path: '/' followed by alphanumeric
+        I !in_path && bytes[i] == 0x2F && i + 1 < bytes.len() {
+            next := mut bytes[i + 1];
+            I (next >= 0x61 && next <= 0x7A) || (next >= 0x41 && next <= 0x5A) {
+                # Check if it looks like a file path (contains .vais or .vdb)
+                look_ahead := mut i;
+                found_ext := mut false;
+                L look_ahead < bytes.len() && look_ahead < i + 256 {
+                    I look_ahead + 4 < bytes.len() {
+                        I bytes[look_ahead] == 0x2E  # '.'
+                            && (bytes[look_ahead + 1] == 0x76)  # 'v'
+                            && (bytes[look_ahead + 2] == 0x61)  # 'a'
+                            && (bytes[look_ahead + 3] == 0x69)  # 'i'
+                            && (bytes[look_ahead + 4] == 0x73) {  # 's'
+                            found_ext = true;
+                        }
+                        I bytes[look_ahead] == 0x2E
+                            && (bytes[look_ahead + 1] == 0x76)  # 'v'
+                            && (bytes[look_ahead + 2] == 0x64)  # 'd'
+                            && (bytes[look_ahead + 3] == 0x62) {  # 'b'
+                            found_ext = true;
+                        }
+                    }
+                    look_ahead = look_ahead + 1;
+                }
+
+                I found_ext {
+                    in_path = true;
+                    path_start = i;
+                    result.push_str("[internal]");
+                    # Skip until whitespace or end of path
+                    L i < bytes.len() && bytes[i] != 0x20 && bytes[i] != 0x0A
+                        && bytes[i] != 0x29 && bytes[i] != 0x2C {
+                        i = i + 1;
+                    }
+                    in_path = false;
+                } E {
+                    result.push_byte(bytes[i]);
+                    i = i + 1;
+                }
+            } E {
+                result.push_byte(bytes[i]);
+                i = i + 1;
+            }
+        } E {
+            result.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    result
+}
+
+# Redact page/slot/offset references
+F redact_page_references(msg: &Str) -> Str {
+    bytes := mut msg.as_bytes();
+    result := mut Str.with_capacity(bytes.len());
+    i: u64 := mut 0;
+
+    L i < bytes.len() {
+        # Detect "page " or "PAGE " followed by a number
+        I i + 5 < bytes.len() {
+            I (bytes[i] == 0x70 || bytes[i] == 0x50)        # p/P
+                && (bytes[i+1] == 0x61 || bytes[i+1] == 0x41) # a/A
+                && (bytes[i+2] == 0x67 || bytes[i+2] == 0x47) # g/G
+                && (bytes[i+3] == 0x65 || bytes[i+3] == 0x45) # e/E
+                && bytes[i+4] == 0x20                          # space
+                && bytes[i+5] >= 0x30 && bytes[i+5] <= 0x39 { # digit
+                result.push_str("page [redacted]");
+                i = i + 5;
+                # Skip digits
+                L i < bytes.len() && bytes[i] >= 0x30 && bytes[i] <= 0x39 {
+                    i = i + 1;
+                }
+            } E {
+                result.push_byte(bytes[i]);
+                i = i + 1;
+            }
+        } E {
+            result.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    result
+}
+
+# Redact internal struct names and memory addresses
+F redact_internal_names(msg: &Str) -> Str {
+    bytes := mut msg.as_bytes();
+    result := mut Str.with_capacity(bytes.len());
+    i: u64 := mut 0;
+
+    L i < bytes.len() {
+        # Detect hex addresses (0x followed by hex digits)
+        I i + 2 < bytes.len()
+            && bytes[i] == 0x30      # '0'
+            && bytes[i+1] == 0x78 {  # 'x'
+            hex_start := mut i + 2;
+            hex_end := mut hex_start;
+            L hex_end < bytes.len() {
+                b := mut bytes[hex_end];
+                is_hex := mut (b >= 0x30 && b <= 0x39)
+                       || (b >= 0x61 && b <= 0x66)
+                       || (b >= 0x41 && b <= 0x46);
+                I !is_hex {
+                    # Exit the inner loop via sentinel
+                    hex_end = bytes.len() + 1;
+                } E {
+                    hex_end = hex_end + 1;
+                }
+            }
+            # Adjust hex_end if we broke out with sentinel
+            I hex_end > bytes.len() {
+                hex_end = hex_end - 1;
+                # Go back to find actual end
+                actual_end := mut hex_start;
+                L actual_end < bytes.len() {
+                    b := mut bytes[actual_end];
+                    is_hex := mut (b >= 0x30 && b <= 0x39)
+                           || (b >= 0x61 && b <= 0x66)
+                           || (b >= 0x41 && b <= 0x46);
+                    I is_hex {
+                        actual_end = actual_end + 1;
+                    } E {
+                        hex_end = actual_end;
+                        actual_end = bytes.len();  # exit
+                    }
+                }
+            }
+
+            # Only redact if it looks like an address (8+ hex digits)
+            I hex_end - hex_start >= 8 {
+                result.push_str("[addr]");
+                i = hex_end;
+            } E {
+                result.push_byte(bytes[i]);
+                i = i + 1;
+            }
+        } E {
+            result.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    result
+}
+
+# Check if a byte slice contains a pattern (case-sensitive)
+F contains_pattern(bytes: &[u8], pattern: &Str) -> bool {
+    pat_bytes := mut pattern.as_bytes();
+    pat_len := mut pat_bytes.len();
+    I bytes.len() < pat_len {
+        R false;
+    }
+    i: u64 := mut 0;
+    limit := mut bytes.len() - pat_len + 1;
+    L i < limit {
+        found := mut true;
+        j: u64 := mut 0;
+        L j < pat_len {
+            I bytes[i + j] != pat_bytes[j] {
+                found = false;
+                j = pat_len;  # break
+            } E {
+                j = j + 1;
+            }
+        }
+        I found {
+            R true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+# Check if a byte slice contains a pattern (case-insensitive)
+F contains_pattern_ci(bytes: &[u8], pattern: &Str) -> bool {
+    pat_bytes := mut pattern.as_bytes();
+    pat_len := mut pat_bytes.len();
+    I bytes.len() < pat_len {
+        R false;
+    }
+    i: u64 := mut 0;
+    limit := mut bytes.len() - pat_len + 1;
+    L i < limit {
+        found := mut true;
+        j: u64 := mut 0;
+        L j < pat_len {
+            a := mut to_lower_byte(bytes[i + j]);
+            b := mut to_lower_byte(pat_bytes[j]);
+            I a != b {
+                found = false;
+                j = pat_len;  # break
+            } E {
+                j = j + 1;
+            }
+        }
+        I found {
+            R true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+# Convert byte to lowercase
+F to_lower_byte(b: u8) -> u8 {
+    I b >= 0x41 && b <= 0x5A {
+        b + 0x20
+    } E {
+        b
+    }
+}
+
+# Convert string to uppercase
+F to_upper(s: &Str) -> Str {
+    bytes := mut s.as_bytes();
+    result := mut Str.with_capacity(bytes.len());
+    i: u64 := mut 0;
+    L i < bytes.len() {
+        b := mut bytes[i];
+        I b >= 0x61 && b <= 0x7A {
+            result.push_byte(b - 0x20);
+        } E {
+            result.push_byte(b);
+        }
+        i = i + 1;
+    }
+    result
+}
+
+# Check if a string is a reserved SQL keyword
+F is_reserved_keyword(upper: &Str) -> bool {
+    I *upper == "SELECT" { R true; }
+    I *upper == "INSERT" { R true; }
+    I *upper == "UPDATE" { R true; }
+    I *upper == "DELETE" { R true; }
+    I *upper == "DROP" { R true; }
+    I *upper == "CREATE" { R true; }
+    I *upper == "ALTER" { R true; }
+    I *upper == "TABLE" { R true; }
+    I *upper == "INDEX" { R true; }
+    I *upper == "FROM" { R true; }
+    I *upper == "WHERE" { R true; }
+    I *upper == "AND" { R true; }
+    I *upper == "OR" { R true; }
+    I *upper == "NOT" { R true; }
+    I *upper == "NULL" { R true; }
+    I *upper == "TRUE" { R true; }
+    I *upper == "FALSE" { R true; }
+    I *upper == "GRANT" { R true; }
+    I *upper == "REVOKE" { R true; }
+    I *upper == "UNION" { R true; }
+    I *upper == "ALL" { R true; }
+    I *upper == "AS" { R true; }
+    I *upper == "ON" { R true; }
+    I *upper == "INTO" { R true; }
+    I *upper == "VALUES" { R true; }
+    I *upper == "SET" { R true; }
+    I *upper == "BEGIN" { R true; }
+    I *upper == "COMMIT" { R true; }
+    I *upper == "ROLLBACK" { R true; }
+    false
+}

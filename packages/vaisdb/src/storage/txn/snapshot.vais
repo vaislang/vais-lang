@@ -1,0 +1,77 @@
+# Transaction Snapshot
+# Represents a point-in-time view for MVCC visibility checks
+# Based on Stage 3 Section 7: Isolation Levels
+
+U storage/constants.{INVALID_TXN_ID};
+
+# Snapshot for transaction isolation
+S Snapshot {
+    txn_id: u64,               # This transaction's ID
+    current_cmd_id: u32,       # Current command sequence within transaction
+    active_txns: Vec<u64>,     # Active transaction IDs at snapshot creation time
+    min_active_txn: u64,       # Smallest active txn_id (optimization)
+}
+
+X Snapshot {
+    # Create a new snapshot
+    F new(txn_id: u64, active_txns: Vec<u64>) -> Snapshot {
+        min_active := mut txn_id;
+        L id: &active_txns {
+            I *id < min_active {
+                min_active = *id;
+            }
+        }
+
+        Snapshot {
+            txn_id,
+            current_cmd_id: 0,
+            active_txns,
+            min_active_txn: min_active,
+        }
+    }
+
+    # Advance command ID (called per statement)
+    F advance_cmd(mut self) {
+        self.current_cmd_id += 1;
+    }
+
+    # Check if a transaction ID was active at snapshot time
+    F is_active(self, txn_id: u64) -> bool {
+        L id: &self.active_txns {
+            I *id == txn_id {
+                R true;
+            }
+        }
+        false
+    }
+
+    # Check if a transaction was committed before this snapshot
+    # txn_id < snapshot.txn_id AND txn_id NOT IN active_txns
+    F is_visible_txn(self, txn_id: u64) -> bool {
+        I txn_id >= self.txn_id {
+            R false;
+        }
+        !self.is_active(txn_id)
+    }
+
+    # Get current transaction ID
+    F get_txn_id(self) -> u64 {
+        self.txn_id
+    }
+
+    # Get current command ID
+    F get_cmd_id(self) -> u32 {
+        self.current_cmd_id
+    }
+
+    # Get low water mark (oldest relevant transaction)
+    F low_water_mark(self) -> u64 {
+        self.min_active_txn
+    }
+}
+
+# Isolation levels supported by VaisDB
+L IsolationLevel = ReadCommitted | SnapshotIsolation;
+
+# Default isolation level
+C DEFAULT_ISOLATION: IsolationLevel = IsolationLevel.SnapshotIsolation;

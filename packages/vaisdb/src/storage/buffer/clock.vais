@@ -1,0 +1,85 @@
+# Clock Replacement Algorithm
+# Second-chance / clock replacement for buffer pool eviction
+# Based on Stage 4: Memory Architecture eviction priority
+
+U storage/buffer/frame.{BufferFrame, FrameState};
+
+# Clock hand for the replacement algorithm
+S ClockReplacer {
+    hand: u32,          # Current position of the clock hand
+    capacity: u32,      # Total number of frames
+}
+
+X ClockReplacer {
+    F new(capacity: u32) -> ClockReplacer {
+        ClockReplacer {
+            hand: 0,
+            capacity,
+        }
+    }
+
+    # Find a frame to evict using clock algorithm (single-pass)
+    # Returns frame_id of victim, or None if all frames are pinned
+    F find_victim(mut self, frames: &mut Vec<BufferFrame>) -> Option<u32> {
+        # Single pass: clear reference bits on the fly, evict immediately when bit is 0
+        scanned: u32 := mut 0;
+        found := mut false;
+        victim: u32 := mut 0;
+
+        L !found && scanned < self.capacity {
+            frame := mut &frames[self.hand as u64];
+
+            I frame.is_evictable() {
+                I !frame.clock_ref {
+                    # Found victim: evictable with reference bit already 0
+                    victim = self.hand;
+                    found = true;
+                } E {
+                    # Clear reference bit (second chance) and move on
+                    frames[self.hand as u64].clock_ref = false;
+                }
+            }
+
+            I !found {
+                self.advance();
+            }
+            scanned += 1;
+        }
+
+        I found {
+            self.advance();
+            R Some(victim);
+        }
+
+        # All frames are pinned - no eviction possible
+        None
+    }
+
+    # Advance clock hand (branch-based, avoids modulo)
+    F advance(mut self) {
+        self.hand = self.hand + 1;
+        I self.hand >= self.capacity {
+            self.hand = 0;
+        }
+    }
+
+    # Reset the replacer (e.g., after pool resize)
+    F reset(mut self) {
+        self.hand = 0;
+    }
+
+    # Pin a frame (inform replacer it shouldn't be evicted)
+    F pin(frames: &mut Vec<BufferFrame>, frame_id: u32) {
+        frames[frame_id as u64].pin();
+    }
+
+    # Unpin a frame (it becomes eviction candidate)
+    F unpin(frames: &mut Vec<BufferFrame>, frame_id: u32) {
+        frames[frame_id as u64].unpin();
+    }
+
+    # Get current hand position
+    F current_hand(self) -> u32 {
+        self.hand
+    }
+}

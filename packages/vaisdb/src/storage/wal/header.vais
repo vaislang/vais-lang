@@ -1,0 +1,132 @@
+# WAL Record Header (48 bytes)
+# Based on Stage 2: WAL Design
+# All fields naturally aligned for ARM/strict-alignment architectures
+
+U storage/error.{VaisError, err_wal_corruption};
+U storage/constants.{WAL_RECORD_HEADER_SIZE};
+U storage/checksum.{calculate_wal_checksum, verify_wal_checksum};
+U std/bytes.{ByteBuffer};
+
+# WAL Record Header Structure (48 bytes)
+S WalRecordHeader {
+    lsn: u64,               # 0-7:   Log Sequence Number
+    txn_id: u64,            # 8-15:  Transaction ID
+    prev_lsn: u64,          # 16-23: Previous LSN for this transaction (undo chain)
+    timestamp: u64,         # 24-31: Unix timestamp in microseconds
+    record_length: u32,     # 32-35: Total record length (header + payload)
+    checksum: u32,          # 36-39: CRC32C of entire record
+    record_type: u8,        # 40:    Type of WAL record
+    engine_type: u8,        # 41:    Engine that generated this record
+    reserved: [u8; 6],      # 42-47: Reserved (must be 0)
+}
+
+X WalRecordHeader {
+    # Create a new WAL record header
+    F new(
+        lsn: u64,
+        txn_id: u64,
+        prev_lsn: u64,
+        record_type: u8,
+        engine_type: u8,
+        record_length: u32
+    ) -> WalRecordHeader {
+        timestamp := mut std/time.unix_timestamp_us();
+        WalRecordHeader {
+            lsn,
+            txn_id,
+            prev_lsn,
+            timestamp,
+            record_length,
+            checksum: 0,  # Set to 0, computed later
+            record_type,
+            engine_type,
+            reserved: [0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    # Serialize header to ByteBuffer (little-endian)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.lsn);
+        buf.put_u64_le(self.txn_id);
+        buf.put_u64_le(self.prev_lsn);
+        buf.put_u64_le(self.timestamp);
+        buf.put_u32_le(self.record_length);
+        buf.put_u32_le(self.checksum);
+        buf.put_u8(self.record_type);
+        buf.put_u8(self.engine_type);
+        # Write reserved bytes
+        L i: 0..6 {
+            buf.put_u8(self.reserved[i]);
+        }
+    }
+
+    # Deserialize header from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<WalRecordHeader, VaisError> {
+        lsn := mut buf.get_u64_le()?;
+        txn_id := mut buf.get_u64_le()?;
+        prev_lsn := mut buf.get_u64_le()?;
+        timestamp := mut buf.get_u64_le()?;
+        record_length := mut buf.get_u32_le()?;
+        checksum := mut buf.get_u32_le()?;
+        record_type := mut buf.get_u8()?;
+        engine_type := mut buf.get_u8()?;
+
+        # Read reserved bytes
+        reserved := mut [0u8; 6];
+        L i: 0..6 {
+            reserved[i] = buf.get_u8()?;
+        }
+
+        Ok(WalRecordHeader {
+            lsn,
+            txn_id,
+            prev_lsn,
+            timestamp,
+            record_length,
+            checksum,
+            record_type,
+            engine_type,
+            reserved,
+        })
+    }
+
+    # Serialize header to byte array (48 bytes)
+    F to_bytes(self) -> [u8; 48] {
+        buf := mut ByteBuffer.with_capacity(WAL_RECORD_HEADER_SIZE as u64);
+        self.serialize(&mut buf);
+        bytes := mut [0u8; 48];
+        buf.as_slice().copy_to(&mut bytes, 0);
+        bytes
+    }
+
+    # Deserialize header from byte array
+    F from_bytes(data: &[u8; 48]) -> Result<WalRecordHeader, VaisError> {
+        buf := mut ByteBuffer.from_slice(data);
+        WalRecordHeader.deserialize(&buf)
+    }
+
+    # Verify header checksum against full record data
+    F verify_checksum(self, full_record: &[u8]) -> bool {
+        verify_wal_checksum(full_record)
+    }
+
+    # Compute and set checksum for full record data
+    # Must be called after full record (header + payload) is assembled
+    F set_checksum(&mut self, full_record: &[u8]) {
+        self.checksum = calculate_wal_checksum(full_record);
+    }
+
+    # Get size in bytes
+    F size() -> u32 {
+        WAL_RECORD_HEADER_SIZE
+    }
+}
+
+# Engine Type Constants
+C ENGINE_META: u8 = 0x00;
+C ENGINE_RELATIONAL: u8 = 0x01;
+C ENGINE_VECTOR: u8 = 0x02;
+C ENGINE_GRAPH: u8 = 0x03;
+C ENGINE_FULLTEXT: u8 = 0x04;
+C ENGINE_RAG: u8 = 0x05;
+C ENGINE_SECURITY: u8 = 0x06;

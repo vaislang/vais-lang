@@ -1,0 +1,152 @@
+# Full-Text + Vector Hybrid Search
+#
+# Combines BM25 full-text search with vector similarity search
+# using score fusion techniques.
+
+U std/vec.Vec;
+U fulltext/integration/fusion.{ScoredDoc, ScoreFusionMethod, fuse_results, sort_by_score_desc};
+
+# HybridSearchPipeline - Combines full-text and vector search
+S HybridSearchPipeline {
+    fusion_method: ScoreFusionMethod,
+}
+
+# HybridSearchConfig - Configuration for hybrid search
+S HybridSearchConfig {
+    # Weight for full-text BM25 scores (used in WeightedSum)
+    fulltext_weight: f64,
+
+    # Weight for vector similarity scores (used in WeightedSum)
+    vector_weight: f64,
+
+    # Fusion method to use
+    fusion_method: ScoreFusionMethod,
+
+    # Number of top results to return
+    top_k: u32,
+}
+
+X HybridSearchPipeline {
+    # Create new pipeline with fusion method
+    F new(fusion_method: ScoreFusionMethod) -> HybridSearchPipeline {
+        HybridSearchPipeline { fusion_method }
+    }
+
+    # Create pipeline from config
+    F from_config(config: &HybridSearchConfig) -> HybridSearchPipeline {
+        HybridSearchPipeline {
+            fusion_method: config.fusion_method,
+        }
+    }
+
+    # Perform hybrid search combining BM25 and vector results
+    #
+    # Process:
+    # 1. Fuse BM25 and vector results using configured method
+    # 2. Sort by fused score descending
+    # 3. Return top_k results
+    #
+    # Parameters:
+    # - bm25_results: Full-text search results with BM25 scores
+    # - vector_results: Vector search results with similarity scores
+    # - top_k: Number of top results to return
+    F hybrid_search(
+        &self,
+        bm25_results: &Vec<ScoredDoc>,
+        vector_results: &Vec<ScoredDoc>,
+        top_k: u32,
+    ) -> Vec<ScoredDoc> {
+        # Fuse the two result sets
+        fused := mut fuse_results(&self.fusion_method, bm25_results, vector_results);
+
+        # Return top_k results
+        limit := mut top_k as u64;
+        I limit >= fused.len() {
+            R fused;
+        }
+
+        # Take only top_k
+        top_results: Vec<ScoredDoc> := mut Vec.new();
+        L i: 0..limit {
+            top_results.push(fused[i]);
+        }
+
+        top_results
+    }
+}
+
+X HybridSearchConfig {
+    # Create default config with RRF fusion
+    F default() -> HybridSearchConfig {
+        HybridSearchConfig {
+            fulltext_weight: 0.5,
+            vector_weight: 0.5,
+            fusion_method: ScoreFusionMethod.ReciprocalRankFusion { k: 60 },
+            top_k: 10,
+        }
+    }
+
+    # Create config with weighted sum fusion
+    F weighted_sum(fulltext_weight: f64, vector_weight: f64, top_k: u32) -> HybridSearchConfig {
+        HybridSearchConfig {
+            fulltext_weight,
+            vector_weight,
+            fusion_method: ScoreFusionMethod.WeightedSum {
+                weight_a: fulltext_weight,
+                weight_b: vector_weight,
+            },
+            top_k,
+        }
+    }
+
+    # Create config with RRF fusion
+    F rrf(k: u32, top_k: u32) -> HybridSearchConfig {
+        HybridSearchConfig {
+            fulltext_weight: 0.5,  # Not used for RRF
+            vector_weight: 0.5,    # Not used for RRF
+            fusion_method: ScoreFusionMethod.ReciprocalRankFusion { k },
+            top_k,
+        }
+    }
+}
+
+# Convert full-text M results to ScoredDoc format
+F fulltext_to_scored_docs(results: &Vec<(u64, f64)>) -> Vec<ScoredDoc> {
+    scored: Vec<ScoredDoc> := mut Vec.new();
+
+    L i: 0..results.len() {
+        doc_id := mut results[i].0;
+        score := mut results[i].1;
+        scored.push(ScoredDoc.new(doc_id, score));
+    }
+
+    scored
+}
+
+# Convert vector search results to ScoredDoc format
+F vector_to_scored_docs(results: &Vec<(u64, f64)>) -> Vec<ScoredDoc> {
+    scored: Vec<ScoredDoc> := mut Vec.new();
+
+    L i: 0..results.len() {
+        doc_id := mut results[i].0;
+        score := mut results[i].1;
+        scored.push(ScoredDoc.new(doc_id, score));
+    }
+
+    scored
+}
+
+# Example usage pattern:
+#
+# # BM25 search
+# bm25_results := mut fulltext_engine.search(&query, 100);
+# bm25_scored := mut fulltext_to_scored_docs(&bm25_results);
+#
+# # Vector search
+# vector_results := mut vector_engine.search(&embedding, 100);
+# vector_scored := mut vector_to_scored_docs(&vector_results);
+#
+# # Hybrid search with RRF
+# config := mut HybridSearchConfig.rrf(60, 10);
+# pipeline := mut HybridSearchPipeline.from_config(&config);
+# final_results := mut pipeline.hybrid_search(&bm25_scored, &vector_scored, config.top_k);

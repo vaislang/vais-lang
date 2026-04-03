@@ -1,0 +1,219 @@
+# Stage 2: WAL Integration Tests
+# Tests: WAL header serialization, record writing, segment management,
+#         group commit, prev_lsn chain, checksum verification
+
+U std/test.{assert_eq, assert_ne, assert_true, assert_false, describe, it};
+U std/bytes.{ByteBuffer};
+
+U storage/constants.{WAL_RECORD_HEADER_SIZE, WAL_SEGMENT_HEADER_SIZE, WAL_SEGMENT_MAGIC};
+U storage/wal/header.{WalRecordHeader, ENGINE_META, ENGINE_RELATIONAL};
+U storage/wal/segment.{WalSegmentHeader};
+U storage/wal/record_types.{
+    TXN_BEGIN, TXN_COMMIT, TXN_ABORT,
+    CHECKPOINT_BEGIN, CHECKPOINT_END, CLR, FPI,
+    TUPLE_INSERT, BTREE_INSERT,
+    TxnBeginPayload, TxnCommitPayload, CheckpointBeginPayload,
+    ClrPayload, PageAllocPayload, FpiPayload,
+    ISOLATION_READ_COMMITTED, ISOLATION_SERIALIZABLE,
+};
+U storage/wal/lsn.{LsnAllocator, LsnAllocation, NULL_LSN, lsn_segment, lsn_offset, lsn_compare, lsn_advance};
+U storage/wal/buffer.{WalBuffer};
+U storage/checksum.{calculate_wal_checksum, verify_wal_checksum};
+
+describe("WAL Record Header") {
+    it("should be exactly 48 bytes") {
+        assert_eq(WAL_RECORD_HEADER_SIZE, 48);
+    }
+
+    it("should serialize and deserialize correctly") {
+        header := mut WalRecordHeader.new(
+            100,         # lsn
+            1,           # txn_id
+            0,           # prev_lsn (first record)
+            TXN_BEGIN,   # record_type
+            ENGINE_META, # engine_type
+            56,          # record_length
+        );
+
+        bytes := mut header.to_bytes();
+        bytes_slice := mut bytes[0..bytes.len()];
+        restored := mut WalRecordHeader.from_bytes(&bytes_slice)!;
+
+        assert_eq(restored.lsn, 100);
+        assert_eq(restored.txn_id, 1);
+        assert_eq(restored.prev_lsn, 0);
+        assert_eq(restored.record_type, TXN_BEGIN);
+        assert_eq(restored.engine_type, ENGINE_META);
+        assert_eq(restored.record_length, 56);
+    }
+
+    it("should verify checksum over full record") {
+        buf := mut ByteBuffer.with_capacity(56);
+        header := mut WalRecordHeader.new(1, 1, 0, TXN_BEGIN, ENGINE_META, 56);
+        header.serialize(&buf);
+        # Pad to 56 bytes
+        i := mut buf.len()
+        L i < 56 {
+            buf.write_u8(0)
+            i += 1
+        }
+
+        record := mut buf.to_vec()
+
+        # Compute checksum with field zeroed
+        checksum := mut calculate_wal_checksum(&record);
+        record[36] = (checksum & 0xFF) as u8;
+        record[37] = ((checksum >> 8) & 0xFF) as u8;
+        record[38] = ((checksum >> 16) & 0xFF) as u8;
+        record[39] = ((checksum >> 24) & 0xFF) as u8;
+
+        assert_true(verify_wal_checksum(&record) as i64);
+
+        # Corrupt payload → checksum fails
+        record[50] = 0xFF;
+        assert_false(verify_wal_checksum(&record) as i64);
+    }
+}
+
+describe("WAL Segment Header") {
+    it("should be exactly 32 bytes") {
+        assert_eq(WAL_SEGMENT_HEADER_SIZE, 32);
+    }
+
+    it("should have correct magic number") {
+        seg := mut WalSegmentHeader.new(1, 0);
+        assert_eq(seg.magic, WAL_SEGMENT_MAGIC);
+    }
+
+    it("should serialize/deserialize round-trip") {
+        original := mut WalSegmentHeader.new(42, 1000);
+        bytes := mut original.to_bytes();
+        restored := mut WalSegmentHeader.from_bytes(&bytes)!;
+
+        assert_eq(restored.segment_number, 42);
+        assert_eq(restored.first_lsn, 1000);
+        assert_eq(restored.last_lsn, 1000);
+    }
+}
+
+describe("LSN Allocator") {
+    it("should allocate monotonically increasing LSNs") {
+        alloc := mut LsnAllocator.new(1024 * 1024);  # 1MB segments
+
+        a1 := mut alloc.allocate(100);
+        a2 := mut alloc.allocate(100);
+        a3 := mut alloc.allocate(100);
+
+        assert_true((lsn_compare(a1.lsn, a2.lsn) < 0) as i64);
+        assert_true((lsn_compare(a2.lsn, a3.lsn) < 0) as i64);
+    }
+
+    it("should trigger new segment when full") {
+        alloc := mut LsnAllocator.new(200);  # Tiny segment for testing
+
+        a1 := mut alloc.allocate(100);
+        assert_false(a1.needs_new_segment as i64);
+
+        a2 := mut alloc.allocate(150);  # Exceeds 200
+        assert_true(a2.needs_new_segment as i64);
+
+        assert_ne(lsn_segment(a1.lsn), lsn_segment(a2.lsn));
+    }
+
+    it("should resume from last known LSN") {
+        alloc := mut LsnAllocator.new(1024 * 1024);
+        a1 := mut alloc.allocate(100);
+
+        # Simulate crash recovery: resume from lsn1
+        resumed := mut LsnAllocator.resume(a1.lsn, 1024 * 1024);
+        a2 := mut resumed.allocate(100);
+        assert_true((lsn_compare(a2.lsn, a1.lsn) > 0) as i64);
+    }
+}
+
+describe("WAL Buffer") {
+    it("should accumulate records") {
+        buf := mut WalBuffer.new();
+        assert_true(buf.is_empty());
+
+        data1 := mut [1u8; 48];
+        data2 := mut [2u8; 48];
+
+        buf.append(&data1)!;
+        assert_eq(buf.record_count(), 1);
+
+        buf.append(&data2)!;
+        assert_eq(buf.record_count(), 2);
+        assert_false(buf.is_empty());
+    }
+
+    it("should clear properly") {
+        buf := mut WalBuffer.new();
+        buf.append(&[1u8; 100])!;
+        buf.append(&[2u8; 100])!;
+
+        buf.clear();
+        assert_true(buf.is_empty());
+        assert_eq(buf.record_count(), 0);
+    }
+}
+
+describe("WAL Record Type Payloads") {
+    it("should serialize TXN_BEGIN round-trip") {
+        original := mut TxnBeginPayload { isolation_level: ISOLATION_SERIALIZABLE };
+        buf := mut ByteBuffer.with_capacity(8);
+        original.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut TxnBeginPayload.deserialize(&read_buf)!;
+        assert_eq(restored.isolation_level, ISOLATION_SERIALIZABLE);
+    }
+
+    it("should serialize CHECKPOINT_BEGIN with active txn list") {
+        original := mut CheckpointBeginPayload {
+            active_txns: vec![100, 200, 300],
+        };
+        buf := mut ByteBuffer.with_capacity(32);
+        original.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut CheckpointBeginPayload.deserialize(&read_buf)!;
+        assert_eq(restored.active_txns.len(), 3);
+        assert_eq(restored.active_txns[0], 100);
+        assert_eq(restored.active_txns[1], 200);
+        assert_eq(restored.active_txns[2], 300);
+    }
+
+    it("should serialize CLR payload correctly") {
+        original := mut ClrPayload {
+            original_record_type: TUPLE_INSERT,
+            undo_next_lsn: 500,
+            file_id: 1,
+            page_id: 42,
+        };
+        buf := mut ByteBuffer.with_capacity(16);
+        original.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut ClrPayload.deserialize(&read_buf)!;
+        assert_eq(restored.original_record_type, TUPLE_INSERT);
+        assert_eq(restored.undo_next_lsn, 500);
+        assert_eq(restored.file_id, 1);
+        assert_eq(restored.page_id, 42);
+    }
+}
+
+describe("prev_lsn Chain") {
+    it("should maintain per-transaction undo chain") {
+        # Simulate prev_lsn chain for transaction 1:
+        # Record A (lsn=100, prev_lsn=0) → Record B (lsn=200, prev_lsn=100) → Record C (lsn=300, prev_lsn=200)
+        h1 := mut WalRecordHeader.new(100, 1, 0,   TXN_BEGIN, ENGINE_META, 48);
+        h2 := mut WalRecordHeader.new(200, 1, 100, TUPLE_INSERT, ENGINE_RELATIONAL, 80);
+        h3 := mut WalRecordHeader.new(300, 1, 200, TXN_COMMIT, ENGINE_META, 48);
+
+        # Walk chain backwards from h3
+        assert_eq(h3.prev_lsn, 200);
+        assert_eq(h2.prev_lsn, 100);
+        assert_eq(h1.prev_lsn, 0);  # First record has prev_lsn = 0
+    }
+}

@@ -1,0 +1,172 @@
+# Undo Log Entry Format
+# 28-byte fixed header + variable old_data
+# Based on Stage 1 Section 7 and Stage 3 Section 1
+
+U std/bytes.{ByteBuffer};
+U storage/constants.{UNDO_ENTRY_HEADER_SIZE, UNDO_INSERT, UNDO_UPDATE, UNDO_DELETE};
+U storage/error.{VaisError, err_internal};
+
+# Undo entry: records a previous version for rollback/snapshot reads
+S UndoEntry {
+    txn_id: u64,           # Transaction that created this undo entry
+    prev_undo_ptr: u64,    # Previous undo entry in chain (0 = none)
+    entry_type: u8,        # UNDO_INSERT=1, UNDO_DELETE=2, UNDO_UPDATE=3
+    file_id: u8,           # File containing the affected page
+    page_id: u32,          # Page containing the affected tuple
+    slot_id: u16,          # Slot within the page
+    data_len: u32,         # Length of old_data
+    old_data: Vec<u8>,     # Old tuple data (for UPDATE/DELETE)
+}
+
+X UndoEntry {
+    # Create an INSERT undo entry (no old data)
+    F new_insert(
+        txn_id: u64,
+        prev_undo_ptr: u64,
+        file_id: u8,
+        page_id: u32,
+        slot_id: u16,
+    ) -> UndoEntry {
+        UndoEntry {
+            txn_id,
+            prev_undo_ptr,
+            entry_type: UNDO_INSERT,
+            file_id,
+            page_id,
+            slot_id,
+            data_len: 0,
+            old_data: Vec.new(),
+        }
+    }
+
+    # Create a DELETE undo entry with old tuple data
+    F new_delete(
+        txn_id: u64,
+        prev_undo_ptr: u64,
+        file_id: u8,
+        page_id: u32,
+        slot_id: u16,
+        old_data: Vec<u8>,
+    ) -> UndoEntry {
+        data_len := mut old_data.len() as u32;
+        UndoEntry {
+            txn_id,
+            prev_undo_ptr,
+            entry_type: UNDO_DELETE,
+            file_id,
+            page_id,
+            slot_id,
+            data_len,
+            old_data,
+        }
+    }
+
+    # Create an UPDATE undo entry with old tuple data
+    F new_update(
+        txn_id: u64,
+        prev_undo_ptr: u64,
+        file_id: u8,
+        page_id: u32,
+        slot_id: u16,
+        old_data: Vec<u8>,
+    ) -> UndoEntry {
+        data_len := mut old_data.len() as u32;
+        UndoEntry {
+            txn_id,
+            prev_undo_ptr,
+            entry_type: UNDO_UPDATE,
+            file_id,
+            page_id,
+            slot_id,
+            data_len,
+            old_data,
+        }
+    }
+
+    # Calculate total size of this entry when serialized
+    F serialized_size(self) -> u32 {
+        UNDO_ENTRY_HEADER_SIZE + self.data_len
+    }
+
+    # Check if this is an INSERT undo entry
+    F is_insert(self) -> bool {
+        self.entry_type == UNDO_INSERT
+    }
+
+    # Check if this is a DELETE undo entry
+    F is_delete(self) -> bool {
+        self.entry_type == UNDO_DELETE
+    }
+
+    # Check if this is an UPDATE undo entry
+    F is_update(self) -> bool {
+        self.entry_type == UNDO_UPDATE
+    }
+
+    # Check if this entry has a previous entry in the chain
+    F has_prev(self) -> bool {
+        self.prev_undo_ptr != 0
+    }
+
+    # Get the entry type as a string (for debugging)
+    F entry_type_str(self) -> Str {
+        M self.entry_type {
+            UNDO_INSERT => "INSERT",
+            UNDO_DELETE => "DELETE",
+            UNDO_UPDATE => "UPDATE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    # Serialize to ByteBuffer (28-byte header + variable old_data)
+    F serialize(self, buf: &mut ByteBuffer) {
+        # Fixed header: 28 bytes
+        buf.put_u64_le(self.txn_id);           # 0-7
+        buf.put_u64_le(self.prev_undo_ptr);    # 8-15
+        buf.put_u8(self.entry_type);           # 16
+        buf.put_u8(self.file_id);              # 17
+        buf.put_u32_le(self.page_id);          # 18-21
+        buf.put_u16_le(self.slot_id);          # 22-23
+        buf.put_u32_le(self.data_len);         # 24-27
+
+        # Variable data
+        I self.data_len > 0 {
+            buf.put_bytes(&self.old_data);
+        }
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<UndoEntry, VaisError> {
+        # Read fixed header: 28 bytes
+        txn_id := mut buf.get_u64_le()?;
+        prev_undo_ptr := mut buf.get_u64_le()?;
+        entry_type := mut buf.get_u8()?;
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        slot_id := mut buf.get_u16_le()?;
+        data_len := mut buf.get_u32_le()?;
+
+        # Validate entry type
+        I entry_type != UNDO_INSERT && entry_type != UNDO_DELETE && entry_type != UNDO_UPDATE {
+            R Err(err_internal("Invalid undo entry type: {entry_type}"));
+        }
+
+        # Read variable data
+        old_data := mut I data_len > 0 {
+            buf.get_bytes(data_len as u64)?
+        } E {
+            Vec.new()
+        };
+
+        Ok(UndoEntry {
+            txn_id,
+            prev_undo_ptr,
+            entry_type,
+            file_id,
+            page_id,
+            slot_id,
+            data_len,
+            old_data,
+        })
+    }
+}

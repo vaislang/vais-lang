@@ -1,0 +1,618 @@
+# SQL Tokenizer
+# Converts SQL text into a stream of tokens
+# Supports: keywords, identifiers, literals (string, integer, float, NULL),
+# operators, parentheses, comma, semicolon, parameter markers ($1, $2)
+
+U storage/error.{VaisError};
+
+# Token types
+L TokenKind =
+    # Keywords
+    Select | Insert | Into | Update | Delete | From | Where | Set |
+    Create | Drop | Alter | Table | Index | Column | Add | Rename |
+    Values | And | Or | Not | Null | Is | In | Between | Like | Exists |
+    Join | Inner | Left | Right | Cross | On | Using | As |
+    Order | By | Asc | Desc | Group | Having | Limit | Offset |
+    Union | Intersect | Except | All | Distinct |
+    Case | When | Then | Else | End |
+    With | Recursive |
+    Primary | Key | Unique | Check | Default | References | Foreign |
+    Int_Kw | Float_Kw | Bool_Kw | Varchar | Text_Kw | Blob_Kw |
+    Date_Kw | Timestamp_Kw | Vector_Kw |
+    True_Kw | False_Kw |
+    Cast | Nulls | First | Last |
+    Explain | Analyze |
+    Begin | Commit | Rollback | Transaction |
+    Count | Sum | Avg | Min | Max |
+    Row_Number | Rank | Dense_Rank | Over | Partition |
+    Window |
+    # Security / Auth keywords (Phase 10)
+    User_Kw | Role_Kw | Grant_Kw | Revoke_Kw |
+    Password_Kw | Login_Kw | Connection_Kw |
+    Policy_Kw | Enable_Kw | Disable_Kw | Row_Kw | Level_Kw |
+    # Literals & Identifiers
+    IntLit { v: i64 } |
+    FloatLit { v: f64 } |
+    StringLit { v: Str } |
+    Identifier { v: Str } |
+    Parameter { idx: u32 } |    # $1, $2, ...
+    # Operators
+    Plus | Minus | Star | Slash | Percent |
+    Eq | Neq | Lt | Gt | Le | Ge |
+    Dot | Comma | Semicolon |
+    LParen | RParen |
+    Pipe |                       # ||  (string concat)
+    # Special
+    Eof;
+
+# Token with source location
+S Token {
+    kind: TokenKind,
+    line: u32,
+    col: u32,
+}
+
+X Token {
+    F new(kind: TokenKind, line: u32, col: u32) -> Token {
+        Token { kind, line, col }
+    }
+}
+
+# SQL Tokenizer
+S Tokenizer {
+    input: Vec<u8>,      # UTF-8 bytes of SQL input
+    pos: u64,          # Current byte position
+    line: u32,           # Current line number (1-based)
+    col: u32,            # Current column number (1-based)
+}
+
+X Tokenizer {
+    # Create a new tokenizer from SQL string
+    F new(input: Str) -> Tokenizer {
+        Tokenizer {
+            input: input.as_bytes().to_vec(),
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    # Get next token from input
+    F next_token(mut self) -> Result<Token, VaisError> {
+        self.skip_whitespace_and_comments();
+
+        I self.is_at_end() {
+            R Ok(Token.new(TokenKind.Eof, self.line, self.col));
+        }
+
+        start_line := self.line;
+        start_col := self.col;
+        ch := self.peek();
+
+        # Handle single-character and multi-character operators
+        kind := M ch {
+            b'(' => {
+                self.advance();
+                TokenKind.LParen
+            },
+            b')' => {
+                self.advance();
+                TokenKind.RParen
+            },
+            b',' => {
+                self.advance();
+                TokenKind.Comma
+            },
+            b';' => {
+                self.advance();
+                TokenKind.Semicolon
+            },
+            b'.' => {
+                self.advance();
+                TokenKind.Dot
+            },
+            b'+' => {
+                self.advance();
+                TokenKind.Plus
+            },
+            b'-' => {
+                self.advance();
+                # Could be -- comment, but we handle that in skip_whitespace
+                TokenKind.Minus
+            },
+            b'*' => {
+                self.advance();
+                TokenKind.Star
+            },
+            b'/' => {
+                self.advance();
+                # Could be /* comment, but we handle that in skip_whitespace
+                TokenKind.Slash
+            },
+            b'%' => {
+                self.advance();
+                TokenKind.Percent
+            },
+            b'=' => {
+                self.advance();
+                TokenKind.Eq
+            },
+            b'<' => {
+                self.advance();
+                I self.peek() == b'=' {
+                    self.advance();
+                    TokenKind.Le
+                } E I self.peek() == b'>' {
+                    self.advance();
+                    TokenKind.Neq
+                } E {
+                    TokenKind.Lt
+                }
+            },
+            b'>' => {
+                self.advance();
+                I self.peek() == b'=' {
+                    self.advance();
+                    TokenKind.Ge
+                } E {
+                    TokenKind.Gt
+                }
+            },
+            b'!' => {
+                self.advance();
+                I self.peek() == b'=' {
+                    self.advance();
+                    TokenKind.Neq
+                } E {
+                    R Err(VaisError.new(
+                        "VAIS-0101001",
+                        "SQL parse error at line {start_line}, col {start_col}: unexpected character '!'"
+                    ));
+                }
+            },
+            b'|' => {
+                self.advance();
+                I self.peek() == b'|' {
+                    self.advance();
+                    TokenKind.Pipe
+                } E {
+                    R Err(VaisError.new(
+                        "VAIS-0101001",
+                        "SQL parse error at line {start_line}, col {start_col}: unexpected character '|'"
+                    ));
+                }
+            },
+            b'\'' => {
+                R self.read_string_literal();
+            },
+            b'$' => {
+                R self.read_parameter();
+            },
+            _ => {
+                I self.is_digit(ch) {
+                    R self.read_number();
+                } E I self.is_alpha(ch) || ch == b'_' {
+                    R Ok(Token.new(self.read_identifier_or_keyword(), start_line, start_col));
+                } E {
+                    ch_str := Str.from_utf8_lossy(&[ch]);
+                    R Err(VaisError.new(
+                        "VAIS-0101001",
+                        "SQL parse error at line {start_line}, col {start_col}: unexpected character '{ch_str}'"
+                    ));
+                }
+            }
+        };
+
+        Ok(Token.new(kind, start_line, start_col))
+    }
+
+    # Tokenize entire input into vector of tokens
+    F tokenize_all(mut self) -> Result<Vec<Token>, VaisError> {
+        tokens := mut Vec.new();
+        at_eof := mut false;
+        L !at_eof {
+            tok := self.next_token()?;
+            at_eof = M tok.kind {
+                TokenKind.Eof => true,
+                _ => false,
+            };
+            tokens.push(tok);
+        }
+        Ok(tokens)
+    }
+
+    # Skip whitespace and comments
+    F skip_whitespace_and_comments(mut self) {
+        skipping := mut true;
+        L skipping {
+            ch := self.peek();
+            I ch == b' ' || ch == b'\t' || ch == b'\n' || ch == b'\r' {
+                self.skip_whitespace();
+            } E I ch == b'-' && self.peek_ahead(1) == b'-' {
+                self.skip_line_comment();
+            } E I ch == b'/' && self.peek_ahead(1) == b'*' {
+                self.skip_block_comment();
+            } E {
+                skipping = false;
+            }
+        }
+    }
+
+    # Skip whitespace characters
+    F skip_whitespace(mut self) {
+        in_ws := mut true;
+        L !(self.is_at_end()) && in_ws {
+            ch := self.peek();
+            I ch == b' ' || ch == b'\t' {
+                self.advance();
+            } E I ch == b'\n' {
+                self.advance();
+                self.line += 1;
+                self.col = 1;
+            } E I ch == b'\r' {
+                self.advance();
+                # Handle \r\n
+                I self.peek() == b'\n' {
+                    self.advance();
+                }
+                self.line += 1;
+                self.col = 1;
+            } E {
+                in_ws = false;
+            }
+        }
+    }
+
+    # Skip line comment (-- to end of line)
+    F skip_line_comment(mut self) {
+        # Skip the --
+        self.advance();
+        self.advance();
+
+        # Read until end of line or EOF
+        L !self.is_at_end() && self.peek() != b'\n' {
+            self.advance();
+        }
+    }
+
+    # Skip block comment (/* ... */)
+    F skip_block_comment(mut self) {
+        # Skip the /*
+        self.advance();
+        self.advance();
+
+        # Read until */ or EOF
+        found_end := mut false;
+        L !(self.is_at_end()) && !found_end {
+            I self.peek() == b'*' && self.peek_ahead(1) == b'/' {
+                self.advance();
+                self.advance();
+                found_end = true;
+            } E {
+                I self.peek() == b'\n' {
+                    self.line += 1;
+                    self.col = 0;  # Will be incremented to 1 by advance()
+                }
+                self.advance();
+            }
+        }
+    }
+
+    # Read integer or float literal
+    F read_number(mut self) -> Result<Token, VaisError> {
+        start_line := self.line;
+        start_col := self.col;
+        num_str := mut Vec.new();
+        is_float := mut false;
+
+        # Read digits
+        L !self.is_at_end() && self.is_digit(self.peek()) {
+            num_str.push(self.advance());
+        }
+
+        # Check for decimal point
+        I !self.is_at_end() && self.peek() == b'.' && self.is_digit(self.peek_ahead(1)) {
+            is_float = true;
+            num_str.push(self.advance());  # consume '.'
+
+            L !self.is_at_end() && self.is_digit(self.peek()) {
+                num_str.push(self.advance());
+            }
+        }
+
+        # Check for scientific notation
+        I !self.is_at_end() && (self.peek() == b'e' || self.peek() == b'E') {
+            is_float = true;
+            num_str.push(self.advance());  # consume 'e' or 'E'
+
+            I !self.is_at_end() && (self.peek() == b'+' || self.peek() == b'-') {
+                num_str.push(self.advance());
+            }
+
+            I !self.is_digit(self.peek()) {
+                R Err(VaisError.new(
+                    "VAIS-0101001",
+                    "SQL parse error at line {start_line}, col {start_col}: invalid number format"
+                ));
+            }
+
+            L !self.is_at_end() && self.is_digit(self.peek()) {
+                num_str.push(self.advance());
+            }
+        }
+
+        num_string := Str.from_utf8_lossy(&num_str);
+
+        I is_float {
+            v := M num_string.parse_f64() {
+                Ok(val) => val,
+                Err(_) => R Err(VaisError.new(
+                    "VAIS-0101001",
+                    "SQL parse error at line {start_line}, col {start_col}: invalid float literal '{num_string}'"
+                )),
+            };
+            Ok(Token.new(TokenKind.FloatLit { v }, start_line, start_col))
+        } E {
+            v := M num_string.parse_i64() {
+                Ok(val) => val,
+                Err(_) => R Err(VaisError.new(
+                    "VAIS-0101001",
+                    "SQL parse error at line {start_line}, col {start_col}: invalid integer literal '{num_string}'"
+                )),
+            };
+            Ok(Token.new(TokenKind.IntLit { v }, start_line, start_col))
+        }
+    }
+
+    # Read string literal ('...' with '' escape)
+    F read_string_literal(mut self) -> Result<Token, VaisError> {
+        start_line := self.line;
+        start_col := self.col;
+
+        # Skip opening '
+        self.advance();
+
+        str_content := mut Vec.new();
+
+        str_closed := mut false;
+        L !str_closed {
+            I self.is_at_end() {
+                R Err(VaisError.new(
+                    "VAIS-0101001",
+                    "SQL parse error at line {start_line}, col {start_col}: unterminated string literal"
+                ));
+            }
+
+            ch := self.peek();
+
+            I ch == b'\'' {
+                self.advance();
+                # Check for '' escape
+                I self.peek() == b'\'' {
+                    str_content.push(b'\'');
+                    self.advance();
+                } E {
+                    # End of string
+                    str_closed = true;
+                }
+            } E I ch == b'\n' {
+                # Allow newlines in strings
+                str_content.push(self.advance());
+                self.line += 1;
+                self.col = 1;
+            } E {
+                str_content.push(self.advance());
+            }
+        }
+
+        v := Str.from_utf8_lossy(&str_content);
+        Ok(Token.new(TokenKind.StringLit { v }, start_line, start_col))
+    }
+
+    # Read identifier or keyword
+    F read_identifier_or_keyword(mut self) -> TokenKind {
+        ident := mut Vec.new();
+
+        in_ident := mut true;
+        L !(self.is_at_end()) && in_ident {
+            ch := self.peek();
+            I self.is_alpha(ch) || self.is_digit(ch) || ch == b'_' {
+                ident.push(self.advance());
+            } E {
+                in_ident = false;
+            }
+        }
+
+        ident_str := Str.from_utf8_lossy(&ident);
+        upper := ident_str.to_uppercase();
+
+        # Check if keyword (case-insensitive)
+        M upper.as_str() {
+            "SELECT" => TokenKind.Select,
+            "INSERT" => TokenKind.Insert,
+            "INTO" => TokenKind.Into,
+            "UPDATE" => TokenKind.Update,
+            "DELETE" => TokenKind.Delete,
+            "FROM" => TokenKind.From,
+            "WHERE" => TokenKind.Where,
+            "SET" => TokenKind.Set,
+            "CREATE" => TokenKind.Create,
+            "DROP" => TokenKind.Drop,
+            "ALTER" => TokenKind.Alter,
+            "TABLE" => TokenKind.Table,
+            "INDEX" => TokenKind.Index,
+            "COLUMN" => TokenKind.Column,
+            "ADD" => TokenKind.Add,
+            "RENAME" => TokenKind.Rename,
+            "VALUES" => TokenKind.Values,
+            "AND" => TokenKind.And,
+            "OR" => TokenKind.Or,
+            "NOT" => TokenKind.Not,
+            "NULL" => TokenKind.Null,
+            "IS" => TokenKind.Is,
+            "IN" => TokenKind.In,
+            "BETWEEN" => TokenKind.Between,
+            "LIKE" => TokenKind.Like,
+            "EXISTS" => TokenKind.Exists,
+            "JOIN" => TokenKind.Join,
+            "INNER" => TokenKind.Inner,
+            "LEFT" => TokenKind.Left,
+            "RIGHT" => TokenKind.Right,
+            "CROSS" => TokenKind.Cross,
+            "ON" => TokenKind.On,
+            "USING" => TokenKind.Using,
+            "AS" => TokenKind.As,
+            "ORDER" => TokenKind.Order,
+            "BY" => TokenKind.By,
+            "ASC" => TokenKind.Asc,
+            "DESC" => TokenKind.Desc,
+            "GROUP" => TokenKind.Group,
+            "HAVING" => TokenKind.Having,
+            "LIMIT" => TokenKind.Limit,
+            "OFFSET" => TokenKind.Offset,
+            "UNION" => TokenKind.Union,
+            "INTERSECT" => TokenKind.Intersect,
+            "EXCEPT" => TokenKind.Except,
+            "ALL" => TokenKind.All,
+            "DISTINCT" => TokenKind.Distinct,
+            "CASE" => TokenKind.Case,
+            "WHEN" => TokenKind.When,
+            "THEN" => TokenKind.Then,
+            "ELSE" => TokenKind.Else,
+            "END" => TokenKind.End,
+            "WITH" => TokenKind.With,
+            "RECURSIVE" => TokenKind.Recursive,
+            "PRIMARY" => TokenKind.Primary,
+            "KEY" => TokenKind.Key,
+            "UNIQUE" => TokenKind.Unique,
+            "CHECK" => TokenKind.Check,
+            "DEFAULT" => TokenKind.Default,
+            "REFERENCES" => TokenKind.References,
+            "FOREIGN" => TokenKind.Foreign,
+            "INT" => TokenKind.Int_Kw,
+            "INTEGER" => TokenKind.Int_Kw,
+            "FLOAT" => TokenKind.Float_Kw,
+            "DOUBLE" => TokenKind.Float_Kw,
+            "REAL" => TokenKind.Float_Kw,
+            "BOOL" => TokenKind.Bool_Kw,
+            "BOOLEAN" => TokenKind.Bool_Kw,
+            "VARCHAR" => TokenKind.Varchar,
+            "TEXT" => TokenKind.Text_Kw,
+            "BLOB" => TokenKind.Blob_Kw,
+            "DATE" => TokenKind.Date_Kw,
+            "TIMESTAMP" => TokenKind.Timestamp_Kw,
+            "VECTOR" => TokenKind.Vector_Kw,
+            "TRUE" => TokenKind.True_Kw,
+            "FALSE" => TokenKind.False_Kw,
+            "CAST" => TokenKind.Cast,
+            "NULLS" => TokenKind.Nulls,
+            "FIRST" => TokenKind.First,
+            "LAST" => TokenKind.Last,
+            "EXPLAIN" => TokenKind.Explain,
+            "ANALYZE" => TokenKind.Analyze,
+            "BEGIN" => TokenKind.Begin,
+            "COMMIT" => TokenKind.Commit,
+            "ROLLBACK" => TokenKind.Rollback,
+            "TRANSACTION" => TokenKind.Transaction,
+            "COUNT" => TokenKind.Count,
+            "SUM" => TokenKind.Sum,
+            "AVG" => TokenKind.Avg,
+            "MIN" => TokenKind.Min,
+            "MAX" => TokenKind.Max,
+            "ROW_NUMBER" => TokenKind.Row_Number,
+            "RANK" => TokenKind.Rank,
+            "DENSE_RANK" => TokenKind.Dense_Rank,
+            "OVER" => TokenKind.Over,
+            "PARTITION" => TokenKind.Partition,
+            "WINDOW" => TokenKind.Window,
+            # Security / Auth keywords (Phase 10)
+            "USER" => TokenKind.User_Kw,
+            "ROLE" => TokenKind.Role_Kw,
+            "GRANT" => TokenKind.Grant_Kw,
+            "REVOKE" => TokenKind.Revoke_Kw,
+            "PASSWORD" => TokenKind.Password_Kw,
+            "LOGIN" => TokenKind.Login_Kw,
+            "CONNECTION" => TokenKind.Connection_Kw,
+            "POLICY" => TokenKind.Policy_Kw,
+            "ENABLE" => TokenKind.Enable_Kw,
+            "DISABLE" => TokenKind.Disable_Kw,
+            "ROW" => TokenKind.Row_Kw,
+            "LEVEL" => TokenKind.Level_Kw,
+            _ => TokenKind.Identifier { v: ident_str },
+        }
+    }
+
+    # Read parameter marker ($1, $2, ...)
+    F read_parameter(mut self) -> Result<Token, VaisError> {
+        start_line := self.line;
+        start_col := self.col;
+
+        # Skip $
+        self.advance();
+
+        I !self.is_digit(self.peek()) {
+            R Err(VaisError.new(
+                "VAIS-0101001",
+                "SQL parse error at line {start_line}, col {start_col}: invalid parameter marker (expected digit after '$')"
+            ));
+        }
+
+        num_str := mut Vec.new();
+        L !self.is_at_end() && self.is_digit(self.peek()) {
+            num_str.push(self.advance());
+        }
+
+        num_string := Str.from_utf8_lossy(&num_str);
+        idx := M num_string.parse_u32() {
+            Ok(val) => val,
+            Err(_) => R Err(VaisError.new(
+                "VAIS-0101001",
+                "SQL parse error at line {start_line}, col {start_col}: invalid parameter index '{num_string}'"
+            )),
+        };
+
+        Ok(Token.new(TokenKind.Parameter { idx }, start_line, start_col))
+    }
+
+    # Peek at current byte (0 if at end)
+    F peek(self) -> u8 {
+        I self.is_at_end() {
+            0
+        } E {
+            self.input[self.pos]
+        }
+    }
+
+    # Peek ahead N bytes (0 if out of bounds)
+    F peek_ahead(self, n: u64) -> u8 {
+        pos := self.pos + n;
+        I pos >= self.input.len() {
+            0
+        } E {
+            self.input[pos]
+        }
+    }
+
+    # Consume and return current byte, update column
+    F advance(mut self) -> u8 {
+        ch := self.input[self.pos];
+        self.pos += 1;
+        self.col += 1;
+        ch
+    }
+
+    # Check if at end of input
+    F is_at_end(self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    # Check if byte is a digit
+    F is_digit(self, ch: u8) -> bool {
+        ch >= b'0' && ch <= b'9'
+    }
+
+    # Check if byte is alphabetic
+    F is_alpha(self, ch: u8) -> bool {
+        (ch >= b'a' && ch <= b'z') || (ch >= b'A' && ch <= b'Z')
+    }
+}

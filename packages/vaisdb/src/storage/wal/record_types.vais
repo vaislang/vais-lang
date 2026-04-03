@@ -1,0 +1,295 @@
+# WAL Record Type Registry
+# Based on Stage 2: WAL Design
+# Defines all record type constants and their meta/relational payloads
+
+U storage/error.{VaisError};
+U storage/bytes.{write_bytes, read_bytes, write_vec_u64, read_vec_u64, write_string, read_string};
+U std/bytes.{ByteBuffer};
+
+# ============================================================================
+# Meta Records (0x00-0x0F)
+# ============================================================================
+
+C TXN_BEGIN: u8 = 0x00;
+C TXN_COMMIT: u8 = 0x01;
+C TXN_ABORT: u8 = 0x02;
+C CHECKPOINT_BEGIN: u8 = 0x03;
+C CHECKPOINT_END: u8 = 0x04;
+C SCHEMA_CHANGE: u8 = 0x05;
+C CLR: u8 = 0x06;
+C PAGE_ALLOC: u8 = 0x07;
+C PAGE_DEALLOC: u8 = 0x08;
+C FPI: u8 = 0x09;
+
+# ============================================================================
+# Relational Records (0x10-0x1F)
+# ============================================================================
+
+C PAGE_WRITE: u8 = 0x10;
+C TUPLE_INSERT: u8 = 0x11;
+C TUPLE_DELETE: u8 = 0x12;
+C TUPLE_UPDATE: u8 = 0x13;
+C BTREE_SPLIT: u8 = 0x14;
+C BTREE_MERGE: u8 = 0x15;
+C BTREE_INSERT: u8 = 0x16;
+C BTREE_DELETE: u8 = 0x17;
+
+# ============================================================================
+# Vector Records (0x20-0x2F)
+# ============================================================================
+
+C HNSW_INSERT_NODE: u8 = 0x20;
+C HNSW_DELETE_NODE: u8 = 0x21;
+C HNSW_UPDATE_EDGES: u8 = 0x22;
+C HNSW_LAYER_PROMOTE: u8 = 0x23;
+C VECTOR_DATA_WRITE: u8 = 0x24;
+C QUANTIZATION_UPDATE: u8 = 0x25;
+
+# ============================================================================
+# Graph Records (0x30-0x3F)
+# ============================================================================
+
+C GRAPH_NODE_INSERT: u8 = 0x30;
+C GRAPH_NODE_DELETE: u8 = 0x31;
+C GRAPH_EDGE_INSERT: u8 = 0x32;
+C GRAPH_EDGE_DELETE: u8 = 0x33;
+C GRAPH_PROPERTY_UPDATE: u8 = 0x34;
+C ADJ_LIST_PAGE_SPLIT: u8 = 0x35;
+
+# ============================================================================
+# Full-Text Records (0x40-0x4F)
+# ============================================================================
+
+C POSTING_LIST_APPEND: u8 = 0x40;
+C POSTING_LIST_DELETE: u8 = 0x41;
+C DICTIONARY_INSERT: u8 = 0x42;
+C DICTIONARY_DELETE: u8 = 0x43;
+C TERM_FREQ_UPDATE: u8 = 0x44;
+
+# ============================================================================
+# RAG Records (0x50-0x5F)
+# ============================================================================
+
+C RAG_DOC_INSERT: u8 = 0x50;
+C RAG_DOC_DELETE: u8 = 0x51;
+C RAG_CHUNK_INSERT: u8 = 0x52;
+C RAG_CHUNK_DELETE: u8 = 0x53;
+C RAG_MEMORY_INSERT: u8 = 0x54;
+C RAG_MEMORY_DELETE: u8 = 0x55;
+
+# ============================================================================
+# Security Records (0x60-0x6F)
+# ============================================================================
+
+C SECURITY_USER_CREATE: u8 = 0x60;
+C SECURITY_USER_ALTER: u8 = 0x61;
+C SECURITY_USER_DROP: u8 = 0x62;
+C SECURITY_ROLE_CREATE: u8 = 0x63;
+C SECURITY_ROLE_DROP: u8 = 0x64;
+C SECURITY_GRANT_CHANGE: u8 = 0x65;
+
+# ============================================================================
+# Meta Record Payloads
+# ============================================================================
+
+# TXN_BEGIN payload
+S TxnBeginPayload {
+    isolation_level: u8,  # 0=READ_UNCOMMITTED, 1=READ_COMMITTED, 2=REPEATABLE_READ, 3=SERIALIZABLE
+}
+
+X TxnBeginPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.isolation_level);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TxnBeginPayload, VaisError> {
+        isolation_level := mut buf.get_u8()?;
+        Ok(TxnBeginPayload { isolation_level })
+    }
+}
+
+# TXN_COMMIT payload (empty)
+S TxnCommitPayload {}
+
+X TxnCommitPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        # No fields
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TxnCommitPayload, VaisError> {
+        Ok(TxnCommitPayload {})
+    }
+}
+
+# TXN_ABORT payload (empty)
+S TxnAbortPayload {}
+
+X TxnAbortPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        # No fields
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<TxnAbortPayload, VaisError> {
+        Ok(TxnAbortPayload {})
+    }
+}
+
+# CHECKPOINT_BEGIN payload
+S CheckpointBeginPayload {
+    active_txns: Vec<u64>,  # List of active transaction IDs at checkpoint start
+}
+
+X CheckpointBeginPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        write_vec_u64(buf, &self.active_txns);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<CheckpointBeginPayload, VaisError> {
+        active_txns := mut read_vec_u64(buf)?;
+        Ok(CheckpointBeginPayload { active_txns })
+    }
+}
+
+# CHECKPOINT_END payload (empty)
+S CheckpointEndPayload {}
+
+X CheckpointEndPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        # No fields
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<CheckpointEndPayload, VaisError> {
+        Ok(CheckpointEndPayload {})
+    }
+}
+
+# SCHEMA_CHANGE payload
+S SchemaChangePayload {
+    change_type: u8,      # 0=CREATE_TABLE, 1=DROP_TABLE, 2=ALTER_TABLE, etc.
+    schema_data: Vec<u8>, # DDL serialized data
+}
+
+X SchemaChangePayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.change_type);
+        write_bytes(buf, &self.schema_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<SchemaChangePayload, VaisError> {
+        change_type := mut buf.get_u8()?;
+        schema_data := mut read_bytes(buf)?;
+        Ok(SchemaChangePayload { change_type, schema_data })
+    }
+}
+
+# CLR (Compensation Log Record) payload
+S ClrPayload {
+    original_record_type: u8,  # Type of record being undone
+    undo_next_lsn: u64,        # Next LSN to undo (skip already-undone records)
+    file_id: u8,               # Physical page reference
+    page_id: u32,              # Physical page reference
+}
+
+X ClrPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.original_record_type);
+        buf.put_u64_le(self.undo_next_lsn);
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<ClrPayload, VaisError> {
+        original_record_type := mut buf.get_u8()?;
+        undo_next_lsn := mut buf.get_u64_le()?;
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        Ok(ClrPayload {
+            original_record_type,
+            undo_next_lsn,
+            file_id,
+            page_id,
+        })
+    }
+}
+
+# PAGE_ALLOC payload
+S PageAllocPayload {
+    file_id: u8,
+    page_id: u32,
+    page_type: u8,  # Type of page being allocated
+}
+
+X PageAllocPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        buf.put_u8(self.page_type);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<PageAllocPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        page_type := mut buf.get_u8()?;
+        Ok(PageAllocPayload { file_id, page_id, page_type })
+    }
+}
+
+# PAGE_DEALLOC payload
+S PageDeallocPayload {
+    file_id: u8,
+    page_id: u32,
+}
+
+X PageDeallocPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<PageDeallocPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        Ok(PageDeallocPayload { file_id, page_id })
+    }
+}
+
+# FPI (Full Page Image) payload
+S FpiPayload {
+    file_id: u8,
+    page_id: u32,
+    page_data: Vec<u8>,  # Complete page contents (PAGE_SIZE bytes)
+}
+
+X FpiPayload {
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.file_id);
+        buf.put_u32_le(self.page_id);
+        write_bytes(buf, &self.page_data);
+    }
+
+    F deserialize(buf: &ByteBuffer) -> Result<FpiPayload, VaisError> {
+        file_id := mut buf.get_u8()?;
+        page_id := mut buf.get_u32_le()?;
+        page_data := mut read_bytes(buf)?;
+        Ok(FpiPayload { file_id, page_id, page_data })
+    }
+}
+
+# ============================================================================
+# Isolation Level Constants
+# ============================================================================
+
+C ISOLATION_READ_UNCOMMITTED: u8 = 0;
+C ISOLATION_READ_COMMITTED: u8 = 1;
+C ISOLATION_REPEATABLE_READ: u8 = 2;
+C ISOLATION_SERIALIZABLE: u8 = 3;
+
+# ============================================================================
+# Schema Change Type Constants
+# ============================================================================
+
+C SCHEMA_CREATE_TABLE: u8 = 0;
+C SCHEMA_DROP_TABLE: u8 = 1;
+C SCHEMA_ALTER_TABLE: u8 = 2;
+C SCHEMA_CREATE_INDEX: u8 = 3;
+C SCHEMA_DROP_INDEX: u8 = 4;

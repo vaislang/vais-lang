@@ -1,0 +1,486 @@
+# Phase 11: Vector Engine Unit Tests
+# Tests: distance metrics (cosine, L2, dot product), dimension validation,
+#         normalization, batch compute, DistanceComputer, HNSW types,
+#         HnswConfig, HnswMeta, HnswNode, SearchCandidate, LayerRng
+
+U std/test.{assert_eq, assert_ne, assert_true, assert_false, describe, it};
+U std/result
+U std/math.{sqrt, abs};
+U std/bytes.{ByteBuffer};
+
+U vector/distance.{
+    DistanceMetric, DistanceComputer,
+    cosine_distance_scalar, l2_distance_scalar, dot_product_scalar,
+    validate_dimensions, normalize_vector, normalize_vector_inplace,
+    vector_magnitude, dot_product, batch_compute_distances,
+};
+U vector/hnsw/types.{
+    HnswConfig, HnswMeta, HnswNode, HnswNeighbor, SearchCandidate, LayerRng,
+    INVALID_NODE_ID, DISTANCE_COSINE, DISTANCE_L2, DISTANCE_DOT_PRODUCT,
+    DEFAULT_M, DEFAULT_M_MAX_0, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH,
+};
+
+# ============================================================================
+# Distance Metrics — Cosine
+# ============================================================================
+
+describe("Cosine Distance") {
+    it("should return ~0 for identical vectors") {
+        a := mut vec![1.0f32, 0.0, 0.0];
+        b := mut vec![1.0f32, 0.0, 0.0];
+        dist := mut cosine_distance_scalar(&a, &b);
+        assert_true(dist < 0.001);
+    }
+
+    it("should return ~1 for orthogonal vectors") {
+        a := mut vec![1.0f32, 0.0, 0.0];
+        b := mut vec![0.0f32, 1.0, 0.0];
+        dist := mut cosine_distance_scalar(&a, &b);
+        assert_true(abs(dist as f64 - 1.0) < 0.001);
+    }
+
+    it("should return ~2 for opposite vectors") {
+        a := mut vec![1.0f32, 0.0, 0.0];
+        b := mut vec![-1.0f32, 0.0, 0.0];
+        dist := mut cosine_distance_scalar(&a, &b);
+        assert_true(abs(dist as f64 - 2.0) < 0.001);
+    }
+
+    it("should handle multi-dimensional vectors") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        dist := mut cosine_distance_scalar(&a, &b);
+        assert_true(dist < 0.001);
+    }
+
+    it("should return max distance for zero vector") {
+        a := mut vec![0.0f32, 0.0, 0.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        dist := mut cosine_distance_scalar(&a, &b);
+        assert_true(dist > 1.9);
+    }
+
+    it("should be symmetric") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        d1 := mut cosine_distance_scalar(&a, &b);
+        d2 := mut cosine_distance_scalar(&b, &a);
+        assert_true(abs(d1 - d2) < 0.0001);
+    }
+}
+
+# ============================================================================
+# Distance Metrics — L2
+# ============================================================================
+
+describe("L2 Distance") {
+    it("should return 0 for identical vectors") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        dist := mut l2_distance_scalar(&a, &b);
+        assert_true(dist < 0.001);
+    }
+
+    it("should compute correct Euclidean distance (3-4-5 triangle)") {
+        a := mut vec![0.0f32, 0.0, 0.0];
+        b := mut vec![3.0f32, 4.0, 0.0];
+        dist := mut l2_distance_scalar(&a, &b);
+        assert_true(abs(dist as f64 - 5.0) < 0.001);
+    }
+
+    it("should compute unit distance along axis") {
+        a := mut vec![0.0f32, 0.0];
+        b := mut vec![1.0f32, 0.0];
+        dist := mut l2_distance_scalar(&a, &b);
+        assert_true(abs(dist as f64 - 1.0) < 0.001);
+    }
+
+    it("should be symmetric") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        d1 := mut l2_distance_scalar(&a, &b);
+        d2 := mut l2_distance_scalar(&b, &a);
+        assert_true(abs(d1 - d2) < 0.0001);
+    }
+
+    it("should handle high-dimensional vectors") {
+        a := mut vec![0.0f32; 128];
+        b := mut vec![1.0f32; 128];
+        dist := mut l2_distance_scalar(&a, &b);
+        # sqrt(128 * 1.0) = sqrt(128) ≈ 11.31
+        assert_true(abs(dist as f64 - sqrt(128.0)) < 0.01);
+    }
+}
+
+# ============================================================================
+# Distance Metrics — Dot Product
+# ============================================================================
+
+describe("Dot Product Distance") {
+    it("should compute correct dot product (negated)") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        dist := mut dot_product_scalar(&a, &b);
+        # dot(a,b) = 4 + 10 + 18 = 32, negated = -32
+        assert_true(abs(dist as f64 + 32.0) < 0.001);
+    }
+
+    it("should return 0 for orthogonal vectors") {
+        a := mut vec![1.0f32, 0.0, 0.0];
+        b := mut vec![0.0f32, 1.0, 0.0];
+        dist := mut dot_product_scalar(&a, &b);
+        assert_true(abs(dist as f64) < 0.001);
+    }
+
+    it("should return negative value for similar vectors") {
+        a := mut vec![1.0f32, 1.0];
+        b := mut vec![1.0f32, 1.0];
+        dist := mut dot_product_scalar(&a, &b);
+        assert_true(dist < 0.0);  # -2.0
+    }
+}
+
+# ============================================================================
+# Dimension Validation
+# ============================================================================
+
+describe("Dimension Validation") {
+    it("should accept matching dimensions") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        assert_true(validate_dimensions(&a, &b).is_ok());
+    }
+
+    it("should reject mismatched dimensions") {
+        a := mut vec![1.0f32, 2.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        assert_true(validate_dimensions(&a, &b).is_err());
+    }
+
+    it("should reject zero-length vectors") {
+        a: Vec<f32> := mut Vec.new();
+        b := mut vec![1.0f32];
+        assert_true(validate_dimensions(&a, &b).is_err());
+    }
+}
+
+# ============================================================================
+# Vector Normalization
+# ============================================================================
+
+describe("Vector Normalization") {
+    it("should normalize to unit length") {
+        v := mut vec![3.0f32, 4.0, 0.0];
+        normalized := mut normalize_vector(&v)!;
+        mag := mut vector_magnitude(&normalized);
+        assert_true(abs(mag - 1.0) < 0.001);
+    }
+
+    it("should produce correct components") {
+        v := mut vec![3.0f32, 4.0, 0.0];
+        normalized := mut normalize_vector(&v)!;
+        assert_true(abs(normalized[0] - 0.6) < 0.001);
+        assert_true(abs(normalized[1] - 0.8) < 0.001);
+        n2 := mut normalized[2];
+        assert_true(abs(n2 as f64) < 0.001);
+    }
+
+    it("should error on zero vector") {
+        v := mut vec![0.0f32, 0.0, 0.0];
+        assert_true(normalize_vector(&v).is_err());
+    }
+
+    it("should error on empty vector") {
+        v: Vec<f32> := mut Vec.new();
+        assert_true(normalize_vector(&v).is_err());
+    }
+
+    it("should normalize in-place") {
+        v := mut vec![3.0f32, 4.0, 0.0];
+        normalize_vector_inplace(&v)!;
+        mag := mut vector_magnitude(&v);
+        assert_true(abs(mag - 1.0) < 0.001);
+    }
+}
+
+# ============================================================================
+# Vector Magnitude
+# ============================================================================
+
+describe("Vector Magnitude") {
+    it("should compute magnitude of unit vector") {
+        v := mut vec![1.0f32, 0.0, 0.0];
+        assert_true(abs(vector_magnitude(&v) as f64 - 1.0) < 0.001);
+    }
+
+    it("should compute magnitude of (3,4,0) vector") {
+        v := mut vec![3.0f32, 4.0, 0.0];
+        assert_true(abs(vector_magnitude(&v) - 5.0) < 0.001);
+    }
+
+    it("should return 0 for zero vector") {
+        v := mut vec![0.0f32, 0.0, 0.0];
+        assert_true(abs(vector_magnitude(&v)) < 0.001);
+    }
+}
+
+# ============================================================================
+# Dot Product (non-negated)
+# ============================================================================
+
+describe("Dot Product (raw)") {
+    it("should compute correct dot product") {
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        result := mut dot_product(&a, &b)!;
+        assert_true(abs(result - 32.0) < 0.001);
+    }
+
+    it("should error on dimension mismatch") {
+        a := mut vec![1.0f32, 2.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        assert_true(dot_product(&a, &b).is_err());
+    }
+}
+
+# ============================================================================
+# DistanceComputer
+# ============================================================================
+
+describe("DistanceComputer") {
+    it("should compute cosine distance") {
+        computer := mut DistanceComputer.new(DistanceMetric.Cosine);
+        a := mut vec![1.0f32, 0.0, 0.0];
+        b := mut vec![0.0f32, 1.0, 0.0];
+        dist := mut computer.compute(&a, &b)!;
+        assert_true(abs(dist as f64 - 1.0) < 0.001);
+    }
+
+    it("should compute L2 distance") {
+        computer := mut DistanceComputer.new(DistanceMetric.L2);
+        a := mut vec![0.0f32, 0.0];
+        b := mut vec![3.0f32, 4.0];
+        dist := mut computer.compute(&a, &b)!;
+        assert_true(abs(dist as f64 - 5.0) < 0.001);
+    }
+
+    it("should compute dot product distance") {
+        computer := mut DistanceComputer.new(DistanceMetric.DotProduct);
+        a := mut vec![1.0f32, 2.0, 3.0];
+        b := mut vec![4.0f32, 5.0, 6.0];
+        dist := mut computer.compute(&a, &b)!;
+        assert_true(abs(dist as f64 + 32.0) < 0.001);
+    }
+
+    it("should reject dimension mismatch") {
+        computer := mut DistanceComputer.new(DistanceMetric.Cosine);
+        a := mut vec![1.0f32, 2.0];
+        b := mut vec![1.0f32, 2.0, 3.0];
+        assert_true(computer.compute(&a, &b).is_err());
+    }
+
+    it("should return correct metric type") {
+        computer := mut DistanceComputer.new(DistanceMetric.L2);
+        # Enum comparison via tag value
+        assert_eq(computer.metric() as i64, DistanceMetric.L2 as i64);
+    }
+}
+
+# ============================================================================
+# Batch Distance Computation
+# ============================================================================
+
+describe("Batch Compute Distances") {
+    it("should compute distances to all candidates") {
+        computer := mut DistanceComputer.new(DistanceMetric.L2);
+        query := mut vec![0.0f32, 0.0];
+        c1 := mut vec![1.0f32, 0.0];
+        c2 := mut vec![0.0f32, 1.0];
+        c3 := mut vec![1.0f32, 1.0];
+        candidates: Vec<&[f32]> := mut vec![&c1, &c2, &c3];
+
+        distances := mut batch_compute_distances(&computer, &query, &candidates)!;
+
+        assert_eq(distances.len(), 3);
+        assert_true(abs(distances[0] - 1.0) < 0.001);
+        assert_true(abs(distances[1] - 1.0) < 0.001);
+        assert_true(abs(distances[2] - sqrt(2.0)) < 0.01);
+    }
+
+    it("should return empty for empty candidates") {
+        computer := mut DistanceComputer.new(DistanceMetric.L2);
+        query := mut vec![0.0f32, 0.0];
+        candidates: Vec<&[f32]> := mut Vec.new();
+
+        distances := mut batch_compute_distances(&computer, &query, &candidates)!;
+        assert_eq(distances.len(), 0);
+    }
+}
+
+# ============================================================================
+# HNSW Types — HnswConfig
+# ============================================================================
+
+describe("HnswConfig") {
+    it("should have correct defaults") {
+        assert_eq(DEFAULT_M, 16);
+        assert_eq(DEFAULT_M_MAX_0, 32);
+        assert_eq(DEFAULT_EF_CONSTRUCTION, 200);
+        assert_eq(DEFAULT_EF_SEARCH, 50);
+    }
+
+    it("should create config with valid values") {
+        config := mut HnswConfig {
+            m: DEFAULT_M,
+            m_max_0: DEFAULT_M_MAX_0,
+            ef_construction: DEFAULT_EF_CONSTRUCTION,
+            ef_search: DEFAULT_EF_SEARCH,
+            max_elements: 128,
+            distance_metric: DISTANCE_COSINE,
+        };
+        assert_eq(config.max_elements, 128);
+        assert_eq(config.m, 16);
+    }
+}
+
+# ============================================================================
+# HNSW Types — HnswMeta
+# ============================================================================
+
+describe("HnswMeta") {
+    it("should initialize with zero counters") {
+        config := mut HnswConfig {
+            m: 16, m_max_0: 32, ef_construction: 200, ef_search: 50,
+            max_elements: 128, distance_metric: DISTANCE_COSINE,
+        };
+        meta := mut HnswMeta.new(config, 1);
+        assert_eq(meta.total_nodes, 0);
+        assert_eq(meta.max_layer, 0);
+        assert_eq(meta.entry_point, INVALID_NODE_ID);
+    }
+}
+
+# ============================================================================
+# HNSW Types — HnswNode
+# ============================================================================
+
+describe("HnswNode") {
+    it("should create a new node with correct fields") {
+        node := mut HnswNode.new(42, 10, 100, 3, 1, 0);
+        assert_eq(node.node_id, 42);
+        assert_eq(node.vector_page_id, 10);
+        assert_eq(node.vector_offset, 100);
+        assert_eq(node.max_layer, 3);
+        assert_eq(node.txn_id_create, 1);
+        assert_eq(node.cmd_id, 0);
+    }
+}
+
+# ============================================================================
+# HNSW Types — LayerRng
+# ============================================================================
+
+describe("LayerRng") {
+    it("should generate deterministic layers for same seed") {
+        rng1 := mut LayerRng.new(42);
+        rng2 := mut LayerRng.new(42);
+        layer1 := mut rng1.random_layer(16);
+        layer2 := mut rng2.random_layer(16);
+        assert_eq(layer1, layer2);
+    }
+
+    it("should generate different layers for different seeds") {
+        # Most seeds should produce different layers (statistical test)
+        different := mut false;
+        i: u64 := mut 0;
+        L i < 100 {
+            rng1 := mut LayerRng.new(i);
+            rng2 := mut LayerRng.new(i + 1000);
+            I rng1.random_layer(16) != rng2.random_layer(16) {
+                different = true;
+            }
+            i += 1;
+        }
+        assert_true(different);
+    }
+
+    it("should produce mostly layer 0 for M=16") {
+        # With M=16, most nodes should be on layer 0
+        # P(layer >= 1) = 1/M = 1/16 ≈ 6.25%
+        layer_0_count: u64 := mut 0;
+        i: u64 := mut 0;
+        L i < 1000 {
+            rng := mut LayerRng.new(i);
+            I rng.random_layer(16) == 0 {
+                layer_0_count += 1;
+            }
+            i += 1;
+        }
+        # Expect >80% on layer 0 (generous margin)
+        assert_true(layer_0_count > 800);
+    }
+}
+
+# ============================================================================
+# SearchCandidate Ordering
+# ============================================================================
+
+describe("SearchCandidate") {
+    it("should order by distance ascending") {
+        c1 := mut SearchCandidate { node_id: 1, distance: 0.5 };
+        c2 := mut SearchCandidate { node_id: 2, distance: 1.0 };
+        c3 := mut SearchCandidate { node_id: 3, distance: 0.1 };
+
+        # Sort candidates (bubble sort by distance ascending)
+        candidates := mut vec![c1, c2, c3];
+        n := mut candidates.len();
+        i := mut 0;
+        L i < n {
+            j := mut 0;
+            L j < n - i - 1 {
+                cj := mut candidates[j];
+                cj1 := mut candidates[j + 1];
+                I cj.distance > cj1.distance {
+                    candidates[j] = cj1;
+                    candidates[j + 1] = cj;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        assert_eq(candidates[0].node_id, 3);
+        assert_eq(candidates[1].node_id, 1);
+        assert_eq(candidates[2].node_id, 2);
+    }
+}
+
+# ============================================================================
+# Distance Metric Triangle Inequality (L2 only)
+# ============================================================================
+
+describe("L2 Triangle Inequality") {
+    it("should satisfy d(a,c) <= d(a,b) + d(b,c)") {
+        a := mut vec![0.0f32, 0.0];
+        b := mut vec![1.0f32, 0.0];
+        c := mut vec![2.0f32, 0.0];
+
+        d_ab := mut l2_distance_scalar(&a, &b);
+        d_bc := mut l2_distance_scalar(&b, &c);
+        d_ac := mut l2_distance_scalar(&a, &c);
+
+        assert_true(d_ac <= d_ab + d_bc + 0.001);
+    }
+
+    it("should hold for random-like vectors") {
+        a := mut vec![1.0f32, 3.0, 5.0, 7.0];
+        b := mut vec![2.0f32, 4.0, 6.0, 8.0];
+        c := mut vec![9.0f32, 1.0, 3.0, 5.0];
+
+        d_ab := mut l2_distance_scalar(&a, &b);
+        d_bc := mut l2_distance_scalar(&b, &c);
+        d_ac := mut l2_distance_scalar(&a, &c);
+
+        assert_true(d_ac <= d_ab + d_bc + 0.001);
+    }
+}

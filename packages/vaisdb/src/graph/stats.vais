@@ -1,0 +1,371 @@
+# Graph Aggregation and Statistics
+# GraphStats struct with methods for graph-level and node-level statistics
+# Provides MVCC-consistent counting and aggregation functions
+# Error codes: EE=03 (graph), CC=11 (stats)
+
+U std/vec.Vec;
+U storage/constants.{INVALID_TXN_ID};
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U graph/types.{
+    GraphMeta, AdjEntry, DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH
+};
+U graph/edge/adj.{AdjacencyManager};
+U graph/visibility.{count_visible_entries};
+U graph/index/label.{LabelIndex};
+
+# ============================================================================
+# Error Codes: EE=03 (graph), CC=11 (stats)
+# ============================================================================
+
+F err_graph_stats_invalid_direction(direction: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0311001",
+        "Invalid direction for stats: {direction}"
+    )
+}
+
+F err_graph_stats_node_missing(node_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0311002",
+        "Node {node_id} not found for statistics"
+    )
+}
+
+# ============================================================================
+# GraphStatsSnapshot - Point-in-time statistics snapshot
+# ============================================================================
+
+S GraphStatsSnapshot {
+    total_nodes: u64,
+    total_edges: u64,
+    edge_types: u16,
+    avg_out_degree: f64,
+    avg_in_degree: f64,
+}
+
+X GraphStatsSnapshot {
+    F new(
+        total_nodes: u64,
+        total_edges: u64,
+        edge_types: u16,
+        avg_out_degree: f64,
+        avg_in_degree: f64
+    ) -> GraphStatsSnapshot {
+        GraphStatsSnapshot {
+            total_nodes,
+            total_edges,
+            edge_types,
+            avg_out_degree,
+            avg_in_degree,
+        }
+    }
+}
+
+# ============================================================================
+# GraphStats - Main statistics interface
+# ============================================================================
+
+S GraphStats {
+    meta: &GraphMeta,
+}
+
+X GraphStats {
+    # Create new GraphStats with reference to GraphMeta
+    F new(meta: &GraphMeta) -> GraphStats {
+        GraphStats { meta }
+    }
+
+    # ========================================================================
+    # Graph-level Statistics (from GraphMeta)
+    # ========================================================================
+
+    # Total number of nodes in the graph
+    F total_nodes(self) -> u64 {
+        self.meta.total_nodes
+    }
+
+    # Total number of edges in the graph
+    F total_edges(self) -> u64 {
+        self.meta.total_edges
+    }
+
+    # Number of distinct edge types
+    F edge_type_count(self) -> u16 {
+        self.meta.edge_type_count
+    }
+
+    # Average degree (both directions combined)
+    # Average degree = total_edges / total_nodes
+    F avg_degree(self, direction: u8) -> f64 {
+        I self.meta.total_nodes == 0 {
+            R 0.0;
+        }
+
+        M direction {
+            DIRECTION_OUTGOING => {
+                (self.meta.total_edges as f64) / (self.meta.total_nodes as f64)
+            },
+            DIRECTION_INCOMING => {
+                (self.meta.total_edges as f64) / (self.meta.total_nodes as f64)
+            },
+            DIRECTION_BOTH => {
+                (self.meta.total_edges as f64 * 2.0) / (self.meta.total_nodes as f64)
+            },
+            _ => 0.0,
+        }
+    }
+
+    # Get a point-in-time statistics snapshot
+    F snapshot(self) -> GraphStatsSnapshot {
+        avg_out := mut self.avg_degree(DIRECTION_OUTGOING);
+        avg_in := mut self.avg_degree(DIRECTION_INCOMING);
+
+        GraphStatsSnapshot.new(
+            self.meta.total_nodes,
+            self.meta.total_edges,
+            self.meta.edge_type_count,
+            avg_out,
+            avg_in
+        )
+    }
+
+    # ========================================================================
+    # Node-level Statistics
+    # ========================================================================
+
+    # Get the degree (edge count) for a node in a specific direction
+    # Uses MVCC visibility to count only edges visible to the snapshot
+    F node_degree(
+        self,
+        node_id: u64,
+        direction: u8,
+        adj_mgr: &AdjacencyManager,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        out_adj_page: u32,
+        in_adj_page: u32
+    ) -> Result<u32, VaisError> {
+        M direction {
+            DIRECTION_OUTGOING => {
+                self.node_out_degree(
+                    node_id,
+                    adj_mgr,
+                    snapshot,
+                    clog,
+                    out_adj_page
+                )
+            },
+            DIRECTION_INCOMING => {
+                self.node_in_degree(
+                    node_id,
+                    adj_mgr,
+                    snapshot,
+                    clog,
+                    in_adj_page
+                )
+            },
+            DIRECTION_BOTH => {
+                out_deg := mut self.node_out_degree(
+                    node_id,
+                    adj_mgr,
+                    snapshot,
+                    clog,
+                    out_adj_page
+                )?;
+                in_deg := mut self.node_in_degree(
+                    node_id,
+                    adj_mgr,
+                    snapshot,
+                    clog,
+                    in_adj_page
+                )?;
+                Ok(out_deg + in_deg)
+            },
+            _ => Err(err_graph_stats_invalid_direction(direction)),
+        }
+    }
+
+    # Count outgoing edges for a node (MVCC-consistent)
+    F node_out_degree(
+        self,
+        node_id: u64,
+        adj_mgr: &AdjacencyManager,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        out_adj_page: u32
+    ) -> Result<u32, VaisError> {
+        # Read all entries from outgoing adjacency list
+        entries := mut adj_mgr.read_all_entries(out_adj_page)?;
+
+        # Count only visible entries
+        count := mut count_visible_entries(&entries, snapshot, clog);
+
+        Ok(count as u32)
+    }
+
+    # Count incoming edges for a node (MVCC-consistent)
+    F node_in_degree(
+        self,
+        node_id: u64,
+        adj_mgr: &AdjacencyManager,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        in_adj_page: u32
+    ) -> Result<u32, VaisError> {
+        # Read all entries from incoming adjacency list
+        entries := mut adj_mgr.read_all_entries(in_adj_page)?;
+
+        # Count only visible entries
+        count := mut count_visible_entries(&entries, snapshot, clog);
+
+        Ok(count as u32)
+    }
+
+    # ========================================================================
+    # Aggregation Functions
+    # ========================================================================
+
+    # Count nodes with a specific label (MVCC-consistent)
+    F count_nodes_with_label(
+        self,
+        label_id: u16,
+        label_index: &LabelIndex,
+        pool: &mut BufferPool
+    ) -> Result<u64, VaisError> {
+        # Use label index to scan all nodes with this label
+        node_ids := mut label_index.scan_by_label(label_id, pool)?;
+
+        # Return count (label index already filters by visibility)
+        Ok(node_ids.len() as u64)
+    }
+
+    # Count edges of a specific type across the entire graph
+    # Note: This requires scanning all adjacency lists (expensive)
+    F count_edges_by_type(
+        self,
+        edge_type: u16,
+        adj_mgr: &AdjacencyManager,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        all_out_adj_pages: &Vec<u32>
+    ) -> Result<u64, VaisError> {
+        total_count: u64 := mut 0;
+
+        # Scan all outgoing adjacency lists
+        i: u64 := mut 0;
+        L i < all_out_adj_pages.len() {
+            page_id := mut all_out_adj_pages[i];
+            entries := mut adj_mgr.read_all_entries(page_id)?;
+
+            # Count visible entries with matching edge_type
+            j: u64 := mut 0;
+            L j < entries.len() {
+                I entries[j].edge_type == edge_type {
+                    I count_visible_entries(&vec![entries[j]], snapshot, clog) > 0 {
+                        total_count += 1;
+                    }
+                }
+                j += 1;
+            }
+
+            i += 1;
+        }
+
+        Ok(total_count)
+    }
+
+    # Compute degree distribution histogram
+    # Returns vector where index = degree, value = count of nodes with that degree
+    F degree_distribution(
+        self,
+        direction: u8,
+        adj_mgr: &AdjacencyManager,
+        snapshot: &Snapshot,
+        clog: &Clog,
+        all_nodes: &Vec<(u64, u32, u32)>  # (node_id, out_adj_page, in_adj_page)
+    ) -> Result<Vec<u64>, VaisError> {
+        # First pass: find max degree
+        max_degree: u32 := mut 0;
+        i: u64 := mut 0;
+        L i < all_nodes.len() {
+            node_id := mut all_nodes[i].0;
+            out_page := mut all_nodes[i].1;
+            in_page := mut all_nodes[i].2;
+
+            deg := mut self.node_degree(
+                node_id,
+                direction,
+                adj_mgr,
+                snapshot,
+                clog,
+                out_page,
+                in_page
+            )?;
+
+            I deg > max_degree {
+                max_degree = deg;
+            }
+
+            i += 1;
+        }
+
+        # Initialize histogram
+        histogram := mut Vec.with_capacity((max_degree + 1) as u64);
+        k: u64 := mut 0;
+        L k <= max_degree as u64 {
+            histogram.push(0u64);
+            k += 1;
+        }
+
+        # Second pass: populate histogram
+        j: u64 := mut 0;
+        L j < all_nodes.len() {
+            node_id := mut all_nodes[j].0;
+            out_page := mut all_nodes[j].1;
+            in_page := mut all_nodes[j].2;
+
+            deg := mut self.node_degree(
+                node_id,
+                direction,
+                adj_mgr,
+                snapshot,
+                clog,
+                out_page,
+                in_page
+            )?;
+
+            histogram[deg as u64] += 1;
+
+            j += 1;
+        }
+
+        Ok(histogram)
+    }
+
+    # Calculate graph density
+    # Density = actual_edges / possible_edges
+    # For directed graph: possible_edges = n * (n - 1)
+    F graph_density(self) -> f64 {
+        I self.meta.total_nodes <= 1 {
+            R 0.0;
+        }
+
+        n := mut self.meta.total_nodes as f64;
+        possible_edges := mut n * (n - 1.0);
+        actual_edges := mut self.meta.total_edges as f64;
+
+        actual_edges / possible_edges
+    }
+
+    # ========================================================================
+    # Helper Methods
+    # ========================================================================
+
+    # Get the underlying GraphMeta reference
+    F get_meta(self) -> &GraphMeta {
+        self.meta
+    }
+}

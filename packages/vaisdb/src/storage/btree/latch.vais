@@ -1,0 +1,258 @@
+# B+Tree Optimistic Latch Crabbing
+# Concurrent B+Tree access using optimistic read locks
+# Based on Stage 4 - latch crabbing protocol
+#
+# Protocol:
+# 1. Acquire read latch on root
+# 2. Descend: read-latch child, release parent (if parent is safe)
+# 3. At leaf: upgrade to write latch if needed
+# 4. If leaf split/merge needed: restart with pessimistic path
+#
+# Optimistic: assume no splits/merges needed. Restart if wrong.
+
+U std/sync.{RwLock};
+U storage/constants.{NULL_PAGE};
+U storage/error.{VaisError, err_internal};
+
+# Latch mode
+L LatchMode = Read | Write | Optimistic;
+
+# Per-page latch
+S PageLatch {
+    page_id: u32,
+    lock: RwLock<()>,
+}
+
+X PageLatch {
+    F new(page_id: u32) -> PageLatch {
+        PageLatch {
+            page_id,
+            lock: RwLock.new(()),
+        }
+    }
+
+    F read_lock(self) {
+        self.lock.read_lock();
+    }
+
+    F write_lock(self) {
+        self.lock.write_lock();
+    }
+
+    F read_unlock(self) {
+        self.lock.read_unlock();
+    }
+
+    F write_unlock(self) {
+        self.lock.write_unlock();
+    }
+
+    # Try to acquire write latch without blocking
+    # Returns true on success, false if already held
+    F try_write_lock(self) -> bool {
+        self.lock.try_write_lock()
+    }
+
+    # Try to acquire read latch without blocking
+    F try_read_lock(self) -> bool {
+        self.lock.try_read_lock()
+    }
+}
+
+# Latch table: maps page_id -> PageLatch
+# Pre-allocated for buffer pool pages
+S LatchTable {
+    latches: Vec<PageLatch>,
+    capacity: u32,
+}
+
+X LatchTable {
+    F new(capacity: u32) -> LatchTable {
+        latches := mut Vec.with_capacity(capacity as u64);
+        L i: 0..capacity {
+            latches.push(PageLatch.new(i));
+        }
+        LatchTable { latches, capacity }
+    }
+
+    F get(self, page_id: u32) -> &PageLatch {
+        &self.latches[page_id as u64 % self.capacity as u64]
+    }
+}
+
+# Latch guard: RAII-style latch release
+# Automatically releases latch when dropped
+S LatchGuard {
+    latch_table: &LatchTable,
+    page_id: u32,
+    mode: LatchMode,
+    held: bool,
+}
+
+X LatchGuard {
+    F new_read(table: &LatchTable, page_id: u32) -> LatchGuard {
+        table.get(page_id).read_lock();
+        LatchGuard {
+            latch_table: table,
+            page_id,
+            mode: LatchMode.Read,
+            held: true,
+        }
+    }
+
+    F new_write(table: &LatchTable, page_id: u32) -> LatchGuard {
+        table.get(page_id).write_lock();
+        LatchGuard {
+            latch_table: table,
+            page_id,
+            mode: LatchMode.Write,
+            held: true,
+        }
+    }
+
+    # Release the latch early (before drop)
+    F release(mut self) {
+        I self.held {
+            M self.mode {
+                LatchMode.Read => self.latch_table.get(self.page_id).read_unlock(),
+                LatchMode.Write => self.latch_table.get(self.page_id).write_unlock(),
+                LatchMode.Optimistic => {},
+            }
+            self.held = false;
+        }
+    }
+
+    # Upgrade from read to write latch
+    # Returns false if upgrade fails (must restart)
+    F try_upgrade(mut self) -> bool {
+        I !self.held {
+            R false;
+        }
+        M self.mode {
+            LatchMode.Read => {
+                self.latch_table.get(self.page_id).read_unlock();
+                I self.latch_table.get(self.page_id).try_write_lock() {
+                    self.mode = LatchMode.Write;
+                    true
+                } E {
+                    self.held = false;
+                    false
+                }
+            },
+            LatchMode.Write => true,   # Already write latched
+            LatchMode.Optimistic => false,
+        }
+    }
+}
+
+# Drop implementation: release latch on scope exit
+X Drop for LatchGuard {
+    F drop(mut self) {
+        self.release();
+    }
+}
+
+# Descent path entry with latch tracking
+S LatchedPathEntry {
+    page_id: u32,
+    child_index: u64,     # Which child we descended to
+}
+
+# Optimistic descent state
+S OptimisticDescent {
+    path: Vec<LatchedPathEntry>,
+    leaf_page_id: u32,
+    needs_restart: bool,     # Set to true if optimistic assumption failed
+}
+
+X OptimisticDescent {
+    F new() -> OptimisticDescent {
+        OptimisticDescent {
+            path: Vec.new(),
+            leaf_page_id: NULL_PAGE,
+            needs_restart: false,
+        }
+    }
+
+    # Record a descent step
+    F push(mut self, page_id: u32, child_index: u64) {
+        self.path.push(LatchedPathEntry { page_id, child_index });
+    }
+
+    # Get the parent of the current node
+    F parent(self) -> Option<&LatchedPathEntry> {
+        I self.path.len() >= 2 {
+            Some(&self.path[self.path.len() - 2])
+        } E {
+            None
+        }
+    }
+
+    # Mark that optimistic assumption failed (need split/merge)
+    F mark_restart(mut self) {
+        self.needs_restart = true;
+    }
+}
+
+# Check if a node is "safe" (no split or merge will propagate)
+# A node is safe for insert if it has room for one more entry
+# A node is safe for delete if it has more than minimum entries
+F is_safe_for_insert(entry_count: u16, max_entries: u16) -> bool {
+    entry_count < max_entries - 1
+}
+
+F is_safe_for_delete(entry_count: u16, min_entries: u16) -> bool {
+    entry_count > min_entries
+}
+
+# Pessimistic descent: hold latches on all ancestors until safe node found
+# Used when optimistic path fails (split/merge needed)
+S PessimisticDescent {
+    held_latches: Vec<u32>,    # Page IDs with write latches held
+}
+
+X PessimisticDescent {
+    F new() -> PessimisticDescent {
+        PessimisticDescent {
+            held_latches: Vec.new(),
+        }
+    }
+
+    # Record that we hold a write latch on this page
+    F hold(mut self, page_id: u32) {
+        self.held_latches.push(page_id);
+    }
+
+    # Release all latches above a safe node
+    # Keeps the latch on safe_page_id and below
+    F release_above(mut self, safe_page_id: u32, table: &LatchTable) {
+        keep_from: u64 := mut 0;
+        found_safe := mut false;
+        L i: 0..self.held_latches.len() {
+            I !found_safe && self.held_latches[i] == safe_page_id {
+                keep_from = i;
+                found_safe = true;
+            }
+        }
+
+        # Release latches above the safe node
+        L i: 0..keep_from {
+            table.get(self.held_latches[i]).write_unlock();
+        }
+
+        # Keep only latches from safe_page_id downward
+        remaining := mut Vec.new();
+        L i: keep_from..self.held_latches.len() {
+            remaining.push(self.held_latches[i]);
+        }
+        self.held_latches = remaining;
+    }
+
+    # Release all held latches
+    F release_all(mut self, table: &LatchTable) {
+        L page_id: &self.held_latches {
+            table.get(*page_id).write_unlock();
+        }
+        self.held_latches.clear();
+    }
+}

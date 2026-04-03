@@ -1,0 +1,571 @@
+# RAG_SEARCH() SQL Function Executor
+# SQL interface: RAG_SEARCH(query_text, top_k, fusion_method, vector_weight,
+#                           fulltext_weight, graph_weight, max_context_tokens)
+# Volcano-style iterator: open → next → close
+# Orchestrates vector search, full-text search, graph traversal, and score fusion
+# Returns RagSearchResult rows for SQL query execution
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+U rag/types.{
+    RagSearchResult, RagFusionConfig, ScoredChunk, ChunkInfo,
+    ENGINE_TAG_RAG, DEFAULT_VECTOR_WEIGHT, DEFAULT_FULLTEXT_WEIGHT,
+    DEFAULT_GRAPH_WEIGHT, DEFAULT_MEMORY_WEIGHT,
+    err_rag_engine_closed, err_rag_chunk_not_found
+};
+
+# ============================================================================
+# Error Codes: EE=08 (RAG), CC=09 (search)
+# ============================================================================
+
+F err_rag_search_failed(reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0809001",
+        "RAG_SEARCH failed: {reason}"
+    )
+}
+
+F err_rag_search_not_open() -> VaisError {
+    VaisError.new(
+        "VAIS-0809002",
+        "RAG_SEARCH executor not opened"
+    )
+}
+
+F err_rag_search_invalid_params(reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0809003",
+        "Invalid RAG_SEARCH parameters: {reason}"
+    )
+}
+
+# ============================================================================
+# RagSearchParams — Parameters parsed from RAG_SEARCH() function call
+# ============================================================================
+
+S RagSearchParams {
+    query_text: Str,                # User query string
+    top_k: u32,                     # Number of results to return
+    fusion_method: u8,              # 0=WeightedSum, 1=RRF
+    vector_weight: f64,
+    fulltext_weight: f64,
+    graph_weight: f64,
+    memory_weight: f64,
+    rrf_k: u32,                     # RRF constant (default 60)
+    max_context_tokens: u32,        # Max tokens for context expansion
+    include_context: bool,          # Whether to expand context window
+    filter_doc_ids: Vec<u64>,       # Optional: restrict to specific documents
+}
+
+X RagSearchParams {
+    ## Create with default weights
+    F default(query_text: Str, top_k: u32) -> RagSearchParams {
+        RagSearchParams {
+            query_text,
+            top_k,
+            fusion_method: 0,
+            vector_weight: DEFAULT_VECTOR_WEIGHT,
+            fulltext_weight: DEFAULT_FULLTEXT_WEIGHT,
+            graph_weight: DEFAULT_GRAPH_WEIGHT,
+            memory_weight: DEFAULT_MEMORY_WEIGHT,
+            rrf_k: 60,
+            max_context_tokens: 2048,
+            include_context: true,
+            filter_doc_ids: Vec.new(),
+        }
+    }
+
+    ## Create from explicit fusion config
+    F from_config(query_text: Str, config: &RagFusionConfig) -> RagSearchParams {
+        RagSearchParams {
+            query_text,
+            top_k: config.top_k,
+            fusion_method: config.fusion_method,
+            vector_weight: config.vector_weight,
+            fulltext_weight: config.fulltext_weight,
+            graph_weight: config.graph_weight,
+            memory_weight: config.memory_weight,
+            rrf_k: config.rrf_k,
+            max_context_tokens: config.max_context_tokens,
+            include_context: true,
+            filter_doc_ids: Vec.new(),
+        }
+    }
+
+    ## Validate parameters
+    F validate(self) -> Result<(), VaisError> {
+        I self.query_text.is_empty() {
+            R Err(err_rag_search_invalid_params(&"query_text is empty"));
+        }
+        I self.top_k == 0 {
+            R Err(err_rag_search_invalid_params(&"top_k must be > 0"));
+        }
+        total_weight := mut self.vector_weight + self.fulltext_weight + self.graph_weight;
+        I total_weight < 0.01 {
+            R Err(err_rag_search_invalid_params(&"All search weights are zero"));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# EngineResultSet — Results from a single engine search
+# ============================================================================
+
+S EngineResultSet {
+    engine_tag: u8,                 # Which engine produced these results
+    scored_chunks: Vec<ScoredChunk>,
+}
+
+X EngineResultSet {
+    F new(engine_tag: u8) -> EngineResultSet {
+        EngineResultSet {
+            engine_tag,
+            scored_chunks: Vec.new(),
+        }
+    }
+
+    ## Add a scored chunk result
+    F add(mut self, chunk_id: u64, doc_id: u64, score: f64) {
+        self.scored_chunks.push(ScoredChunk.new(chunk_id, doc_id, score, self.engine_tag));
+    }
+
+    ## Get result count
+    F len(self) -> u32 {
+        self.scored_chunks.len() as u32
+    }
+
+    ## Check if empty
+    F is_empty(self) -> bool {
+        self.scored_chunks.len() == 0
+    }
+}
+
+# ============================================================================
+# RagSearchExecutor — Volcano-style executor for RAG_SEARCH()
+# ============================================================================
+
+S RagSearchExecutor {
+    params: RagSearchParams,
+    results: Vec<RagSearchResult>,
+    cursor: u32,
+    is_open: bool,
+    exec_time_us: u64,              # Execution time in microseconds
+}
+
+X RagSearchExecutor {
+    ## Create a new RAG search executor
+    F new(params: RagSearchParams) -> RagSearchExecutor {
+        RagSearchExecutor {
+            params,
+            results: Vec.new(),
+            cursor: 0,
+            is_open: false,
+            exec_time_us: 0,
+        }
+    }
+
+    ## Open the executor — triggers the full search pipeline
+    ## This materializes all results since score fusion requires global normalization
+    ##
+    ## Pipeline:
+    ## 1. Vector search (HNSW) → ScoredChunks
+    ## 2. Full-text search (BM25) → ScoredChunks
+    ## 3. Graph proximity boost → ScoredChunks
+    ## 4. Normalize + fuse scores
+    ## 5. Sort by fused score, take top_k
+    ## 6. Expand context windows (optional)
+    ## 7. Build RagSearchResult records
+    F open(mut self,
+           vector_results: &EngineResultSet,
+           fulltext_results: &EngineResultSet,
+           graph_boost_results: &EngineResultSet,
+           chunk_text_lookup: &Vec<(u64, Str)>,
+    ) -> Result<(), VaisError> {
+        self.params.validate()?;
+
+        # Step 1-3: Engine results are passed in by the caller (RagSearchPipeline)
+        # We just need to fuse them here
+
+        # Step 4: Normalize and fuse
+        fused := mut M self.params.fusion_method {
+            0 => fuse_weighted_sum(
+                vector_results, fulltext_results, graph_boost_results,
+                self.params.vector_weight, self.params.fulltext_weight,
+                self.params.graph_weight,
+            ),
+            1 => fuse_rrf(
+                vector_results, fulltext_results, graph_boost_results,
+                self.params.rrf_k,
+            ),
+            _ => fuse_weighted_sum(
+                vector_results, fulltext_results, graph_boost_results,
+                self.params.vector_weight, self.params.fulltext_weight,
+                self.params.graph_weight,
+            ),
+        };
+
+        # Step 5: Sort by score descending, take top_k
+        sort_scored_chunks_desc(&mut fused);
+
+        limit := mut I self.params.top_k < fused.len() as u32 {
+            self.params.top_k
+        } E {
+            fused.len() as u32
+        };
+
+        # Step 6-7: Build RagSearchResult from top_k fused chunks
+        i: u32 := mut 0;
+        L i < limit {
+            sc := mut fused.get(i as u64);
+
+            # Look up chunk text
+            text := mut lookup_chunk_text(sc.chunk_id, chunk_text_lookup);
+
+            result := mut RagSearchResult.new(
+                sc.doc_id, sc.chunk_id, sc.score, text
+            );
+            result = result.with_parent(sc.doc_id);
+
+            self.results.push(result);
+            i = i + 1;
+        }
+
+        self.cursor = 0;
+        self.is_open = true;
+        Ok(())
+    }
+
+    ## Get the next result (Volcano iterator)
+    F next(&mut self) -> Option<&RagSearchResult> {
+        I !self.is_open {
+            R None;
+        }
+        I self.cursor >= self.results.len() as u32 {
+            R None;
+        }
+        result := mut self.results.get(self.cursor as u64);
+        self.cursor = self.cursor + 1;
+        Some(result)
+    }
+
+    ## Close the executor
+    F close(mut self) {
+        self.is_open = false;
+        self.results = Vec.new();
+        self.cursor = 0;
+    }
+
+    ## Get total result count
+    F result_count(self) -> u32 {
+        self.results.len() as u32
+    }
+
+    ## Get all results (for non-iterator access)
+    F get_results(self) -> &Vec<RagSearchResult> {
+        &self.results
+    }
+
+    ## Get execution time
+    F exec_time(self) -> u64 {
+        self.exec_time_us
+    }
+
+    ## Set execution time (called by pipeline after measurement)
+    F set_exec_time(mut self, us: u64) {
+        self.exec_time_us = us;
+    }
+}
+
+# ============================================================================
+# Score Fusion — Multi-engine score normalization and combination
+# ============================================================================
+
+## Weighted sum fusion across 3 engine result sets
+## 1. Normalize each set to [0, 1] via min-max
+## 2. For each unique chunk_id: fused = w_v*v + w_f*f + w_g*g
+## 3. Return combined results (unsorted)
+F fuse_weighted_sum(
+    vector_results: &EngineResultSet,
+    fulltext_results: &EngineResultSet,
+    graph_results: &EngineResultSet,
+    weight_v: f64,
+    weight_f: f64,
+    weight_g: f64,
+) -> Vec<ScoredChunk> {
+    norm_v := mut normalize_engine_scores(&vector_results.scored_chunks);
+    norm_f := mut normalize_engine_scores(&fulltext_results.scored_chunks);
+    norm_g := mut normalize_engine_scores(&graph_results.scored_chunks);
+
+    # Build score HashMaps for O(1) lookup
+    map_v := mut build_score_map(&norm_v);
+    map_f := mut build_score_map(&norm_f);
+    map_g := mut build_score_map(&norm_g);
+
+    # Collect all unique chunk_ids via HashMap
+    chunk_doc_map: HashMap<u64, u64> := mut HashMap.new();  # chunk_id → doc_id
+    collect_unique_chunks_map(&norm_v, &mut chunk_doc_map);
+    collect_unique_chunks_map(&norm_f, &mut chunk_doc_map);
+    collect_unique_chunks_map(&norm_g, &mut chunk_doc_map);
+
+    # For each unique chunk, compute fused score
+    result := mut Vec.new();
+    keys := mut chunk_doc_map.keys();
+    i: u32 := mut 0;
+    L i < keys.len() as u32 {
+        chunk_id := mut keys.get(i as u64);
+        doc_id := mut chunk_doc_map.get(chunk_id);
+
+        score_v := mut get_score_from_map(&map_v, chunk_id);
+        score_f := mut get_score_from_map(&map_f, chunk_id);
+        score_g := mut get_score_from_map(&map_g, chunk_id);
+
+        fused := mut weight_v * score_v + weight_f * score_f + weight_g * score_g;
+        result.push(ScoredChunk.new(chunk_id, doc_id, fused, ENGINE_TAG_RAG));
+        i = i + 1;
+    }
+    result
+}
+
+## Reciprocal Rank Fusion across 3 engine result sets
+## Score = Σ 1/(k + rank_i) across all lists where chunk appears
+F fuse_rrf(
+    vector_results: &EngineResultSet,
+    fulltext_results: &EngineResultSet,
+    graph_results: &EngineResultSet,
+    k: u32,
+) -> Vec<ScoredChunk> {
+    k_f64 := mut k as f64;
+
+    # Build rank HashMaps for O(1) lookup
+    rank_map_v := mut build_rank_map(&vector_results.scored_chunks);
+    rank_map_f := mut build_rank_map(&fulltext_results.scored_chunks);
+    rank_map_g := mut build_rank_map(&graph_results.scored_chunks);
+
+    # Collect all unique chunk_ids via HashMap
+    chunk_doc_map: HashMap<u64, u64> := mut HashMap.new();
+    collect_unique_chunks_map(&vector_results.scored_chunks, &mut chunk_doc_map);
+    collect_unique_chunks_map(&fulltext_results.scored_chunks, &mut chunk_doc_map);
+    collect_unique_chunks_map(&graph_results.scored_chunks, &mut chunk_doc_map);
+
+    # For each unique chunk, compute RRF score
+    result := mut Vec.new();
+    keys := mut chunk_doc_map.keys();
+    i: u32 := mut 0;
+    L i < keys.len() as u32 {
+        chunk_id := mut keys.get(i as u64);
+        doc_id := mut chunk_doc_map.get(chunk_id);
+
+        rrf_score: f64 := mut 0.0;
+
+        M rank_map_v.get(&chunk_id) {
+            Some(rank_v) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_v as f64); },
+            None => {},
+        }
+        M rank_map_f.get(&chunk_id) {
+            Some(rank_f) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_f as f64); },
+            None => {},
+        }
+        M rank_map_g.get(&chunk_id) {
+            Some(rank_g) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_g as f64); },
+            None => {},
+        }
+
+        result.push(ScoredChunk.new(chunk_id, doc_id, rrf_score, ENGINE_TAG_RAG));
+        i = i + 1;
+    }
+    result
+}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+## Normalize scores to [0, 1] via min-max normalization
+F normalize_engine_scores(chunks: &Vec<ScoredChunk>) -> Vec<ScoredChunk> {
+    I chunks.len() == 0 {
+        R Vec.new();
+    }
+
+    # Find min and max
+    min_s := mut chunks.get(0).score;
+    max_s := mut chunks.get(0).score;
+    i: u32 := mut 1;
+    L i < chunks.len() as u32 {
+        s := mut chunks.get(i as u64).score;
+        I s < min_s { min_s = s; }
+        I s > max_s { max_s = s; }
+        i = i + 1;
+    }
+
+    range := mut max_s - min_s;
+    result := mut Vec.new();
+
+    I range < 0.000001 {
+        # All scores equal → normalize to 1.0
+        j: u32 := mut 0;
+        L j < chunks.len() as u32 {
+            c := mut chunks.get(j as u64);
+            result.push(ScoredChunk.new(c.chunk_id, c.doc_id, 1.0, c.source_engine));
+            j = j + 1;
+        }
+    } E {
+        j: u32 := mut 0;
+        L j < chunks.len() as u32 {
+            c := mut chunks.get(j as u64);
+            norm := mut (c.score - min_s) / range;
+            result.push(ScoredChunk.new(c.chunk_id, c.doc_id, norm, c.source_engine));
+            j = j + 1;
+        }
+    }
+    result
+}
+
+## Collect unique (chunk_id → doc_id) pairs into HashMap
+F collect_unique_chunks_map(chunks: &Vec<ScoredChunk>, acc: &mut HashMap<u64, u64>) {
+    i: u32 := mut 0;
+    L i < chunks.len() as u32 {
+        c := mut chunks.get(i as u64);
+        I !acc.contains_key(&c.chunk_id) {
+            acc.insert(c.chunk_id, c.doc_id);
+        }
+        i = i + 1;
+    }
+}
+
+## Build a HashMap of chunk_id → normalized score for O(1) lookup
+F build_score_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, f64> {
+    map: HashMap<u64, f64> := mut HashMap.new();
+    i: u32 := mut 0;
+    L i < chunks.len() as u32 {
+        c := mut chunks.get(i as u64);
+        map.insert(c.chunk_id, c.score);
+        i = i + 1;
+    }
+    map
+}
+
+## Get score from HashMap (0.0 if not present)
+F get_score_from_map(map: &HashMap<u64, f64>, chunk_id: u64) -> f64 {
+    M map.get(&chunk_id) {
+        Some(score) => score,
+        None => 0.0,
+    }
+}
+
+## Build a HashMap of chunk_id → 1-based rank for O(1) lookup
+## Assumes input is pre-sorted by score descending
+F build_rank_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, u32> {
+    map: HashMap<u64, u32> := mut HashMap.new();
+    i: u32 := mut 0;
+    L i < chunks.len() as u32 {
+        c := mut chunks.get(i as u64);
+        I !map.contains_key(&c.chunk_id) {
+            map.insert(c.chunk_id, i + 1);  # 1-based rank
+        }
+        i = i + 1;
+    }
+    map
+}
+
+## Sort scored chunks by score descending — O(N log N) merge sort
+F sort_scored_chunks_desc(chunks: &mut Vec<ScoredChunk>) {
+    n := mut chunks.len() as u32;
+    I n <= 1 {
+        R;
+    }
+    # Bottom-up merge sort using auxiliary vector of indices
+    indices := mut Vec.new();
+    aux := mut Vec.new();
+    i: u32 := mut 0;
+    L i < n {
+        indices.push(i);
+        aux.push(i);
+        i = i + 1;
+    }
+
+    width: u32 := mut 1;
+    L width < n {
+        left: u32 := mut 0;
+        L left < n {
+            mid := mut left + width;
+            I mid > n { mid = n; }
+            right := mut left + width * 2;
+            I right > n { right = n; }
+            # Merge [left, mid) and [mid, right) from indices into aux
+            li := mut left;
+            ri := mut mid;
+            k := mut left;
+            L k < right {
+                I li < mid && (ri >= right ||
+                    chunks.get(indices.get(li as u64) as u64).score >=
+                    chunks.get(indices.get(ri as u64) as u64).score) {
+                    aux.set(k as u64, indices.get(li as u64));
+                    li = li + 1;
+                } E {
+                    aux.set(k as u64, indices.get(ri as u64));
+                    ri = ri + 1;
+                }
+                k = k + 1;
+            }
+            left = left + width * 2;
+        }
+        # Copy aux back to indices
+        c: u32 := mut 0;
+        L c < n {
+            indices.set(c as u64, aux.get(c as u64));
+            c = c + 1;
+        }
+        width = width * 2;
+    }
+
+    # Reorder chunks in-place based on sorted indices
+    sorted := mut Vec.new();
+    si: u32 := mut 0;
+    L si < n {
+        idx := mut indices.get(si as u64);
+        c := mut chunks.get(idx as u64);
+        sorted.push(ScoredChunk.new(c.chunk_id, c.doc_id, c.score, c.source_engine));
+        si = si + 1;
+    }
+    wi: u32 := mut 0;
+    L wi < n {
+        s := mut sorted.get(wi as u64);
+        target := mut chunks.get_mut(wi as u64);
+        target.chunk_id = s.chunk_id;
+        target.doc_id = s.doc_id;
+        target.score = s.score;
+        target.source_engine = s.source_engine;
+        wi = wi + 1;
+    }
+}
+
+## Look up chunk text from a (chunk_id, text) lookup table
+F lookup_chunk_text(chunk_id: u64, lookup: &Vec<(u64, Str)>) -> Str {
+    # Build HashMap for O(1) lookup when called in a loop
+    # Callers with many lookups should use build_chunk_text_map instead
+    i: u32 := mut 0;
+    L i < lookup.len() as u32 {
+        entry := mut lookup.get(i as u64);
+        I entry.0 == chunk_id {
+            R entry.1.clone();
+        }
+        i = i + 1;
+    }
+    Str.new()
+}
+
+## Build a HashMap for chunk text lookups (O(1) per lookup)
+F build_chunk_text_map(lookup: &Vec<(u64, Str)>) -> HashMap<u64, Str> {
+    map: HashMap<u64, Str> := mut HashMap.new();
+    i: u32 := mut 0;
+    L i < lookup.len() as u32 {
+        entry := mut lookup.get(i as u64);
+        map.insert(entry.0, entry.1.clone());
+        i = i + 1;
+    }
+    map
+}

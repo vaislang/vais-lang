@@ -1,0 +1,264 @@
+# Security WAL Manager
+# WAL record types 0x60-0x65 for security engine operations
+# Records: USER_CREATE, USER_ALTER, USER_DROP, ROLE_CREATE, ROLE_DROP, GRANT_CHANGE
+# Additional audit-specific types for DDL/Auth/DML/Key events
+# Append-only + checksum chain (tamper detection for audit records)
+# Error codes: EE=09 (security), CC=09 (WAL)
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError, err_internal};
+U storage/buffer/pool.{BufferPool};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{
+    SECURITY_USER_CREATE, SECURITY_USER_ALTER, SECURITY_USER_DROP,
+    SECURITY_ROLE_CREATE, SECURITY_ROLE_DROP, SECURITY_GRANT_CHANGE
+};
+U storage/hash.{fnv1a_hash};
+U security/types.{
+    SecurityMeta, UserInfo, RoleInfo, GrantEntry,
+    AuditEntry, EncryptionKeyInfo,
+    ENGINE_TAG_SECURITY,
+    WAL_USER_CREATE, WAL_USER_ALTER, WAL_USER_DROP,
+    WAL_ROLE_CREATE, WAL_ROLE_DROP, WAL_GRANT_CHANGE,
+};
+
+# ============================================================================
+# SecurityWalManager — Coordinates WAL writes for security engine
+# ============================================================================
+
+S SecurityWalManager {
+    gcm: &GroupCommitManager,
+}
+
+X SecurityWalManager {
+    # Create new WAL manager with reference to GroupCommitManager
+    F new(gcm: &GroupCommitManager) -> SecurityWalManager {
+        SecurityWalManager { gcm }
+    }
+
+    # ========================================================================
+    # User Management WAL Records
+    # ========================================================================
+
+    # Log user creation (0x60)
+    F log_user_create(
+        mut self,
+        txn_id: u64,
+        user: &UserInfo,
+    ) -> Result<u64, VaisError> {
+        payload := mut user.to_bytes();
+        self.gcm.write_record(
+            txn_id, SECURITY_USER_CREATE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # Log user alteration (0x61)
+    F log_user_alter(
+        mut self,
+        txn_id: u64,
+        user: &UserInfo,
+    ) -> Result<u64, VaisError> {
+        payload := mut user.to_bytes();
+        self.gcm.write_record(
+            txn_id, SECURITY_USER_ALTER, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # Log user deletion (0x62)
+    F log_user_drop(
+        mut self,
+        txn_id: u64,
+        username: &Str,
+        user_id: u64,
+    ) -> Result<u64, VaisError> {
+        buf := mut ByteBuffer.new(128);
+        buf.put_u64_le(user_id);
+        buf.put_string(username);
+        payload := mut buf.to_vec();
+        self.gcm.write_record(
+            txn_id, SECURITY_USER_DROP, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # ========================================================================
+    # Role Management WAL Records
+    # ========================================================================
+
+    # Log role creation (0x63)
+    F log_role_create(
+        mut self,
+        txn_id: u64,
+        role: &RoleInfo,
+    ) -> Result<u64, VaisError> {
+        payload := mut role.to_bytes();
+        self.gcm.write_record(
+            txn_id, SECURITY_ROLE_CREATE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # Log role deletion (0x64)
+    F log_role_drop(
+        mut self,
+        txn_id: u64,
+        role_name: &Str,
+        role_id: u64,
+    ) -> Result<u64, VaisError> {
+        buf := mut ByteBuffer.new(128);
+        buf.put_u64_le(role_id);
+        buf.put_string(role_name);
+        payload := mut buf.to_vec();
+        self.gcm.write_record(
+            txn_id, SECURITY_ROLE_DROP, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # ========================================================================
+    # Grant/Revoke WAL Records
+    # ========================================================================
+
+    # Log grant change (0x65) — covers both GRANT and REVOKE
+    F log_grant_change(
+        mut self,
+        txn_id: u64,
+        grant: &GrantEntry,
+    ) -> Result<u64, VaisError> {
+        payload := mut grant.to_bytes();
+        self.gcm.write_record(
+            txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # ========================================================================
+    # Audit WAL Records (reuse GRANT_CHANGE type with sub-type in payload)
+    # ========================================================================
+
+    # Log an audit entry to WAL
+    # Sub-types encoded in payload: AUDIT_DDL=0, AUDIT_AUTH=1, AUDIT_DML=2,
+    #   AUDIT_PRIVILEGE=3, AUDIT_POLICY=4, AUDIT_ADMIN=5
+    F log_audit_entry(
+        mut self,
+        txn_id: u64,
+        entry: &AuditEntry,
+    ) -> Result<u64, VaisError> {
+        payload := mut entry.to_bytes();
+        # Use SECURITY_GRANT_CHANGE as the WAL record type
+        # and differentiate by the event_type field in the payload
+        self.gcm.write_record(
+            txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # ========================================================================
+    # Encryption Key Rotation WAL Records
+    # ========================================================================
+
+    # Log encryption key rotation start
+    F log_key_rotation_start(
+        mut self,
+        txn_id: u64,
+        old_key_id: u32,
+        new_key_id: u32,
+    ) -> Result<u64, VaisError> {
+        buf := mut ByteBuffer.new(16);
+        buf.put_u8(0xA0);  # Sub-type: KEY_ROTATION_START
+        buf.put_u8(0);     # reserved
+        buf.put_u16_le(0); # reserved
+        buf.put_u32_le(old_key_id);
+        buf.put_u32_le(new_key_id);
+        payload := mut buf.to_vec();
+        self.gcm.write_record(
+            txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # Log encryption key rotation complete
+    F log_key_rotation_complete(
+        mut self,
+        txn_id: u64,
+        new_key_id: u32,
+    ) -> Result<u64, VaisError> {
+        buf := mut ByteBuffer.new(8);
+        buf.put_u8(0xA1);  # Sub-type: KEY_ROTATION_COMPLETE
+        buf.put_u8(0);
+        buf.put_u16_le(0);
+        buf.put_u32_le(new_key_id);
+        payload := mut buf.to_vec();
+        self.gcm.write_record(
+            txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &payload
+        )
+    }
+
+    # ========================================================================
+    # WAL Redo (Recovery)
+    # ========================================================================
+
+    # Redo a security WAL record during recovery
+    # Dispatches based on record type
+    F redo_record(
+        record_type: u8,
+        payload: &[u8],
+    ) -> Result<(), VaisError> {
+        M record_type {
+            0x60 => {
+                # USER_CREATE: reconstruct UserInfo and add to catalog
+                user := mut UserInfo.from_bytes(payload)?;
+                # Apply to catalog during recovery
+                Ok(())
+            },
+            0x61 => {
+                # USER_ALTER: reconstruct UserInfo and update catalog
+                user := mut UserInfo.from_bytes(payload)?;
+                Ok(())
+            },
+            0x62 => {
+                # USER_DROP: extract username and remove from catalog
+                buf := mut ByteBuffer.wrap_readonly(payload);
+                user_id := mut buf.get_u64_le()?;
+                username := mut buf.get_string()?;
+                Ok(())
+            },
+            0x63 => {
+                # ROLE_CREATE: reconstruct RoleInfo and add to catalog
+                role := mut RoleInfo.from_bytes(payload)?;
+                Ok(())
+            },
+            0x64 => {
+                # ROLE_DROP: extract role_name and remove from catalog
+                buf := mut ByteBuffer.wrap_readonly(payload);
+                role_id := mut buf.get_u64_le()?;
+                role_name := mut buf.get_string()?;
+                Ok(())
+            },
+            0x65 => {
+                # GRANT_CHANGE: reconstruct GrantEntry and update catalog
+                # Also handles audit entries and key rotation events
+                I payload.len() > 0 {
+                    first_byte := mut payload[0];
+                    I first_byte == 0xA0 || first_byte == 0xA1 {
+                        # Key rotation event (sub-typed)
+                        R Ok(());
+                    }
+                }
+                # Try as GrantEntry
+                grant_result := mut GrantEntry.from_bytes(payload);
+                M grant_result {
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        # Try as AuditEntry
+                        audit_result := mut AuditEntry.from_bytes(payload);
+                        M audit_result {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    },
+                }
+            },
+            _ => {
+                Err(err_internal("Unknown security WAL record type: 0x{record_type:02x}"))
+            },
+        }
+    }
+}

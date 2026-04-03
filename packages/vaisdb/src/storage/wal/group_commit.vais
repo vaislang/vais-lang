@@ -1,0 +1,232 @@
+# Group Commit Manager
+# Batches WAL writes and performs single fsync for throughput
+# Based on Stage 2: WAL Design
+# Default batching window: 1ms (1000μs)
+# Reduces fsync calls from 1-per-txn to 1-per-batch
+
+U std/sync.{Mutex, CondVar};
+U std/file.{fsync};
+
+U storage/error.{VaisError, err_internal};
+U storage/constants.{DEFAULT_GROUP_COMMIT_TIMEOUT_US};
+U storage/wal/writer.{WalWriter};
+U storage/wal/lsn.{NULL_LSN};
+
+# Sync mode configuration
+L SyncMode = Fsync | Fdatasync | Async;
+
+# Group commit configuration
+S GroupCommitConfig {
+    sync_mode: SyncMode,
+    timeout_us: u32,         # Max wait time before forced flush (microseconds)
+    max_batch_size: u32,     # Max records per batch before forced flush
+}
+
+X GroupCommitConfig {
+    F default() -> GroupCommitConfig {
+        GroupCommitConfig {
+            sync_mode: SyncMode.Fsync,
+            timeout_us: DEFAULT_GROUP_COMMIT_TIMEOUT_US,
+            max_batch_size: 256,
+        }
+    }
+
+    F with_sync_mode(sync_mode: SyncMode) -> GroupCommitConfig {
+        config := mut GroupCommitConfig.default();
+        config.sync_mode = sync_mode;
+        config
+    }
+
+    F async_mode() -> GroupCommitConfig {
+        GroupCommitConfig {
+            sync_mode: SyncMode.Async,
+            timeout_us: 0,
+            max_batch_size: 1024,
+        }
+    }
+}
+
+# Pending commit entry
+S PendingCommit {
+    txn_id: u64,
+    lsn: u64,               # LSN of the commit record
+    completed: bool,         # Whether fsync has been done
+}
+
+# Group commit manager
+S GroupCommitManager {
+    config: GroupCommitConfig,
+    writer: WalWriter,
+    pending: Vec<PendingCommit>,
+    flushed_lsn: u64,       # Highest LSN that has been fsynced
+    lock: Mutex,
+    flush_cv: CondVar,       # Signal when flush completes
+}
+
+X GroupCommitManager {
+    # Create a new group commit manager
+    F new(config: GroupCommitConfig, writer: WalWriter) -> GroupCommitManager {
+        GroupCommitManager {
+            config,
+            writer,
+            pending: Vec.new(),
+            flushed_lsn: NULL_LSN,
+            lock: Mutex.new(),
+            flush_cv: CondVar.new(),
+        }
+    }
+
+    # Write a WAL record through the group commit pipeline
+    # Returns the assigned LSN
+    F write_record(
+        mut self,
+        txn_id: u64,
+        record_type: u8,
+        engine_type: u8,
+        payload: &[u8],
+    ) -> Result<u64, VaisError> {
+        # Write to WAL buffer (no fsync yet)
+        lsn := mut self.writer.write_record(txn_id, record_type, engine_type, payload)?;
+        Ok(lsn)
+    }
+
+    # Submit a commit and wait for it to be durable
+    # This is the key group commit function:
+    # 1. Record is already written to buffer via write_record()
+    # 2. This adds the commit to the pending batch
+    # 3. If batch is full or timeout, trigger flush
+    # 4. Wait until this LSN has been fsynced
+    F commit_and_wait(mut self, txn_id: u64, commit_lsn: u64) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+
+        # If async mode, don't wait for fsync
+        M self.config.sync_mode {
+            SyncMode.Async => {
+                # Just mark as done without waiting
+                self.writer.clear_txn(txn_id);
+                drop(guard);
+                R Ok(());
+            },
+            _ => {},
+        }
+
+        # Add to pending commits
+        self.pending.push(PendingCommit {
+            txn_id,
+            lsn: commit_lsn,
+            completed: false,
+        });
+
+        # Check if we should trigger a flush
+        should_flush := mut self.pending.len() as u32 >= self.config.max_batch_size;
+
+        I should_flush {
+            self.do_flush()?;
+            drop(guard);
+            R Ok(());
+        }
+
+        # Wait for timeout or another txn to trigger flush
+        # condvar wait with timeout: batches concurrent commits into one fsync
+        waited := mut self.flush_cv.wait_timeout(guard, self.config.timeout_us as u64);
+
+        # After wakeup: check if our LSN has been flushed by another thread
+        I self.flushed_lsn >= commit_lsn {
+            drop(waited);
+            R Ok(());
+        }
+
+        # Our LSN not yet flushed — we are the flush leader for this batch
+        self.do_flush()?;
+
+        drop(waited);
+        Ok(())
+    }
+
+    # Periodic flush (called by background timer or batch trigger)
+    F periodic_flush(mut self) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+        I !self.pending.is_empty() {
+            self.do_flush()?;
+        }
+        drop(guard);
+        Ok(())
+    }
+
+    # Force flush all pending records
+    F flush(mut self) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+        self.do_flush()?;
+        drop(guard);
+        Ok(())
+    }
+
+    # Get the highest durable LSN
+    F flushed_lsn(self) -> u64 {
+        self.flushed_lsn
+    }
+
+    # Access underlying writer (for non-commit records)
+    F writer(mut self) -> &mut WalWriter {
+        &self.writer
+    }
+
+    # Close the group commit manager
+    F close(mut self) -> Result<(), VaisError> {
+        guard := mut self.lock.lock();
+        I !self.pending.is_empty() {
+            self.do_flush()?;
+        }
+        self.writer.close()?;
+        drop(guard);
+        Ok(())
+    }
+
+    # --- Private helpers ---
+
+    # Perform the actual flush + fsync
+    F do_flush(mut self) -> Result<(), VaisError> {
+        I self.pending.is_empty() {
+            R Ok(());
+        }
+
+        # Flush writer buffer to OS page cache
+        self.writer.flush()?;
+
+        # fsync based on sync mode
+        M self.config.sync_mode {
+            SyncMode.Fsync => {
+                self.writer.sync()?;
+            },
+            SyncMode.Fdatasync => {
+                # Use fdatasync (metadata not synced) - falls back to sync
+                self.writer.sync()?;
+            },
+            SyncMode.Async => {
+                # No sync needed
+            },
+        }
+
+        # Find max LSN in pending commits
+        max_lsn := mut self.flushed_lsn;
+        L pending: &self.pending {
+            I pending.lsn > max_lsn {
+                max_lsn = pending.lsn;
+            }
+        }
+        self.flushed_lsn = max_lsn;
+
+        # Clear prev_lsn entries for committed transactions
+        L pending: &self.pending {
+            self.writer.clear_txn(pending.txn_id);
+        }
+
+        # Clear pending list
+        self.pending.clear();
+
+        # Notify all waiters
+        self.flush_cv.notify_all();
+
+        Ok(())
+    }
+}

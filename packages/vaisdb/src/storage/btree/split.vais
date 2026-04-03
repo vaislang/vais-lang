@@ -1,0 +1,225 @@
+# B+Tree Node Split Operations with WAL Integration
+# WAL-first allocation: PAGE_ALLOC first, then BTREE_SPLIT
+# Based on Stage 1 Section 9 - median split
+
+U storage/constants.{NULL_PAGE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError, err_internal, err_page_full};
+U storage/buffer/pool.{BufferPool};
+U storage/btree/node.{BTreeInternalNode, BTreeLeafNode};
+U storage/btree/entry.{BTreeLeafEntry, BTreeInternalEntry, compare_keys, KeyCmp};
+
+# Split result containing the separator key and new page ID
+S SplitResult {
+    separator_key: Vec<u8>,   # Key to push up to parent
+    new_page_id: u32,         # Page ID of the new right sibling
+}
+
+# Split a leaf node at the median
+# Returns SplitResult with separator key and new sibling page
+# WAL records should be written BEFORE calling this function
+F split_leaf_at_median(
+    leaf: &BTreeLeafNode,
+    page_size: u32,
+    file_id: u8,
+    new_page_id: u32,
+    pool: &mut BufferPool,
+) -> Result<SplitResult, VaisError> {
+    mid := mut leaf.median_index();
+    entry_count := mut leaf.entry_count() as u64;
+
+    I entry_count < 2 {
+        R Err(err_internal("Cannot split leaf with fewer than 2 entries"));
+    }
+
+    # Create right sibling
+    right := mut BTreeLeafNode.new(new_page_id, page_size, false);
+
+    # Move entries [mid..] to right sibling
+    L i: mid..entry_count {
+        key := mut leaf.get_key(i).to_vec();
+        tid := mut leaf.entries[i].tid;
+        right.insert(&key, tid)?;
+    }
+
+    # Create left node (truncated original)
+    left := mut BTreeLeafNode.new(leaf.header.page_id, page_size, leaf.is_root());
+    L i: 0..mid {
+        key := mut leaf.get_key(i).to_vec();
+        tid := mut leaf.entries[i].tid;
+        left.insert(&key, tid)?;
+    }
+
+    # Update leaf chain pointers
+    old_next := mut leaf.next_leaf();
+    left.set_next_leaf(new_page_id);
+    left.set_prev_leaf(leaf.prev_leaf());
+    right.set_prev_leaf(leaf.header.page_id);
+    right.set_next_leaf(old_next);
+
+    # Update next leaf's prev pointer
+    I old_next != NULL_PAGE {
+        next_frame := mut pool.fetch_page(file_id, old_next)?;
+        next_data := mut pool.get_page(next_frame);
+        next_leaf := mut BTreeLeafNode.from_page_data(next_data, page_size)?;
+        next_leaf.set_prev_leaf(new_page_id);
+        next_flushed := mut next_leaf.flush();
+        pool.write_page(next_frame, next_flushed)?;
+        pool.unpin_page(next_frame, true);
+    }
+
+    # Separator = first key of right sibling
+    separator := mut right.get_key(0).to_vec();
+
+    # Write left and right pages
+    left_frame := mut pool.fetch_page(file_id, leaf.header.page_id)?;
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+    pool.unpin_page(left_frame, true);
+
+    right_frame := mut pool.fetch_page(file_id, new_page_id)?;
+    right_flushed := mut right.flush();
+    pool.write_page(right_frame, right_flushed)?;
+    pool.unpin_page(right_frame, true);
+
+    Ok(SplitResult {
+        separator_key: separator,
+        new_page_id,
+    })
+}
+
+# Split an internal node at the median
+# The median key is pushed up (not copied to either child)
+# Returns SplitResult with the key to push up and new page
+F split_internal_at_median(
+    internal: &BTreeInternalNode,
+    page_size: u32,
+    file_id: u8,
+    new_page_id: u32,
+    pool: &mut BufferPool,
+) -> Result<SplitResult, VaisError> {
+    entry_count := mut internal.entry_count() as u64;
+
+    I entry_count < 3 {
+        R Err(err_internal("Cannot split internal node with fewer than 3 entries"));
+    }
+
+    mid := mut entry_count / 2;
+
+    # The median key goes UP to parent, not into either child
+    push_up_key := mut internal.get_key(mid).to_vec();
+
+    # Left child: entries [0..mid]
+    left := mut BTreeInternalNode.new(internal.header.page_id, page_size, internal.is_root());
+    left.set_leftmost_child(internal.leftmost_child);
+    L i: 0..mid {
+        key := mut internal.get_key(i).to_vec();
+        child := mut internal.entries[i].child_page;
+        left.insert_entry(&key, child)?;
+    }
+
+    # Right child: entries [mid+1..], leftmost_child = entries[mid].child_page
+    right := mut BTreeInternalNode.new(new_page_id, page_size, false);
+    right.set_leftmost_child(internal.entries[mid].child_page);
+    L i: (mid + 1)..entry_count {
+        key := mut internal.get_key(i).to_vec();
+        child := mut internal.entries[i].child_page;
+        right.insert_entry(&key, child)?;
+    }
+
+    # Write both nodes
+    left_frame := mut pool.fetch_page(file_id, internal.header.page_id)?;
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+    pool.unpin_page(left_frame, true);
+
+    right_frame := mut pool.fetch_page(file_id, new_page_id)?;
+    right_flushed := mut right.flush();
+    pool.write_page(right_frame, right_flushed)?;
+    pool.unpin_page(right_frame, true);
+
+    Ok(SplitResult {
+        separator_key: push_up_key,
+        new_page_id,
+    })
+}
+
+# Split a leaf and insert a new entry that caused the overflow
+# Combines allocation, split, and insert in one operation
+F split_leaf_and_insert(
+    leaf: &BTreeLeafNode,
+    key: &[u8],
+    tid: u32,
+    page_size: u32,
+    file_id: u8,
+    new_page_id: u32,
+    pool: &mut BufferPool,
+) -> Result<SplitResult, VaisError> {
+    # Collect all entries + new entry in sorted order
+    all_keys := mut Vec.new();
+    all_tids := mut Vec.new();
+    insert_pos := mut leaf.lower_bound(key);
+
+    L i: 0..leaf.entry_count() as u64 {
+        I i == insert_pos {
+            all_keys.push(key.to_vec());
+            all_tids.push(tid);
+        }
+        all_keys.push(leaf.get_key(i).to_vec());
+        all_tids.push(leaf.entries[i].tid);
+    }
+    I insert_pos >= leaf.entry_count() as u64 {
+        all_keys.push(key.to_vec());
+        all_tids.push(tid);
+    }
+
+    total := mut all_keys.len();
+    split_at := mut total / 2;
+
+    # Build left leaf (reuse original page)
+    left := mut BTreeLeafNode.new(leaf.header.page_id, page_size, leaf.is_root());
+    L i: 0..split_at {
+        left.insert(&all_keys[i], all_tids[i])?;
+    }
+
+    # Build right leaf
+    right := mut BTreeLeafNode.new(new_page_id, page_size, false);
+    L i: split_at..total {
+        right.insert(&all_keys[i], all_tids[i])?;
+    }
+
+    # Update leaf chain
+    old_next := mut leaf.next_leaf();
+    left.set_next_leaf(new_page_id);
+    left.set_prev_leaf(leaf.prev_leaf());
+    right.set_prev_leaf(leaf.header.page_id);
+    right.set_next_leaf(old_next);
+
+    I old_next != NULL_PAGE {
+        next_frame := mut pool.fetch_page(file_id, old_next)?;
+        next_data := mut pool.get_page(next_frame);
+        next_leaf := mut BTreeLeafNode.from_page_data(next_data, page_size)?;
+        next_leaf.set_prev_leaf(new_page_id);
+        next_flushed := mut next_leaf.flush();
+        pool.write_page(next_frame, next_flushed)?;
+        pool.unpin_page(next_frame, true);
+    }
+
+    # Separator = first key of right
+    separator := mut all_keys[split_at].clone();
+
+    # Write both pages
+    left_frame := mut pool.fetch_page(file_id, leaf.header.page_id)?;
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+    pool.unpin_page(left_frame, true);
+
+    right_frame := mut pool.fetch_page(file_id, new_page_id)?;
+    right_flushed := mut right.flush();
+    pool.write_page(right_frame, right_flushed)?;
+    pool.unpin_page(right_frame, true);
+
+    Ok(SplitResult {
+        separator_key: separator,
+        new_page_id,
+    })
+}

@@ -1,0 +1,268 @@
+# Checkpoint Manager
+# Fuzzy checkpoint: flush dirty pages while database continues serving queries
+# Based on Stage 2 Section 6 - Checkpoint Design
+#
+# Process:
+# 1. Write CHECKPOINT_BEGIN { active_txns } to WAL
+# 2. Flush all dirty pages in buffer pool to disk (gradual/fuzzy)
+# 3. fsync all data files
+# 4. Write CHECKPOINT_END to WAL
+# 5. fsync WAL
+# 6. Update meta page with checkpoint LSN
+# 7. WAL segments before checkpoint LSN are safe to truncate/archive
+
+U std/file.{fsync};
+U std/sync.{Mutex};
+U std/bytes.{ByteBuffer};
+
+U storage/error.{VaisError, err_internal};
+U storage/constants.{
+    WAL_RECORD_HEADER_SIZE,
+    DEFAULT_CHECKPOINT_INTERVAL_SEC,
+    DEFAULT_CHECKPOINT_WAL_SIZE,
+};
+U storage/wal/header.{ENGINE_META};
+U storage/wal/record_types.{
+    CHECKPOINT_BEGIN, CHECKPOINT_END, FPI,
+    CheckpointBeginPayload, CheckpointEndPayload, FpiPayload,
+};
+U storage/wal/writer.{WalWriter};
+U storage/wal/lsn.{NULL_LSN};
+U storage/buffer/pool.{BufferPool};
+U storage/page/meta.{MetaPage};
+
+# Checkpoint configuration
+S CheckpointConfig {
+    interval_sec: u32,         # Seconds between checkpoints (default 300)
+    wal_size_trigger: u64,     # WAL size in bytes that triggers checkpoint (default 256MB)
+    force_flush: bool,         # Force flush all dirty pages (vs gradual)
+}
+
+X CheckpointConfig {
+    F default() -> CheckpointConfig {
+        CheckpointConfig {
+            interval_sec: DEFAULT_CHECKPOINT_INTERVAL_SEC,
+            wal_size_trigger: DEFAULT_CHECKPOINT_WAL_SIZE,
+            force_flush: true,
+        }
+    }
+}
+
+# Checkpoint result information
+S CheckpointResult {
+    begin_lsn: u64,            # LSN of CHECKPOINT_BEGIN record
+    end_lsn: u64,              # LSN of CHECKPOINT_END record
+    pages_flushed: u32,        # Number of dirty pages flushed
+    active_txns: Vec<u64>,     # Active transactions at checkpoint start
+}
+
+# Checkpoint state tracking
+S CheckpointState {
+    in_progress: bool,
+    last_checkpoint_lsn: u64,       # LSN of last successful checkpoint
+    last_checkpoint_time: u64,      # Timestamp of last checkpoint (us)
+    checkpoint_count: u64,          # Total checkpoints completed
+}
+
+X CheckpointState {
+    F new() -> CheckpointState {
+        CheckpointState {
+            in_progress: false,
+            last_checkpoint_lsn: NULL_LSN,
+            last_checkpoint_time: 0,
+            checkpoint_count: 0,
+        }
+    }
+}
+
+# Checkpoint Manager
+S CheckpointManager {
+    config: CheckpointConfig,
+    state: CheckpointState,
+    lock: Mutex,
+}
+
+X CheckpointManager {
+    F new(config: CheckpointConfig) -> CheckpointManager {
+        CheckpointManager {
+            config,
+            state: CheckpointState.new(),
+            lock: Mutex.new(),
+        }
+    }
+
+    F with_defaults() -> CheckpointManager {
+        CheckpointManager.new(CheckpointConfig.default())
+    }
+
+    # Perform a full checkpoint
+    # Steps: CHECKPOINT_BEGIN → flush dirty pages → fsync → CHECKPOINT_END → update meta
+    F perform_checkpoint(
+        mut self,
+        writer: &mut WalWriter,
+        pool: &mut BufferPool,
+        active_txn_ids: &[u64],
+    ) -> Result<CheckpointResult, VaisError> {
+        guard := mut self.lock.lock();
+
+        I self.state.in_progress {
+            drop(guard);
+            R Err(err_internal("Checkpoint already in progress"));
+        }
+        self.state.in_progress = true;
+        drop(guard);
+
+        # Step 1: Write CHECKPOINT_BEGIN with active transaction list
+        begin_payload := mut CheckpointBeginPayload {
+            active_txns: active_txn_ids.to_vec(),
+        };
+        begin_buf := mut ByteBuffer.with_capacity(8 + active_txn_ids.len() * 8);
+        begin_payload.serialize(&begin_buf);
+        begin_lsn := mut writer.write_record(
+            0,  # No transaction ID for checkpoint records
+            CHECKPOINT_BEGIN,
+            ENGINE_META,
+            begin_buf.as_bytes(),
+        )?;
+
+        # Flush WAL to ensure CHECKPOINT_BEGIN is on disk
+        writer.sync()?;
+
+        # Step 2: Flush all dirty pages in buffer pool
+        pages_flushed := mut pool.flush_all_dirty_pages()?;
+
+        # Step 3: fsync all data files (handled by buffer pool flush)
+
+        # Step 4: Write CHECKPOINT_END
+        end_payload := mut CheckpointEndPayload {};
+        end_buf := mut ByteBuffer.with_capacity(4);
+        end_payload.serialize(&end_buf);
+        end_lsn := mut writer.write_record(
+            0,
+            CHECKPOINT_END,
+            ENGINE_META,
+            end_buf.as_bytes(),
+        )?;
+
+        # Step 5: fsync WAL
+        writer.sync()?;
+
+        # Step 5.5: Mark all buffer pool pages as needing FPI on next modification
+        pool.set_all_needs_fpi();
+
+        # Step 6: Update checkpoint state
+        guard2 := mut self.lock.lock();
+        self.state.last_checkpoint_lsn = end_lsn;
+        self.state.last_checkpoint_time = std/time.unix_timestamp_us();
+        self.state.checkpoint_count += 1;
+        self.state.in_progress = false;
+        drop(guard2);
+
+        Ok(CheckpointResult {
+            begin_lsn,
+            end_lsn,
+            pages_flushed,
+            active_txns: active_txn_ids.to_vec(),
+        })
+    }
+
+    # Check if a checkpoint is needed based on configuration
+    F needs_checkpoint(self, current_wal_size: u64) -> bool {
+        # Check WAL size trigger
+        I current_wal_size >= self.config.wal_size_trigger {
+            R true;
+        }
+
+        # Check time-based trigger
+        now := mut std/time.unix_timestamp_us();
+        elapsed_sec := mut (now - self.state.last_checkpoint_time) / 1_000_000;
+        I elapsed_sec >= self.config.interval_sec as u64 {
+            R true;
+        }
+
+        false
+    }
+
+    # Get the LSN of the last successful checkpoint
+    F last_checkpoint_lsn(self) -> u64 {
+        self.state.last_checkpoint_lsn
+    }
+
+    # Set the last checkpoint LSN (used during recovery)
+    F set_last_checkpoint_lsn(mut self, lsn: u64) {
+        self.state.last_checkpoint_lsn = lsn;
+    }
+
+    # Get checkpoint statistics
+    F checkpoint_count(self) -> u64 {
+        self.state.checkpoint_count
+    }
+
+    # Check if checkpoint is currently running
+    F is_in_progress(self) -> bool {
+        self.state.in_progress
+    }
+}
+
+# Write a Full Page Image (FPI) for a page
+# Called on first modification to a page after each checkpoint
+F write_fpi(
+    writer: &mut WalWriter,
+    txn_id: u64,
+    file_id: u8,
+    page_id: u32,
+    page_data: &[u8],
+) -> Result<u64, VaisError> {
+    payload := mut FpiPayload {
+        file_id,
+        page_id,
+        page_data: page_data.to_vec(),
+    };
+    buf := mut ByteBuffer.with_capacity(16 + page_data.len());
+    payload.serialize(&buf);
+
+    writer.write_record(txn_id, FPI, ENGINE_META, buf.as_bytes())
+}
+
+# FPI tracking: tracks which pages have had FPI written since last checkpoint
+# First modification to a page after checkpoint writes FPI before the actual modification
+S FpiTracker {
+    pages_with_fpi: Vec<(u8, u32)>,   # (file_id, page_id) pairs
+    lock: Mutex,
+}
+
+X FpiTracker {
+    F new() -> FpiTracker {
+        FpiTracker {
+            pages_with_fpi: Vec.new(),
+            lock: Mutex.new(),
+        }
+    }
+
+    # Check if FPI has been written for this page since last checkpoint
+    F has_fpi(self, file_id: u8, page_id: u32) -> bool {
+        guard := mut self.lock.lock();
+        L &(fid, pid): &self.pages_with_fpi {
+            I fid == file_id && pid == page_id {
+                drop(guard);
+                R true;
+            }
+        }
+        drop(guard);
+        false
+    }
+
+    # Record that FPI was written for this page
+    F mark_fpi_written(mut self, file_id: u8, page_id: u32) {
+        guard := mut self.lock.lock();
+        self.pages_with_fpi.push((file_id, page_id));
+        drop(guard);
+    }
+
+    # Clear all FPI tracking (called after each checkpoint)
+    F reset(mut self) {
+        guard := mut self.lock.lock();
+        self.pages_with_fpi.clear();
+        drop(guard);
+    }
+}

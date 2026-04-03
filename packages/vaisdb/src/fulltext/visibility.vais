@@ -1,0 +1,147 @@
+# Full-Text MVCC Visibility
+# Full-text specific visibility helpers wrapping the unified is_visible() function
+# Provides snapshot-consistent search support for full-text operations
+# Based on Stage 3 Section 3: unified 3-case visibility + is_aborted fast-path
+
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/txn/visibility.{is_posting_visible as storage_is_posting_visible};
+U fulltext/types.{PostingEntry};
+U std/vec.Vec;
+
+# ============================================================================
+# Posting Visibility — Check if a PostingEntry is visible to the snapshot
+# ============================================================================
+
+# Check if a posting entry is visible under the given MVCC snapshot
+F is_posting_visible(entry: &PostingEntry, snapshot: &Snapshot, clog: &Clog) -> bool {
+    storage_is_posting_visible(
+        entry.txn_id_create,
+        entry.txn_id_expire,
+        entry.cmd_id,
+        entry.expire_cmd_id,
+        snapshot,
+        clog,
+    )
+}
+
+# ============================================================================
+# Filtered Posting Scan — Return only visible entries from a list
+# ============================================================================
+
+# Filter a list of posting entries to only those visible to the snapshot
+# Used during full-text search to ensure snapshot-consistent results
+F filter_visible_postings(
+    entries: &Vec<PostingEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<PostingEntry> {
+    result := mut Vec.new();
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I is_posting_visible(&entries[i], snapshot, clog) {
+            result.push(entries[i]);
+        }
+        i += 1;
+    }
+    result
+}
+
+# ============================================================================
+# Visibility Helpers for Full-Text Search
+# ============================================================================
+
+# Count visible posting entries from a list
+F count_visible_postings(
+    entries: &Vec<PostingEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> u64 {
+    count: u64 := mut 0;
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I is_posting_visible(&entries[i], snapshot, clog) {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+# Filter posting entries by document ID, returning only visible ones
+# Used for per-document term frequency queries
+F filter_visible_postings_for_doc(
+    entries: &Vec<PostingEntry>,
+    doc_id: u64,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<PostingEntry> {
+    result := mut Vec.new();
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I entries[i].doc_id == doc_id && is_posting_visible(&entries[i], snapshot, clog) {
+            result.push(entries[i]);
+        }
+        i += 1;
+    }
+    result
+}
+
+# Get visible document IDs from posting entries
+F visible_doc_ids(
+    entries: &Vec<PostingEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> Vec<u64> {
+    result := mut Vec.new();
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I is_posting_visible(&entries[i], snapshot, clog) {
+            result.push(entries[i].doc_id);
+        }
+        i += 1;
+    }
+    result
+}
+
+# Calculate total term frequency across all visible postings
+# Used for BM25 scoring calculations
+F visible_term_frequency(
+    entries: &Vec<PostingEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> u64 {
+    total: u64 := mut 0;
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I is_posting_visible(&entries[i], snapshot, clog) {
+            total += entries[i].term_freq as u64;
+        }
+        i += 1;
+    }
+    total
+}
+
+# Calculate document frequency (number of visible documents containing the term)
+# Used for BM25 IDF calculation
+F visible_doc_frequency(
+    entries: &Vec<PostingEntry>,
+    snapshot: &Snapshot,
+    clog: &Clog,
+) -> u32 {
+    # Note: Assumes entries are sorted by doc_id (enforced by posting list storage)
+    # We count unique doc_ids among visible entries
+    doc_freq: u32 := mut 0;
+    last_doc_id: u64 := mut 0;
+    i: u64 := mut 0;
+    L i < entries.len() {
+        I is_posting_visible(&entries[i], snapshot, clog) {
+            I i == 0 || entries[i].doc_id != last_doc_id {
+                doc_freq += 1;
+                last_doc_id = entries[i].doc_id;
+            }
+        }
+        i += 1;
+    }
+    doc_freq
+}

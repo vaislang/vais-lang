@@ -1,0 +1,258 @@
+# B+Tree Search Operations
+# Point lookups, range scans, and cursor-based iteration
+# Extends tree.vais with advanced search patterns
+
+U storage/constants.{NULL_PAGE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError, err_internal};
+U storage/buffer/pool.{BufferPool};
+U storage/btree/tree.{BTree};
+U storage/btree/node.{BTreeInternalNode, BTreeLeafNode};
+U storage/btree/entry.{BTreeLeafEntry, compare_keys, KeyCmp};
+U storage/btree/cursor.{BTreeCursor, ScanDirection};
+U storage/btree/key.{KeyRange};
+
+# Search result for point lookups
+L SearchResult = Found(u32) | NotFound;
+
+# Search for a key and return a cursor positioned at it
+F search_cursor(tree: &BTree, key: &[u8], pool: &mut BufferPool) -> Result<BTreeCursor, VaisError> {
+    frame_id := mut tree.find_leaf(key, pool)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    M leaf.search(key) {
+        Some(idx) => {
+            Ok(BTreeCursor.new(tree.file_id, tree.page_size, leaf.header.page_id, idx, frame_id))
+        },
+        None => {
+            pool.unpin_page(frame_id, false);
+            Ok(BTreeCursor.invalid())
+        },
+    }
+}
+
+# Find the first key >= search_key (for range scan start)
+# Returns a cursor positioned at the first matching entry
+F search_lower_bound(tree: &BTree, key: &[u8], pool: &mut BufferPool) -> Result<BTreeCursor, VaisError> {
+    frame_id := mut tree.find_leaf(key, pool)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    idx := mut leaf.lower_bound(key);
+
+    I idx < leaf.entry_count() as u64 {
+        Ok(BTreeCursor.new(tree.file_id, tree.page_size, leaf.header.page_id, idx, frame_id))
+    } E {
+        # Key is beyond all entries in this leaf, check next leaf
+        next := mut leaf.next_leaf();
+        pool.unpin_page(frame_id, false);
+
+        I next == NULL_PAGE {
+            Ok(BTreeCursor.invalid())
+        } E {
+            next_frame := mut pool.fetch_page(tree.file_id, next)?;
+            next_data := mut pool.get_page(next_frame);
+            next_leaf := mut BTreeLeafNode.from_page_data(next_data, tree.page_size)?;
+            I next_leaf.entry_count() > 0 {
+                Ok(BTreeCursor.new(tree.file_id, tree.page_size, next, 0, next_frame))
+            } E {
+                pool.unpin_page(next_frame, false);
+                Ok(BTreeCursor.invalid())
+            }
+        }
+    }
+}
+
+# Find the last key <= search_key (for reverse range scan)
+F search_upper_bound(tree: &BTree, key: &[u8], pool: &mut BufferPool) -> Result<BTreeCursor, VaisError> {
+    frame_id := mut tree.find_leaf(key, pool)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    # Find last entry <= key
+    idx := mut leaf.lower_bound(key);
+
+    # lower_bound gives first entry >= key, so we may need to go back one
+    I idx < leaf.entry_count() as u64 {
+        found_key := mut leaf.get_key(idx);
+        M compare_keys(found_key, key) {
+            KeyCmp.Equal => {
+                # Exact M Ok(BTreeCursor.new(tree.file_id, tree.page_size, leaf.header.page_id, idx, frame_id))
+            },
+            _ => {
+                # found_key > key, go back one
+                I idx > 0 {
+                    Ok(BTreeCursor.new(tree.file_id, tree.page_size, leaf.header.page_id, idx - 1, frame_id))
+                } E {
+                    # Need to check previous leaf
+                    prev := mut leaf.prev_leaf();
+                    pool.unpin_page(frame_id, false);
+                    I prev == NULL_PAGE {
+                        Ok(BTreeCursor.invalid())
+                    } E {
+                        prev_frame := mut pool.fetch_page(tree.file_id, prev)?;
+                        prev_data := mut pool.get_page(prev_frame);
+                        prev_leaf := mut BTreeLeafNode.from_page_data(prev_data, tree.page_size)?;
+                        I prev_leaf.entry_count() > 0 {
+                            last_idx := mut (prev_leaf.entry_count() - 1) as u64;
+                            Ok(BTreeCursor.new(tree.file_id, tree.page_size, prev, last_idx, prev_frame))
+                        } E {
+                            pool.unpin_page(prev_frame, false);
+                            Ok(BTreeCursor.invalid())
+                        }
+                    }
+                }
+            },
+        }
+    } E {
+        # Beyond all entries, last entry is upper bound
+        I leaf.entry_count() > 0 {
+            last_idx := mut (leaf.entry_count() - 1) as u64;
+            Ok(BTreeCursor.new(tree.file_id, tree.page_size, leaf.header.page_id, last_idx, frame_id))
+        } E {
+            pool.unpin_page(frame_id, false);
+            Ok(BTreeCursor.invalid())
+        }
+    }
+}
+
+# Range scan with KeyRange bounds, returns Vec<(key, tid)>
+F range_scan_bounded(
+    tree: &BTree,
+    range: &KeyRange,
+    pool: &mut BufferPool,
+) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
+    results := mut Vec.new();
+
+    # Determine starting position
+    cursor := mut M &range.start {
+        Some(ref start_key) => {
+            I range.start_inclusive {
+                search_lower_bound(tree, start_key, pool)?
+            } E {
+                # For exclusive start, find lower_bound then skip equal keys
+                c := mut search_lower_bound(tree, start_key, pool)?;
+                I c.valid() {
+                    (key, _) := mut c.current(pool)?;
+                    M compare_keys(&key, start_key) {
+                        KeyCmp.Equal => {
+                            c.next(pool)?;
+                            c
+                        },
+                        _ => c,
+                    }
+                } E {
+                    c
+                }
+            }
+        },
+        None => {
+            # Start from beginning (first leaf)
+            search_first(tree, pool)?
+        },
+    };
+
+    # Iterate through entries
+    in_range := mut true;
+    L cursor.valid() && in_range {
+        (key, tid) := mut cursor.current(pool)?;
+
+        # Check if past end of range
+        I range.is_past_end(&key) {
+            in_range = false;
+        } E {
+            results.push((key, tid));
+            cursor.next(pool)?;
+        }
+    }
+
+    cursor.close(pool);
+    Ok(results)
+}
+
+# Get cursor to first entry in the tree
+F search_first(tree: &BTree, pool: &mut BufferPool) -> Result<BTreeCursor, VaisError> {
+    # Descend to leftmost leaf
+    current_page := mut tree.root_page_id;
+
+    L _: 0..(tree.height - 1) {
+        frame_id := mut pool.fetch_page(tree.file_id, current_page)?;
+        page_data := mut pool.get_page(frame_id);
+        internal := mut BTreeInternalNode.from_page_data(page_data, tree.page_size)?;
+        current_page = internal.leftmost_child;
+        pool.unpin_page(frame_id, false);
+    }
+
+    frame_id := mut pool.fetch_page(tree.file_id, current_page)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    I leaf.entry_count() > 0 {
+        Ok(BTreeCursor.new(tree.file_id, tree.page_size, current_page, 0, frame_id))
+    } E {
+        pool.unpin_page(frame_id, false);
+        Ok(BTreeCursor.invalid())
+    }
+}
+
+# Get cursor to last entry in the tree
+F search_last(tree: &BTree, pool: &mut BufferPool) -> Result<BTreeCursor, VaisError> {
+    # Descend to rightmost leaf
+    current_page := mut tree.root_page_id;
+
+    L _: 0..(tree.height - 1) {
+        frame_id := mut pool.fetch_page(tree.file_id, current_page)?;
+        page_data := mut pool.get_page(frame_id);
+        internal := mut BTreeInternalNode.from_page_data(page_data, tree.page_size)?;
+
+        # Follow rightmost child
+        I internal.entry_count() > 0 {
+            current_page = internal.entries[(internal.entry_count() - 1) as u64].child_page;
+        } E {
+            current_page = internal.leftmost_child;
+        }
+        pool.unpin_page(frame_id, false);
+    }
+
+    frame_id := mut pool.fetch_page(tree.file_id, current_page)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    I leaf.entry_count() > 0 {
+        last_idx := mut (leaf.entry_count() - 1) as u64;
+        Ok(BTreeCursor.new(tree.file_id, tree.page_size, current_page, last_idx, frame_id))
+    } E {
+        pool.unpin_page(frame_id, false);
+        Ok(BTreeCursor.invalid())
+    }
+}
+
+# Count entries in a range (without materializing)
+F count_range(
+    tree: &BTree,
+    range: &KeyRange,
+    pool: &mut BufferPool,
+) -> Result<u64, VaisError> {
+    count: u64 := mut 0;
+
+    cursor := mut M &range.start {
+        Some(ref start_key) => search_lower_bound(tree, start_key, pool)?,
+        None => search_first(tree, pool)?,
+    };
+
+    in_range := mut true;
+    L cursor.valid() && in_range {
+        (key, _) := mut cursor.current(pool)?;
+        I range.is_past_end(&key) {
+            in_range = false;
+        } E {
+            I range.contains(&key) {
+                count += 1;
+            }
+            cursor.next(pool)?;
+        }
+    }
+
+    cursor.close(pool);
+    Ok(count)
+}

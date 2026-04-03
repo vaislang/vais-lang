@@ -1,0 +1,141 @@
+# Meta Page Layout (META 0x00)
+# meta.vdb page 0: Database header (256 bytes total = 48 header + 208 metadata)
+# Contains critical bootstrap info: magic, UUID, checkpoint LSN, CLOG range, config store
+
+U std/bytes.{ByteBuffer};
+U storage/constants.{
+    VAISDB_MAGIC, DB_FORMAT_VERSION, FILE_LAYOUT_VERSION,
+    PAGE_HEADER_SIZE, META_PAGE_RESERVED_SIZE,
+};
+U storage/error.{VaisError, err_invalid_magic, err_internal};
+U storage/page/header.{PageHeader};
+U storage/page/types.{PAGE_TYPE_META, ENGINE_TAG_COMMON};
+
+# Database metadata stored at meta.vdb page 0 (after 48B page header)
+S MetaPageHeader {
+    magic: u64,                   # 0x5641495344422031 ("VAISDB 1")
+    db_format_version: u32,       # Database format version (1)
+    page_size: u32,               # Page size in bytes (8192 or 16384)
+    db_uuid: [u8; 16],            # Database UUID
+    creation_timestamp: u64,      # Unix timestamp (microseconds)
+    last_checkpoint_lsn: u64,     # LSN of last checkpoint
+    clog_first_page: u32,         # First CLOG page ID in meta.vdb
+    clog_last_page: u32,          # Last CLOG page ID in meta.vdb
+    catalog_root_page: u32,       # Root page of catalog B+Tree (in data.vdb)
+    next_txn_id_page: u32,        # Page storing next_txn_id counter
+    config_first_page: u32,       # First config page ID (ALTER SYSTEM store)
+    file_layout_version: u32,     # File layout version (1)
+    next_txn_id: u64,             # Next transaction ID to assign
+    reserved: [u8; 128],          # Reserved for future fields (must be 0)
+}
+
+X MetaPageHeader {
+    # Create a new database meta header with defaults
+    F new(page_size: u32, db_uuid: [u8; 16], creation_timestamp: u64) -> MetaPageHeader {
+        MetaPageHeader {
+            magic: VAISDB_MAGIC,
+            db_format_version: DB_FORMAT_VERSION,
+            page_size,
+            db_uuid,
+            creation_timestamp,
+            last_checkpoint_lsn: 0,
+            clog_first_page: 0,
+            clog_last_page: 0,
+            catalog_root_page: 0,
+            next_txn_id_page: 0,
+            config_first_page: 0,
+            file_layout_version: FILE_LAYOUT_VERSION,
+            next_txn_id: 1,  # Transaction IDs start at 1 (0 = invalid)
+            reserved: [0u8; 128],
+        }
+    }
+
+    # Serialize metadata fields (writes 208 bytes after page header)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.magic);
+        buf.put_u32_le(self.db_format_version);
+        buf.put_u32_le(self.page_size);
+        buf.put_bytes(&self.db_uuid);
+        buf.put_u64_le(self.creation_timestamp);
+        buf.put_u64_le(self.last_checkpoint_lsn);
+        buf.put_u32_le(self.clog_first_page);
+        buf.put_u32_le(self.clog_last_page);
+        buf.put_u32_le(self.catalog_root_page);
+        buf.put_u32_le(self.next_txn_id_page);
+        buf.put_u32_le(self.config_first_page);
+        buf.put_u32_le(self.file_layout_version);
+        buf.put_u64_le(self.next_txn_id);
+        buf.put_bytes(&self.reserved);
+    }
+
+    # Deserialize metadata fields (reads 208 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<MetaPageHeader, VaisError> {
+        magic := mut buf.get_u64_le()?;
+        I magic != VAISDB_MAGIC {
+            R Err(err_invalid_magic());
+        }
+        Ok(MetaPageHeader {
+            magic,
+            db_format_version: buf.get_u32_le()?,
+            page_size: buf.get_u32_le()?,
+            db_uuid: buf.get_bytes(16)?.try_into()?,
+            creation_timestamp: buf.get_u64_le()?,
+            last_checkpoint_lsn: buf.get_u64_le()?,
+            clog_first_page: buf.get_u32_le()?,
+            clog_last_page: buf.get_u32_le()?,
+            catalog_root_page: buf.get_u32_le()?,
+            next_txn_id_page: buf.get_u32_le()?,
+            config_first_page: buf.get_u32_le()?,
+            file_layout_version: buf.get_u32_le()?,
+            next_txn_id: buf.get_u64_le()?,
+            reserved: buf.get_bytes(128)?.try_into()?,
+        })
+    }
+
+    # Write complete meta page (header + metadata) to a page-sized buffer
+    F write_to_page(self, page_data: &mut [u8]) {
+        header := mut PageHeader.new(0, PAGE_TYPE_META, ENGINE_TAG_COMMON);
+        buf := mut ByteBuffer.wrap(page_data);
+        header.serialize(&buf);
+        self.serialize(&buf);
+    }
+
+    # Read metadata from a page-sized buffer (skips 48B page header)
+    F read_from_page(page_data: &[u8]) -> Result<MetaPageHeader, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(page_data);
+        buf.set_position(PAGE_HEADER_SIZE as u64);
+        MetaPageHeader.deserialize(&buf)
+    }
+
+    # Validate the meta page header
+    F validate(self) -> Result<(), VaisError> {
+        I self.magic != VAISDB_MAGIC {
+            R Err(err_invalid_magic());
+        }
+        I self.page_size != 8192 && self.page_size != 16384 {
+            R Err(err_internal("Invalid page size in meta header"));
+        }
+        I self.db_format_version == 0 {
+            R Err(err_internal("Invalid format version 0"));
+        }
+        Ok(())
+    }
+
+    # Allocate next transaction ID (thread-safe increment needed at call site)
+    F alloc_txn_id(mut self) -> u64 {
+        id := mut self.next_txn_id;
+        self.next_txn_id += 1;
+        id
+    }
+
+    # Update checkpoint LSN
+    F set_checkpoint_lsn(mut self, lsn: u64) {
+        self.last_checkpoint_lsn = lsn;
+    }
+
+    # Update CLOG page range
+    F set_clog_range(mut self, first: u32, last: u32) {
+        self.clog_first_page = first;
+        self.clog_last_page = last;
+    }
+}

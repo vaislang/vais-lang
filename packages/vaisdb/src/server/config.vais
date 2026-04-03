@@ -1,0 +1,772 @@
+# Server Configuration
+# Runtime and startup configuration, global overrides, validation
+# Based on Stage 6: Configuration System
+
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+
+# ============================================================================
+# ServerConfig — All server settings
+# ============================================================================
+
+S ServerConfig {
+    # [server] section
+    port: u16,                    # Default 5433
+    bind_address: Str,            # Default "0.0.0.0"
+    max_connections: u32,         # Default auto-calculated (CPU cores * 4)
+
+    # [storage] section
+    data_dir: Str,                # .vaisdb directory path
+    page_size: u32,               # 8192 (immutable after creation)
+
+    # [memory] section
+    memory_budget: u64,           # bytes, default auto (80% of available RAM)
+    buffer_pool_percent: u32,     # Default 50
+    hnsw_cache_percent: u32,      # Default 25
+    dict_cache_percent: u32,      # Default 5
+    query_memory_percent: u32,    # Default 15
+
+    # [wal] section
+    wal_sync_mode: Str,           # "fsync" | "fdatasync" | "async"
+    wal_buffer_size: u64,         # bytes, default 16MB
+    group_commit_timeout_us: u32, # Default 1000
+    checkpoint_interval_sec: u32, # Default 300
+    checkpoint_wal_size: u64,     # bytes, default 256MB
+
+    # [query] section
+    query_memory_limit: u64,      # bytes, default 256MB
+    query_timeout_sec: u32,       # Default 30
+    slow_query_threshold_ms: u32, # Default 1000
+    max_concurrent_queries: u32,  # Default auto (CPU cores * 2)
+
+    # [transaction] section
+    default_isolation: Str,       # "snapshot" | "read_committed"
+    transaction_timeout_sec: u32, # Default 300
+
+    # [gc] section
+    gc_io_limit_mbps: u32,        # Default 50
+    gc_cpu_limit_percent: u32,    # Default 10
+    gc_min_interval_sec: u32,     # Default 60
+
+    # [tls] section
+    tls_cert_file: Str,           # Empty = no TLS
+    tls_key_file: Str,            # Empty = no TLS
+
+    # [logging] section
+    log_level: Str,               # "debug" | "info" | "warn" | "error"
+    slow_query_log: bool,         # Default true
+    log_file: Str,                # Default "vaisdb.log"
+
+    # [vector] section
+    hnsw_ef_search: u32,          # Default 64
+    oversample_factor: f64,       # Default 2.0
+}
+
+# ============================================================================
+# ServerConfig Implementation
+# ============================================================================
+
+X ServerConfig {
+    # Create default configuration
+    F default() -> ServerConfig {
+        ServerConfig {
+            # [server]
+            port: 5433,
+            bind_address: "0.0.0.0",
+            max_connections: 100,  # Auto-calculated at runtime based on CPU cores
+
+            # [storage]
+            data_dir: "./data",
+            page_size: 8192,
+
+            # [memory]
+            memory_budget: 0,      # Auto-calculated: 80% of available RAM
+            buffer_pool_percent: 50,
+            hnsw_cache_percent: 25,
+            dict_cache_percent: 5,
+            query_memory_percent: 15,
+
+            # [wal]
+            wal_sync_mode: "fsync",
+            wal_buffer_size: 16777216,  # 16MB
+            group_commit_timeout_us: 1000,
+            checkpoint_interval_sec: 300,
+            checkpoint_wal_size: 268435456,  # 256MB
+
+            # [query]
+            query_memory_limit: 268435456,  # 256MB
+            query_timeout_sec: 30,
+            slow_query_threshold_ms: 1000,
+            max_concurrent_queries: 0,  # Auto-calculated: CPU cores * 2
+
+            # [transaction]
+            default_isolation: "snapshot",
+            transaction_timeout_sec: 300,
+
+            # [gc]
+            gc_io_limit_mbps: 50,
+            gc_cpu_limit_percent: 10,
+            gc_min_interval_sec: 60,
+
+            # [tls]
+            tls_cert_file: "",
+            tls_key_file: "",
+
+            # [logging]
+            log_level: "info",
+            slow_query_log: true,
+            log_file: "vaisdb.log",
+
+            # [vector]
+            hnsw_ef_search: 64,
+            oversample_factor: 2.0,
+        }
+    }
+
+    # Builder pattern methods (take by value, caller must capture)
+    F with_port(mut self, port: u16) -> ServerConfig {
+        self.port = port;
+        self
+    }
+
+    F with_data_dir(mut self, dir: Str) -> ServerConfig {
+        self.data_dir = dir;
+        self
+    }
+
+    F with_bind_address(mut self, addr: Str) -> ServerConfig {
+        self.bind_address = addr;
+        self
+    }
+
+    F with_max_connections(mut self, max: u32) -> ServerConfig {
+        self.max_connections = max;
+        self
+    }
+
+    F with_memory_budget(mut self, budget: u64) -> ServerConfig {
+        self.memory_budget = budget;
+        self
+    }
+
+    F with_wal_sync_mode(mut self, mode: Str) -> ServerConfig {
+        self.wal_sync_mode = mode;
+        self
+    }
+
+    F with_query_timeout(mut self, timeout_sec: u32) -> ServerConfig {
+        self.query_timeout_sec = timeout_sec;
+        self
+    }
+
+    F with_default_isolation(mut self, isolation: Str) -> ServerConfig {
+        self.default_isolation = isolation;
+        self
+    }
+
+    F with_log_level(mut self, level: Str) -> ServerConfig {
+        self.log_level = level;
+        self
+    }
+
+    F with_tls(mut self, cert: Str, key: Str) -> ServerConfig {
+        self.tls_cert_file = cert;
+        self.tls_key_file = key;
+        self
+    }
+
+    # Check if TLS is enabled
+    F has_tls(self) -> bool {
+        self.tls_cert_file.len() > 0 && self.tls_key_file.len() > 0
+    }
+
+    # Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        # Validate port range
+        I self.port == 0 {
+            R Err(err_invalid_config("port", "Port must be between 1 and 65535"));
+        }
+
+        # Validate max_connections
+        I self.max_connections == 0 {
+            R Err(err_invalid_config("max_connections", "Max connections must be >= 1"));
+        }
+
+        # Validate memory percentages sum
+        total_percent := mut self.buffer_pool_percent + self.hnsw_cache_percent +
+                         self.dict_cache_percent + self.query_memory_percent;
+        I total_percent > 95 {
+            R Err(err_invalid_config(
+                "memory",
+                "Memory percentages sum to {total_percent}%, must be <= 95%"
+            ));
+        }
+
+        # Validate wal_sync_mode
+        I self.wal_sync_mode != "fsync" &&
+          self.wal_sync_mode != "fdatasync" &&
+          self.wal_sync_mode != "async" {
+            R Err(err_invalid_config(
+                "wal_sync_mode",
+                "Must be 'fsync', 'fdatasync', or 'async'"
+            ));
+        }
+
+        # Validate query_timeout
+        I self.query_timeout_sec == 0 {
+            R Err(err_invalid_config("query_timeout_sec", "Query timeout must be > 0"));
+        }
+
+        # Validate transaction_timeout
+        I self.transaction_timeout_sec == 0 {
+            R Err(err_invalid_config("transaction_timeout_sec", "Transaction timeout must be > 0"));
+        }
+
+        # Validate default_isolation
+        I self.default_isolation != "snapshot" &&
+          self.default_isolation != "read_committed" {
+            R Err(err_invalid_config(
+                "default_isolation",
+                "Must be 'snapshot' or 'read_committed'"
+            ));
+        }
+
+        # Validate log_level
+        I self.log_level != "debug" &&
+          self.log_level != "info" &&
+          self.log_level != "warn" &&
+          self.log_level != "error" {
+            R Err(err_invalid_config(
+                "log_level",
+                "Must be 'debug', 'info', 'warn', or 'error'"
+            ));
+        }
+
+        # Validate TLS files (both or neither)
+        I (self.tls_cert_file.len() > 0) != (self.tls_key_file.len() > 0) {
+            R Err(err_invalid_config(
+                "tls",
+                "Both tls_cert_file and tls_key_file must be specified, or neither"
+            ));
+        }
+
+        # Validate oversample_factor
+        I self.oversample_factor < 1.0 {
+            R Err(err_invalid_config(
+                "oversample_factor",
+                "Oversample factor must be >= 1.0"
+            ));
+        }
+
+        # Validate hnsw_ef_search
+        I self.hnsw_ef_search == 0 {
+            R Err(err_invalid_config("hnsw_ef_search", "HNSW ef_search must be > 0"));
+        }
+
+        # Validate GC limits
+        I self.gc_cpu_limit_percent > 100 {
+            R Err(err_invalid_config(
+                "gc_cpu_limit_percent",
+                "GC CPU limit must be <= 100"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+# ============================================================================
+# GlobalConfig — Runtime configuration state
+# ============================================================================
+
+# Global runtime config state (shared across connections)
+S GlobalConfig {
+    defaults: ServerConfig,       # Base config (from file/CLI/env)
+    overrides: GlobalOverrides,   # SET GLOBAL overrides
+}
+
+X GlobalConfig {
+    F new(defaults: ServerConfig) -> GlobalConfig {
+        GlobalConfig {
+            defaults,
+            overrides: GlobalOverrides.new(),
+        }
+    }
+
+    # Get effective ef_search (override or default)
+    F effective_ef_search(self) -> u32 {
+        M self.overrides.hnsw_ef_search {
+            Some(v) => v,
+            None => self.defaults.hnsw_ef_search,
+        }
+    }
+
+    # Get effective query timeout (override or default)
+    F effective_query_timeout(self) -> u32 {
+        M self.overrides.query_timeout_sec {
+            Some(v) => v,
+            None => self.defaults.query_timeout_sec,
+        }
+    }
+
+    # Get effective transaction timeout (override or default)
+    F effective_txn_timeout(self) -> u32 {
+        M self.overrides.transaction_timeout_sec {
+            Some(v) => v,
+            None => self.defaults.transaction_timeout_sec,
+        }
+    }
+
+    # Get effective query memory limit (override or default)
+    F effective_query_memory_limit(self) -> u64 {
+        M self.overrides.query_memory_limit {
+            Some(v) => v,
+            None => self.defaults.query_memory_limit,
+        }
+    }
+
+    # Get effective max concurrent queries (override or default)
+    F effective_max_concurrent(self) -> u32 {
+        M self.overrides.max_concurrent_queries {
+            Some(v) => v,
+            None => self.defaults.max_concurrent_queries,
+        }
+    }
+
+    # Get effective isolation level (override or default)
+    F effective_isolation(self) -> Str {
+        M &self.overrides.default_isolation {
+            Some(v) => v.clone(),
+            None => self.defaults.default_isolation.clone(),
+        }
+    }
+
+    # Get effective oversample factor (override or default)
+    F effective_oversample_factor(self) -> f64 {
+        M self.overrides.oversample_factor {
+            Some(v) => v,
+            None => self.defaults.oversample_factor,
+        }
+    }
+
+    # Get effective memory budget (override or default)
+    F effective_memory_budget(self) -> u64 {
+        M self.overrides.memory_budget {
+            Some(v) => v,
+            None => self.defaults.memory_budget,
+        }
+    }
+
+    # Get effective buffer pool percent (override or default)
+    F effective_buffer_pool_percent(self) -> u32 {
+        M self.overrides.buffer_pool_percent {
+            Some(v) => v,
+            None => self.defaults.buffer_pool_percent,
+        }
+    }
+
+    # Get effective HNSW cache percent (override or default)
+    F effective_hnsw_cache_percent(self) -> u32 {
+        M self.overrides.hnsw_cache_percent {
+            Some(v) => v,
+            None => self.defaults.hnsw_cache_percent,
+        }
+    }
+
+    # Get effective dictionary cache percent (override or default)
+    F effective_dict_cache_percent(self) -> u32 {
+        M self.overrides.dict_cache_percent {
+            Some(v) => v,
+            None => self.defaults.dict_cache_percent,
+        }
+    }
+
+    # Get effective query memory percent (override or default)
+    F effective_query_memory_percent(self) -> u32 {
+        M self.overrides.query_memory_percent {
+            Some(v) => v,
+            None => self.defaults.query_memory_percent,
+        }
+    }
+
+    # Set global override by key-value pair
+    F set_global(mut self, key: &Str, value: &Str) -> Result<(), VaisError> {
+        # Parse and validate based on key
+        I *key == "hnsw_ef_search" {
+            parsed := mut parse_u32(value)?;
+            I parsed == 0 {
+                R Err(err_invalid_config_value(key, "Must be > 0"));
+            }
+            self.overrides.hnsw_ef_search = Some(parsed);
+            Ok(())
+        } E I *key == "oversample_factor" {
+            parsed := mut parse_f64(value)?;
+            I parsed < 1.0 {
+                R Err(err_invalid_config_value(key, "Must be >= 1.0"));
+            }
+            self.overrides.oversample_factor = Some(parsed);
+            Ok(())
+        } E I *key == "query_memory_limit" {
+            parsed := mut parse_u64(value)?;
+            self.overrides.query_memory_limit = Some(parsed);
+            Ok(())
+        } E I *key == "query_timeout_sec" {
+            parsed := mut parse_u32(value)?;
+            I parsed == 0 {
+                R Err(err_invalid_config_value(key, "Must be > 0"));
+            }
+            self.overrides.query_timeout_sec = Some(parsed);
+            Ok(())
+        } E I *key == "transaction_timeout_sec" {
+            parsed := mut parse_u32(value)?;
+            I parsed == 0 {
+                R Err(err_invalid_config_value(key, "Must be > 0"));
+            }
+            self.overrides.transaction_timeout_sec = Some(parsed);
+            Ok(())
+        } E I *key == "max_concurrent_queries" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.max_concurrent_queries = Some(parsed);
+            Ok(())
+        } E I *key == "slow_query_threshold_ms" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.slow_query_threshold_ms = Some(parsed);
+            Ok(())
+        } E I *key == "default_isolation" {
+            I *value != "snapshot" && *value != "read_committed" {
+                R Err(err_invalid_config_value(key, "Must be 'snapshot' or 'read_committed'"));
+            }
+            self.overrides.default_isolation = Some(value.clone());
+            Ok(())
+        } E I *key == "gc_io_limit_mbps" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.gc_io_limit_mbps = Some(parsed);
+            Ok(())
+        } E I *key == "gc_cpu_limit_percent" {
+            parsed := mut parse_u32(value)?;
+            I parsed > 100 {
+                R Err(err_invalid_config_value(key, "Must be <= 100"));
+            }
+            self.overrides.gc_cpu_limit_percent = Some(parsed);
+            Ok(())
+        } E I *key == "gc_min_interval_sec" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.gc_min_interval_sec = Some(parsed);
+            Ok(())
+        } E I *key == "log_level" {
+            I *value != "debug" && *value != "info" && *value != "warn" && *value != "error" {
+                R Err(err_invalid_config_value(key, "Must be 'debug', 'info', 'warn', or 'error'"));
+            }
+            self.overrides.log_level = Some(value.clone());
+            Ok(())
+        } E I *key == "slow_query_log" {
+            parsed := mut parse_bool(value)?;
+            self.overrides.slow_query_log = Some(parsed);
+            Ok(())
+        } E I *key == "group_commit_timeout_us" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.group_commit_timeout_us = Some(parsed);
+            Ok(())
+        } E I *key == "checkpoint_interval_sec" {
+            parsed := mut parse_u32(value)?;
+            self.overrides.checkpoint_interval_sec = Some(parsed);
+            Ok(())
+        } E I *key == "memory_budget" {
+            parsed := mut parse_u64(value)?;
+            self.overrides.memory_budget = Some(parsed);
+            Ok(())
+        } E I *key == "buffer_pool_percent" {
+            parsed := mut parse_u32(value)?;
+            I parsed > 95 {
+                R Err(err_invalid_config_value(key, "Must be <= 95"));
+            }
+            # Cross-validate: sum of all memory percents must be <= 95
+            bp := mut parsed;
+            hc := mut self.effective_hnsw_cache_percent();
+            dc := mut self.effective_dict_cache_percent();
+            qm := mut self.effective_query_memory_percent();
+            I bp + hc + dc + qm > 95 {
+                R Err(err_invalid_config_value(key,
+                    "Memory percentages would sum to {bp + hc + dc + qm}%, must be <= 95%"));
+            }
+            self.overrides.buffer_pool_percent = Some(parsed);
+            Ok(())
+        } E I *key == "hnsw_cache_percent" {
+            parsed := mut parse_u32(value)?;
+            I parsed > 95 {
+                R Err(err_invalid_config_value(key, "Must be <= 95"));
+            }
+            bp := mut self.effective_buffer_pool_percent();
+            hc := mut parsed;
+            dc := mut self.effective_dict_cache_percent();
+            qm := mut self.effective_query_memory_percent();
+            I bp + hc + dc + qm > 95 {
+                R Err(err_invalid_config_value(key,
+                    "Memory percentages would sum to {bp + hc + dc + qm}%, must be <= 95%"));
+            }
+            self.overrides.hnsw_cache_percent = Some(parsed);
+            Ok(())
+        } E I *key == "dict_cache_percent" {
+            parsed := mut parse_u32(value)?;
+            I parsed > 95 {
+                R Err(err_invalid_config_value(key, "Must be <= 95"));
+            }
+            bp := mut self.effective_buffer_pool_percent();
+            hc := mut self.effective_hnsw_cache_percent();
+            dc := mut parsed;
+            qm := mut self.effective_query_memory_percent();
+            I bp + hc + dc + qm > 95 {
+                R Err(err_invalid_config_value(key,
+                    "Memory percentages would sum to {bp + hc + dc + qm}%, must be <= 95%"));
+            }
+            self.overrides.dict_cache_percent = Some(parsed);
+            Ok(())
+        } E I *key == "query_memory_percent" {
+            parsed := mut parse_u32(value)?;
+            I parsed > 95 {
+                R Err(err_invalid_config_value(key, "Must be <= 95"));
+            }
+            bp := mut self.effective_buffer_pool_percent();
+            hc := mut self.effective_hnsw_cache_percent();
+            dc := mut self.effective_dict_cache_percent();
+            qm := mut parsed;
+            I bp + hc + dc + qm > 95 {
+                R Err(err_invalid_config_value(key,
+                    "Memory percentages would sum to {bp + hc + dc + qm}%, must be <= 95%"));
+            }
+            self.overrides.query_memory_percent = Some(parsed);
+            Ok(())
+        } E {
+            Err(err_unknown_config_key(key))
+        }
+    }
+
+    # Reset global override by key
+    F reset_global(mut self, key: &Str) -> Result<(), VaisError> {
+        I *key == "hnsw_ef_search" {
+            self.overrides.hnsw_ef_search = None;
+        } E I *key == "oversample_factor" {
+            self.overrides.oversample_factor = None;
+        } E I *key == "query_memory_limit" {
+            self.overrides.query_memory_limit = None;
+        } E I *key == "query_timeout_sec" {
+            self.overrides.query_timeout_sec = None;
+        } E I *key == "transaction_timeout_sec" {
+            self.overrides.transaction_timeout_sec = None;
+        } E I *key == "max_concurrent_queries" {
+            self.overrides.max_concurrent_queries = None;
+        } E I *key == "slow_query_threshold_ms" {
+            self.overrides.slow_query_threshold_ms = None;
+        } E I *key == "default_isolation" {
+            self.overrides.default_isolation = None;
+        } E I *key == "gc_io_limit_mbps" {
+            self.overrides.gc_io_limit_mbps = None;
+        } E I *key == "gc_cpu_limit_percent" {
+            self.overrides.gc_cpu_limit_percent = None;
+        } E I *key == "gc_min_interval_sec" {
+            self.overrides.gc_min_interval_sec = None;
+        } E I *key == "log_level" {
+            self.overrides.log_level = None;
+        } E I *key == "slow_query_log" {
+            self.overrides.slow_query_log = None;
+        } E I *key == "group_commit_timeout_us" {
+            self.overrides.group_commit_timeout_us = None;
+        } E I *key == "checkpoint_interval_sec" {
+            self.overrides.checkpoint_interval_sec = None;
+        } E I *key == "memory_budget" {
+            self.overrides.memory_budget = None;
+        } E I *key == "buffer_pool_percent" {
+            self.overrides.buffer_pool_percent = None;
+        } E I *key == "hnsw_cache_percent" {
+            self.overrides.hnsw_cache_percent = None;
+        } E I *key == "dict_cache_percent" {
+            self.overrides.dict_cache_percent = None;
+        } E I *key == "query_memory_percent" {
+            self.overrides.query_memory_percent = None;
+        } E {
+            R Err(err_unknown_config_key(key));
+        }
+
+        Ok(())
+    }
+}
+
+# ============================================================================
+# GlobalOverrides — SET GLOBAL runtime overrides
+# ============================================================================
+
+# SET GLOBAL overrides (only runtime-changeable settings)
+S GlobalOverrides {
+    memory_budget: Option<u64>,
+    buffer_pool_percent: Option<u32>,
+    hnsw_cache_percent: Option<u32>,
+    dict_cache_percent: Option<u32>,
+    query_memory_percent: Option<u32>,
+    hnsw_ef_search: Option<u32>,
+    oversample_factor: Option<f64>,
+    query_memory_limit: Option<u64>,
+    query_timeout_sec: Option<u32>,
+    transaction_timeout_sec: Option<u32>,
+    max_concurrent_queries: Option<u32>,
+    slow_query_threshold_ms: Option<u32>,
+    default_isolation: Option<Str>,
+    gc_io_limit_mbps: Option<u32>,
+    gc_cpu_limit_percent: Option<u32>,
+    gc_min_interval_sec: Option<u32>,
+    log_level: Option<Str>,
+    slow_query_log: Option<bool>,
+    group_commit_timeout_us: Option<u32>,
+    checkpoint_interval_sec: Option<u32>,
+}
+
+X GlobalOverrides {
+    F new() -> GlobalOverrides {
+        GlobalOverrides {
+            memory_budget: None,
+            buffer_pool_percent: None,
+            hnsw_cache_percent: None,
+            dict_cache_percent: None,
+            query_memory_percent: None,
+            hnsw_ef_search: None,
+            oversample_factor: None,
+            query_memory_limit: None,
+            query_timeout_sec: None,
+            transaction_timeout_sec: None,
+            max_concurrent_queries: None,
+            slow_query_threshold_ms: None,
+            default_isolation: None,
+            gc_io_limit_mbps: None,
+            gc_cpu_limit_percent: None,
+            gc_min_interval_sec: None,
+            log_level: None,
+            slow_query_log: None,
+            group_commit_timeout_us: None,
+            checkpoint_interval_sec: None,
+        }
+    }
+}
+
+# ============================================================================
+# Configuration Error Constructors (EE=00, CC=07)
+# ============================================================================
+
+# Invalid configuration
+F err_invalid_config(key: &Str, reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0007001",
+        "Invalid configuration '{key}': {reason}"
+    )
+}
+
+# Invalid configuration value
+F err_invalid_config_value(key: &Str, reason: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0007001",
+        "Invalid value for '{key}': {reason}"
+    )
+}
+
+# Unknown configuration key
+F err_unknown_config_key(key: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0007003",
+        "Unknown configuration key: '{key}'"
+    )
+}
+
+# ============================================================================
+# Helper Parsing Functions (placeholder signatures)
+# ============================================================================
+
+# Parse u32 from string
+F parse_u32(s: &Str) -> Result<u32, VaisError> {
+    result: u64 := mut 0;
+    i: u64 := mut 0;
+    bytes := mut s.as_bytes();
+    I bytes.len() == 0 {
+        R Err(VaisError.new("VAIS-0007001", "Empty string cannot be parsed as u32"));
+    }
+    L i < bytes.len() {
+        ch := mut bytes[i];
+        I ch < 48 || ch > 57 {  # '0'=48, '9'=57
+            R Err(VaisError.new("VAIS-0007001", "Invalid character in u32: '{s}'"));
+        }
+        result = result * 10 + (ch - 48) as u64;
+        I result > 4294967295 {  # u32 max
+            R Err(VaisError.new("VAIS-0007001", "Value out of u32 range: '{s}'"));
+        }
+        i += 1;
+    }
+    Ok(result as u32)
+}
+
+# Parse u64 from string
+F parse_u64(s: &Str) -> Result<u64, VaisError> {
+    result: u64 := mut 0;
+    i: u64 := mut 0;
+    bytes := mut s.as_bytes();
+    I bytes.len() == 0 {
+        R Err(VaisError.new("VAIS-0007001", "Empty string cannot be parsed as u64"));
+    }
+    prev: u64 := mut 0;
+    L i < bytes.len() {
+        ch := mut bytes[i];
+        I ch < 48 || ch > 57 {
+            R Err(VaisError.new("VAIS-0007001", "Invalid character in u64: '{s}'"));
+        }
+        prev = result;
+        result = result * 10 + (ch - 48) as u64;
+        I result < prev {  # overflow detection
+            R Err(VaisError.new("VAIS-0007001", "Value out of u64 range: '{s}'"));
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+# Parse f64 from string
+F parse_f64(s: &Str) -> Result<f64, VaisError> {
+    # Simple decimal parser: [digits][.digits]
+    whole: f64 := mut 0.0;
+    frac: f64 := mut 0.0;
+    frac_div: f64 := mut 1.0;
+    in_frac := mut false;
+    i: u64 := mut 0;
+    bytes := mut s.as_bytes();
+    I bytes.len() == 0 {
+        R Err(VaisError.new("VAIS-0007001", "Empty string cannot be parsed as f64"));
+    }
+    L i < bytes.len() {
+        ch := mut bytes[i];
+        I ch == 46 {  # '.'
+            I in_frac {
+                R Err(VaisError.new("VAIS-0007001", "Multiple decimal points in f64: '{s}'"));
+            }
+            in_frac = true;
+        } E I ch >= 48 && ch <= 57 {
+            I in_frac {
+                frac_div = frac_div * 10.0;
+                frac = frac + (ch - 48) as f64 / frac_div;
+            } E {
+                whole = whole * 10.0 + (ch - 48) as f64;
+            }
+        } E {
+            R Err(VaisError.new("VAIS-0007001", "Invalid character in f64: '{s}'"));
+        }
+        i += 1;
+    }
+    Ok(whole + frac)
+}
+
+# Parse bool from string
+F parse_bool(s: &Str) -> Result<bool, VaisError> {
+    # FUTURE(std/parse): Use standard library parsing when available
+    I *s == "true" || *s == "1" {
+        Ok(true)
+    } E I *s == "false" || *s == "0" {
+        Ok(false)
+    } E {
+        Err(VaisError.new("VAIS-0007001", "Invalid boolean value: '{s}'"))
+    }
+}

@@ -1,0 +1,405 @@
+# search.vais - VECTOR_SEARCH() SQL function executor for VaisDB
+# Provides Volcano-style iterator that wraps HNSW MVCC-filtered search
+
+U std/result.{Result, Ok, Err};
+U std/option.{Option, Some, None};
+U std/vec.Vec;
+U std/string.Str;
+
+U storage/error.{VaisError, error_code};
+U sql/executor/mod.{ExecContext, ExecutorRow, ExecStats};
+U sql/types.{SqlValue, Expr};
+U sql/row.Row;
+U vector/hnsw/search.{knn_search, SearchResult, SearchResultEntry};
+U vector/hnsw/delete.{mvcc_filtered_search, MvccSearchResult};
+U vector/hnsw/types.HnswMeta;
+U vector/distance.{DistanceComputer, create_distance_computer};
+U storage/buffer/pool.BufferPool;
+U sql/catalog/manager.CatalogManager;
+
+# Error codes: EE=02 (vector), CC=03 (search)
+# 02-03-007: Invalid VECTOR_SEARCH arguments
+# 02-03-008: Vector dimension mismatch
+# 02-03-009: Search execution failed
+
+# VectorSearchParams: parsed parameters from SQL VECTOR_SEARCH() call
+S VectorSearchParams {
+    table_name: Str,
+    column_name: Str,       # VECTOR column to search
+    query_vector: Vec<f32>, # Query embedding
+    top_k: u64,           # Number of results to R     ef_search: Option<u32>, # Optional ef_search override
+    index_id: u32,          # Resolved from catalog (set during open())
+    table_id: u32,          # Resolved table ID
+}
+
+# VectorSearchRow: materialized result row with distance and original data
+S VectorSearchRow {
+    node_id: u64,
+    distance: f32,
+    row: Row,  # Original row data from table
+}
+
+# VectorSearchExecutor: Volcano-style iterator for VECTOR_SEARCH()
+S VectorSearchExecutor {
+    params: VectorSearchParams,
+    results: Option<Vec<VectorSearchRow>>,
+    cursor: u64,
+    stats: ExecStats,
+    ctx: &ExecContext,
+}
+
+X VectorSearchExecutor {
+    # Create new executor with parsed parameters
+    F new(params: VectorSearchParams, ctx: &ExecContext) -> VectorSearchExecutor {
+        VectorSearchExecutor {
+            params: params,
+            results: None,
+            cursor: 0,
+            stats: ExecStats.new(),
+            ctx: ctx,
+        }
+    }
+
+    # Open: resolve index, execute MVCC-filtered search, materialize results
+    F open(mut self) -> Result<(), VaisError> {
+        # 1. Resolve table and column from catalog
+        table_meta := self.ctx.catalog.get_table(&self.params.table_name)
+            .ok_or(error_code(2, 3, 7, "Table not found for VECTOR_SEARCH"))?;
+
+        self.params.table_id = table_meta.table_id;
+
+        # 2. Find VECTOR column and its index
+        column_found := mut false;
+        vector_index_id := mut 0u32;
+        column_idx := mut 0u64;
+
+        L col: table_meta.columns.iter() {
+            I !column_found {
+                M col.col_type {
+                    SqlValue.VectorVal { .. } => {
+                        I col.name == self.params.column_name {
+                            column_found = true;
+                            column_idx = col.column_id as u64;
+                            # Find associated HNSW index
+                            index_meta := self.ctx.catalog.get_vector_index(
+                                self.params.table_id,
+                                col.column_id
+                            ).ok_or(error_code(2, 3, 7, "No HNSW index found for column"))?;
+                            vector_index_id = index_meta.index_id;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        I !column_found {
+            R Err(error_code(2, 3, 7, "VECTOR column not found"));
+        }
+
+        self.params.index_id = vector_index_id;
+
+        # 3. Load HNSW metadata and verify dimension
+        index_meta := self.ctx.catalog.get_hnsw_metadata(vector_index_id)
+            .ok_or(error_code(2, 3, 7, "HNSW metadata not found"))?;
+
+        I self.params.query_vector.len() != index_meta.dimension as u64 {
+            R Err(error_code(2, 3, 8, "Query vector dimension mismatch"));
+        }
+
+        # 4. Create distance computer from index config
+        distance_computer := create_distance_computer(
+            &index_meta.metric_type,
+            index_meta.dimension
+        )?;
+
+        # 5. Determine ef_search value (use override or default)
+        ef_search := M self.params.ef_search {
+            Some(ef) => ef,
+            None => index_meta.ef_construction * 2,  # Default heuristic
+        };
+
+        # 6. Get node store from buffer pool
+        node_store := self.ctx.pool.get_hnsw_node_store(vector_index_id)?;
+
+        # 7. Execute MVCC-filtered search
+        search_result := mvcc_filtered_search(
+            &self.params.query_vector,
+            self.params.top_k,
+            ef_search,
+            &index_meta,
+            node_store,
+            &distance_computer,
+            &self.ctx.snapshot,
+            self.ctx.catalog.get_clog(),
+        ).map_err(|e| error_code(2, 3, 9, "MVCC search failed"))?;
+
+        self.stats.add_scanned(search_result.total_candidates);
+
+        # 8. Materialize results by loading original rows
+        materialized := mut Vec.with_capacity(search_result.results.len());
+
+        L entry: search_result.results.iter() {
+            # Load original row from table using node_id as TID
+            row := self.load_row_by_node_id(entry.node_id)?;
+
+            materialized.push(VectorSearchRow {
+                node_id: entry.node_id,
+                distance: entry.distance,
+                row: row,
+            });
+
+            self.stats.add_produced();
+        }
+
+        self.results = Some(materialized);
+        self.cursor = 0;
+
+        Ok(())
+    }
+
+    # Next: return next result row as ExecutorRow
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+        M &self.results {
+            None => Err(error_code(2, 3, 9, "VectorSearchExecutor not opened")),
+            Some(results) => {
+                I self.cursor >= results.len() {
+                    R Ok(None);
+                }
+
+                result_row := &results[self.cursor];
+                self.cursor += 1;
+
+                # Build output row: (distance, ...original_columns)
+                output_row := mut Row.new();
+
+                # First column: distance
+                output_row.add_column(SqlValue.FloatVal { v: result_row.distance as f64 });
+
+                # Append all original columns
+                L i: 0..result_row.row.column_count() {
+                    output_row.add_column(result_row.row.get(i).clone());
+                }
+
+                # Return as virtual ExecutorRow (no physical TID)
+                Ok(Some(ExecutorRow.virtual(output_row)))
+            }
+        }
+    }
+
+    # Close: release resources
+    F close(mut self) -> Result<(), VaisError> {
+        self.results = None;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    # Stats: return execution statistics
+    F stats(self) -> &ExecStats {
+        &self.stats
+    }
+
+    # Helper: load row by node_id (maps to physical TID)
+    F load_row_by_node_id(self, node_id: u64) -> Result<Row, VaisError> {
+        # node_id encoding: high 24 bits = page_id, low 16 bits = slot_id
+        page_id := (node_id >> 16) as u32;
+        slot_id := (node_id & 0xFFFF) as u16;
+
+        # Get table file_id from catalog
+        table_meta := self.ctx.catalog.get_table_by_id(self.params.table_id)
+            .ok_or(error_code(2, 3, 9, "Table metadata not found"))?;
+
+        file_id := table_meta.file_id;
+
+        # Read page from buffer pool
+        page := self.ctx.pool.fetch_page(file_id, page_id)?;
+        page_guard := page.read();
+
+        # Parse heap page and extract slot
+        heap_page := HeapPage.from_bytes(page_guard.data())?;
+        tuple_data := heap_page.get_slot(slot_id)
+            .ok_or(error_code(2, 3, 9, "Slot not found in heap page"))?;
+
+        # Deserialize row
+        row := Row.deserialize(tuple_data, &table_meta.columns)?;
+
+        # Check MVCC visibility
+        mvcc_tuple := heap_page.get_mvcc_tuple(slot_id)
+            .ok_or(error_code(2, 3, 9, "MVCC tuple not found"))?;
+
+        I !is_visible(
+            mvcc_tuple,
+            self.ctx.txn_id,
+            0,  # cmd_id (not used for read-only search)
+            &self.ctx.snapshot,
+            self.ctx.catalog.get_clog()
+        ) {
+            R Err(error_code(2, 3, 9, "Row not visible to snapshot"));
+        }
+
+        Ok(row)
+    }
+}
+
+# parse_vector_search_args: parse VECTOR_SEARCH(column, query_vector, top_k, [ef_search])
+# Expected signature:
+#   VECTOR_SEARCH(table.column, ARRAY[0.1, 0.2, ...], 10)
+#   VECTOR_SEARCH(table.column, ARRAY[0.1, 0.2, ...], 10, 200)  -- with ef_search
+F parse_vector_search_args(
+    args: &[Expr],
+    ctx: &ExecContext
+) -> Result<VectorSearchParams, VaisError> {
+    I args.len() < 3 || args.len() > 4 {
+        R Err(error_code(2, 3, 7, "VECTOR_SEARCH requires 3 or 4 arguments"));
+    }
+
+    # Argument 1: table.column reference
+    (table_name, column_name) := M &args[0] {
+        Expr.ColumnRef { table, column } => {
+            (table.clone(), column.clone())
+        },
+        _ => R Err(error_code(2, 3, 7, "First arg must be column reference"))
+    };
+
+    # Argument 2: query vector (ARRAY[...] or vector literal)
+    query_vector := M &args[1] {
+        Expr.ArrayLiteral { elements } => {
+            vec := mut Vec.with_capacity(elements.len());
+            L elem: elements.iter() {
+                M elem {
+                    Expr.Literal { value: SqlValue.FloatVal { v } } => {
+                        vec.push(*v as f32);
+                    },
+                    Expr.Literal { value: SqlValue.IntVal { v } } => {
+                        vec.push(*v as f32);
+                    },
+                    _ => R Err(error_code(2, 3, 7, "Array elements must be numeric"))
+                }
+            }
+            vec
+        },
+        Expr.Literal { value: SqlValue.VectorVal { v } } => v.clone(),
+        _ => R Err(error_code(2, 3, 7, "Second arg must be vector"))
+    };
+
+    # Argument 3: top_k
+    top_k := M &args[2] {
+        Expr.Literal { value: SqlValue.IntVal { v } } => {
+            I *v <= 0 {
+                R Err(error_code(2, 3, 7, "top_k must be positive"));
+            }
+            *v as u64
+        },
+        _ => R Err(error_code(2, 3, 7, "Third arg must be integer"))
+    };
+
+    # Argument 4: ef_search (optional)
+    ef_search := I args.len() == 4 {
+        M &args[3] {
+            Expr.Literal { value: SqlValue.IntVal { v } } => {
+                I *v <= 0 {
+                    R Err(error_code(2, 3, 7, "ef_search must be positive"));
+                }
+                Some(*v as u32)
+            },
+            _ => R Err(error_code(2, 3, 7, "Fourth arg must be integer"))
+        }
+    } E {
+        None
+    };
+
+    Ok(VectorSearchParams {
+        table_name: table_name,
+        column_name: column_name,
+        query_vector: query_vector,
+        top_k: top_k,
+        ef_search: ef_search,
+        index_id: 0,  # Resolved during open()
+        table_id: 0,  # Resolved during open()
+    })
+}
+
+# execute_vector_search: standalone helper for direct execution
+# (Used when VECTOR_SEARCH is called outside Volcano iterator context)
+F execute_vector_search(
+    params: &VectorSearchParams,
+    ctx: &ExecContext
+) -> Result<Vec<VectorSearchRow>, VaisError> {
+    executor := mut VectorSearchExecutor.new(params.clone(), ctx);
+    executor.open()?;
+
+    results := mut Vec.new();
+    # Trigger materialization by calling next once
+    executor.next()?;
+
+    M executor.results {
+        Some(materialized) => Ok(materialized),
+        None => Ok(Vec.new())
+    }
+}
+
+# Helper imports for row loading (would be in actual implementation)
+U storage/page/heap.HeapPage;
+U storage/txn/visibility.is_tuple_visible;
+
+# VectorSearchBuilder: fluent API for constructing searches
+S VectorSearchBuilder {
+    table: Option<Str>,
+    column: Option<Str>,
+    query: Option<Vec<f32>>,
+    k: Option<u64>,
+    ef: Option<u32>,
+}
+
+X VectorSearchBuilder {
+    F new() -> VectorSearchBuilder {
+        VectorSearchBuilder {
+            table: None,
+            column: None,
+            query: None,
+            k: None,
+            ef: None,
+        }
+    }
+
+    F table(mut self, name: Str) -> Self {
+        self.table = Some(name);
+        self
+    }
+
+    F column(mut self, name: Str) -> Self {
+        self.column = Some(name);
+        self
+    }
+
+    F query(mut self, vec: Vec<f32>) -> Self {
+        self.query = Some(vec);
+        self
+    }
+
+    F top_k(mut self, k: u64) -> Self {
+        self.k = Some(k);
+        self
+    }
+
+    F ef_search(mut self, ef: u32) -> Self {
+        self.ef = Some(ef);
+        self
+    }
+
+    F build(self) -> Result<VectorSearchParams, VaisError> {
+        Ok(VectorSearchParams {
+            table_name: self.table.ok_or(error_code(2, 3, 7, "Missing table"))?,
+            column_name: self.column.ok_or(error_code(2, 3, 7, "Missing column"))?,
+            query_vector: self.query.ok_or(error_code(2, 3, 7, "Missing query vector"))?,
+            top_k: self.k.ok_or(error_code(2, 3, 7, "Missing top_k"))?,
+            ef_search: self.ef,
+            index_id: 0,
+            table_id: 0,
+        })
+    }
+}
+
+# Public API: VectorSearchParams, VectorSearchRow,
+# VectorSearchExecutor, VectorSearchBuilder,
+# parse_vector_search_args, execute_vector_search

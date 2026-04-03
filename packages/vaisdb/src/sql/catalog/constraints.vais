@@ -1,0 +1,415 @@
+# Constraint Validation System
+# Validates table constraints (NOT NULL, PRIMARY KEY, UNIQUE, DEFAULT, CHECK)
+# Called during INSERT/UPDATE execution to ensure data integrity
+# Error codes: EE=01 (SQL), CC=02 (Constraint), NNN=001-005
+
+U std/bytes.{ByteBuffer};
+U storage/error.{VaisError};
+U storage/constants.{DEFAULT_PAGE_SIZE};
+U storage/buffer/pool.{BufferPool};
+U storage/btree/tree.{BTree};
+U storage/btree/search.{search_cursor};
+U sql/catalog/schema.{TableInfo, ColumnInfo, IndexInfo};
+U sql/types.{SqlType, SqlValue};
+U sql/row.{Row};
+
+# ============================================================================
+# Error constructors (EE=01 SQL, CC=02 Constraint)
+# ============================================================================
+
+# VAIS-0102001: NOT NULL constraint violated
+F err_not_null_violation(column: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0102001",
+        "NOT NULL constraint violated: column '{column}' cannot be NULL"
+    )
+}
+
+# VAIS-0102002: PRIMARY KEY constraint violated (duplicate)
+F err_primary_key_violation(column: Str, value: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0102002",
+        "PRIMARY KEY constraint violated: duplicate key '{value}' in column '{column}'"
+    )
+}
+
+# VAIS-0102003: UNIQUE constraint violated (duplicate)
+F err_unique_violation(columns: Str, value: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0102003",
+        "UNIQUE constraint violated: duplicate key '{value}' in columns '{columns}'"
+    )
+}
+
+# VAIS-0102004: CHECK constraint violated
+F err_check_violation(constraint_name: Str, expression: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0102004",
+        "CHECK constraint '{constraint_name}' violated: expression '{expression}' evaluated to false"
+    )
+}
+
+# VAIS-0102005: DEFAULT value cannot be applied
+F err_default_error(column: Str, detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0102005",
+        "DEFAULT value cannot be applied to column '{column}': {detail}"
+    )
+}
+
+# ============================================================================
+# ConstraintChecker — Main constraint validation structure
+# ============================================================================
+
+S ConstraintChecker {
+    table_info: TableInfo,
+    columns: Vec<ColumnInfo>,
+    indexes: Vec<IndexInfo>,  # All indexes for this table (PK + UNIQUE + regular)
+}
+
+X ConstraintChecker {
+    # Create a new constraint checker for a table
+    F new(table_info: TableInfo, columns: Vec<ColumnInfo>, indexes: Vec<IndexInfo>) -> ConstraintChecker {
+        ConstraintChecker {
+            table_info,
+            columns,
+            indexes,
+        }
+    }
+
+    # Check NOT NULL constraints
+    # Validates that all non-nullable columns have non-NULL values
+    F check_not_null(self, row: &Row) -> Result<(), VaisError> {
+        L i: 0..self.columns.len() {
+            col := mut &self.columns[i];
+            I !col.nullable {
+                val := mut row.get(i);
+                I val.is_null() {
+                    R Err(err_not_null_violation(col.name.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    # Check PRIMARY KEY constraint
+    # Validates that PK column values are not NULL and not duplicate in the B+Tree index
+    # Uses the primary key index to search for existing values
+    F check_primary_key(self, row: &Row, pool: &mut BufferPool) -> Result<(), VaisError> {
+        # Find the primary key index
+        pk_index: Option<&IndexInfo> := mut None;
+        L idx: &self.indexes {
+            I pk_index.is_none() && idx.is_primary {
+                pk_index = Some(idx);
+            }
+        }
+
+        M pk_index {
+            None => {
+                # No primary key defined, nothing to check
+                Ok(())
+            },
+            Some(pk_idx) => {
+                # Build composite key from PK columns
+                pk_values := mut Vec.new();
+                L col_name: &pk_idx.columns {
+                    # Find column index by name
+                    col_idx := mut self.find_column_index(col_name)?;
+                    val := mut row.get(col_idx);
+
+                    # PK columns cannot be NULL
+                    I val.is_null() {
+                        R Err(err_not_null_violation(col_name.clone()));
+                    }
+
+                    pk_values.push(val);
+                }
+
+                # Build index key bytes
+                key_bytes := mut build_index_key(&pk_values)?;
+
+                # Search in the PK index B+Tree
+                tree := mut BTree.new(pk_idx.root_page_id, 0, DEFAULT_PAGE_SIZE);
+                cursor := mut search_cursor(&tree, &key_bytes, pool)?;
+
+                I cursor.valid() {
+                    # Key already exists = duplicate
+                    cursor.close(pool);
+                    display_key := mut format_key_values(&pk_idx.columns, &pk_values);
+                    R Err(err_primary_key_violation(
+                        pk_idx.columns.join(", "),
+                        display_key
+                    ));
+                }
+
+                cursor.close(pool);
+                Ok(())
+            },
+        }
+    }
+
+    # Check UNIQUE constraints
+    # Validates that UNIQUE index column values are not duplicate
+    # NULL values are allowed and do not count as duplicates (NULL != NULL in SQL)
+    F check_unique(self, row: &Row, pool: &mut BufferPool) -> Result<(), VaisError> {
+        L idx: &self.indexes {
+            # Only check UNIQUE indexes (excluding primary key, already checked)
+            I idx.is_unique && !idx.is_primary {
+                # Build composite key from UNIQUE columns
+                unique_values := mut Vec.new();
+                has_null := mut false;
+
+                L col_name: &idx.columns {
+                    col_idx := mut self.find_column_index(col_name)?;
+                    val := mut row.get(col_idx);
+
+                    # NULL in UNIQUE column: skip this check (NULL != NULL)
+                    I val.is_null() {
+                        has_null = true;
+                    }
+
+                    I !has_null {
+                        unique_values.push(val);
+                    }
+                }
+
+                # If any column is NULL, skip uniqueness check for this index
+                I !has_null {
+                    # Build index key bytes
+                    key_bytes := mut build_index_key(&unique_values)?;
+
+                    # Search in the UNIQUE index B+Tree
+                    tree := mut BTree.new(idx.root_page_id, 0, DEFAULT_PAGE_SIZE);
+                    cursor := mut search_cursor(&tree, &key_bytes, pool)?;
+
+                    I cursor.valid() {
+                        # Key already exists = duplicate
+                        cursor.close(pool);
+                        display_key := mut format_key_values(&idx.columns, &unique_values);
+                        R Err(err_unique_violation(
+                            idx.columns.join(", "),
+                            display_key
+                        ));
+                    }
+
+                    cursor.close(pool);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    # Apply DEFAULT values to missing or NULL columns
+    # For INSERT operations where columns are omitted or explicitly NULL
+    # Returns a new Row with defaults applied
+    F apply_defaults(self, values: Vec<SqlValue>, specified_columns: &[Str]) -> Result<Row, VaisError> {
+        result_values := mut Vec.with_capacity(self.columns.len());
+
+        L i: 0..self.columns.len() {
+            col := mut &self.columns[i];
+
+            # Check if this column was specified by the user
+            is_specified := mut specified_columns.len() == 0 || specified_columns.contains(&col.name);
+
+            final_value := mut I is_specified && i < values.len() {
+                # User provided a value (may be NULL)
+                provided_val := mut &values[i];
+
+                I provided_val.is_null() {
+                    # User explicitly provided NULL, try to apply default
+                    M &col.default_value {
+                        Some(ref default_str) => {
+                            parse_default_value(default_str, &col.data_type)?
+                        },
+                        None => {
+                            # No default, check nullable
+                            I col.nullable {
+                                SqlValue.Null
+                            } E {
+                                R Err(err_not_null_violation(col.name.clone()));
+                            }
+                        },
+                    }
+                } E {
+                    # User provided non-NULL value, use it
+                    provided_val.clone()
+                }
+            } E {
+                # Column not specified, apply default
+                M &col.default_value {
+                    Some(ref default_str) => {
+                        parse_default_value(default_str, &col.data_type)?
+                    },
+                    None => {
+                        # No default value specified
+                        I col.nullable {
+                            SqlValue.Null
+                        } E {
+                            R Err(err_default_error(
+                                col.name.clone(),
+                                "no default value defined and column is NOT NULL"
+                            ));
+                        }
+                    },
+                }
+            };
+
+            result_values.push(final_value);
+        }
+
+        Ok(Row.new(result_values))
+    }
+
+    # Check CHECK constraints (placeholder for future implementation)
+    # CHECK constraints require expression evaluation, which will be integrated
+    # with the SQL expression evaluator in the executor module
+    # For now, this is a no-op that always succeeds
+    F check_check_constraint(self, row: &Row) -> Result<(), VaisError> {
+        # FUTURE(sql/executor): Evaluate CHECK expression using expression evaluator
+        # Parse CHECK expr from table metadata, build eval context, evaluate, reject NULL/FALSE
+        Ok(())
+    }
+
+    # Validate all constraints for a row
+    # Called by INSERT/UPDATE executors before committing the row
+    # Performs checks in order: NOT NULL, PRIMARY KEY, UNIQUE, CHECK
+    F validate_row(self, row: &Row, pool: &mut BufferPool) -> Result<(), VaisError> {
+        # 1. Check NOT NULL constraints
+        self.check_not_null(row)?;
+
+        # 2. Check PRIMARY KEY constraint (includes NULL check and uniqueness)
+        self.check_primary_key(row, pool)?;
+
+        # 3. Check UNIQUE constraints
+        self.check_unique(row, pool)?;
+
+        # 4. Check CHECK constraints (placeholder)
+        self.check_check_constraint(row)?;
+
+        Ok(())
+    }
+
+    # Helper: Find column index by name
+    F find_column_index(self, col_name: &Str) -> Result<u64, VaisError> {
+        L i: 0..self.columns.len() {
+            I &self.columns[i].name == col_name {
+                R Ok(i);
+            }
+        }
+        Err(VaisError.new(
+            "VAIS-0102005",
+            "Column '{col_name}' not found in table '{self.table_info.name}'"
+        ))
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Build index key bytes from a list of SqlValues
+# Concatenates serialized values to form a composite key
+# Used for PK and UNIQUE index lookups
+F build_index_key(values: &[&SqlValue]) -> Result<Vec<u8>, VaisError> {
+    buf := mut ByteBuffer.new();
+
+    L val: values {
+        # Serialize each value (includes type tag and data)
+        val.serialize(&mut buf);
+    }
+
+    Ok(buf.to_vec())
+}
+
+# Format key values for error messages
+# Example: ["id", "email"] with [IntVal(42), StringVal("test")] -> "id=42, email='test'"
+F format_key_values(col_names: &[Str], values: &[&SqlValue]) -> Str {
+    parts := mut Vec.new();
+
+    L i: 0..col_names.len() {
+        I i < values.len() {
+            part := mut "{col_names[i]}={values[i].to_string()}";
+            parts.push(part);
+        }
+    }
+
+    parts.join(", ")
+}
+
+# Parse a default value string into a SqlValue
+# Handles simple literals: integers, floats, booleans, strings, NULL
+# Format examples: "42", "3.14", "true", "'hello'", "NULL"
+F parse_default_value(default_str: &Str, data_type: &SqlType) -> Result<SqlValue, VaisError> {
+    trimmed := mut default_str.trim();
+
+    # Handle NULL literal
+    I trimmed.to_uppercase() == "NULL" {
+        R Ok(SqlValue.Null);
+    }
+
+    # Parse based on target type
+    M data_type {
+        SqlType.Int => {
+            M i64.parse(trimmed) {
+                Ok(n) => Ok(SqlValue.IntVal { v: n }),
+                Err(_) => Err(VaisError.new(
+                    "VAIS-0102005",
+                    "Cannot parse default value '{default_str}' as INT"
+                )),
+            }
+        },
+        SqlType.Float => {
+            M f64.parse(trimmed) {
+                Ok(n) => Ok(SqlValue.FloatVal { v: n }),
+                Err(_) => Err(VaisError.new(
+                    "VAIS-0102005",
+                    "Cannot parse default value '{default_str}' as FLOAT"
+                )),
+            }
+        },
+        SqlType.Bool => {
+            lower := mut trimmed.to_lowercase();
+            M lower.as_str() {
+                "true" | "1" | "yes" => Ok(SqlValue.BoolVal { v: true }),
+                "false" | "0" | "no" => Ok(SqlValue.BoolVal { v: false }),
+                _ => Err(VaisError.new(
+                    "VAIS-0102005",
+                    "Cannot parse default value '{default_str}' as BOOL"
+                )),
+            }
+        },
+        SqlType.Varchar { .. } | SqlType.Text => {
+            # String literals: strip surrounding quotes if present
+            str_val := mut I trimmed.starts_with("'") && trimmed.ends_with("'") && trimmed.len() >= 2 {
+                trimmed[1..(trimmed.len() - 1)].to_string()
+            } E {
+                trimmed.to_string()
+            };
+            Ok(SqlValue.StringVal { v: str_val })
+        },
+        SqlType.Date => {
+            # Date as days since epoch (integer)
+            M i32.parse(trimmed) {
+                Ok(n) => Ok(SqlValue.DateVal { v: n }),
+                Err(_) => Err(VaisError.new(
+                    "VAIS-0102005",
+                    "Cannot parse default value '{default_str}' as DATE"
+                )),
+            }
+        },
+        SqlType.Timestamp => {
+            # Timestamp as microseconds since epoch (integer)
+            M i64.parse(trimmed) {
+                Ok(n) => Ok(SqlValue.TimestampVal { v: n }),
+                Err(_) => Err(VaisError.new(
+                    "VAIS-0102005",
+                    "Cannot parse default value '{default_str}' as TIMESTAMP"
+                )),
+            }
+        },
+        _ => {
+            # For BLOB and VECTOR, use type's default value (not parseable from string)
+            Ok(data_type.default_value())
+        },
+    }
+}

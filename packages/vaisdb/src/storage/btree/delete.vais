@@ -1,0 +1,454 @@
+# B+Tree Delete Operations
+# Delete key-TID pairs with underflow detection and merge/redistribution
+# Based on Stage 1 Section 9 - 40% merge threshold
+
+U storage/constants.{NULL_PAGE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError, err_internal, err_key_not_found};
+U storage/buffer/pool.{BufferPool};
+U storage/btree/tree.{BTree};
+U storage/btree/node.{BTreeInternalNode, BTreeLeafNode};
+U storage/btree/entry.{BTreeLeafEntry, BTreeInternalEntry, compare_keys, KeyCmp, key_equal};
+U storage/btree/insert.{PathEntry, collect_insert_path, find_child_index};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/recovery/checkpoint.{write_fpi};
+U storage/btree/latch.{LatchGuard};
+
+# Merge threshold: if utilization drops below 40%, consider merge
+C MERGE_THRESHOLD: f64 = 0.40;
+
+# Result of a delete that may trigger merge/redistribution
+L DeleteResult =
+    Done                       # Delete completed, no underflow
+  | Underflow(u32);           # Page with underflow (page_id)
+
+# Delete a key from the B+Tree
+# Returns Ok(Some(tid)) if found and deleted, Ok(None) if not found
+F btree_delete(
+    tree: &mut BTree,
+    key: &[u8],
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+) -> Result<Option<u32>, VaisError> {
+    # Collect path to leaf
+    path := mut collect_insert_path(tree, key, pool)?;
+
+    # Find and delete from leaf
+    leaf_info := mut &path[path.len() - 1];
+    leaf_frame := mut pool.fetch_page(tree.file_id, leaf_info.page_id)?;
+    page_data := mut pool.get_page(leaf_frame);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    # Acquire write latch on leaf before modification
+    leaf_latch := mut LatchGuard.new_write(tree.get_latch_table(), leaf_info.page_id);
+
+    removed_tid := mut leaf.delete(key);
+    M removed_tid {
+        None => {
+            leaf_latch.release();
+            pool.unpin_page(leaf_frame, false);
+            R Ok(None);
+        },
+        Some(_) => {},
+    }
+
+    # FPI: leaf page being modified
+    I pool.needs_fpi(leaf_frame) {
+        fpi_data := mut pool.get_page(leaf_frame);
+        write_fpi(gcm.writer(), txn_id, tree.file_id, leaf_info.page_id, fpi_data)?;
+        pool.clear_fpi(leaf_frame);
+    }
+
+    # Write the modified leaf
+    flushed := mut leaf.flush();
+    pool.write_page(leaf_frame, flushed)?;
+
+    # Check for underflow (skip if root)
+    needs_merge := mut !leaf.is_root() && leaf.utilization() < MERGE_THRESHOLD;
+
+    leaf_latch.release();
+    pool.unpin_page(leaf_frame, true);
+    tree.dec_entries();
+
+    # Handle underflow by attempting merge or redistribution
+    I needs_merge && path.len() > 1 {
+        handle_leaf_underflow(tree, &path, txn_id, gcm, pool)?;
+    }
+
+    Ok(removed_tid)
+}
+
+# Handle leaf underflow by merging with a sibling or redistributing
+F handle_leaf_underflow(
+    tree: &mut BTree,
+    path: &[PathEntry],
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+) -> Result<(), VaisError> {
+    leaf_info := mut &path[path.len() - 1];
+    parent_info := mut &path[path.len() - 2];
+
+    # Load parent to find siblings
+    parent_frame := mut pool.fetch_page(tree.file_id, parent_info.page_id)?;
+    parent_data := mut pool.get_page(parent_frame);
+    parent := mut BTreeInternalNode.from_page_data(parent_data, tree.page_size)?;
+
+    # Find the index of our leaf in the parent
+    child_idx := mut parent_info.index;
+
+    # Try to merge with left sibling first, then right
+    left_sibling := mut get_left_sibling(&parent, child_idx);
+    right_sibling := mut get_right_sibling(&parent, child_idx);
+
+    # Load the underflowing leaf
+    leaf_frame2 := mut pool.fetch_page(tree.file_id, leaf_info.page_id)?;
+    leaf_data := mut pool.get_page(leaf_frame2);
+    leaf := mut BTreeLeafNode.from_page_data(leaf_data, tree.page_size)?;
+
+    # Try left sibling merge/redistribute
+    I left_sibling != NULL_PAGE {
+        left_frame := mut pool.fetch_page(tree.file_id, left_sibling)?;
+        left_data := mut pool.get_page(left_frame);
+        left_leaf := mut BTreeLeafNode.from_page_data(left_data, tree.page_size)?;
+
+        combined_entries := mut left_leaf.entry_count() as u32 + leaf.entry_count() as u32;
+
+        I can_merge_leaves(&left_leaf, &leaf, tree.page_size) {
+            # Merge: move all entries from right into left
+            merge_leaves(&left_leaf, &leaf, left_frame, leaf_frame2, tree, txn_id, gcm, pool)?;
+
+            # Remove separator from parent
+            remove_from_parent(tree, &parent, child_idx, parent_frame, path, txn_id, gcm, pool)?;
+
+            pool.unpin_page(left_frame, true);
+            pool.unpin_page(leaf_frame2, true);
+            pool.unpin_page(parent_frame, true);
+            R Ok(());
+        } E I left_leaf.entry_count() > 1 {
+            # Redistribute: move entries from left to right
+            redistribute_from_left(&left_leaf, &leaf, &parent, child_idx,
+                left_frame, leaf_frame2, parent_frame, txn_id, gcm, pool, tree.file_id)?;
+
+            pool.unpin_page(left_frame, true);
+            pool.unpin_page(leaf_frame2, true);
+            pool.unpin_page(parent_frame, true);
+            R Ok(());
+        }
+
+        pool.unpin_page(left_frame, false);
+    }
+
+    # Try right sibling merge/redistribute
+    I right_sibling != NULL_PAGE {
+        right_frame := mut pool.fetch_page(tree.file_id, right_sibling)?;
+        right_data := mut pool.get_page(right_frame);
+        right_leaf := mut BTreeLeafNode.from_page_data(right_data, tree.page_size)?;
+
+        I can_merge_leaves(&leaf, &right_leaf, tree.page_size) {
+            # Merge: move all entries from right into left (our leaf)
+            merge_leaves(&leaf, &right_leaf, leaf_frame2, right_frame, tree, txn_id, gcm, pool)?;
+
+            # Remove separator from parent (right sibling's entry)
+            right_child_idx := mut child_idx + 1;
+            remove_from_parent(tree, &parent, right_child_idx, parent_frame, path, txn_id, gcm, pool)?;
+
+            pool.unpin_page(right_frame, true);
+            pool.unpin_page(leaf_frame2, true);
+            pool.unpin_page(parent_frame, true);
+            R Ok(());
+        } E I right_leaf.entry_count() > 1 {
+            # Redistribute: move entries from right to left
+            redistribute_from_right(&leaf, &right_leaf, &parent, child_idx,
+                leaf_frame2, right_frame, parent_frame, txn_id, gcm, pool, tree.file_id)?;
+
+            pool.unpin_page(right_frame, true);
+            pool.unpin_page(leaf_frame2, true);
+            pool.unpin_page(parent_frame, true);
+            R Ok(());
+        }
+
+        pool.unpin_page(right_frame, false);
+    }
+
+    # Neither sibling can merge or redistribute — leave as is (lazy approach)
+    pool.unpin_page(leaf_frame2, false);
+    pool.unpin_page(parent_frame, false);
+    Ok(())
+}
+
+# Get the left sibling page ID from the parent
+F get_left_sibling(parent: &BTreeInternalNode, child_idx: u64) -> u32 {
+    I child_idx == 0 {
+        NULL_PAGE
+    } E I child_idx == 1 {
+        parent.leftmost_child
+    } E {
+        parent.entries[child_idx - 2].child_page
+    }
+}
+
+# Get the right sibling page ID from the parent
+F get_right_sibling(parent: &BTreeInternalNode, child_idx: u64) -> u32 {
+    I child_idx < parent.entries.len() {
+        parent.entries[child_idx].child_page
+    } E {
+        NULL_PAGE
+    }
+}
+
+# Check if two leaf nodes can be merged into one
+F can_merge_leaves(left: &BTreeLeafNode, right: &BTreeLeafNode, page_size: u32) -> bool {
+    # Conservative: check if all entries from both leaves fit in one page
+    total_entries := mut left.entry_count() as u32 + right.entry_count() as u32;
+    body_size := mut page_size - PAGE_HEADER_SIZE;
+    # Each entry needs at least 8 bytes (directory) + average key size
+    # Conservative estimate: use 50% utilization as merge threshold
+    total_entries * 16 < body_size  # rough estimate
+}
+
+# Merge right leaf into left leaf
+F merge_leaves(
+    left: &mut BTreeLeafNode,
+    right: &BTreeLeafNode,
+    left_frame: u32,
+    right_frame: u32,
+    tree: &BTree,
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+) -> Result<(), VaisError> {
+    # Move all entries from right to left
+    L i: 0..right.entry_count() as u64 {
+        key := mut right.get_key(i).to_vec();
+        tid := mut right.entries[i].tid;
+        left.insert(&key, tid)?;
+    }
+
+    # Update leaf chain: left.next = right.next
+    right_next := mut right.next_leaf();
+    left.set_next_leaf(right_next);
+
+    # Update the next leaf's prev pointer
+    I right_next != NULL_PAGE {
+        next_frame := mut pool.fetch_page(tree.file_id, right_next)?;
+        # FPI: next leaf's prev pointer is being modified
+        I pool.needs_fpi(next_frame) {
+            fpi_data := mut pool.get_page(next_frame);
+            write_fpi(gcm.writer(), txn_id, tree.file_id, right_next, fpi_data)?;
+            pool.clear_fpi(next_frame);
+        }
+        next_data := mut pool.get_page(next_frame);
+        next_leaf := mut BTreeLeafNode.from_page_data(next_data, tree.page_size)?;
+        next_leaf.set_prev_leaf(left.header.page_id);
+        next_flushed := mut next_leaf.flush();
+        pool.write_page(next_frame, next_flushed)?;
+        pool.unpin_page(next_frame, true);
+    }
+
+    # FPI: left leaf is being rewritten with merged data
+    I pool.needs_fpi(left_frame) {
+        fpi_data := mut pool.get_page(left_frame);
+        write_fpi(gcm.writer(), txn_id, tree.file_id, left.header.page_id, fpi_data)?;
+        pool.clear_fpi(left_frame);
+    }
+
+    # Flush left leaf
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+
+    # Deallocate right page
+    pool.deallocate_page(tree.file_id, right.header.page_id)?;
+
+    Ok(())
+}
+
+# Redistribute entries from left sibling to underflowing right node
+F redistribute_from_left(
+    left: &mut BTreeLeafNode,
+    right: &mut BTreeLeafNode,
+    parent: &mut BTreeInternalNode,
+    child_idx: u64,
+    left_frame: u32,
+    right_frame: u32,
+    parent_frame: u32,
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+    file_id: u8,
+) -> Result<(), VaisError> {
+    # Move last entry from left to beginning of right
+    last_idx := mut (left.entry_count() - 1) as u64;
+    move_key := mut left.get_key(last_idx).to_vec();
+    move_tid := mut left.entries[last_idx].tid;
+
+    right.insert(&move_key, move_tid)?;
+    left.delete(&move_key);
+
+    # Update parent separator: new separator = first key of right
+    new_sep := mut right.get_key(0).to_vec();
+    I child_idx > 0 {
+        sep_idx := mut child_idx - 1;
+        child_page := mut parent.entries[sep_idx].child_page;
+        parent.entries.remove(sep_idx);
+        parent.insert_entry(&new_sep, child_page)?;
+        parent.header.item_count = parent.entries.len() as u16;
+    }
+
+    # FPI: all three pages are being modified
+    I pool.needs_fpi(left_frame) {
+        fpi_data := mut pool.get_page(left_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, left.header.page_id, fpi_data)?;
+        pool.clear_fpi(left_frame);
+    }
+    I pool.needs_fpi(right_frame) {
+        fpi_data := mut pool.get_page(right_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, right.header.page_id, fpi_data)?;
+        pool.clear_fpi(right_frame);
+    }
+    I pool.needs_fpi(parent_frame) {
+        fpi_data := mut pool.get_page(parent_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, parent.header.page_id, fpi_data)?;
+        pool.clear_fpi(parent_frame);
+    }
+
+    # Flush all modified pages
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+    right_flushed := mut right.flush();
+    pool.write_page(right_frame, right_flushed)?;
+    parent_flushed := mut parent.flush();
+    pool.write_page(parent_frame, parent_flushed)?;
+
+    Ok(())
+}
+
+# Redistribute entries from right sibling to underflowing left node
+F redistribute_from_right(
+    left: &mut BTreeLeafNode,
+    right: &mut BTreeLeafNode,
+    parent: &mut BTreeInternalNode,
+    child_idx: u64,
+    left_frame: u32,
+    right_frame: u32,
+    parent_frame: u32,
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+    file_id: u8,
+) -> Result<(), VaisError> {
+    # Move first entry from right to end of left
+    move_key := mut right.get_key(0).to_vec();
+    move_tid := mut right.entries[0].tid;
+
+    left.insert(&move_key, move_tid)?;
+    right.delete(&move_key);
+
+    # Update parent separator: new separator = first key of right (after removal)
+    I right.entry_count() > 0 {
+        new_sep := mut right.get_key(0).to_vec();
+        # The separator at child_idx points to the right sibling
+        I child_idx < parent.entries.len() {
+            child_page := mut parent.entries[child_idx].child_page;
+            parent.entries.remove(child_idx);
+            parent.insert_entry(&new_sep, child_page)?;
+            parent.header.item_count = parent.entries.len() as u16;
+        }
+    }
+
+    # FPI: all three pages are being modified
+    I pool.needs_fpi(left_frame) {
+        fpi_data := mut pool.get_page(left_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, left.header.page_id, fpi_data)?;
+        pool.clear_fpi(left_frame);
+    }
+    I pool.needs_fpi(right_frame) {
+        fpi_data := mut pool.get_page(right_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, right.header.page_id, fpi_data)?;
+        pool.clear_fpi(right_frame);
+    }
+    I pool.needs_fpi(parent_frame) {
+        fpi_data := mut pool.get_page(parent_frame);
+        write_fpi(gcm.writer(), txn_id, file_id, parent.header.page_id, fpi_data)?;
+        pool.clear_fpi(parent_frame);
+    }
+
+    # Flush all modified pages
+    left_flushed := mut left.flush();
+    pool.write_page(left_frame, left_flushed)?;
+    right_flushed := mut right.flush();
+    pool.write_page(right_frame, right_flushed)?;
+    parent_flushed := mut parent.flush();
+    pool.write_page(parent_frame, parent_flushed)?;
+
+    Ok(())
+}
+
+# Remove a separator from parent internal node after merge
+F remove_from_parent(
+    tree: &mut BTree,
+    parent: &mut BTreeInternalNode,
+    child_idx: u64,
+    parent_frame: u32,
+    path: &[PathEntry],
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+) -> Result<(), VaisError> {
+    # Remove the entry at child_idx - 1 (separator between merged children)
+    sep_idx := mut I child_idx > 0 { child_idx - 1 } E { 0 };
+
+    I sep_idx < parent.entries.len() {
+        parent.entries.remove(sep_idx);
+        parent.header.item_count = parent.entries.len() as u16;
+    }
+
+    # If parent is root and empty, the merged child becomes root
+    I parent.is_root() && parent.entries.is_empty() {
+        tree.root_page_id = parent.leftmost_child;
+        tree.height -= 1;
+        pool.deallocate_page(tree.file_id, parent.header.page_id)?;
+    } E {
+        # FPI: parent page is being modified
+        I pool.needs_fpi(parent_frame) {
+            fpi_data := mut pool.get_page(parent_frame);
+            write_fpi(gcm.writer(), txn_id, tree.file_id, parent.header.page_id, fpi_data)?;
+            pool.clear_fpi(parent_frame);
+        }
+
+        # Flush parent
+        flushed := mut parent.flush();
+        pool.write_page(parent_frame, flushed)?;
+
+        # Check if parent also underflows (recursive merge)
+        # For now, use lazy approach (don't cascade)
+    }
+
+    Ok(())
+}
+
+# Update an existing key's TID value (for in-place update)
+F btree_update_tid(
+    tree: &BTree,
+    key: &[u8],
+    new_tid: u32,
+    pool: &mut BufferPool,
+) -> Result<bool, VaisError> {
+    frame_id := mut tree.find_leaf(key, pool)?;
+    page_data := mut pool.get_page(frame_id);
+    leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
+
+    M leaf.search(key) {
+        Some(idx) => {
+            leaf.entries[idx].tid = new_tid;
+            flushed := mut leaf.flush();
+            pool.write_page(frame_id, flushed)?;
+            pool.unpin_page(frame_id, true);
+            Ok(true)
+        },
+        None => {
+            pool.unpin_page(frame_id, false);
+            Ok(false)
+        },
+    }
+}

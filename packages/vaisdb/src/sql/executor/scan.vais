@@ -1,0 +1,603 @@
+# Table Scan and Index Scan Executors
+# TableScan: sequential heap page scan with predicate pushdown + MVCC visibility
+# IndexScan: B+Tree range scan → TID lookup → heap tuple fetch + MVCC visibility
+# Both produce ExecutorRow one at a time (Volcano iterator model)
+
+U storage/error.{VaisError, err_internal};
+U storage/constants.{FILE_ID_DATA, NULL_PAGE};
+U storage/buffer/pool.{BufferPool};
+U storage/page/heap.{HeapPage};
+U storage/page/tuple.{Tuple};
+U storage/page/mvcc.{MvccTupleMeta};
+U storage/txn/visibility.{is_tuple_visible};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/btree/tree.{BTree};
+U storage/btree/search.{search_lower_bound, search_first, search_cursor};
+U storage/btree/cursor.{BTreeCursor};
+U storage/btree/entry.{compare_keys, KeyCmp};
+U storage/btree/key.{KeyRange};
+U storage/bytes.{decode_tid};
+U sql/types.{SqlType, SqlValue};
+U sql/row.{Row};
+U sql/catalog/schema.{TableInfo, ColumnInfo, IndexInfo};
+U sql/executor/mod.{ExecutorRow, ExecContext, ExecStats};
+U sql/executor/expr_eval.{Expr, EvalContext, eval_predicate};
+U sql/parser/ast.{Expr};
+
+# ============================================================================
+# TableScanExecutor — Full table scan
+# ============================================================================
+
+# Scans all heap pages for a table, checking MVCC visibility per tuple.
+# Supports optional predicate pushdown (WHERE clause filter).
+S TableScanExecutor {
+    table_info: TableInfo,
+    columns: Vec<ColumnInfo>,
+    schema: Vec<SqlType>,          # Column types for row decoding
+    filter: Option<Expr>,          # Pushed-down WHERE predicate
+    eval_ctx: EvalContext,         # Column bindings for expression evaluation
+
+    # Iterator state
+    current_page_id: u32,          # Current heap page being scanned
+    current_slot: u16,             # Current slot within the page
+    current_page: Option<HeapPage>,  # Loaded heap page
+    is_open: bool,
+    is_exhausted: bool,
+
+    # Stats
+    stats: ExecStats,
+}
+
+X TableScanExecutor {
+    # Create a new table scan executor
+    F new(
+        table_info: TableInfo,
+        columns: Vec<ColumnInfo>,
+        filter: Option<Expr>,
+    ) -> TableScanExecutor {
+        # Build schema types array from columns
+        schema := mut Vec.with_capacity(columns.len());
+        L col: &columns {
+            schema.push(col.data_type);
+        }
+
+        # Build evaluation context
+        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
+
+        TableScanExecutor {
+            table_info,
+            columns,
+            schema,
+            filter,
+            eval_ctx,
+            current_page_id: 0,
+            current_slot: 0,
+            current_page: None,
+            is_open: false,
+            is_exhausted: false,
+            stats: ExecStats.new(),
+        }
+    }
+
+    # Open the executor — initialize to the first heap page
+    F open(mut self, ctx: &ExecContext) -> Result<(), VaisError> {
+        self.current_page_id = self.table_info.first_page_id;
+        self.current_slot = 0;
+        self.is_open = true;
+        self.is_exhausted = false;
+
+        # Load the first page
+        self.load_page(ctx)?;
+
+        Ok(())
+    }
+
+    # Get next visible row matching the filter
+    # Returns None when scan is exhausted
+    F next(mut self, ctx: &ExecContext) -> Result<Option<ExecutorRow>, VaisError> {
+        I !self.is_open || self.is_exhausted {
+            R Ok(None);
+        }
+
+        L {
+            # Try to get a tuple from the current page
+            M self.try_next_from_current_page(ctx)? {
+                Some(row) => { R Ok(Some(row)); },
+                None => {
+                    # Current page exhausted, move to next page
+                    I !self.advance_page(ctx)? {
+                        # No more pages
+                        self.is_exhausted = true;
+                        R Ok(None);
+                    }
+                    # Continue loop with new page
+                },
+            }
+        }
+    }
+
+    # Close the executor — release resources
+    F close(mut self) {
+        self.current_page = None;
+        self.is_open = false;
+    }
+
+    # Get execution statistics
+    F get_stats(self) -> &ExecStats {
+        &self.stats
+    }
+
+    # ========================================================================
+    # Internal methods
+    # ========================================================================
+
+    # Load the current page into memory
+    F load_page(mut self, ctx: &ExecContext) -> Result<(), VaisError> {
+        I self.current_page_id == 0 || self.current_page_id == NULL_PAGE {
+            self.is_exhausted = true;
+            R Ok(());
+        }
+
+        frame_id := mut ctx.pool.fetch_page(FILE_ID_DATA, self.current_page_id)?;
+        page_data := mut ctx.pool.get_page(frame_id);
+        heap := mut HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
+        ctx.pool.unpin_page(frame_id, false);
+
+        self.current_page = Some(heap);
+        self.current_slot = 0;
+        self.stats.add_page_read();
+
+        Ok(())
+    }
+
+    # Try to get the next visible, filter-matching tuple from the current page
+    F try_next_from_current_page(mut self, ctx: &ExecContext) -> Result<Option<ExecutorRow>, VaisError> {
+        heap := mut M &self.current_page {
+            Some(ref h) => h,
+            None => { R Ok(None); },
+        };
+
+        L self.current_slot < heap.item_count() {
+            slot_idx := mut self.current_slot;
+            self.current_slot += 1;
+            self.stats.add_scanned(1);
+
+            # Try to read the tuple (skip dead slots)
+            tuple_result := mut heap.read_tuple(slot_idx);
+            M tuple_result {
+                Ok(t) => {
+                    # MVCC visibility check
+                    mvcc := mut t.get_mvcc();
+                    I is_tuple_visible(
+                        mvcc.txn_id_create,
+                        mvcc.txn_id_expire,
+                        mvcc.cmd_id,
+                        mvcc.expire_cmd_id,
+                        ctx.snapshot,
+                        ctx.clog,
+                    ) {
+                        # Decode tuple data into a Row
+                        row := mut Row.decode(t.get_data().as_slice(), self.schema.as_slice())?;
+
+                        # Apply pushed-down filter
+                        passed_filter := mut true;
+                        M &self.filter {
+                            Some(ref filter_expr) => {
+                                I !eval_predicate(filter_expr, &row, &self.eval_ctx)? {
+                                    self.stats.add_rejected();
+                                    passed_filter = false;
+                                }
+                            },
+                            None => {},
+                        }
+
+                        I passed_filter {
+                            self.stats.add_produced();
+                            R Ok(Some(ExecutorRow.with_alias(
+                                row,
+                                self.table_info.name.clone(),
+                                self.current_page_id,
+                                slot_idx,
+                            )));
+                        }
+                    }
+                },
+                Err(_) => {},  # Dead or corrupt slot, skip
+            }
+        }
+
+        Ok(None)
+    }
+
+    # Advance to the next heap page
+    # Returns false if no more pages
+    F advance_page(mut self, ctx: &ExecContext) -> Result<bool, VaisError> {
+        heap := mut M &self.current_page {
+            Some(ref h) => h,
+            None => { R Ok(false); },
+        };
+
+        # Follow the next_page link in the page header
+        next := mut heap.get_header().next_page;
+        I next == 0 || next == NULL_PAGE {
+            R Ok(false);
+        }
+
+        self.current_page_id = next;
+        self.load_page(ctx)?;
+
+        Ok(!self.is_exhausted)
+    }
+}
+
+# ============================================================================
+# IndexScanExecutor — B+Tree index scan
+# ============================================================================
+
+# Scans a B+Tree index within a key range, fetches heap tuples by TID,
+# checks MVCC visibility, and optionally applies a residual filter.
+# Much faster than TableScan for selective queries (small result set).
+S IndexScanExecutor {
+    table_info: TableInfo,
+    columns: Vec<ColumnInfo>,
+    schema: Vec<SqlType>,          # Column types for row decoding
+    index_info: IndexInfo,         # Index being scanned
+    key_range: KeyRange,           # Scan bounds
+    residual_filter: Option<Expr>, # Filter for conditions not covered by index
+    eval_ctx: EvalContext,
+
+    # Iterator state
+    cursor: Option<BTreeCursor>,   # Current position in B+Tree
+    is_open: bool,
+    is_exhausted: bool,
+
+    # Stats
+    stats: ExecStats,
+}
+
+X IndexScanExecutor {
+    # Create a new index scan executor
+    F new(
+        table_info: TableInfo,
+        columns: Vec<ColumnInfo>,
+        index_info: IndexInfo,
+        key_range: KeyRange,
+        residual_filter: Option<Expr>,
+    ) -> IndexScanExecutor {
+        schema := mut Vec.with_capacity(columns.len());
+        L col: &columns {
+            schema.push(col.data_type);
+        }
+
+        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice());
+
+        IndexScanExecutor {
+            table_info,
+            columns,
+            schema,
+            index_info,
+            key_range,
+            residual_filter,
+            eval_ctx,
+            cursor: None,
+            is_open: false,
+            is_exhausted: false,
+            stats: ExecStats.new(),
+        }
+    }
+
+    # Open the executor — position the B+Tree cursor at the start of the range
+    F open(mut self, ctx: &ExecContext) -> Result<(), VaisError> {
+        tree := mut BTree {
+            file_id: FILE_ID_DATA,
+            root_page_id: self.index_info.root_page_id,
+            page_size: ctx.pool.page_size,
+            height: 0,  # Will be determined during traversal
+        };
+
+        cursor := mut M &self.key_range.start {
+            Some(ref start_key) => {
+                search_lower_bound(&tree, start_key, ctx.pool)?
+            },
+            None => {
+                search_first(&tree, ctx.pool)?
+            },
+        };
+
+        # If start is exclusive, skip entries equal to start key
+        I cursor.valid() && !self.key_range.start_inclusive {
+            M &self.key_range.start {
+                Some(ref start_key) => {
+                    (key, _) := mut cursor.current(ctx.pool)?;
+                    M compare_keys(&key, start_key) {
+                        KeyCmp.Equal => {
+                            cursor.next(ctx.pool)?;
+                        },
+                        _ => {},
+                    }
+                },
+                None => {},
+            }
+        }
+
+        self.cursor = Some(cursor);
+        self.is_open = true;
+        self.is_exhausted = false;
+
+        Ok(())
+    }
+
+    # Get next visible row matching the filter
+    F next(mut self, ctx: &ExecContext) -> Result<Option<ExecutorRow>, VaisError> {
+        I !self.is_open || self.is_exhausted {
+            R Ok(None);
+        }
+
+        cursor := mut M &self.cursor {
+            Some(ref c) => c,
+            None => { R Ok(None); },
+        };
+
+        L cursor.valid() {
+            (key, tid) := mut cursor.current(ctx.pool)?;
+
+            # Check if we've passed the end of the range
+            I self.key_range.is_past_end(&key) {
+                self.is_exhausted = true;
+                R Ok(None);
+            }
+
+            self.stats.add_scanned(1);
+
+            # Decode TID to locate the heap tuple
+            (page_id, slot_id) := mut decode_tid(tid);
+
+            # Fetch the heap page and read the tuple
+            frame_id := mut ctx.pool.fetch_page(FILE_ID_DATA, page_id)?;
+            page_data := mut ctx.pool.get_page(frame_id);
+            heap := mut HeapPage.from_page_data(page_data, ctx.pool.page_size)?;
+            tuple_result := mut heap.read_tuple(slot_id);
+            ctx.pool.unpin_page(frame_id, false);
+            self.stats.add_page_read();
+
+            M tuple_result {
+                Ok(t) => {
+                    # MVCC visibility check
+                    mvcc := mut t.get_mvcc();
+                    I is_tuple_visible(
+                        mvcc.txn_id_create,
+                        mvcc.txn_id_expire,
+                        mvcc.cmd_id,
+                        mvcc.expire_cmd_id,
+                        ctx.snapshot,
+                        ctx.clog,
+                    ) {
+                        # Decode tuple data into a Row
+                        row := mut Row.decode(t.get_data().as_slice(), self.schema.as_slice())?;
+
+                        # Apply residual filter (for conditions not covered by the index)
+                        passed_filter := mut true;
+                        M &self.residual_filter {
+                            Some(ref filter_expr) => {
+                                I !eval_predicate(filter_expr, &row, &self.eval_ctx)? {
+                                    self.stats.add_rejected();
+                                    passed_filter = false;
+                                }
+                            },
+                            None => {},
+                        }
+
+                        I passed_filter {
+                            self.stats.add_produced();
+                            cursor.next(ctx.pool)?;
+
+                            R Ok(Some(ExecutorRow.with_alias(
+                                row,
+                                self.table_info.name.clone(),
+                                page_id,
+                                slot_id,
+                            )));
+                        }
+                    }
+                },
+                Err(_) => {},  # Dead tuple, skip
+            }
+
+            cursor.next(ctx.pool)?;
+        }
+
+        self.is_exhausted = true;
+        Ok(None)
+    }
+
+    # Close the executor
+    F close(mut self, ctx: &ExecContext) {
+        M &self.cursor {
+            Some(ref c) => { c.close(ctx.pool); },
+            None => {},
+        }
+        self.cursor = None;
+        self.is_open = false;
+    }
+
+    # Get execution statistics
+    F get_stats(self) -> &ExecStats {
+        &self.stats
+    }
+}
+
+# ============================================================================
+# Index Key Builders — convert SqlValues to B+Tree key bytes
+# ============================================================================
+
+# Build a B+Tree index key from one or more SqlValues (composite key support)
+# Key format: concatenation of each value's byte encoding (type-tagged for sort correctness)
+# Ordering: type_tag(1B) + value_bytes (big-endian for correct lexicographic order)
+F build_index_key(values: &[SqlValue]) -> Vec<u8> {
+    key := mut Vec.with_capacity(32);
+    L val: values {
+        encode_key_value(&key, val);
+    }
+    key
+}
+
+# Encode a single SqlValue into index key bytes
+# Uses big-endian encoding so that byte comparison matches value comparison
+F encode_key_value(key: &mut Vec<u8>, val: &SqlValue) {
+    M val {
+        SqlValue.Null => {
+            key.push(0x00);  # NULL sorts lowest
+        },
+        SqlValue.IntVal { v } => {
+            key.push(0x01);  # INT tag
+            # Encode i64 as big-endian with sign bit flipped for correct unsigned ordering
+            unsigned := mut (*v as u64) ^ 0x8000000000000000;
+            key.push(((unsigned >> 56) & 0xFF) as u8);
+            key.push(((unsigned >> 48) & 0xFF) as u8);
+            key.push(((unsigned >> 40) & 0xFF) as u8);
+            key.push(((unsigned >> 32) & 0xFF) as u8);
+            key.push(((unsigned >> 24) & 0xFF) as u8);
+            key.push(((unsigned >> 16) & 0xFF) as u8);
+            key.push(((unsigned >> 8) & 0xFF) as u8);
+            key.push((unsigned & 0xFF) as u8);
+        },
+        SqlValue.FloatVal { v } => {
+            key.push(0x02);  # FLOAT tag
+            # IEEE 754 double: flip sign bit; if negative, flip all bits
+            bits := mut v.to_bits();
+            I (*v).is_sign_bit_set() {
+                bits = !bits;
+            } E {
+                bits = bits ^ 0x8000000000000000;
+            }
+            key.push(((bits >> 56) & 0xFF) as u8);
+            key.push(((bits >> 48) & 0xFF) as u8);
+            key.push(((bits >> 40) & 0xFF) as u8);
+            key.push(((bits >> 32) & 0xFF) as u8);
+            key.push(((bits >> 24) & 0xFF) as u8);
+            key.push(((bits >> 16) & 0xFF) as u8);
+            key.push(((bits >> 8) & 0xFF) as u8);
+            key.push((bits & 0xFF) as u8);
+        },
+        SqlValue.BoolVal { v } => {
+            key.push(0x03);  # BOOL tag
+            key.push(I *v { 1 } E { 0 });
+        },
+        SqlValue.StringVal { v } => {
+            key.push(0x04);  # STRING tag
+            # Store string bytes directly (UTF-8 preserves lexicographic order for ASCII)
+            L b: v.as_bytes() {
+                key.push(*b);
+            }
+            key.push(0x00);  # Null terminator for correct prefix comparison
+        },
+        SqlValue.DateVal { v } => {
+            key.push(0x05);  # DATE tag
+            unsigned := mut (*v as u32) ^ 0x80000000;
+            key.push(((unsigned >> 24) & 0xFF) as u8);
+            key.push(((unsigned >> 16) & 0xFF) as u8);
+            key.push(((unsigned >> 8) & 0xFF) as u8);
+            key.push((unsigned & 0xFF) as u8);
+        },
+        SqlValue.TimestampVal { v } => {
+            key.push(0x06);  # TIMESTAMP tag
+            unsigned := mut (*v as u64) ^ 0x8000000000000000;
+            key.push(((unsigned >> 56) & 0xFF) as u8);
+            key.push(((unsigned >> 48) & 0xFF) as u8);
+            key.push(((unsigned >> 40) & 0xFF) as u8);
+            key.push(((unsigned >> 32) & 0xFF) as u8);
+            key.push(((unsigned >> 24) & 0xFF) as u8);
+            key.push(((unsigned >> 16) & 0xFF) as u8);
+            key.push(((unsigned >> 8) & 0xFF) as u8);
+            key.push((unsigned & 0xFF) as u8);
+        },
+        SqlValue.BlobVal { v } => {
+            key.push(0x07);  # BLOB tag
+            L b: v {
+                key.push(*b);
+            }
+            key.push(0x00);  # Null terminator
+        },
+        SqlValue.VectorVal { .. } => {
+            # Vectors are not indexable in B+Tree (use HNSW)
+            key.push(0xFF);
+        },
+    }
+}
+
+# Build index key from a Row using the index's column positions
+# column_indices maps index columns to row column positions
+F build_index_key_from_row(row: &Row, column_indices: &[u64]) -> Vec<u8> {
+    values := mut Vec.with_capacity(column_indices.len());
+    L idx: column_indices {
+        values.push(row.get(*idx).clone());
+    }
+    build_index_key(values.as_slice())
+}
+
+# Resolve index column names to row column indices
+F resolve_index_columns(
+    index_columns: &[Str],
+    table_columns: &[ColumnInfo],
+) -> Result<Vec<u64>, VaisError> {
+    indices := mut Vec.with_capacity(index_columns.len());
+    L idx_col: index_columns {
+        found := mut false;
+        L i: 0..table_columns.len() {
+            I !found && &table_columns[i].name == idx_col {
+                indices.push(i);
+                found = true;
+            }
+        }
+        I !found {
+            R Err(err_internal("Index column '{idx_col}' not found in table"));
+        }
+    }
+    Ok(indices)
+}
+
+# ============================================================================
+# ProjectionExecutor — SELECT list column projection
+# ============================================================================
+
+# Projects specific columns or expressions from input rows
+# Wraps any scan executor to produce the desired output schema
+S ProjectionExecutor {
+    # Indices into the input row for simple column references
+    # For expression-based projections, use expr_eval
+    projections: Vec<ProjectionItem>,
+    eval_ctx: EvalContext,
+}
+
+L ProjectionItem =
+    ColumnIndex { idx: u64 } |
+    Expression { expr: Expr, alias: Option<Str> };
+
+X ProjectionExecutor {
+    F new(projections: Vec<ProjectionItem>, eval_ctx: EvalContext) -> ProjectionExecutor {
+        ProjectionExecutor {
+            projections,
+            eval_ctx,
+        }
+    }
+
+    # Project a single input row to the output schema
+    F project(self, input: &ExecutorRow) -> Result<Row, VaisError> {
+        values := mut Vec.with_capacity(self.projections.len());
+        L proj: &self.projections {
+            M proj {
+                ProjectionItem.ColumnIndex { idx } => {
+                    values.push(input.get(*idx).clone());
+                },
+                ProjectionItem.Expression { expr, alias: _ } => {
+                    val := mut eval_expr(expr, input.get_row(), &self.eval_ctx)?;
+                    values.push(val);
+                },
+            }
+        }
+        Ok(Row.new(values))
+    }
+}
+
+U sql/executor/expr_eval.{eval_expr};

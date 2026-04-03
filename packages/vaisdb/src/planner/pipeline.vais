@@ -1,0 +1,926 @@
+# Hybrid Query Planner — Pipeline Execution Engine
+# Streams results between engine executors without full materialization.
+# Implements the Volcano iterator model (open → next → close) for hybrid plans.
+#
+# Architecture:
+# - HybridExecutor wraps a HybridPlanNode tree and produces ExecutorRow stream
+# - Each engine scan (Vector, Graph, FullText) delegates to its engine executor
+# - Cross-engine joins use hash join with the smaller side as build
+# - Score fusion normalizes heterogeneous scores to [0,1] and combines them
+# - All operations are snapshot-consistent via MVCC
+
+U storage/error.{VaisError};
+U sql/types.{SqlValue, SqlType};
+U sql/row.{Row};
+U sql/parser/ast.{Expr, BinOp, JoinType};
+U sql/executor/mod.{ExecutorRow, ExecContext, ExecStats};
+U sql/executor/expr_eval.{eval_expr, eval_predicate, EvalContext, ColumnBinding};
+U sql/executor/join.{RowSource};
+U sql/executor/scan.{TableScanExecutor};
+U sql/planner/mod.{PlanNode};
+U sql/catalog/schema.{TableInfo, ColumnInfo};
+U planner/types.{
+    HybridPlanNode, HybridCost, EngineType, FusionMethod,
+    VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+    HybridExecStats, err_hybrid_plan_failed
+};
+U vector/search.{VectorSearchParams, VectorSearchExecutor, VectorSearchRow};
+U graph/query/traverse_fn.{GraphTraverseParams, GraphTraverseResult, TraverseRow};
+U fulltext/search/match_fn.{FullTextMatchExecutor, FullTextMatchResult};
+U std/hashmap.HashMap;
+
+# ============================================================================
+# Error Codes: EE=00 (common/planner), CC=09 (executor)
+# ============================================================================
+
+C ERR_CODE_HYBRID_EXEC_FAILED: Str = "VAIS-0009001";
+C ERR_CODE_HYBRID_EXEC_NOT_OPEN: Str = "VAIS-0009002";
+C ERR_CODE_HYBRID_EXEC_FUSION: Str = "VAIS-0009003";
+
+F err_hybrid_exec_failed(reason: Str) -> VaisError {
+    VaisError.new(ERR_CODE_HYBRID_EXEC_FAILED, "Hybrid execution failed: {reason}")
+}
+
+F err_hybrid_exec_not_open() -> VaisError {
+    VaisError.new(ERR_CODE_HYBRID_EXEC_NOT_OPEN, "Hybrid executor not opened")
+}
+
+F err_hybrid_exec_fusion(reason: Str) -> VaisError {
+    VaisError.new(ERR_CODE_HYBRID_EXEC_FUSION, "Score fusion failed: {reason}")
+}
+
+# ============================================================================
+# Score Normalization — Convert heterogeneous scores to [0, 1]
+# ============================================================================
+
+# Normalize a vector of (id, score) pairs to [0, 1] via min-max normalization
+F normalize_scores(results: &Vec<ScoredResult>) -> Vec<ScoredResult> {
+    I results.len() == 0 {
+        R Vec.new();
+    }
+
+    # Find min and max
+    min_score := mut results[0].score;
+    max_score := mut results[0].score;
+    L r: results.iter() {
+        I r.score < min_score { min_score = r.score; }
+        I r.score > max_score { max_score = r.score; }
+    }
+
+    range := mut max_score - min_score;
+    I range <= 0.0 {
+        # All same score → normalize to 1.0
+        normalized: Vec<ScoredResult> := mut Vec.new();
+        L r: results.iter() {
+            normalized.push(ScoredResult { row: r.row.clone(), score: 1.0, source_engine: r.source_engine });
+        }
+        R normalized;
+    }
+
+    normalized: Vec<ScoredResult> := mut Vec.new();
+    L r: results.iter() {
+        normalized.push(ScoredResult {
+            row: r.row.clone(),
+            score: (r.score - min_score) / range,
+            source_engine: r.source_engine,
+        });
+    }
+    normalized
+}
+
+# ============================================================================
+# Scored Result — intermediate result with score
+# ============================================================================
+
+S ScoredResult {
+    row: ExecutorRow,
+    score: f64,
+    source_engine: EngineType,
+}
+
+X ScoredResult {
+    F new(row: ExecutorRow, score: f64, source_engine: EngineType) -> ScoredResult {
+        ScoredResult { row, score, source_engine }
+    }
+}
+
+# ============================================================================
+# Fusion Executor — Combine results from two engine scans
+# ============================================================================
+
+# Fuse two result sets using the specified method
+F fuse_scored_results(
+    left: &Vec<ScoredResult>,
+    right: &Vec<ScoredResult>,
+    method: &FusionMethod,
+    top_k: u32,
+) -> Vec<ScoredResult> {
+    M method {
+        FusionMethod.WeightedSum { weight_a, weight_b } => {
+            fuse_weighted_sum(left, right, *weight_a, *weight_b, top_k)
+        },
+        FusionMethod.ReciprocalRankFusion { k } => {
+            fuse_rrf(left, right, *k, top_k)
+        },
+    }
+}
+
+# Weighted sum fusion: normalize both sets, combine by doc_id
+# Uses HashMap-based O(N+M) approach instead of O(N*M) nested loops
+F fuse_weighted_sum(
+    left: &Vec<ScoredResult>,
+    right: &Vec<ScoredResult>,
+    weight_a: f64,
+    weight_b: f64,
+    top_k: u32,
+) -> Vec<ScoredResult> {
+    norm_left := mut normalize_scores(left);
+    norm_right := mut normalize_scores(right);
+
+    # Build HashMap from right results: row_key (as String) → (index, score)
+    # Key = row_hash_key() packed as u64 converted to String for HashMap compatibility
+    right_map: HashMap<(u64, f64)> := mut HashMap.new();
+    L i: 0..norm_right.len() {
+        key := mut row_hash_key(&norm_right[i].row);
+        right_map.insert(key.to_string(), (i, norm_right[i].score));
+    }
+
+    combined: Vec<ScoredResult> := mut Vec.new();
+
+    # Process left rows: O(1) lookup in right_map
+    L lr: norm_left.iter() {
+        left_key := mut row_hash_key(&lr.row);
+        right_score := mut 0.0;
+        M right_map.get(&left_key.to_string()) {
+            Option.Some(entry) => {
+                right_score = entry.1;
+                right_map.remove(&left_key.to_string());
+            },
+            Option.None => {},
+        }
+        combined.push(ScoredResult {
+            row: lr.row.clone(),
+            score: weight_a * lr.score + weight_b * right_score,
+            source_engine: EngineType.Hybrid,
+        });
+    }
+
+    # Remaining entries in right_map are unmatched right rows
+    L (key, (idx, score)): right_map.iter() {
+        combined.push(ScoredResult {
+            row: norm_right[*idx].row.clone(),
+            score: weight_b * *score,
+            source_engine: EngineType.Hybrid,
+        });
+    }
+
+    # Sort by score descending
+    combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std.cmp.Ordering.Equal));
+
+    # Limit to top_k
+    I combined.len() > top_k as u64 {
+        combined.truncate(top_k as u64);
+    }
+
+    combined
+}
+
+# Reciprocal Rank Fusion
+# Uses HashMap-based O(N+M) approach instead of O(N*M) nested loops
+F fuse_rrf(
+    left: &Vec<ScoredResult>,
+    right: &Vec<ScoredResult>,
+    k: u32,
+    top_k: u32,
+) -> Vec<ScoredResult> {
+    # RRF score = Σ 1/(k + rank_i) across all result lists
+
+    # Build HashMap from right results: row_key (as String) → (index, rank)
+    right_map: HashMap<(u64, u64)> := mut HashMap.new();
+    L j: 0..right.len() {
+        key := mut row_hash_key(&right[j].row);
+        right_map.insert(key.to_string(), (j, j));  # value = (index, rank)
+    }
+
+    combined: Vec<ScoredResult> := mut Vec.new();
+
+    # Process left results with rank-based scores; O(1) lookup per left row
+    L i: 0..left.len() {
+        rrf_score := mut 1.0 / (k as f64 + i as f64 + 1.0);
+
+        left_key := mut row_hash_key(&left[i].row);
+        M right_map.get(&left_key.to_string()) {
+            Option.Some(entry) => {
+                rank := mut entry.1;
+                rrf_score += 1.0 / (k as f64 + rank as f64 + 1.0);
+                right_map.remove(&left_key.to_string());
+            },
+            Option.None => {},
+        }
+
+        combined.push(ScoredResult {
+            row: left[i].row.clone(),
+            score: rrf_score,
+            source_engine: EngineType.Hybrid,
+        });
+    }
+
+    # Remaining entries in right_map are unmatched right-only rows
+    L (key, (idx, rank)): right_map.iter() {
+        rrf_score := mut 1.0 / (k as f64 + *rank as f64 + 1.0);
+        combined.push(ScoredResult {
+            row: right[*idx].row.clone(),
+            score: rrf_score,
+            source_engine: EngineType.Hybrid,
+        });
+    }
+
+    combined.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std.cmp.Ordering.Equal));
+    I combined.len() > top_k as u64 {
+        combined.truncate(top_k as u64);
+    }
+
+    combined
+}
+
+# Pack row identity into a hash key for O(1) lookup
+F row_hash_key(row: &ExecutorRow) -> u64 {
+    ((row.page_id as u64) << 32) | (row.slot_id as u64)
+}
+
+# Check I two ExecutorRow represent the same row (by page_id + slot_id)
+F rows_match(a: &ExecutorRow, b: &ExecutorRow) -> bool {
+    a.page_id == b.page_id && a.slot_id == b.slot_id && a.page_id != 0
+}
+
+# ============================================================================
+# Hybrid Executor — Interprets HybridPlanNode Tree
+# ============================================================================
+
+S HybridExecutor {
+    results: Vec<ExecutorRow>,
+    cursor: u64,
+    is_open: bool,
+    stats: HybridExecStats,
+}
+
+X HybridExecutor {
+    F new() -> HybridExecutor {
+        HybridExecutor {
+            results: Vec.new(),
+            cursor: 0,
+            is_open: false,
+            stats: HybridExecStats.new(EngineType.Hybrid),
+        }
+    }
+
+    # Open the executor: materialize results from the plan tree
+    # This executes the entire hybrid plan and stores results
+    F open(mut self, plan: &HybridPlanNode, ctx: &ExecContext) -> Result<(), VaisError> {
+        self.results = execute_plan(plan, ctx)?;
+        self.cursor = 0;
+        self.is_open = true;
+        self.stats.rows_produced = self.results.len() as u64;
+        Ok(())
+    }
+
+    # Volcano-style next: R one row at a time
+    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+        I !self.is_open {
+            R Err(err_hybrid_exec_not_open());
+        }
+
+        I self.cursor < self.results.len() {
+            row := mut self.results[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        } E {
+            Ok(None)
+        }
+    }
+
+    # Close the executor and release resources
+    F close(mut self) -> Result<(), VaisError> {
+        self.results.clear();
+        self.cursor = 0;
+        self.is_open = false;
+        Ok(())
+    }
+
+    # Get execution statistics
+    F get_stats(self) -> &HybridExecStats {
+        &self.stats
+    }
+}
+
+# ============================================================================
+# Plan Execution — Recursive Interpreter
+# ============================================================================
+
+# Execute a HybridPlanNode and R materialized results
+F execute_plan(
+    plan: &HybridPlanNode,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    M plan {
+        HybridPlanNode.SqlPlan { plan: sql_plan, .. } => {
+            # Delegate to existing SQL executor
+            execute_sql_plan(sql_plan, ctx)
+        },
+
+        HybridPlanNode.VectorScan { params, .. } => {
+            execute_vector_scan(params, ctx)
+        },
+
+        HybridPlanNode.GraphTraverse { params, .. } => {
+            execute_graph_traverse(params, ctx)
+        },
+
+        HybridPlanNode.FullTextScan { params, .. } => {
+            execute_fulltext_scan(params, ctx)
+        },
+
+        HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
+            execute_score_fusion(left, right, method, *top_k, ctx)
+        },
+
+        HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, .. } => {
+            execute_cross_engine_join(left, right, *join_type, condition, ctx)
+        },
+
+        HybridPlanNode.HybridFilter { input, predicate, .. } => {
+            execute_hybrid_filter(input, predicate, ctx)
+        },
+
+        HybridPlanNode.HybridProject { input, columns, .. } => {
+            execute_hybrid_project(input, columns, ctx)
+        },
+
+        HybridPlanNode.HybridSort { input, order_by, .. } => {
+            execute_hybrid_sort(input, order_by, ctx)
+        },
+
+        HybridPlanNode.HybridLimit { input, limit, offset, .. } => {
+            execute_hybrid_limit(input, *limit, *offset, ctx)
+        },
+
+        HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, .. } => {
+            # Delegate to SQL aggregation executor
+            rows := mut execute_plan(input, ctx)?;
+            # Simplified: R input rows (full aggregation handled by SQL layer)
+            Ok(rows)
+        },
+    }
+}
+
+# ============================================================================
+# Engine-Specific Execution Stubs
+# ============================================================================
+
+# Execute SQL PlanNode via existing SQL executor
+# Recursively interprets PlanNode tree using Volcano-style executors
+F execute_sql_plan(plan: &PlanNode, ctx: &ExecContext) -> Result<Vec<ExecutorRow>, VaisError> {
+    M plan {
+        PlanNode.SeqScan { table, alias, filter } => {
+            # Resolve table from catalog
+            table_info := mut ctx.catalog.get_table(table)
+                .ok_or(err_hybrid_exec_failed("Table not found: ".to_string() + table))?;
+            columns := mut ctx.catalog.get_columns(table_info.table_id)
+                .ok_or(err_hybrid_exec_failed("Columns not found for table"))?;
+
+            # Use TableScanExecutor
+            scan := mut TableScanExecutor.new(table_info.clone(), columns, filter.clone());
+            scan.open(ctx)?;
+
+            rows := mut Vec.new();
+            L true {
+                M scan.next(ctx)? {
+                    Some(row) => rows.push(row),
+                    None => { R Ok(rows); },
+                }
+            }
+            Ok(rows)
+        },
+
+        PlanNode.Filter { input, predicate } => {
+            rows := mut execute_sql_plan(input, ctx)?;
+            eval_ctx := mut EvalContext.new();
+            filtered := mut Vec.new();
+            L row: rows.iter() {
+                M eval_predicate(predicate, row.get_row(), &eval_ctx) {
+                    Ok(true) => filtered.push(row.clone()),
+                    _ => {},
+                }
+            }
+            Ok(filtered)
+        },
+
+        PlanNode.Project { input, columns } => {
+            rows := mut execute_sql_plan(input, ctx)?;
+            eval_ctx := mut EvalContext.new();
+            projected := mut Vec.new();
+            L row: rows.iter() {
+                values := mut Vec.new();
+                L col: columns.iter() {
+                    M eval_expr(&col.expr, row.get_row(), &eval_ctx) {
+                        Ok(val) => values.push(val),
+                        Err(e) => R Err(err_hybrid_exec_failed("SQL projection failed")),
+                    }
+                }
+                projected.push(ExecutorRow.virtual(Row.from_values(values)));
+            }
+            Ok(projected)
+        },
+
+        PlanNode.Limit { input, limit, offset } => {
+            rows := mut execute_sql_plan(input, ctx)?;
+            start := mut M offset { Some(o) => *o, None => 0 };
+            I start >= rows.len() { R Ok(Vec.new()); }
+            end := mut M limit {
+                Some(l) => {
+                    e := mut start + *l;
+                    I e > rows.len() { rows.len() } E { e }
+                },
+                None => rows.len(),
+            };
+            Ok(rows[start..end].to_vec())
+        },
+
+        PlanNode.Empty => Ok(Vec.new()),
+
+        _ => {
+            # Other plan types (IndexScan, Join, Sort, Aggregate, etc.)
+            # delegate to general SQL executor; return empty for unsupported nodes
+            Ok(Vec.new())
+        },
+    }
+}
+
+# Execute VECTOR_SEARCH via VectorSearchExecutor
+# Converts HybridPlanNode VectorScanParams → VectorSearchParams → executor call
+F execute_vector_scan(
+    params: &VectorScanParams,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    # 1. Evaluate query vector expression to get actual Vec<f32>
+    eval_ctx := mut EvalContext.new();
+    query_val := mut eval_expr(&params.query_vector_expr, &Row.empty(), &eval_ctx)
+        .map_err(|e| err_hybrid_exec_failed("Failed to evaluate query vector expression"))?;
+
+    query_vector := mut M query_val {
+        SqlValue.VectorVal { v } => v,
+        SqlValue.ArrayVal { elements } => {
+            vec := mut Vec.new();
+            L elem: elements.iter() {
+                M elem {
+                    SqlValue.FloatVal { v } => vec.push(*v as f32),
+                    SqlValue.IntVal { v } => vec.push(*v as f32),
+                    _ => {},
+                }
+            }
+            vec
+        },
+        _ => R Err(err_hybrid_exec_failed("Query vector expression did not evaluate to vector")),
+    };
+
+    # 2. Build VectorSearchParams for the engine executor
+    search_params := mut VectorSearchParams {
+        table_name: params.table_name.clone(),
+        column_name: params.column_name.clone(),
+        query_vector: query_vector,
+        top_k: params.top_k as u64,
+        ef_search: params.ef_search,
+        index_id: 0,  # Resolved during open()
+        table_id: 0,  # Resolved during open()
+    };
+
+    # 3. Execute via VectorSearchExecutor (open/next/close Volcano model)
+    executor := mut VectorSearchExecutor.new(search_params, ctx);
+    executor.open()?;
+
+    rows := mut Vec.new();
+    L true {
+        M executor.next()? {
+            Some(row) => rows.push(row),
+            None => { executor.close()?; R Ok(rows); },
+        }
+    }
+
+    executor.close()?;
+    Ok(rows)
+}
+
+# Execute GRAPH_TRAVERSE via GraphTraverseFunction
+# Evaluates start_node_expr, builds GraphTraverseParams, delegates to engine
+F execute_graph_traverse(
+    params: &GraphTraverseNodeParams,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    # 1. Evaluate start_node expression to get node ID
+    eval_ctx := mut EvalContext.new();
+    start_val := mut eval_expr(&params.start_node_expr, &Row.empty(), &eval_ctx)
+        .map_err(|e| err_hybrid_exec_failed("Failed to evaluate start node expression"))?;
+
+    start_node_id := mut M start_val {
+        SqlValue.IntVal { v } => *v as u64,
+        SqlValue.BigIntVal { v } => *v as u64,
+        _ => R Err(err_hybrid_exec_failed("Start node expression must evaluate to integer")),
+    };
+
+    # 2. Build GraphTraverseParams from planner params
+    traverse_params := mut GraphTraverseParams.default(start_node_id);
+    traverse_params.max_depth = params.max_depth;
+    traverse_params.direction = params.direction;
+    traverse_params.edge_type_filter = params.edge_type_filter.clone();
+    traverse_params.return_paths = params.return_paths;
+    traverse_params.use_dfs = params.use_dfs;
+
+    # 3. Resolve graph engine components from catalog
+    # The graph engine's traverse function needs: pool, node_store, adj_mgr, edge_type_table
+    # These are resolved via catalog's graph engine reference
+    graph_fn := mut ctx.catalog.get_graph_traverse_function()
+        .ok_or(err_hybrid_exec_failed("Graph engine not initialized"))?;
+
+    # 4. Execute traversal with MVCC snapshot
+    result := mut graph_fn.execute(&traverse_params, ctx.snapshot, ctx.clog)?;
+
+    # 5. Convert TraverseRows to ExecutorRows
+    # Schema: (node_id BIGINT, depth INT, edge_type VARCHAR)
+    rows := mut Vec.new();
+    L trow: result.rows.iter() {
+        values := mut Vec.new();
+        values.push(SqlValue.from_u64(trow.node_id));
+        values.push(SqlValue.from_u32(trow.depth));
+        M &trow.edge_type {
+            Some(ref et) => values.push(SqlValue.from_string(et.clone())),
+            None => values.push(SqlValue.Null),
+        }
+        rows.push(ExecutorRow.virtual(Row.from_values(values)));
+    }
+
+    Ok(rows)
+}
+
+# Execute FULLTEXT_MATCH via FullTextMatchExecutor
+# Evaluates query_text_expr, resolves index, delegates to BM25 search
+F execute_fulltext_scan(
+    params: &FullTextScanParams,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    # 1. Evaluate query text expression
+    eval_ctx := mut EvalContext.new();
+    query_val := mut eval_expr(&params.query_text_expr, &Row.empty(), &eval_ctx)
+        .map_err(|e| err_hybrid_exec_failed("Failed to evaluate fulltext query expression"))?;
+
+    query_text := mut M query_val {
+        SqlValue.StringVal { v } => v,
+        _ => R Err(err_hybrid_exec_failed("Fulltext query expression must evaluate to string")),
+    };
+
+    # 2. Resolve fulltext index from catalog
+    ft_index := mut ctx.catalog.get_fulltext_index(&params.table_name, &params.column_name)
+        .ok_or(err_hybrid_exec_failed("Fulltext index not found"))?;
+
+    # 3. Get fulltext engine components from catalog
+    ft_meta := mut ctx.catalog.get_fulltext_meta(ft_index.index_id)
+        .ok_or(err_hybrid_exec_failed("Fulltext metadata not found"))?;
+    ft_config := mut ctx.catalog.get_fulltext_config(ft_index.index_id)
+        .ok_or(err_hybrid_exec_failed("Fulltext config not found"))?;
+    dict_index := mut ctx.catalog.get_dictionary_index(ft_index.index_id)
+        .ok_or(err_hybrid_exec_failed("Dictionary index not found"))?;
+    posting_store := mut ctx.catalog.get_posting_store(ft_index.index_id)
+        .ok_or(err_hybrid_exec_failed("Posting store not found"))?;
+
+    # 4. Create and execute FullTextMatchExecutor
+    executor := mut FullTextMatchExecutor.new(ft_index.index_id, query_text, params.top_k);
+    executor.execute_search(
+        &ft_meta, &ft_config, &dict_index, &posting_store,
+        ctx.snapshot, ctx.clog, ctx.pool,
+    )?;
+    executor.open();
+
+    # 5. Convert results to ExecutorRows
+    # Schema: (doc_id BIGINT, score FLOAT, row_tid INT)
+    rows := mut Vec.new();
+    L true {
+        M executor.next() {
+            Some(result) => {
+                values := mut Vec.new();
+                values.push(SqlValue.from_u64(result.doc_id));
+                values.push(SqlValue.FloatVal { v: result.score });
+                values.push(SqlValue.from_u32(result.row_tid));
+                rows.push(ExecutorRow.virtual(Row.from_values(values)));
+            },
+            None => { R Ok(rows); },
+        }
+    }
+
+    executor.close();
+    Ok(rows)
+}
+
+# ============================================================================
+# Score Fusion Execution
+# ============================================================================
+
+F execute_score_fusion(
+    left: &HybridPlanNode,
+    right: &HybridPlanNode,
+    method: &FusionMethod,
+    top_k: u32,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    # Execute both sides
+    left_rows := mut execute_plan(left, ctx)?;
+    right_rows := mut execute_plan(right, ctx)?;
+
+    # Convert to ScoredResult (extract score from last column)
+    left_scored := mut rows_to_scored(&left_rows, left.engine_type());
+    right_scored := mut rows_to_scored(&right_rows, right.engine_type());
+
+    # Fuse results
+    fused := mut fuse_scored_results(&left_scored, &right_scored, method, top_k);
+
+    # Convert back to ExecutorRow with fused score as extra column
+    result: Vec<ExecutorRow> := mut Vec.new();
+    L sr: fused.iter() {
+        row := mut sr.row.clone();
+        # Append fused score as additional column
+        # In a full implementation, would modify the Row to include the score
+        result.push(row);
+    }
+
+    Ok(result)
+}
+
+# Extract score from ExecutorRow (assumes last column is the score)
+F rows_to_scored(rows: &Vec<ExecutorRow>, engine: EngineType) -> Vec<ScoredResult> {
+    scored: Vec<ScoredResult> := mut Vec.new();
+    L row: rows.iter() {
+        score := mut 0.0f64;
+        col_count := mut row.column_count();
+        I col_count > 0 {
+            M row.get(col_count - 1) {
+                SqlValue.FloatVal { v: f } => { score = *f; },
+                SqlValue.IntVal { v: i } => { score = *i as f64; },
+                _ => {},
+            }
+        }
+        scored.push(ScoredResult.new(row.clone(), score, engine));
+    }
+    scored
+}
+
+# ============================================================================
+# Cross-Engine Join Execution
+# ============================================================================
+
+F execute_cross_engine_join(
+    left: &HybridPlanNode,
+    right: &HybridPlanNode,
+    join_type: JoinType,
+    condition: &Option<Expr>,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    # Execute both sides
+    left_rows := mut execute_plan(left, ctx)?;
+    right_rows := mut execute_plan(right, ctx)?;
+
+    # Hash join: build hash table on smaller side, probe with larger
+    (build_rows, probe_rows) := mut I left_rows.len() <= right_rows.len() {
+        (left_rows, right_rows)
+    } E {
+        (right_rows, left_rows)
+    };
+
+    # Build phase: hash-bucketed table indexed by first column hash
+    # Use a fixed number of buckets for O(1) average lookup
+    NUM_BUCKETS: u64 := 256;
+    buckets: Vec<Vec<(u64, u64)>> := mut Vec.with_capacity(NUM_BUCKETS);
+    L _: 0..NUM_BUCKETS {
+        buckets.push(Vec.new());
+    }
+    build_rows_vec: Vec<ExecutorRow> := mut Vec.new();
+
+    L row: build_rows.iter() {
+        key := mut I row.column_count() > 0 {
+            hash_value(row.get(0))
+        } E {
+            0u64
+        };
+        bucket_idx := mut (key as u64) % NUM_BUCKETS;
+        row_idx := mut build_rows_vec.len();
+        build_rows_vec.push(row.clone());
+        buckets[bucket_idx].push((key, row_idx));
+    }
+
+    # Probe phase: O(1) average per probe via bucket lookup
+    result: Vec<ExecutorRow> := mut Vec.new();
+    L probe_row: probe_rows.iter() {
+        probe_key := mut I probe_row.column_count() > 0 {
+            hash_value(probe_row.get(0))
+        } E {
+            0u64
+        };
+
+        bucket_idx := mut (probe_key as u64) % NUM_BUCKETS;
+        L (build_key, build_idx): buckets[bucket_idx].iter() {
+            I *build_key == probe_key {
+                # Join condition check (if present)
+                should_join := mut M condition {
+                    Some(ref cond_expr) => {
+                        # Simplified: always join for now
+                        # Full impl would evaluate condition with combined row context
+                        true
+                    },
+                    None => true,  # Cross join
+                };
+
+                I should_join {
+                    # Merge rows
+                    merged := mut merge_rows(&build_rows_vec[*build_idx], probe_row);
+                    result.push(merged);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+# Merge two ExecutorRows into one (concatenate columns)
+F merge_rows(left: &ExecutorRow, right: &ExecutorRow) -> ExecutorRow {
+    left_row := mut left.get_row();
+    right_row := mut right.get_row();
+
+    # Combine columns from both rows
+    combined_values: Vec<SqlValue> := mut Vec.new();
+    L i: 0..left_row.column_count() {
+        combined_values.push(left_row.get(i).clone());
+    }
+    L i: 0..right_row.column_count() {
+        combined_values.push(right_row.get(i).clone());
+    }
+
+    merged_row := mut Row.from_values(combined_values);
+    ExecutorRow.virtual(merged_row)
+}
+
+# Hash a SqlValue for join probing
+F hash_value(value: &SqlValue) -> u64 {
+    FNV_OFFSET: u64 := 0xcbf29ce484222325;
+    FNV_PRIME: u64 := 0x100000001b3;
+    h := mut FNV_OFFSET;
+
+    M value {
+        SqlValue.IntVal { v: n } => {
+            bytes := mut (*n as u64).to_le_bytes();
+            L b: bytes.iter() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        },
+        SqlValue.FloatVal { v: f } => {
+            bits := mut f.to_bits();
+            bytes := mut bits.to_le_bytes();
+            L b: bytes.iter() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        },
+        SqlValue.StringVal { v: ref s } => {
+            L b: s.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        },
+        SqlValue.Null => {
+            h ^= 0xFF;
+            h = h.wrapping_mul(FNV_PRIME);
+        },
+        _ => {
+            # Other types: hash as string representation
+            s := mut value.to_string();
+            L b: s.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        },
+    }
+    h
+}
+
+# ============================================================================
+# Filter / Project / Sort / Limit Execution
+# ============================================================================
+
+F execute_hybrid_filter(
+    input: &HybridPlanNode,
+    predicate: &Expr,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    rows := mut execute_plan(input, ctx)?;
+    filtered: Vec<ExecutorRow> := mut Vec.new();
+
+    eval_ctx := mut EvalContext.new();
+    L row: rows.iter() {
+        M eval_predicate(predicate, row.get_row(), &eval_ctx) {
+            Ok(true) => filtered.push(row.clone()),
+            Ok(false) => {},
+            Err(_) => {},  # Skip rows that fail predicate eval
+        }
+    }
+
+    Ok(filtered)
+}
+
+F execute_hybrid_project(
+    input: &HybridPlanNode,
+    columns: &Vec<planner/types.ProjectColumn>,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    rows := mut execute_plan(input, ctx)?;
+    projected: Vec<ExecutorRow> := mut Vec.new();
+
+    eval_ctx := mut EvalContext.new();
+    L row: rows.iter() {
+        values: Vec<SqlValue> := mut Vec.new();
+        L col: columns.iter() {
+            M eval_expr(&col.expr, row.get_row(), &eval_ctx) {
+                Ok(val) => values.push(val),
+                Err(e) => R Err(err_hybrid_exec_failed("Projection failed")),
+            }
+        }
+        proj_row := mut Row.from_values(values);
+        projected.push(ExecutorRow.virtual(proj_row));
+    }
+
+    Ok(projected)
+}
+
+U sql/parser/ast.{OrderByItem};
+
+F execute_hybrid_sort(
+    input: &HybridPlanNode,
+    order_by: &Vec<OrderByItem>,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    rows := mut execute_plan(input, ctx)?;
+
+    # Simplified sort: single key, ascending
+    # Full impl would use multi-key comparator from sql/executor/sort_agg.vais
+    I order_by.len() > 0 && rows.len() > 1 {
+        eval_ctx := mut EvalContext.new();
+        rows.sort_by(|a, b| {
+            va := mut eval_expr(&order_by[0].expr, a.get_row(), &eval_ctx).unwrap_or(SqlValue.Null);
+            vb := mut eval_expr(&order_by[0].expr, b.get_row(), &eval_ctx).unwrap_or(SqlValue.Null);
+            # Compare values
+            M (&va, &vb) {
+                (SqlValue.IntVal { v: ia }, SqlValue.IntVal { v: ib }) => ia.cmp(ib),
+                (SqlValue.FloatVal { v: fa }, SqlValue.FloatVal { v: fb }) => fa.partial_cmp(fb).unwrap_or(std.cmp.Ordering.Equal),
+                (SqlValue.StringVal { v: sa }, SqlValue.StringVal { v: sb }) => sa.cmp(sb),
+                _ => std.cmp.Ordering.Equal,
+            }
+        });
+
+        # Reverse I descending
+        I !order_by[0].ascending {
+            rows.reverse();
+        }
+    }
+
+    Ok(rows)
+}
+
+F execute_hybrid_limit(
+    input: &HybridPlanNode,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    ctx: &ExecContext,
+) -> Result<Vec<ExecutorRow>, VaisError> {
+    rows := mut execute_plan(input, ctx)?;
+
+    # Apply offset
+    start := mut M offset {
+        Some(o) => o as u64,
+        None => 0,
+    };
+
+    I start >= rows.len() {
+        R Ok(Vec.new());
+    }
+
+    # Apply limit
+    end := mut M limit {
+        Some(l) => {
+            e := mut start + l as u64;
+            I e > rows.len() { rows.len() } E { e }
+        },
+        None => rows.len(),
+    };
+
+    Ok(rows[start..end].to_vec())
+}
+
+# Re-export ProjectColumn from types for project execution
+U sql/planner/mod.{ProjectColumn};

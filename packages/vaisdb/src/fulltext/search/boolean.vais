@@ -1,0 +1,757 @@
+# Boolean Query Engine
+# Supports AND, OR, NOT boolean queries with phrase query support
+# Simple query syntax: "word1 word2" (AND), "word1 OR word2", "-word" (NOT), "exact phrase"
+
+U std/vec.Vec;
+U std/string.Str;
+U storage/error.{VaisError, Result};
+U fulltext/types.{err_fulltext_invalid_query};
+
+# ============================================================================
+# Query AST — Abstract syntax tree for boolean queries
+# ============================================================================
+
+# TermQuery — Single term M S TermQuery {
+    term: Str,
+}
+
+X TermQuery {
+    F new(term: Str) -> TermQuery {
+        TermQuery { term }
+    }
+}
+
+# PhraseQuery — Exact phrase M with optional slop
+S PhraseQuery {
+    terms: Vec<Str>,    # Ordered terms in the phrase
+    slop: u32,          # Maximum position gap (0 = exact phrase)
+}
+
+X PhraseQuery {
+    F new(terms: Vec<Str>) -> PhraseQuery {
+        PhraseQuery { terms, slop: 0 }
+    }
+
+    F with_slop(terms: Vec<Str>, slop: u32) -> PhraseQuery {
+        PhraseQuery { terms, slop }
+    }
+}
+
+# BooleanClause — Clause in a boolean query
+L BooleanClause {
+    Must(Query),        # Document MUST match this query (AND)
+    Should(Query),      # Document SHOULD match this query (OR)
+    MustNot(Query),     # Document MUST NOT match this query (NOT)
+}
+
+# BooleanQuery — Combination of clauses
+S BooleanQuery {
+    clauses: Vec<BooleanClause>,
+}
+
+X BooleanQuery {
+    F new() -> BooleanQuery {
+        BooleanQuery { clauses: Vec.new() }
+    }
+
+    F add_must(mut self, query: Query) {
+        self.clauses.push(BooleanClause.Must(query));
+    }
+
+    F add_should(mut self, query: Query) {
+        self.clauses.push(BooleanClause.Should(query));
+    }
+
+    F add_must_not(mut self, query: Query) {
+        self.clauses.push(BooleanClause.MustNot(query));
+    }
+
+    F clause_count(self) -> u64 {
+        self.clauses.len()
+    }
+}
+
+# Query — Top-level query enum
+L Query {
+    Term(TermQuery),
+    Phrase(PhraseQuery),
+    Boolean(BooleanQuery),
+}
+
+# ============================================================================
+# BooleanQueryParser — Parse query strings into Query AST
+# ============================================================================
+
+S BooleanQueryParser {}
+
+X BooleanQueryParser {
+    # Create new parser
+    F new() -> BooleanQueryParser {
+        BooleanQueryParser {}
+    }
+
+    # Parse query string into Query AST
+    #
+    # Syntax:
+    # - "word1 word2" → AND (both must match)
+    # - "word1 OR word2" → OR (either matches)
+    # - "-word" → NOT (must not match)
+    # - '"exact phrase"' → Phrase query
+    # - Combined: "word1 -word2 OR word3 \"phrase query\""
+    #
+    # Grammar:
+    # query .= term+
+    # term .= ["-"] (word | OR word | "phrase")
+    #
+    # Returns: Query enum
+    F parse(self, query_str: &Str) -> Result<Query, VaisError> {
+        # Tokenize query string
+        tokens := mut self.tokenize(query_str)?;
+
+        I tokens.len() == 0 {
+            R Err(err_fulltext_invalid_query(&Str.from("Empty query")));
+        }
+
+        # Parse tokens into query
+        self.parse_tokens(&tokens)
+    }
+
+    # Tokenize query string into tokens
+    # Returns Vec of tokens: words, "OR", "-", quoted phrases
+    F tokenize(self, query_str: &Str) -> Result<Vec<Str>, VaisError> {
+        tokens := mut Vec.new();
+        bytes := mut query_str.as_bytes();
+        i: u64 := mut 0;
+
+        L i < bytes.len() {
+            ch := mut bytes[i] as char;
+
+            # Skip whitespace
+            I ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+                i += 1;
+            } E I ch == '"' {
+                # Handle quoted phrase
+                phrase := mut self.extract_quoted_phrase(bytes, i)?;
+                tokens.push(phrase);
+                # Skip past closing quote
+                i += phrase.len() + 2;  # +2 for opening and closing quotes
+            } E I ch == '-' {
+                # Handle negation operator
+                tokens.push(Str.from("-"));
+                i += 1;
+            } E {
+                # Extract word
+                word_start := mut i;
+                at_word_end := mut false;
+                L i < bytes.len() && !at_word_end {
+                    word_ch := mut bytes[i] as char;
+                    I word_ch == ' ' || word_ch == '\t' || word_ch == '\n' || word_ch == '\r' || word_ch == '"' {
+                        at_word_end = true;
+                    } E {
+                        i += 1;
+                    }
+                }
+
+                I i > word_start {
+                    word := mut self.substring(query_str, word_start, i);
+                    tokens.push(word);
+                }
+            }
+        }
+
+        Ok(tokens)
+    }
+
+    # Extract quoted phrase content (without quotes)
+    F extract_quoted_phrase(self, bytes: &[u8], start: u64) -> Result<Str, VaisError> {
+        i := mut start + 1;  # Skip opening quote
+        phrase_start := mut i;
+
+        # Find closing quote
+        L i < bytes.len() {
+            I (bytes[i] as char) == '"' {
+                # Found closing quote
+                phrase_bytes := mut Vec.with_capacity(i - phrase_start);
+                j := mut phrase_start;
+                L j < i {
+                    phrase_bytes.push(bytes[j]);
+                    j += 1;
+                }
+                R Ok(Str.from_utf8(&phrase_bytes)?);
+            }
+            i += 1;
+        }
+
+        # No closing quote found
+        Err(err_fulltext_invalid_query(&Str.from("Unclosed quoted phrase")))
+    }
+
+    # Parse tokens into Query AST
+    F parse_tokens(self, tokens: &Vec<Str>) -> Result<Query, VaisError> {
+        boolean_query := mut BooleanQuery.new();
+        i: u64 := mut 0;
+        default_operator_is_or := mut false;
+
+        L i < tokens.len() {
+            token := mut &tokens[i];
+
+            # Check for negation
+            I token.as_str() == "-" {
+                i += 1;
+                I i >= tokens.len() {
+                    R Err(err_fulltext_invalid_query(&Str.from("Negation without term")));
+                }
+
+                negated_term := mut &tokens[i];
+                term_query := mut TermQuery.new(negated_term.clone());
+                boolean_query.add_must_not(Query.Term(term_query));
+                i += 1;
+            } E I token.as_str() == "OR" || token.as_str() == "or" {
+                # Check for OR operator
+                default_operator_is_or = true;
+                i += 1;
+            } E {
+                # Regular term or phrase
+                I self.is_phrase(token) {
+                    # Phrase query (contains spaces - was quoted)
+                    phrase_terms := mut self.split_phrase_into_terms(token);
+                    phrase_query := mut PhraseQuery.new(phrase_terms);
+
+                    I default_operator_is_or {
+                        boolean_query.add_should(Query.Phrase(phrase_query));
+                        default_operator_is_or = false;
+                    } E {
+                        boolean_query.add_must(Query.Phrase(phrase_query));
+                    }
+                } E {
+                    # Term query
+                    term_query := mut TermQuery.new(token.clone());
+
+                    I default_operator_is_or {
+                        boolean_query.add_should(Query.Term(term_query));
+                        default_operator_is_or = false;
+                    } E {
+                        boolean_query.add_must(Query.Term(term_query));
+                    }
+                }
+
+                i += 1;
+            }
+        }
+
+        # If only one clause and it's a MUST, return the inner query directly
+        I boolean_query.clause_count() == 1 {
+            M &boolean_query.clauses[0] {
+                BooleanClause.Must(q) -> R Ok(q.clone()),
+                _ -> {},
+            }
+        }
+
+        Ok(Query.Boolean(boolean_query))
+    }
+
+    # Check if token represents a phrase (contains internal spaces)
+    F is_phrase(self, token: &Str) -> bool {
+        bytes := mut token.as_bytes();
+        i: u64 := mut 0;
+        L i < bytes.len() {
+            I (bytes[i] as char) == ' ' {
+                R true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    # Split phrase into individual terms
+    F split_phrase_into_terms(self, phrase: &Str) -> Vec<Str> {
+        terms := mut Vec.new();
+        bytes := mut phrase.as_bytes();
+        i: u64 := mut 0;
+
+        L i < bytes.len() {
+            # Skip whitespace
+            L i < bytes.len() && (bytes[i] as char) == ' ' {
+                i += 1;
+            }
+
+            term_start := mut i;
+            L i < bytes.len() && (bytes[i] as char) != ' ' {
+                i += 1;
+            }
+
+            I i > term_start {
+                term := mut self.substring(phrase, term_start, i);
+                terms.push(term);
+            }
+        }
+
+        terms
+    }
+
+    # Extract substring (helper)
+    F substring(self, s: &Str, start: u64, end: u64) -> Str {
+        bytes := mut s.as_bytes();
+        result_bytes := mut Vec.with_capacity(end - start);
+        i := mut start;
+        L i < end && i < bytes.len() {
+            result_bytes.push(bytes[i]);
+            i += 1;
+        }
+        Str.from_utf8(&result_bytes).unwrap_or(Str.from(""))
+    }
+}
+
+# ============================================================================
+# BooleanQueryExecutor — Execute boolean queries against search results
+# ============================================================================
+
+S BooleanQueryExecutor {}
+
+X BooleanQueryExecutor {
+    # Create new executor
+    F new() -> BooleanQueryExecutor {
+        BooleanQueryExecutor {}
+    }
+
+    # Execute boolean query against per-term results
+    #
+    # Parameters:
+    # - query: parsed Query AST
+    # - results_per_term: Vec<(term: Str, results: Vec<(doc_id: u64, score: f64)>)>
+    #
+    # Returns: Vec<(doc_id, score)> sorted by score descending
+    #
+    # Algorithm:
+    # - MUST clauses: Intersect doc_id sets, sum scores
+    # - SHOULD clauses: Union doc_id sets, sum scores
+    # - MUST_NOT clauses: Remove doc_ids from result set
+    F execute(
+        self,
+        query: &Query,
+        results_per_term: &Vec<(Str, Vec<(u64, f64)>)>,
+    ) -> Vec<(u64, f64)> {
+        M query {
+            Query.Term(tq) -> {
+                # Simple term query
+                self.execute_term_query(&tq.term, results_per_term)
+            }
+            Query.Phrase(pq) -> {
+                # Phrase query (treat as intersection of terms for now)
+                # Note: Actual phrase verification done by PhraseSearcher
+                self.execute_phrase_query(&pq.terms, results_per_term)
+            }
+            Query.Boolean(bq) -> {
+                # Boolean query
+                self.execute_boolean_query(&bq.clauses, results_per_term)
+            }
+        }
+    }
+
+    # Execute term query
+    F execute_term_query(
+        self,
+        term: &Str,
+        results_per_term: &Vec<(Str, Vec<(u64, f64)>)>,
+    ) -> Vec<(u64, f64)> {
+        # Find results for this term
+        i: u64 := mut 0;
+        L i < results_per_term.len() {
+            I results_per_term[i].0.as_str() == term.as_str() {
+                R results_per_term[i].1.clone();
+            }
+            i += 1;
+        }
+        Vec.new()
+    }
+
+    # Execute phrase query (intersection of term results)
+    F execute_phrase_query(
+        self,
+        terms: &Vec<Str>,
+        results_per_term: &Vec<(Str, Vec<(u64, f64)>)>,
+    ) -> Vec<(u64, f64)> {
+        I terms.len() == 0 {
+            R Vec.new();
+        }
+
+        # Start with first term's results
+        result := mut self.execute_term_query(&terms[0], results_per_term);
+
+        # Intersect with remaining terms
+        i: u64 := mut 1;
+        L i < terms.len() {
+            term_results := mut self.execute_term_query(&terms[i], results_per_term);
+            result = self.intersect_results(&result, &term_results);
+            i += 1;
+        }
+
+        result
+    }
+
+    # Execute boolean query
+    F execute_boolean_query(
+        self,
+        clauses: &Vec<BooleanClause>,
+        results_per_term: &Vec<(Str, Vec<(u64, f64)>)>,
+    ) -> Vec<(u64, f64)> {
+        must_results := mut Vec.new();
+        should_results := mut Vec.new();
+        must_not_doc_ids := mut Vec.new();
+
+        # Process each clause
+        i: u64 := mut 0;
+        L i < clauses.len() {
+            M &clauses[i] {
+                BooleanClause.Must(q) -> {
+                    clause_results := mut self.execute(q, results_per_term);
+                    must_results.push(clause_results);
+                }
+                BooleanClause.Should(q) -> {
+                    clause_results := mut self.execute(q, results_per_term);
+                    should_results.push(clause_results);
+                }
+                BooleanClause.MustNot(q) -> {
+                    clause_results := mut self.execute(q, results_per_term);
+                    j: u64 := mut 0;
+                    L j < clause_results.len() {
+                        must_not_doc_ids.push(clause_results[j].0);
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        # Combine results
+        result := mut self.combine_boolean_results(
+            &must_results,
+            &should_results,
+            &must_not_doc_ids,
+        );
+
+        # Sort by score descending
+        self.sort_by_score(&result);
+
+        result
+    }
+
+    # Combine boolean results
+    # - If MUST clauses exist: intersect all MUST results
+    # - If SHOULD clauses exist: union all SHOULD results (added to MUST if any)
+    # - Remove MUST_NOT doc_ids
+    F combine_boolean_results(
+        self,
+        must_results: &Vec<Vec<(u64, f64)>>,
+        should_results: &Vec<Vec<(u64, f64)>>,
+        must_not_doc_ids: &Vec<u64>,
+    ) -> Vec<(u64, f64)> {
+        result := mut Vec.new();
+
+        # Start with MUST results (intersection)
+        I must_results.len() > 0 {
+            result = must_results[0].clone();
+            i: u64 := mut 1;
+            L i < must_results.len() {
+                result = self.intersect_results(&result, &must_results[i]);
+                i += 1;
+            }
+        }
+
+        # Add SHOULD results (union)
+        I should_results.len() > 0 {
+            i: u64 := mut 0;
+            L i < should_results.len() {
+                result = self.union_results(&result, &should_results[i]);
+                i += 1;
+            }
+        }
+
+        # Remove MUST_NOT doc_ids
+        result = self.filter_out_doc_ids(&result, must_not_doc_ids);
+
+        result
+    }
+
+    # Intersect two result sets, summing scores for common doc_ids
+    F intersect_results(
+        self,
+        results1: &Vec<(u64, f64)>,
+        results2: &Vec<(u64, f64)>,
+    ) -> Vec<(u64, f64)> {
+        result := mut Vec.new();
+
+        i: u64 := mut 0;
+        L i < results1.len() {
+            doc_id := mut results1[i].0;
+            score1 := mut results1[i].1;
+
+            # Find matching doc_id in results2
+            found_score := mut self.find_score_for_doc(doc_id, results2);
+            M found_score {
+                Some(score2) -> {
+                    result.push((doc_id, score1 + score2));
+                }
+                None -> {}
+            }
+
+            i += 1;
+        }
+
+        result
+    }
+
+    # Union two result sets, summing scores for common doc_ids
+    F union_results(
+        self,
+        results1: &Vec<(u64, f64)>,
+        results2: &Vec<(u64, f64)>,
+    ) -> Vec<(u64, f64)> {
+        result := mut results1.clone();
+
+        # Add results2, merging scores for existing doc_ids
+        i: u64 := mut 0;
+        L i < results2.len() {
+            doc_id := mut results2[i].0;
+            score2 := mut results2[i].1;
+
+            found_idx := mut self.find_index_for_doc(doc_id, &result);
+            M found_idx {
+                Some(idx) -> {
+                    # Update score
+                    result[idx].1 += score2;
+                }
+                None -> {
+                    # Add new entry
+                    result.push((doc_id, score2));
+                }
+            }
+
+            i += 1;
+        }
+
+        result
+    }
+
+    # Filter out doc_ids from results
+    F filter_out_doc_ids(
+        self,
+        results: &Vec<(u64, f64)>,
+        exclude_doc_ids: &Vec<u64>,
+    ) -> Vec<(u64, f64)> {
+        result := mut Vec.new();
+
+        i: u64 := mut 0;
+        L i < results.len() {
+            doc_id := mut results[i].0;
+
+            excluded := mut false;
+            j: u64 := mut 0;
+            L j < exclude_doc_ids.len() {
+                I exclude_doc_ids[j] == doc_id {
+                    excluded = true;
+                }
+                j += 1;
+            }
+
+            I !excluded {
+                result.push(results[i]);
+            }
+
+            i += 1;
+        }
+
+        result
+    }
+
+    # Find score for doc_id in results
+    F find_score_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<f64> {
+        i: u64 := mut 0;
+        L i < results.len() {
+            I results[i].0 == doc_id {
+                R Some(results[i].1);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    # Find index for doc_id in results
+    F find_index_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<u64> {
+        i: u64 := mut 0;
+        L i < results.len() {
+            I results[i].0 == doc_id {
+                R Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    # Sort results by score descending (bubble sort)
+    F sort_by_score(self, results: &Vec<(u64, f64)>) {
+        I results.len() <= 1 {
+            R;
+        }
+
+        n := mut results.len();
+        i: u64 := mut 0;
+        L i < n {
+            j: u64 := mut 0;
+            L j < n - i - 1 {
+                I results[j].1 < results[j + 1].1 {
+                    # Swap
+                    temp := mut results[j];
+                    results[j] = results[j + 1];
+                    results[j + 1] = temp;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+# ============================================================================
+# Unit tests
+# ============================================================================
+
+#[test]
+F test_parser_single_term() {
+    parser := mut BooleanQueryParser.new();
+    query := mut parser.parse(&Str.from("hello"))!;
+
+    M query {
+        Query.Term(tq) -> {
+            assert_eq!(tq.term.as_str(), "hello");
+        }
+        _ -> panic!("Expected Term query"),
+    }
+}
+
+#[test]
+F test_parser_multiple_terms_and() {
+    parser := mut BooleanQueryParser.new();
+    query := mut parser.parse(&Str.from("hello world"))!;
+
+    M query {
+        Query.Boolean(bq) -> {
+            assert_eq!(bq.clause_count(), 2);
+        }
+        _ -> panic!("Expected Boolean query"),
+    }
+}
+
+#[test]
+F test_parser_or_operator() {
+    parser := mut BooleanQueryParser.new();
+    query := mut parser.parse(&Str.from("hello OR world"))!;
+
+    M query {
+        Query.Boolean(bq) -> {
+            assert_eq!(bq.clause_count(), 2);
+        }
+        _ -> panic!("Expected Boolean query"),
+    }
+}
+
+#[test]
+F test_parser_negation() {
+    parser := mut BooleanQueryParser.new();
+    query := mut parser.parse(&Str.from("hello -world"))!;
+
+    M query {
+        Query.Boolean(bq) -> {
+            assert_eq!(bq.clause_count(), 2);
+        }
+        _ -> panic!("Expected Boolean query"),
+    }
+}
+
+#[test]
+F test_parser_quoted_phrase() {
+    parser := mut BooleanQueryParser.new();
+    query := mut parser.parse(&Str.from(r#""hello world""#))!;
+
+    M query {
+        Query.Phrase(pq) -> {
+            assert_eq!(pq.terms.len(), 2);
+            assert_eq!(pq.terms[0].as_str(), "hello");
+            assert_eq!(pq.terms[1].as_str(), "world");
+            assert_eq!(pq.slop, 0);
+        }
+        _ -> panic!("Expected Phrase query"),
+    }
+}
+
+#[test]
+F test_executor_term_query() {
+    executor := mut BooleanQueryExecutor.new();
+
+    results_per_term := mut Vec.new();
+    hello_results := mut Vec.new();
+    hello_results.push((1, 1.5));
+    hello_results.push((2, 2.0));
+    results_per_term.push((Str.from("hello"), hello_results));
+
+    query := mut Query.Term(TermQuery.new(Str.from("hello")));
+    result := mut executor.execute(&query, &results_per_term);
+
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+F test_executor_intersect_results() {
+    executor := mut BooleanQueryExecutor.new();
+
+    results1 := mut Vec.new();
+    results1.push((1, 1.0));
+    results1.push((2, 2.0));
+    results1.push((3, 3.0));
+
+    results2 := mut Vec.new();
+    results2.push((2, 0.5));
+    results2.push((3, 1.0));
+    results2.push((4, 2.0));
+
+    result := mut executor.intersect_results(&results1, &results2);
+
+    # Should contain doc_id 2 and 3 with summed scores
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+F test_executor_union_results() {
+    executor := mut BooleanQueryExecutor.new();
+
+    results1 := mut Vec.new();
+    results1.push((1, 1.0));
+    results1.push((2, 2.0));
+
+    results2 := mut Vec.new();
+    results2.push((2, 0.5));
+    results2.push((3, 1.0));
+
+    result := mut executor.union_results(&results1, &results2);
+
+    # Should contain doc_id 1, 2 (with summed score), and 3
+    assert_eq!(result.len(), 3);
+}
+
+#[test]
+F test_executor_filter_out_doc_ids() {
+    executor := mut BooleanQueryExecutor.new();
+
+    results := mut Vec.new();
+    results.push((1, 1.0));
+    results.push((2, 2.0));
+    results.push((3, 3.0));
+
+    exclude := mut Vec.new();
+    exclude.push(2);
+
+    result := mut executor.filter_out_doc_ids(&results, &exclude);
+
+    # Should contain doc_id 1 and 3
+    assert_eq!(result.len(), 2);
+}

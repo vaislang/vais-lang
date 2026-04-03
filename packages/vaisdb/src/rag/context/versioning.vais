@@ -1,0 +1,330 @@
+# Chunk Version Tracker
+# Tracks chunk lineage when documents are updated/re-ingested
+# Uses SUPERSEDES edges in the graph for version chains
+# Enables answering "what was the previous version of this chunk?"
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U rag/types.{
+    EDGE_TYPE_SUPERSEDES,
+    err_rag_chunk_not_found
+};
+U rag/context/helpers.{find_graph_node};
+
+# ============================================================================
+# ChunkVersion — Version record for a chunk
+# ============================================================================
+
+S ChunkVersion {
+    chunk_id: u64,                  # Current chunk ID
+    previous_chunk_id: u64,         # Previous version (0 if first)
+    doc_id: u64,
+    version_number: u32,            # 1-based version number
+    content_hash: u64,              # FNV-1a hash of chunk text
+    created_at: i64,
+}
+
+X ChunkVersion {
+    F new(chunk_id: u64, doc_id: u64, version: u32, hash: u64) -> ChunkVersion {
+        ChunkVersion {
+            chunk_id,
+            previous_chunk_id: 0,
+            doc_id,
+            version_number: version,
+            content_hash: hash,
+            created_at: 0,
+        }
+    }
+
+    F with_previous(mut self, prev_id: u64) -> ChunkVersion {
+        self.previous_chunk_id = prev_id;
+        self
+    }
+
+    F is_first_version(self) -> bool {
+        self.previous_chunk_id == 0
+    }
+}
+
+# ============================================================================
+# VersionTracker — Manages chunk version history
+# ============================================================================
+
+S VersionTracker {
+    versions: Vec<ChunkVersion>,
+}
+
+X VersionTracker {
+    F new() -> VersionTracker {
+        VersionTracker {
+            versions: Vec.new(),
+        }
+    }
+
+    ## Record a new version of a chunk
+    F record_version(
+        &mut self,
+        chunk_id: u64,
+        doc_id: u64,
+        content_hash: u64,
+        prev_chunk_id: u64,
+        created_at: i64
+    ) -> u32 {
+        # Find previous version number for this lineage
+        version_num := mut 1u32;
+        I prev_chunk_id != 0 {
+            M self.find_version(prev_chunk_id) {
+                Some(prev_version) => {
+                    version_num = prev_version.version_number + 1;
+                },
+                None => {
+                    # Previous chunk not found, assume version 2
+                    version_num = 2;
+                },
+            }
+        }
+
+        version := mut ChunkVersion.new(chunk_id, doc_id, version_num, content_hash);
+        version = version.with_previous(prev_chunk_id);
+        version.created_at = created_at;
+
+        self.versions.push(version);
+        version_num
+    }
+
+    ## Get the latest version of a chunk lineage by following SUPERSEDES
+    ## Guarded against infinite loops via visited set + iteration cap
+    F get_latest_version(self, chunk_id: u64) -> Option<&ChunkVersion> {
+        # Find the chunk in versions
+        M self.find_version(chunk_id) {
+            Some(version) => {
+                latest_id := mut chunk_id;
+                visited := mut Vec.new();
+                visited.push(chunk_id);
+                max_steps := mut self.versions.len() as u32;
+                steps: u32 := mut 0;
+                found_newer := mut true;
+
+                L found_newer && steps < max_steps {
+                    found_newer = false;
+                    i: u32 := mut 0;
+                    L i < self.versions.len() as u32 {
+                        v := mut self.versions.get(i as u64);
+                        I v.previous_chunk_id == latest_id {
+                            # Check if already visited (cycle detection)
+                            is_visited := mut false;
+                            vi: u32 := mut 0;
+                            L vi < visited.len() as u32 {
+                                I *visited.get(vi as u64) == v.chunk_id {
+                                    is_visited = true;
+                                }
+                                vi = vi + 1;
+                            }
+                            I !is_visited {
+                                latest_id = v.chunk_id;
+                                visited.push(v.chunk_id);
+                                found_newer = true;
+                            }
+                        }
+                        i = i + 1;
+                    }
+                    steps = steps + 1;
+                }
+
+                self.find_version(latest_id)
+            },
+            None => None,
+        }
+    }
+
+    ## Get the full version chain for a chunk (oldest to newest)
+    ## Guarded against infinite loops via visited set + iteration cap
+    F get_version_chain(self, chunk_id: u64) -> Vec<&ChunkVersion> {
+        chain := mut Vec.new();
+        max_steps := mut self.versions.len() as u32;
+
+        # First, walk backward to find the oldest version
+        current_id := mut chunk_id;
+        oldest_id := mut chunk_id;
+        walking_back := mut true;
+        back_visited := mut Vec.new();
+        back_visited.push(chunk_id);
+        back_steps: u32 := mut 0;
+
+        L walking_back && back_steps < max_steps {
+            M self.find_version(current_id) {
+                Some(version) => {
+                    I version.previous_chunk_id == 0 {
+                        oldest_id = current_id;
+                        walking_back = false;
+                    } E {
+                        # Cycle detection: check if prev was already visited
+                        is_visited := mut false;
+                        vi: u32 := mut 0;
+                        L vi < back_visited.len() as u32 {
+                            I *back_visited.get(vi as u64) == version.previous_chunk_id {
+                                is_visited = true;
+                            }
+                            vi = vi + 1;
+                        }
+                        I is_visited {
+                            oldest_id = current_id;
+                            walking_back = false;
+                        } E {
+                            back_visited.push(version.previous_chunk_id);
+                            current_id = version.previous_chunk_id;
+                        }
+                    }
+                },
+                None => {
+                    oldest_id = current_id;
+                    walking_back = false;
+                },
+            }
+            back_steps = back_steps + 1;
+        }
+
+        # Now walk forward from oldest to newest
+        current := mut oldest_id;
+        walking_fwd := mut true;
+        fwd_visited := mut Vec.new();
+        fwd_visited.push(oldest_id);
+        fwd_steps: u32 := mut 0;
+
+        L walking_fwd && fwd_steps < max_steps {
+            M self.find_version(current) {
+                Some(version) => {
+                    chain.push(version);
+
+                    # Find next version
+                    found_next := mut false;
+                    next_id: u64 := mut 0;
+                    i: u32 := mut 0;
+                    L i < self.versions.len() as u32 {
+                        v := mut self.versions.get(i as u64);
+                        I v.previous_chunk_id == current {
+                            next_id = v.chunk_id;
+                            found_next = true;
+                        }
+                        i = i + 1;
+                    }
+
+                    I found_next {
+                        # Cycle detection
+                        is_visited := mut false;
+                        vi: u32 := mut 0;
+                        L vi < fwd_visited.len() as u32 {
+                            I *fwd_visited.get(vi as u64) == next_id {
+                                is_visited = true;
+                            }
+                            vi = vi + 1;
+                        }
+                        I is_visited {
+                            walking_fwd = false;
+                        } E {
+                            fwd_visited.push(next_id);
+                            current = next_id;
+                        }
+                    } E {
+                        walking_fwd = false;
+                    }
+                },
+                None => {
+                    walking_fwd = false;
+                },
+            }
+            fwd_steps = fwd_steps + 1;
+        }
+
+        chain
+    }
+
+    ## Check if a chunk has been superseded
+    F is_superseded(self, chunk_id: u64) -> bool {
+        i: u32 := mut 0;
+        L i < self.versions.len() as u32 {
+            version := mut self.versions.get(i as u64);
+            I version.previous_chunk_id == chunk_id {
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    ## Get the previous version of a chunk
+    F get_previous(self, chunk_id: u64) -> Option<&ChunkVersion> {
+        M self.find_version(chunk_id) {
+            Some(version) => {
+                I version.previous_chunk_id == 0 {
+                    R None;
+                }
+                self.find_version(version.previous_chunk_id)
+            },
+            None => None,
+        }
+    }
+
+    ## Remove version history for a document
+    F remove_doc_versions(&mut self, doc_id: u64) {
+        new_versions := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.versions.len() as u32 {
+            version := mut self.versions.get(i as u64);
+            I version.doc_id != doc_id {
+                new_versions.push(*version);
+            }
+            i = i + 1;
+        }
+        self.versions = new_versions;
+    }
+
+    ## Build SUPERSEDES edges for GraphEngine
+    ## Returns (new_chunk_graph_node, old_chunk_graph_node) pairs
+    F build_supersedes_edges(self, chunk_to_graph_node: &Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        edges := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.versions.len() as u32 {
+            version := mut self.versions.get(i as u64);
+            I version.previous_chunk_id != 0 {
+                # Find graph nodes for both chunks
+                new_node_opt := mut find_graph_node(version.chunk_id, chunk_to_graph_node);
+                old_node_opt := mut find_graph_node(version.previous_chunk_id, chunk_to_graph_node);
+
+                M new_node_opt {
+                    Some(new_node) => {
+                        M old_node_opt {
+                            Some(old_node) => {
+                                edges.push((new_node, old_node));
+                            },
+                            None => {},
+                        }
+                    },
+                    None => {},
+                }
+            }
+            i = i + 1;
+        }
+        edges
+    }
+
+    ## Get total version count
+    F version_count(self) -> u64 {
+        self.versions.len() as u64
+    }
+
+    ## Helper: find a version by chunk_id
+    F find_version(self, chunk_id: u64) -> Option<&ChunkVersion> {
+        i: u32 := mut 0;
+        L i < self.versions.len() as u32 {
+            version := mut self.versions.get(i as u64);
+            I version.chunk_id == chunk_id {
+                R Some(version);
+            }
+            i = i + 1;
+        }
+        None
+    }
+}

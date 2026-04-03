@@ -1,0 +1,447 @@
+# Document Hierarchy Manager
+# Maintains Document → Section → Paragraph → Chunk tree structure
+# Each level is a graph node with CONTAINS edges to children
+# Enables context expansion: given a chunk, traverse up to section/document level
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+U rag/types.{
+    LABEL_DOCUMENT, LABEL_SECTION, LABEL_PARAGRAPH, LABEL_CHUNK,
+    EDGE_TYPE_CONTAINS, MAX_HIERARCHY_DEPTH,
+    err_rag_doc_not_found, err_rag_chunk_not_found
+};
+
+# ============================================================================
+# HierarchyLevel — Levels in the document hierarchy
+# ============================================================================
+
+C LEVEL_DOCUMENT: u8 = 0;
+C LEVEL_SECTION: u8 = 1;
+C LEVEL_PARAGRAPH: u8 = 2;
+C LEVEL_CHUNK: u8 = 3;
+
+# ============================================================================
+# HierarchyNode — A node in the document hierarchy tree
+# ============================================================================
+
+S HierarchyNode {
+    node_id: u64,               # Internal hierarchy node ID
+    graph_node_id: u64,         # Corresponding graph engine node ID (0 if not yet assigned)
+    level: u8,                  # LEVEL_DOCUMENT / SECTION / PARAGRAPH / CHUNK
+    parent_node_id: u64,        # Parent hierarchy node ID (0 for root document)
+    entity_id: u64,             # doc_id for document, section_index for section, chunk_id for chunk
+    title: Str,                 # Section/document title (empty for chunks)
+    child_count: u32,           # Number of direct children
+    byte_start: u32,            # Start byte offset in original document
+    byte_end: u32,              # End byte offset in original document
+}
+
+X HierarchyNode {
+    F new(node_id: u64, level: u8, parent_node_id: u64,
+          entity_id: u64) -> HierarchyNode {
+        HierarchyNode {
+            node_id,
+            graph_node_id: 0,
+            level,
+            parent_node_id,
+            entity_id,
+            title: Str.new(),
+            child_count: 0,
+            byte_start: 0,
+            byte_end: 0,
+        }
+    }
+
+    F with_title(mut self, title: Str) -> HierarchyNode {
+        self.title = title;
+        self
+    }
+
+    F with_graph_node(mut self, graph_node_id: u64) -> HierarchyNode {
+        self.graph_node_id = graph_node_id;
+        self
+    }
+
+    F with_range(mut self, start: u32, end: u32) -> HierarchyNode {
+        self.byte_start = start;
+        self.byte_end = end;
+        self
+    }
+
+    ## Get label for graph node creation
+    F label(self) -> Str {
+        M self.level {
+            0 => LABEL_DOCUMENT,
+            1 => LABEL_SECTION,
+            2 => LABEL_PARAGRAPH,
+            3 => LABEL_CHUNK,
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+# ============================================================================
+# DocumentHierarchy — Manages the full document hierarchy tree
+# ============================================================================
+
+S DocumentHierarchy {
+    nodes: Vec<HierarchyNode>,
+    next_node_id: u64,
+}
+
+X DocumentHierarchy {
+    F new() -> DocumentHierarchy {
+        DocumentHierarchy {
+            nodes: Vec.new(),
+            next_node_id: 1,
+        }
+    }
+
+    ## Create a document root node
+    F add_document(mut self, doc_id: u64, title: Str) -> u64 {
+        node_id := mut self.next_node_id;
+        self.next_node_id = self.next_node_id + 1;
+
+        node := mut HierarchyNode.new(node_id, LEVEL_DOCUMENT, 0, doc_id);
+        node = node.with_title(title);
+        self.nodes.push(node);
+        node_id
+    }
+
+    ## Add a section under a document
+    F add_section(mut self, parent_doc_node_id: u64, section_index: u32,
+                  title: Str, byte_start: u32, byte_end: u32) -> u64 {
+        node_id := mut self.next_node_id;
+        self.next_node_id = self.next_node_id + 1;
+
+        node := mut HierarchyNode.new(
+            node_id, LEVEL_SECTION, parent_doc_node_id, section_index as u64
+        );
+        node = node.with_title(title);
+        node = node.with_range(byte_start, byte_end);
+        self.nodes.push(node);
+
+        # Increment parent's child count
+        self.increment_child_count(parent_doc_node_id);
+
+        node_id
+    }
+
+    ## Add a paragraph under a section
+    F add_paragraph(mut self, parent_section_node_id: u64, para_index: u32,
+                    byte_start: u32, byte_end: u32) -> u64 {
+        node_id := mut self.next_node_id;
+        self.next_node_id = self.next_node_id + 1;
+
+        node := mut HierarchyNode.new(
+            node_id, LEVEL_PARAGRAPH, parent_section_node_id, para_index as u64
+        );
+        node = node.with_range(byte_start, byte_end);
+        self.nodes.push(node);
+
+        self.increment_child_count(parent_section_node_id);
+
+        node_id
+    }
+
+    ## Add a chunk under a section or paragraph
+    F add_chunk(mut self, parent_node_id: u64, chunk_id: u64,
+                byte_start: u32, byte_end: u32) -> u64 {
+        node_id := mut self.next_node_id;
+        self.next_node_id = self.next_node_id + 1;
+
+        node := mut HierarchyNode.new(
+            node_id, LEVEL_CHUNK, parent_node_id, chunk_id
+        );
+        node = node.with_range(byte_start, byte_end);
+        self.nodes.push(node);
+
+        self.increment_child_count(parent_node_id);
+
+        node_id
+    }
+
+    ## Set graph node ID for a hierarchy node (after graph node creation)
+    F set_graph_node_id(mut self, hier_node_id: u64, graph_node_id: u64) {
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get_mut(i as u64);
+            I node.node_id == hier_node_id {
+                node.graph_node_id = graph_node_id;
+                R;
+            }
+            i = i + 1;
+        }
+    }
+
+    ## Get a hierarchy node by ID
+    F get_node(self, node_id: u64) -> Option<&HierarchyNode> {
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.node_id == node_id {
+                R Some(node);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Get all children of a hierarchy node
+    F get_children(self, parent_node_id: u64) -> Vec<&HierarchyNode> {
+        result := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.parent_node_id == parent_node_id {
+                result.push(node);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    ## Get the parent chain (ancestor path) from chunk up to document
+    ## Returns nodes from chunk → paragraph → section → document order
+    F get_ancestor_path(self, node_id: u64) -> Vec<&HierarchyNode> {
+        path := mut Vec.new();
+        current_id := mut node_id;
+        depth: u32 := mut 0;
+
+        L depth < MAX_HIERARCHY_DEPTH {
+            M self.get_node(current_id) {
+                Some(node) => {
+                    path.push(node);
+                    I node.parent_node_id == 0 {
+                        R path;  # Reached root
+                    }
+                    current_id = node.parent_node_id;
+                },
+                None => {
+                    R path;  # Node not found, return partial path
+                },
+            }
+            depth = depth + 1;
+        }
+        path
+    }
+
+    ## Find the hierarchy node for a given chunk_id
+    F find_chunk_node(self, chunk_id: u64) -> Option<&HierarchyNode> {
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.level == LEVEL_CHUNK && node.entity_id == chunk_id {
+                R Some(node);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Find the document node for a given doc_id
+    F find_document_node(self, doc_id: u64) -> Option<&HierarchyNode> {
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.level == LEVEL_DOCUMENT && node.entity_id == doc_id {
+                R Some(node);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Build CONTAINS edges for the entire hierarchy
+    ## Returns (parent_graph_node_id, child_graph_node_id) pairs
+    F build_contains_edges(self) -> Vec<(u64, u64)> {
+        edges := mut Vec.new();
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.parent_node_id != 0 && node.graph_node_id != 0 {
+                # Find parent's graph_node_id
+                M self.get_node(node.parent_node_id) {
+                    Some(parent) => {
+                        I parent.graph_node_id != 0 {
+                            edges.push((parent.graph_node_id, node.graph_node_id));
+                        }
+                    },
+                    None => {},
+                }
+            }
+            i = i + 1;
+        }
+        edges
+    }
+
+    ## Remove all hierarchy nodes for a document
+    F remove_document(mut self, doc_id: u64) {
+        # Find document root first
+        doc_node_id: u64 := mut 0;
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.level == LEVEL_DOCUMENT && node.entity_id == doc_id {
+                doc_node_id = node.node_id;
+                i = self.nodes.len() as u32;  # Break
+            }
+            i = i + 1;
+        }
+
+        I doc_node_id == 0 {
+            R;
+        }
+
+        # Collect all node IDs to remove (BFS from document root)
+        to_remove := mut Vec.new();
+        queue := mut Vec.new();
+        queue.push(doc_node_id);
+
+        L queue.len() > 0 {
+            current := mut queue.remove(0);
+            to_remove.push(current);
+
+            # Find children
+            j: u32 := mut 0;
+            L j < self.nodes.len() as u32 {
+                node := mut self.nodes.get(j as u64);
+                I node.parent_node_id == current {
+                    queue.push(node.node_id);
+                }
+                j = j + 1;
+            }
+        }
+
+        # Filter out removed nodes
+        new_nodes := mut Vec.new();
+        k: u32 := mut 0;
+        L k < self.nodes.len() as u32 {
+            node := mut self.nodes.get(k as u64);
+            should_remove := mut false;
+            m: u32 := mut 0;
+            L m < to_remove.len() as u32 {
+                I *to_remove.get(m as u64) == node.node_id {
+                    should_remove = true;
+                    m = to_remove.len() as u32;  # Break
+                }
+                m = m + 1;
+            }
+            I !should_remove {
+                new_nodes.push(HierarchyNode.new(
+                    node.node_id, node.level, node.parent_node_id, node.entity_id
+                ));
+            }
+            k = k + 1;
+        }
+        self.nodes = new_nodes;
+    }
+
+    ## Get total node count
+    F node_count(self) -> u64 {
+        self.nodes.len() as u64
+    }
+
+    ## Get node count by level
+    F count_by_level(self, level: u8) -> u32 {
+        count: u32 := mut 0;
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get(i as u64);
+            I node.level == level {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        count
+    }
+
+    # ========================================================================
+    # Internal helpers
+    # ========================================================================
+
+    F increment_child_count(mut self, parent_id: u64) {
+        i: u32 := mut 0;
+        L i < self.nodes.len() as u32 {
+            node := mut self.nodes.get_mut(i as u64);
+            I node.node_id == parent_id {
+                node.child_count = node.child_count + 1;
+                R;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+# ============================================================================
+# Helper: Build hierarchy from detected sections and chunks
+# ============================================================================
+
+## Build a complete document hierarchy given section boundaries and chunks
+## section_boundaries: byte offsets from detect_section_boundaries()
+## chunk_byte_starts: byte start offsets for each chunk (position-indexed)
+## Returns a DocumentHierarchy with all levels populated
+F build_document_hierarchy(
+    doc_id: u64,
+    doc_title: Str,
+    section_boundaries: &Vec<u32>,
+    chunk_ids: &Vec<u64>,
+    chunk_byte_starts: &Vec<u32>,
+    chunk_byte_ends: &Vec<u32>,
+) -> DocumentHierarchy {
+    hierarchy := mut DocumentHierarchy.new();
+
+    # Level 0: Document root
+    doc_node := mut hierarchy.add_document(doc_id, doc_title);
+
+    # Level 1: Sections
+    section_nodes := mut Vec.new();
+    s: u32 := mut 0;
+    L s < section_boundaries.len() as u32 {
+        start := mut *section_boundaries.get(s as u64);
+        end: u32 := mut I s + 1 < section_boundaries.len() as u32 {
+            *section_boundaries.get((s + 1) as u64)
+        } E {
+            0xFFFFFFFF  # Last section extends to end
+        };
+
+        section_title := mut "Section {s}";
+        section_node := mut hierarchy.add_section(doc_node, s, section_title, start, end);
+        section_nodes.push(section_node);
+        s = s + 1;
+    }
+
+    # Level 3: Chunks (directly under sections, skip paragraph level for simplicity)
+    c: u32 := mut 0;
+    L c < chunk_ids.len() as u32 {
+        chunk_id := mut *chunk_ids.get(c as u64);
+        byte_start := mut *chunk_byte_starts.get(c as u64);
+        byte_end := mut *chunk_byte_ends.get(c as u64);
+
+        # Find which section this chunk belongs to
+        section_idx: u32 := mut 0;
+        si: u32 := mut 0;
+        L si < section_boundaries.len() as u32 {
+            boundary := mut *section_boundaries.get(si as u64);
+            I boundary <= byte_start {
+                section_idx = si;
+            }
+            si = si + 1;
+        }
+
+        # Get parent section node
+        parent_node: u64 := mut I section_idx < section_nodes.len() as u32 {
+            *section_nodes.get(section_idx as u64)
+        } E {
+            doc_node  # Fallback to document root
+        };
+
+        hierarchy.add_chunk(parent_node, chunk_id, byte_start, byte_end);
+        c = c + 1;
+    }
+
+    hierarchy
+}

@@ -1,0 +1,403 @@
+# Semantic Chunker — Document splitting pipeline
+# Splits documents into chunks with position and overlap metadata
+# Orchestrates different chunking strategies and generates ChunkInfo records
+
+U std/vec.Vec;
+U std/string.Str;
+U std/time.{SystemTime};
+U rag/types.{ChunkInfo};
+U rag/chunking/strategies.{
+    ChunkBoundary, split_fixed_size, split_sentence_boundary,
+    split_paragraph_boundary, count_tokens_in_range
+};
+
+# ============================================================================
+# ChunkingConfig — Chunking strategy configuration
+# ============================================================================
+
+S ChunkingConfig {
+    strategy: u8,              # 0=fixed_size, 1=sentence, 2=paragraph
+    target_chunk_size: u32,    # Target token count per chunk (default 512)
+    min_chunk_size: u32,       # Minimum token count (default 64)
+    max_chunk_size: u32,       # Maximum token count (default 1024)
+    overlap_tokens: u32,       # Overlap between consecutive chunks (default 50)
+}
+
+X ChunkingConfig {
+    ## Create a new chunking config with specified values
+    F new(
+        strategy: u8,
+        target_chunk_size: u32,
+        min_chunk_size: u32,
+        max_chunk_size: u32,
+        overlap_tokens: u32,
+    ) -> ChunkingConfig {
+        ChunkingConfig {
+            strategy,
+            target_chunk_size,
+            min_chunk_size,
+            max_chunk_size,
+            overlap_tokens,
+        }
+    }
+
+    ## Create default config (fixed-size, 512 target, 64 min, 1024 max, 50 overlap)
+    F default() -> ChunkingConfig {
+        ChunkingConfig {
+            strategy: 0,            # Fixed-size
+            target_chunk_size: 512,
+            min_chunk_size: 64,
+            max_chunk_size: 1024,
+            overlap_tokens: 50,
+        }
+    }
+
+    ## Create sentence-boundary config
+    F sentence_boundary() -> ChunkingConfig {
+        ChunkingConfig {
+            strategy: 1,            # Sentence boundary
+            target_chunk_size: 512,
+            min_chunk_size: 64,
+            max_chunk_size: 1024,
+            overlap_tokens: 50,
+        }
+    }
+
+    ## Create paragraph-boundary config
+    F paragraph_boundary() -> ChunkingConfig {
+        ChunkingConfig {
+            strategy: 2,            # Paragraph boundary
+            target_chunk_size: 512,
+            min_chunk_size: 64,
+            max_chunk_size: 1024,
+            overlap_tokens: 50,
+        }
+    }
+}
+
+# ============================================================================
+# SemanticChunker — Main chunking facade
+# ============================================================================
+
+S SemanticChunker {
+    config: ChunkingConfig,
+    next_chunk_id: u64,        # Monotonic chunk ID allocator
+}
+
+X SemanticChunker {
+    ## Create a new semantic chunker with the given config
+    F new(config: ChunkingConfig) -> SemanticChunker {
+        SemanticChunker {
+            config,
+            next_chunk_id: 1,  # Start from 1
+        }
+    }
+
+    ## Create a chunker with default config
+    F default() -> SemanticChunker {
+        SemanticChunker.new(ChunkingConfig.default())
+    }
+
+    # ========================================================================
+    # Main chunking entry point
+    # ========================================================================
+
+    ## Chunk a document into semantic chunks with overlap
+    ## Returns a vector of ChunkInfo records with position and metadata
+    F chunk_document(mut self, doc_id: u64, content: &Str) -> Vec<ChunkInfo> {
+        # Get chunk boundaries based on strategy
+        boundaries := mut M self.config.strategy {
+            0 => split_fixed_size(
+                content,
+                self.config.target_chunk_size,
+                self.config.min_chunk_size,
+                self.config.max_chunk_size,
+            ),
+            1 => split_sentence_boundary(
+                content,
+                self.config.target_chunk_size,
+                self.config.min_chunk_size,
+                self.config.max_chunk_size,
+            ),
+            2 => split_paragraph_boundary(
+                content,
+                self.config.target_chunk_size,
+                self.config.min_chunk_size,
+                self.config.max_chunk_size,
+            ),
+            _ => split_fixed_size(
+                content,
+                self.config.target_chunk_size,
+                self.config.min_chunk_size,
+                self.config.max_chunk_size,
+            ),
+        };
+
+        I boundaries.is_empty() {
+            R Vec.new();
+        }
+
+        # Generate ChunkInfo records with overlap calculation
+        chunks := mut Vec.with_capacity(boundaries.len());
+        timestamp := mut get_current_timestamp();
+
+        i: u64 := mut 0;
+        L i < boundaries.len() {
+            boundary := mut &boundaries[i];
+            chunk_text := mut content.substring(
+                boundary.start_byte as u64,
+                boundary.end_byte as u64,
+            );
+
+            # Count tokens in this chunk
+            token_count := mut self.count_tokens(&chunk_text);
+
+            # Calculate overlap with previous chunk
+            prev_boundary: Option<&ChunkBoundary> := mut I i > 0 {
+                Some(&boundaries[i - 1])
+            } E {
+                None
+            };
+            overlap := mut self.calculate_overlap(prev_boundary, boundary, content);
+
+            chunk_info := mut ChunkInfo {
+                chunk_id: self.next_chunk_id,
+                parent_doc_id: doc_id,
+                position_in_doc: i as u32,
+                chunk_text,
+                chunk_type: self.config.strategy,
+                token_count,
+                overlap_start: overlap.0,
+                overlap_end: overlap.1,
+                created_at: timestamp,
+            };
+
+            chunks.push(chunk_info);
+            self.next_chunk_id += 1;
+            i += 1;
+        }
+
+        chunks
+    }
+
+    # ========================================================================
+    # Token counting
+    # ========================================================================
+
+    ## Count tokens in text using whitespace-based tokenization
+    ## Matches the tokenizer's word-splitting logic
+    F count_tokens(self, text: &Str) -> u32 {
+        I text.is_empty() {
+            R 0;
+        }
+
+        bytes := mut text.as_bytes();
+        count: u32 := mut 0;
+        in_word := mut false;
+        i: u64 := mut 0;
+
+        L i < bytes.len() {
+            b := mut bytes[i];
+
+            I is_whitespace_byte(b) {
+                in_word = false;
+            } E {
+                I !in_word {
+                    count += 1;
+                    in_word = true;
+                }
+            }
+
+            i += 1;
+        }
+
+        count
+    }
+
+    # ========================================================================
+    # Overlap calculation
+    # ========================================================================
+
+    ## Calculate overlap region between consecutive chunks
+    ## Returns (overlap_start_byte, overlap_end_byte) within current chunk
+    ## If no overlap or first chunk, returns (0, 0)
+    F calculate_overlap(
+        self,
+        prev_boundary: Option<&ChunkBoundary>,
+        current_boundary: &ChunkBoundary,
+        content: &Str,
+    ) -> (u32, u32) {
+        M prev_boundary {
+            None => {
+                # First chunk, no overlap
+                R (0, 0);
+            },
+            Some(prev) => {
+                I self.config.overlap_tokens == 0 {
+                    R (0, 0);
+                }
+
+                # Find overlap region: last N tokens of previous chunk
+                # that fall within current chunk's boundaries
+                overlap_start := mut current_boundary.start_byte;
+                overlap_end := mut current_boundary.start_byte;
+
+                # Calculate target overlap byte range from end of previous chunk
+                prev_end := mut prev.end_byte as u64;
+                curr_start := mut current_boundary.start_byte as u64;
+
+                # If chunks are adjacent or overlapping
+                I curr_start <= prev_end {
+                    # Find the start of overlap region (N tokens back from prev_end)
+                    target_start := mut self.find_token_boundary_backward(
+                        content,
+                        prev_end,
+                        self.config.overlap_tokens,
+                    );
+
+                    # Overlap region is from target_start to prev_end, clipped to current chunk
+                    I target_start < prev_end {
+                        overlap_start = I target_start >= curr_start {
+                            target_start as u32
+                        } E {
+                            curr_start as u32
+                        };
+                        overlap_end = I prev_end <= current_boundary.end_byte as u64 {
+                            prev_end as u32
+                        } E {
+                            current_boundary.end_byte
+                        };
+                    }
+                }
+
+                # Return as offsets relative to current chunk start
+                chunk_start := mut current_boundary.start_byte;
+                relative_start := mut I overlap_start > chunk_start {
+                    overlap_start - chunk_start
+                } E {
+                    0
+                };
+                relative_end := mut I overlap_end > chunk_start {
+                    overlap_end - chunk_start
+                } E {
+                    0
+                };
+
+                R (relative_start, relative_end);
+            },
+        }
+    }
+
+    ## Find the byte offset N tokens backward from end position
+    F find_token_boundary_backward(
+        self,
+        content: &Str,
+        end_pos: u64,
+        token_count: u32,
+    ) -> u64 {
+        I token_count == 0 || end_pos == 0 {
+            R end_pos;
+        }
+
+        bytes := mut content.as_bytes();
+        pos := mut I end_pos > bytes.len() { bytes.len() } E { end_pos };
+        tokens_found: u32 := mut 0;
+        in_word := mut false;
+
+        # Scan backward
+        L pos > 0 {
+            pos -= 1;
+            b := mut bytes[pos];
+
+            I is_whitespace_byte(b) {
+                I in_word {
+                    # Just finished a word (scanning backward)
+                    tokens_found += 1;
+                    I tokens_found >= token_count {
+                        # Skip remaining whitespace to start of word
+                        L pos > 0 && is_whitespace_byte(bytes[pos]) {
+                            pos -= 1;
+                        }
+                        # Now at last char of word, move to start
+                        I pos < bytes.len() && !is_whitespace_byte(bytes[pos]) {
+                            pos += 1;  # Move past the word start
+                        }
+                        R pos;
+                    }
+                    in_word = false;
+                }
+            } E {
+                in_word = true;
+            }
+        }
+
+        # Reached the beginning
+        I in_word {
+            tokens_found += 1;
+        }
+
+        0
+    }
+}
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+## Check if byte is whitespace
+F is_whitespace_byte(b: u8) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13  # space, tab, newline, CR
+}
+
+## Get current timestamp in seconds since Unix epoch
+F get_current_timestamp() -> i64 {
+    now := mut SystemTime.now();
+    duration := mut now.duration_since_epoch();
+    duration.as_secs() as i64
+}
+
+# ============================================================================
+# Convenience functions for one-shot chunking
+# ============================================================================
+
+## Chunk a document using default config
+F chunk_document_default(doc_id: u64, content: &Str) -> Vec<ChunkInfo> {
+    chunker := mut SemanticChunker.default();
+    chunker.chunk_document(doc_id, content)
+}
+
+## Chunk a document using fixed-size strategy
+F chunk_document_fixed_size(
+    doc_id: u64,
+    content: &Str,
+    target_size: u32,
+    overlap_tokens: u32,
+) -> Vec<ChunkInfo> {
+    config := mut ChunkingConfig.new(0, target_size, 64, target_size * 2, overlap_tokens);
+    chunker := mut SemanticChunker.new(config);
+    chunker.chunk_document(doc_id, content)
+}
+
+## Chunk a document using sentence-boundary strategy
+F chunk_document_sentence_boundary(
+    doc_id: u64,
+    content: &Str,
+    target_size: u32,
+    overlap_tokens: u32,
+) -> Vec<ChunkInfo> {
+    config := mut ChunkingConfig.new(1, target_size, 64, target_size * 2, overlap_tokens);
+    chunker := mut SemanticChunker.new(config);
+    chunker.chunk_document(doc_id, content)
+}
+
+## Chunk a document using paragraph-boundary strategy
+F chunk_document_paragraph_boundary(
+    doc_id: u64,
+    content: &Str,
+    target_size: u32,
+    overlap_tokens: u32,
+) -> Vec<ChunkInfo> {
+    config := mut ChunkingConfig.new(2, target_size, 64, target_size * 2, overlap_tokens);
+    chunker := mut SemanticChunker.new(config);
+    chunker.chunk_document(doc_id, content)
+}

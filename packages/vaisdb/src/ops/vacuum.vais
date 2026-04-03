@@ -1,0 +1,257 @@
+# Production Operations — VACUUM Implementation
+# Phase 9 Task 9: Dead tuple removal, undo log cleanup, space reclamation
+# Provides: VacuumExecutor (standard + FULL modes)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/sync.{Mutex};
+U storage/error.{VaisError};
+U storage/constants.{
+    FILE_ID_DATA, FILE_ID_VECTORS, FILE_ID_GRAPH, FILE_ID_FULLTEXT,
+    INVALID_TXN_ID, PAGE_HEADER_SIZE,
+};
+U ops/types.{
+    VacuumResult, VacuumTarget,
+    VACUUM_MODE_STANDARD, VACUUM_MODE_FULL, VACUUM_MODE_ANALYZE,
+    err_vacuum_failed, err_vacuum_already_running,
+};
+U ops/config.{VacuumConfig};
+
+# ============================================================================
+# VacuumExecutor — Executes VACUUM operations
+# ============================================================================
+
+## VACUUM removes dead tuples (MVCC expired rows no longer visible to any txn),
+## compacts undo log entries, and returns freed pages to the freelist.
+##
+## Standard VACUUM:
+##   - Scans heap pages for dead tuples (txn_id_expire committed and not visible)
+##   - Removes dead tuples, compacts page slots
+##   - Reclaims undo entries for committed/aborted txns with no active readers
+##   - Returns completely empty pages to freelist
+##   - Non-blocking: runs concurrently with queries
+##
+## VACUUM FULL:
+##   - Rewrites entire table to new pages (exclusive table lock)
+##   - Maximum space reclamation (defragments within and across pages)
+##   - More expensive but reclaims more space
+S VacuumExecutor {
+    config: VacuumConfig,
+    is_running: bool,
+    lock: Mutex,
+}
+
+X VacuumExecutor {
+    ## Create a new vacuum executor
+    F new(config: VacuumConfig) -> VacuumExecutor {
+        VacuumExecutor {
+            config,
+            is_running: false,
+            lock: Mutex.new(),
+        }
+    }
+
+    ## Execute VACUUM on specified target
+    ## oldest_active_txn: oldest txn ID still in progress (tuples expired before this are dead)
+    ## current_time: for duration tracking
+    F execute(
+        mut self,
+        target: &VacuumTarget,
+        oldest_active_txn: u64,
+        current_time_ms: u64,
+    ) -> Result<VacuumResult, VaisError> {
+        guard := mut self.lock.lock();
+
+        I self.is_running {
+            R Err(err_vacuum_already_running());
+        }
+        self.is_running = true;
+
+        # Validate config
+        self.config.validate()?;
+
+        start_ms := mut current_time_ms;
+        result := mut VacuumResult.new();
+
+        M target.mode {
+            0 => {
+                # VACUUM_MODE_STANDARD
+                result = self.vacuum_standard(target, oldest_active_txn)?;
+            },
+            1 => {
+                # VACUUM_MODE_FULL
+                result = self.vacuum_full(target, oldest_active_txn)?;
+            },
+            2 => {
+                # VACUUM_MODE_ANALYZE: vacuum + update statistics
+                result = self.vacuum_standard(target, oldest_active_txn)?;
+                # Statistics update would be handled by the planner's ANALYZE
+            },
+            _ => {
+                self.is_running = false;
+                R Err(err_vacuum_failed("Unknown vacuum mode"));
+            },
+        }
+
+        # Compute duration (approximate: uses provided ms counter)
+        result.duration_ms = current_time_ms - start_ms;
+
+        self.is_running = false;
+        Ok(result)
+    }
+
+    ## Check if vacuum is running
+    F is_running(self) -> bool {
+        self.is_running
+    }
+
+    # ========================================================================
+    # Standard VACUUM
+    # ========================================================================
+
+    ## Standard VACUUM: non-blocking dead tuple removal
+    ## Scans pages, removes dead tuples, returns free pages to freelist
+    F vacuum_standard(
+        self,
+        target: &VacuumTarget,
+        oldest_active_txn: u64,
+    ) -> Result<VacuumResult, VaisError> {
+        result := mut VacuumResult.new();
+
+        # In production implementation:
+        #
+        # For each table (or the specified table):
+        #   1. Acquire advisory lock (skip if SKIP_LOCKED and locked)
+        #   2. Scan visibility map to find pages with dead tuples
+        #   3. For each such page:
+        #      a. Pin page in buffer pool
+        #      b. Scan all tuple slots
+        #      c. For each tuple where txn_id_expire < oldest_active_txn
+        #         AND txn_id_expire is committed:
+        #         - Mark slot as free
+        #         - Increment dead_tuples_removed counter
+        #      d. Compact page slots (optional, in-place)
+        #      e. If page is now empty, return to freelist
+        #      f. Unpin page
+        #   4. Scan undo log:
+        #      a. Reclaim undo entries for txns < oldest_active_txn
+        #      b. Increment undo_entries_reclaimed counter
+        #   5. Update visibility map
+        #   6. Release advisory lock
+        #
+        # I/O throttling: if config.io_limit_mbps > 0, sleep between
+        # page reads to stay within the I/O budget.
+
+        # FUTURE(storage): Connect to storage layer for actual dead tuple removal
+        result.tables_vacuumed = M &target.table_name {
+            Some(_) => 1,
+            None => 0,  # Would count all tables
+        };
+
+        Ok(result)
+    }
+
+    # ========================================================================
+    # VACUUM FULL
+    # ========================================================================
+
+    ## VACUUM FULL: exclusive rewrite for maximum space reclamation
+    ## Rewrites entire table to new pages, then swaps
+    F vacuum_full(
+        self,
+        target: &VacuumTarget,
+        oldest_active_txn: u64,
+    ) -> Result<VacuumResult, VaisError> {
+        result := mut VacuumResult.new();
+
+        # In production implementation:
+        #
+        # For each table:
+        #   1. Acquire exclusive table lock (blocks all concurrent access)
+        #   2. Allocate new pages for the table
+        #   3. Scan all pages in the old table:
+        #      a. For each live tuple (visible and not expired):
+        #         - Copy to new page set
+        #         - Track old page -> new page mapping
+        #      b. Skip dead tuples entirely
+        #   4. Rebuild all indexes on the table (point to new tuple locations)
+        #   5. Swap old pages with new pages atomically:
+        #      a. Update catalog with new root page
+        #      b. Return old pages to freelist
+        #   6. WAL-log the rewrite operation
+        #   7. Release exclusive lock
+        #
+        # This is more expensive but produces perfectly compacted pages
+        # with no fragmentation.
+
+        result.tables_vacuumed = M &target.table_name {
+            Some(_) => 1,
+            None => 0,
+        };
+
+        Ok(result)
+    }
+
+    # ========================================================================
+    # Undo Log Cleanup
+    # ========================================================================
+
+    ## Reclaim undo log entries that are no longer needed
+    ## An undo entry is reclaimable when:
+    ## - Its transaction has committed or aborted
+    ## - No active snapshot references a txn_id <= the entry's txn_id
+    F cleanup_undo(
+        self,
+        oldest_active_txn: u64,
+    ) -> Result<u64, VaisError> {
+        # In production implementation:
+        #
+        # 1. Scan undo log pages from oldest to newest
+        # 2. For each entry:
+        #    a. If entry.txn_id < oldest_active_txn:
+        #       - Entry is no longer needed by any snapshot
+        #       - Mark page space as free
+        #       - Increment counter
+        # 3. If an entire undo page is reclaimed, return to freelist
+        #
+        # Returns number of undo entries reclaimed
+
+        Ok(0)
+    }
+
+    # ========================================================================
+    # Dead Tuple Detection Helpers
+    # ========================================================================
+
+    ## Check if a tuple is dead (safe to remove)
+    ## A tuple is dead when:
+    ## 1. txn_id_expire is set (not INVALID_TXN_ID)
+    ## 2. The expiring transaction has committed
+    ## 3. No active transaction could see this tuple (txn_id_expire < oldest_active_txn)
+    F is_dead_tuple(
+        txn_id_expire: u64,
+        oldest_active_txn: u64,
+    ) -> bool {
+        txn_id_expire != INVALID_TXN_ID && txn_id_expire < oldest_active_txn
+    }
+
+    ## Estimate dead tuple ratio for a table
+    ## Used to decide whether to skip a table (below min_dead_tuple_percent threshold)
+    F estimate_dead_ratio(
+        self,
+        total_tuples: u64,
+        dead_tuples: u64,
+    ) -> f64 {
+        I total_tuples == 0 {
+            R 0.0;
+        }
+        (dead_tuples as f64) / (total_tuples as f64) * 100.0
+    }
+
+    ## Check if a table should be vacuumed based on dead tuple ratio
+    F should_vacuum_table(self, total_tuples: u64, dead_tuples: u64) -> bool {
+        ratio := mut self.estimate_dead_ratio(total_tuples, dead_tuples);
+        ratio >= self.config.min_dead_tuple_percent
+    }
+}

@@ -1,0 +1,402 @@
+# Query Handler & Executor Bridge
+# Bridges wire protocol messages → SQL parser → planner/executor → wire responses
+# Handles simple query protocol, extended query (parse/bind/execute), SET commands
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/bytes.ByteBuffer;
+U std/hashmap.HashMap;
+U storage/error.VaisError;
+U storage/bytes.{write_string};
+U server/types.{
+    MessageHeader, ErrorResponse, ColumnDesc, RowDescription, CommandComplete,
+    TransactionState, PreparedStmtInfo, BindParams, ParamValue,
+    MSG_TYPE_QUERY, MSG_TYPE_PARSE, MSG_TYPE_BIND, MSG_TYPE_EXECUTE,
+    MSG_TYPE_DESCRIBE, MSG_TYPE_CLOSE_STMT, MSG_TYPE_SYNC, MSG_TYPE_TERMINATE,
+    err_protocol_error, err_prepared_stmt_not_found,
+};
+U server/protocol.{
+    deserialize_query, deserialize_parse, deserialize_bind,
+    deserialize_execute, deserialize_describe, deserialize_close_stmt,
+    serialize_row_description, serialize_row_data, serialize_command_complete,
+    serialize_ready, serialize_error, serialize_auth_request, serialize_auth_ok,
+    serialize_param_desc,
+    FramedMessage, ExecuteMsg, DescribeMsg, CloseStmtMsg,
+    encode_int, encode_float, encode_bool, encode_string,
+};
+U server/connection.{Connection, ConnectionPool};
+U server/auth.{Authenticator, AuthResult};
+
+# ============================================================================
+# QueryHandler — processes wire protocol messages for a connection
+# ============================================================================
+
+S QueryHandler {
+    conn_id: u64,
+}
+
+X QueryHandler {
+    F new(conn_id: u64) -> QueryHandler {
+        QueryHandler { conn_id }
+    }
+
+    # Process a single framed message and return response bytes.
+    # Returns Vec of response byte buffers to send to client.
+    F handle_message(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        msg_type := mut msg.msg_type;
+
+        I msg_type == MSG_TYPE_QUERY {
+            self.handle_simple_query(msg, pool)
+        } E I msg_type == MSG_TYPE_PARSE {
+            self.handle_parse(msg, pool)
+        } E I msg_type == MSG_TYPE_BIND {
+            self.handle_bind(msg, pool)
+        } E I msg_type == MSG_TYPE_EXECUTE {
+            self.handle_execute(msg, pool)
+        } E I msg_type == MSG_TYPE_DESCRIBE {
+            self.handle_describe(msg, pool)
+        } E I msg_type == MSG_TYPE_CLOSE_STMT {
+            self.handle_close_stmt(msg, pool)
+        } E I msg_type == MSG_TYPE_SYNC {
+            self.handle_sync(pool)
+        } E I msg_type == MSG_TYPE_TERMINATE {
+            self.handle_terminate(pool)
+        } E {
+            Err(err_protocol_error("Unknown message type: {msg_type}"))
+        }
+    }
+
+    # ========================================================================
+    # Simple Query Protocol
+    # ========================================================================
+
+    # Handle simple query: parse SQL → execute → return results
+    F handle_simple_query(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        sql := mut deserialize_query(&reader)?;
+        responses := mut Vec.new();
+
+        # Update connection state to InQuery
+        pool.with_connection(self.conn_id, |conn| {
+            conn.set_state(ConnectionState.InQuery)
+        })??;
+
+        # FUTURE(integration): Route to SQL execution pipeline
+        # parse_sql -> HybridPlanner.execute_query / Executor.execute_dml / DDL / txn mgmt
+        # Placeholder: return empty result with CommandComplete
+
+        tag := mut classify_sql_tag(&sql);
+        responses.push(serialize_command_complete(&tag));
+
+        # Return to Ready state
+        pool.with_connection(self.conn_id, |conn| {
+            conn.set_state(ConnectionState.Ready)
+        })??;
+
+        # Send ReadyForQuery
+        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
+            M conn.get_txn_state() {
+                TransactionState.Idle => TransactionState.Idle,
+                TransactionState.InBlock => TransactionState.InBlock,
+                TransactionState.Failed => TransactionState.Failed,
+            }
+        })?;
+        responses.push(serialize_ready(&txn_state));
+
+        Ok(responses)
+    }
+
+    # ========================================================================
+    # Extended Query Protocol
+    # ========================================================================
+
+    # Handle Parse: prepare a statement
+    F handle_parse(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        stmt_info := mut deserialize_parse(&reader)?;
+
+        # FUTURE(integration): Parse SQL and validate parameter types via sql/parser
+        # Currently stores the prepared statement without validation
+
+        pool.with_connection(self.conn_id, |conn| {
+            conn.add_prepared_stmt(stmt_info)
+        })?;
+
+        # ParseComplete (no specific message type defined, use empty response)
+        # In a full impl, this would be a specific message
+        Ok(Vec.new())
+    }
+
+    # Handle Bind: bind parameters to a prepared statement → create portal
+    F handle_bind(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        bind_params := mut deserialize_bind(&reader)?;
+
+        # Store portal in connection
+        U server/connection.PortalInfo;
+
+        pool.with_connection(self.conn_id, |conn| {
+            portal := mut PortalInfo.new(
+                bind_params.portal_name.clone(),
+                bind_params.stmt_name.clone(),
+                bind_params.param_values,
+            );
+            conn.add_portal(portal);
+        })?;
+
+        # BindComplete
+        Ok(Vec.new())
+    }
+
+    # Handle Execute: execute a bound portal
+    F handle_execute(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        exec_msg := mut deserialize_execute(&reader)?;
+        responses := mut Vec.new();
+
+        # FUTURE(integration): Look up portal, resolve bound statement + params, execute
+        # Placeholder: return empty CommandComplete
+
+        responses.push(serialize_command_complete("SELECT 0"));
+
+        Ok(responses)
+    }
+
+    # Handle Describe: return parameter/column descriptions
+    F handle_describe(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        desc_msg := mut deserialize_describe(&reader)?;
+        responses := mut Vec.new();
+
+        I desc_msg.describe_type == 0x53 {
+            # Describe Statement ('S')
+            param_types := mut pool.with_connection_ref(self.conn_id, |conn| {
+                M conn.get_prepared_stmt(&desc_msg.name) {
+                    Ok(stmt) => stmt.param_types.clone(),
+                    Err(_) => Vec.new(),
+                }
+            })?;
+            responses.push(serialize_param_desc(&param_types));
+
+            # Also send RowDescription if available
+            result_cols := mut pool.with_connection_ref(self.conn_id, |conn| {
+                M conn.get_prepared_stmt(&desc_msg.name) {
+                    Ok(stmt) => {
+                        I stmt.has_result_columns() {
+                            Some(RowDescription.new(stmt.result_columns.clone()))
+                        } E {
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                }
+            })?;
+            M result_cols {
+                Some(desc) => { responses.push(serialize_row_description(&desc)); },
+                None => {},
+            }
+        } E {
+            # Describe Portal ('P') — return RowDescription
+            # FUTURE(integration): Look up portal and return its column info
+        }
+
+        Ok(responses)
+    }
+
+    # Handle CloseStmt: close a prepared statement or portal
+    F handle_close_stmt(
+        mut self,
+        msg: &FramedMessage,
+        pool: &mut ConnectionPool,
+    ) -> Result<Vec<Vec<u8>>, VaisError> {
+        reader := mut msg.payload_reader();
+        close_msg := mut deserialize_close_stmt(&reader)?;
+
+        I close_msg.close_type == 0x53 {
+            # Close Statement
+            pool.with_connection(self.conn_id, |conn| {
+                conn.remove_prepared_stmt(&close_msg.name)
+            })??;
+        } E {
+            # Close Portal
+            pool.with_connection(self.conn_id, |conn| {
+                conn.remove_portal(&close_msg.name)
+            })??;
+        }
+
+        # CloseComplete
+        Ok(Vec.new())
+    }
+
+    # Handle Sync: mark end of extended query sequence
+    F handle_sync(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+        # Clear all portals
+        pool.with_connection(self.conn_id, |conn| {
+            conn.clear_portals();
+        })?;
+
+        # Send ReadyForQuery
+        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
+            M conn.get_txn_state() {
+                TransactionState.Idle => TransactionState.Idle,
+                TransactionState.InBlock => TransactionState.InBlock,
+                TransactionState.Failed => TransactionState.Failed,
+            }
+        })?;
+
+        responses := mut Vec.new();
+        responses.push(serialize_ready(&txn_state));
+        Ok(responses)
+    }
+
+    # Handle Terminate: client disconnecting
+    F handle_terminate(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+        pool.remove_connection(self.conn_id);
+        Ok(Vec.new())  # No response sent for terminate
+    }
+}
+
+# Need ConnectionState for state transitions
+U server/types.ConnectionState;
+
+# ============================================================================
+# SQL Tag Classification
+# ============================================================================
+
+# Classify SQL string to a command tag for CommandComplete
+# Examines the first keyword to determine the command type
+F classify_sql_tag(sql: &Str) -> Str {
+    bytes := mut sql.as_bytes();
+    len := mut bytes.len();
+
+    # Skip leading whitespace
+    pos: u64 := mut 0;
+    L pos < len {
+        ch := mut bytes[pos];
+        I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
+            pos = len;  # exit
+        } E {
+            pos += 1;
+        }
+    }
+
+    # Reset pos to first non-whitespace
+    start: u64 := mut 0;
+    s: u64 := mut 0;
+    L s < len {
+        ch := mut bytes[s];
+        I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
+            start = s;
+            s = len;
+        } E {
+            s += 1;
+        }
+    }
+
+    # Find end of first word
+    end := mut start;
+    L end < len {
+        ch := mut bytes[end];
+        I ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 59 {
+            end = end;  # found boundary, keep position
+            L end < len { end = len; }  # exit outer loop
+        } E {
+            end += 1;
+        }
+    }
+
+    # Extract first word and uppercase it
+    word := mut Vec.new();
+    w: u64 := mut start;
+    word_end := mut end;
+    I word_end > start + 20 {
+        word_end = start + 20;  # limit to 20 chars
+    }
+    L w < word_end {
+        ch := mut bytes[w];
+        # To uppercase: if 'a'-'z' (97-122), subtract 32
+        I ch >= 97 && ch <= 122 {
+            word.push(ch - 32);
+        } E {
+            word.push(ch);
+        }
+        w += 1;
+    }
+
+    # Match first keyword
+    I word.len() >= 6 && word[0] == 83 && word[1] == 69 && word[2] == 76 &&
+      word[3] == 69 && word[4] == 67 && word[5] == 84 {
+        "SELECT 0"
+    } E I word.len() >= 6 && word[0] == 73 && word[1] == 78 && word[2] == 83 &&
+      word[3] == 69 && word[4] == 82 && word[5] == 84 {
+        "INSERT 0 0"
+    } E I word.len() >= 6 && word[0] == 85 && word[1] == 80 && word[2] == 68 &&
+      word[3] == 65 && word[4] == 84 && word[5] == 69 {
+        "UPDATE 0"
+    } E I word.len() >= 6 && word[0] == 68 && word[1] == 69 && word[2] == 76 &&
+      word[3] == 69 && word[4] == 84 && word[5] == 69 {
+        "DELETE 0"
+    } E I word.len() >= 6 && word[0] == 67 && word[1] == 82 && word[2] == 69 &&
+      word[3] == 65 && word[4] == 84 && word[5] == 69 {
+        "CREATE TABLE"
+    } E I word.len() >= 4 && word[0] == 68 && word[1] == 82 && word[2] == 79 &&
+      word[3] == 80 {
+        "DROP TABLE"
+    } E I word.len() >= 5 && word[0] == 66 && word[1] == 69 && word[2] == 71 &&
+      word[3] == 73 && word[4] == 78 {
+        "BEGIN"
+    } E I word.len() >= 6 && word[0] == 67 && word[1] == 79 && word[2] == 77 &&
+      word[3] == 77 && word[4] == 73 && word[5] == 84 {
+        "COMMIT"
+    } E I word.len() >= 8 && word[0] == 82 && word[1] == 79 && word[2] == 76 &&
+      word[3] == 76 && word[4] == 66 && word[5] == 65 && word[6] == 67 && word[7] == 75 {
+        "ROLLBACK"
+    } E I word.len() >= 7 && word[0] == 69 && word[1] == 88 && word[2] == 80 &&
+      word[3] == 76 && word[4] == 65 && word[5] == 73 && word[6] == 78 {
+        "EXPLAIN"
+    } E I word.len() >= 3 && word[0] == 83 && word[1] == 69 && word[2] == 84 {
+        "SET"
+    } E {
+        "OK"
+    }
+}
+
+# ============================================================================
+# SqlValue → Wire Bytes Conversion
+# ============================================================================
+
+# Convert an SqlValue to wire bytes for RowData transmission.
+# Returns None for NULL values.
+# type_tag: SQL type tag for encoding guidance
+F sql_value_to_wire_bytes(type_tag: u8, is_null: bool, data: &[u8]) -> Option<Vec<u8>> {
+    I is_null {
+        None
+    } E {
+        Some(data.to_vec())
+    }
+}

@@ -1,0 +1,815 @@
+# Phase 11 — Cross-Engine Integration Tests
+# Tests that span multiple engine boundaries:
+#   Score fusion (FullText + Vector), Graph-Vector pipeline scoring,
+#   Plan cache with multi-engine plans, EXPLAIN format for hybrid plans,
+#   RAG fusion config validation, MVCC metadata across engines,
+#   Pipeline score normalization, Query profile classification
+
+U std/test.{describe, it, assert_eq, assert_ne, assert_true, assert_false};
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+
+# Score fusion (fulltext integration)
+U fulltext/integration/fusion.{
+    ScoredDoc, ScoreFusionMethod,
+    fuse_results, normalize_scores,
+};
+
+# Graph-vector integration
+U graph/integration/vector.{
+    VectorSearchHit, GraphExpandedResult,
+};
+
+# Planner types and cross-engine plan nodes
+U planner/types.{
+    HybridCost, EngineType, FusionMethod, EngineBreakdown,
+    VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+    FullTextSearchMode, HybridPlanNode, QueryProfile, HybridExecStats,
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+};
+
+# Planner pipeline
+U planner/pipeline.{
+    ScoredResult, normalize_scores as pipeline_normalize_scores,
+};
+
+# Plan cache
+U planner/cache.{
+    PlanCacheKey, PlanCacheStats, PlanCache,
+    normalize_query,
+};
+
+# EXPLAIN
+U planner/explain.{
+    ExplainFormat, ExplainOptions,
+    explain_plan, format_hybrid_cost,
+};
+
+# Statistics
+U planner/statistics.{
+    TableColumnStats, StatisticsConfig,
+    pseudo_random, compare_values,
+};
+
+# RAG types
+U rag/types.{
+    RagConfig, RagMeta, RagFusionConfig, RagSearchResult,
+    ScoredChunk, ChunkMeta, DocumentMeta,
+    ENGINE_TAG_RAG,
+    DEFAULT_VECTOR_WEIGHT, DEFAULT_FULLTEXT_WEIGHT, DEFAULT_GRAPH_WEIGHT,
+};
+
+# SQL types (shared data representation across all engines)
+U sql/types.{SqlValue, SqlType};
+
+# Storage hash (used across fulltext, RAG, planner cache)
+U storage/hash.{fnv1a_hash};
+
+# ==========================================================================
+# Cross-Engine: Score Fusion (FullText + Vector combined via fusion.vais)
+# ==========================================================================
+
+describe("Score Fusion — WeightedSum", |t| {
+    it("fuses two result sets with equal weights", || {
+        results_a := mut Vec.new();
+        results_a.push(ScoredDoc.new(1, 0.9));
+        results_a.push(ScoredDoc.new(2, 0.7));
+        results_a.push(ScoredDoc.new(3, 0.5));
+
+        results_b := mut Vec.new();
+        results_b.push(ScoredDoc.new(1, 0.8));
+        results_b.push(ScoredDoc.new(3, 0.6));
+        results_b.push(ScoredDoc.new(4, 0.4));
+
+        method := mut ScoreFusionMethod.WeightedSum { weight_a: 0.5, weight_b: 0.5 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+
+        # All unique doc_ids should be present: 1, 2, 3, 4
+        assert_eq(fused.len(), 4u64);
+        # Doc 1 appears in both lists, should have highest combined score
+        assert_eq(fused[0].doc_id, 1u64);
+    });
+
+    it("fuses with asymmetric weights", || {
+        results_a := mut Vec.new();
+        results_a.push(ScoredDoc.new(10, 1.0));
+
+        results_b := mut Vec.new();
+        results_b.push(ScoredDoc.new(20, 1.0));
+
+        method := mut ScoreFusionMethod.WeightedSum { weight_a: 0.8, weight_b: 0.2 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+
+        # Doc 10 should have score 0.8*1.0 = 0.8
+        # Doc 20 should have score 0.2*1.0 = 0.2
+        assert_eq(fused.len(), 2u64);
+        assert_eq(fused[0].doc_id, 10u64);  # Higher weighted
+        assert_eq(fused[1].doc_id, 20u64);
+    });
+
+    it("handles empty result sets", || {
+        results_a: Vec<ScoredDoc> := mut Vec.new();
+        results_b: Vec<ScoredDoc> := mut Vec.new();
+
+        method := mut ScoreFusionMethod.WeightedSum { weight_a: 0.5, weight_b: 0.5 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+        assert_eq(fused.len(), 0u64);
+    });
+
+    it("handles one empty result set", || {
+        results_a := mut Vec.new();
+        results_a.push(ScoredDoc.new(1, 0.9));
+
+        results_b: Vec<ScoredDoc> := mut Vec.new();
+
+        method := mut ScoreFusionMethod.WeightedSum { weight_a: 0.5, weight_b: 0.5 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+        assert_eq(fused.len(), 1u64);
+        assert_eq(fused[0].doc_id, 1u64);
+    });
+});
+
+describe("Score Fusion — RRF", |t| {
+    it("fuses using reciprocal rank with k=60", || {
+        results_a := mut Vec.new();
+        results_a.push(ScoredDoc.new(1, 10.0));  # rank 1 in A
+        results_a.push(ScoredDoc.new(2, 8.0));   # rank 2 in A
+
+        results_b := mut Vec.new();
+        results_b.push(ScoredDoc.new(2, 5.0));   # rank 1 in B
+        results_b.push(ScoredDoc.new(3, 3.0));   # rank 2 in B
+
+        method := mut ScoreFusionMethod.ReciprocalRankFusion { k: 60 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+
+        # Doc 2 appears in both lists (rank 2 in A, rank 1 in B)
+        # RRF(2) = 1/(60+2) + 1/(60+1) = 0.01613 + 0.01639 = 0.03252
+        # Doc 1 only in A (rank 1): RRF(1) = 1/(60+1) = 0.01639
+        # Doc 3 only in B (rank 2): RRF(3) = 1/(60+2) = 0.01613
+        assert_eq(fused.len(), 3u64);
+        # Doc 2 should have highest RRF score (appears in both)
+        assert_eq(fused[0].doc_id, 2u64);
+    });
+
+    it("RRF handles disjoint result sets", || {
+        results_a := mut Vec.new();
+        results_a.push(ScoredDoc.new(1, 10.0));
+        results_a.push(ScoredDoc.new(2, 8.0));
+
+        results_b := mut Vec.new();
+        results_b.push(ScoredDoc.new(3, 5.0));
+        results_b.push(ScoredDoc.new(4, 3.0));
+
+        method := mut ScoreFusionMethod.ReciprocalRankFusion { k: 60 };
+        fused := mut fuse_results(&method, &results_a, &results_b);
+        assert_eq(fused.len(), 4u64);
+    });
+});
+
+describe("Score Normalization", |t| {
+    it("normalizes diverse scores to [0,1]", || {
+        results := mut Vec.new();
+        results.push(ScoredDoc.new(1, 10.0));
+        results.push(ScoredDoc.new(2, 5.0));
+        results.push(ScoredDoc.new(3, 0.0));
+
+        normalized := mut normalize_scores(&results);
+        assert_eq(normalized.len(), 3u64);
+
+        # Max score (10.0) should normalize to 1.0
+        assert_true(normalized[0].score > 0.99 && normalized[0].score < 1.01);
+        # Mid score (5.0) should normalize to 0.5
+        assert_true(normalized[1].score > 0.49 && normalized[1].score < 0.51);
+        # Min score (0.0) should normalize to 0.0
+        assert_true(normalized[2].score > -0.01 && normalized[2].score < 0.01);
+    });
+
+    it("normalizes equal scores to 1.0", || {
+        results := mut Vec.new();
+        results.push(ScoredDoc.new(1, 5.0));
+        results.push(ScoredDoc.new(2, 5.0));
+        results.push(ScoredDoc.new(3, 5.0));
+
+        normalized := mut normalize_scores(&results);
+        # All equal scores normalize to 1.0
+        L i: 0..normalized.len() {
+            assert_true(normalized[i].score > 0.99 && normalized[i].score < 1.01);
+        }
+    });
+
+    it("normalizes empty results", || {
+        results: Vec<ScoredDoc> := mut Vec.new();
+        normalized := mut normalize_scores(&results);
+        assert_eq(normalized.len(), 0u64);
+    });
+
+    it("normalizes single result to 1.0", || {
+        results := mut Vec.new();
+        results.push(ScoredDoc.new(1, 42.0));
+
+        normalized := mut normalize_scores(&results);
+        assert_eq(normalized.len(), 1u64);
+        assert_true(normalized[0].score > 0.99 && normalized[0].score < 1.01);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: Graph-Vector Integration Types
+# ==========================================================================
+
+describe("VectorSearchHit", |t| {
+    it("creates hit with distance-to-similarity conversion", || {
+        hit := mut VectorSearchHit.new(1, 100, 0.5f32);
+        assert_eq(hit.row_id, 1u64);
+        assert_eq(hit.node_id, 100u64);
+        assert_true(hit.distance > 0.49 && hit.distance < 0.51);
+        # similarity = 1.0 / (1.0 + 0.5) = 0.667
+        assert_true(hit.similarity > 0.65 && hit.similarity < 0.68);
+    });
+
+    it("zero distance gives perfect similarity", || {
+        hit := mut VectorSearchHit.new(1, 100, 0.0f32);
+        assert_true(hit.similarity > 0.99 && hit.similarity < 1.01);
+    });
+
+    it("large distance gives low similarity", || {
+        hit := mut VectorSearchHit.new(1, 100, 99.0f32);
+        # 1/(1+99) = 0.01
+        assert_true(hit.similarity > 0.009 && hit.similarity < 0.011);
+    });
+});
+
+describe("GraphExpandedResult", |t| {
+    it("origin node has depth 0 and full similarity", || {
+        result := mut GraphExpandedResult.origin(42, 0.85f32);
+        assert_eq(result.origin_node_id, 42u64);
+        assert_eq(result.neighbor_node_id, 42u64);
+        assert_eq(result.graph_depth, 0u32);
+        assert_true(result.graph_proximity > 0.99 && result.graph_proximity < 1.01);
+        # combined_score = similarity for origin
+        assert_true(result.combined_score > 0.84 && result.combined_score < 0.86);
+    });
+
+    it("neighbor at depth 1 has decayed proximity", || {
+        result := mut GraphExpandedResult.new(
+            42,      # origin_node_id
+            0.9f32,  # origin_similarity
+            100,     # neighbor_node_id
+            1,       # graph_depth
+            0.7f32,  # alpha (vector weight)
+        );
+        assert_eq(result.origin_node_id, 42u64);
+        assert_eq(result.neighbor_node_id, 100u64);
+        assert_eq(result.graph_depth, 1u32);
+        # proximity = 1/(1+1) = 0.5
+        assert_true(result.graph_proximity > 0.49 && result.graph_proximity < 0.51);
+        # combined = 0.7 * 0.9 + 0.3 * 0.5 = 0.63 + 0.15 = 0.78
+        assert_true(result.combined_score > 0.77 && result.combined_score < 0.79);
+    });
+
+    it("neighbor at depth 2 has further decayed proximity", || {
+        result := mut GraphExpandedResult.new(
+            42,      # origin_node_id
+            0.8f32,  # origin_similarity
+            200,     # neighbor_node_id
+            2,       # graph_depth
+            0.5f32,  # alpha (equal weight)
+        );
+        # proximity = 1/(1+2) = 0.333
+        assert_true(result.graph_proximity > 0.32 && result.graph_proximity < 0.34);
+        # combined = 0.5 * 0.8 + 0.5 * 0.333 = 0.4 + 0.167 = 0.567
+        assert_true(result.combined_score > 0.56 && result.combined_score < 0.58);
+    });
+
+    it("alpha=1.0 gives pure vector scoring", || {
+        result := mut GraphExpandedResult.new(42, 0.9f32, 100, 3, 1.0f32);
+        # combined = 1.0 * 0.9 + 0.0 * proximity = 0.9
+        assert_true(result.combined_score > 0.89 && result.combined_score < 0.91);
+    });
+
+    it("alpha=0.0 gives pure graph scoring", || {
+        result := mut GraphExpandedResult.new(42, 0.9f32, 100, 1, 0.0f32);
+        # combined = 0.0 * 0.9 + 1.0 * 0.5 = 0.5
+        assert_true(result.combined_score > 0.49 && result.combined_score < 0.51);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: QueryProfile classifies engine combinations
+# ==========================================================================
+
+describe("QueryProfile — Cross-engine classification", |t| {
+    it("SQL + Vector is not pure SQL", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        assert_false(profile.is_pure_sql());
+        assert_eq(profile.engine_count(), 2u32);
+    });
+
+    it("Vector + FullText requires score fusion", || {
+        profile := mut QueryProfile.new();
+        profile.uses_vector = true;
+        profile.uses_fulltext = true;
+        assert_true(profile.needs_score_fusion());
+        assert_false(profile.is_pure_sql());
+        assert_false(profile.is_single_engine());
+    });
+
+    it("Vector + Graph does not require score fusion", || {
+        profile := mut QueryProfile.new();
+        profile.uses_vector = true;
+        profile.uses_graph = true;
+        assert_false(profile.needs_score_fusion());
+    });
+
+    it("all four engines produces engine_count=4", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        profile.uses_graph = true;
+        profile.uses_fulltext = true;
+        assert_eq(profile.engine_count(), 4u32);
+        assert_false(profile.is_single_engine());
+        assert_false(profile.is_pure_sql());
+        assert_true(profile.needs_score_fusion());
+    });
+
+    it("FullText only does not require score fusion", || {
+        profile := mut QueryProfile.new();
+        profile.uses_fulltext = true;
+        assert_false(profile.needs_score_fusion());
+        assert_true(profile.is_single_engine());
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: HybridCost models multi-engine workloads
+# ==========================================================================
+
+describe("HybridCost — Multi-engine cost modeling", |t| {
+    it("combined vector + fulltext cost", || {
+        cost := mut HybridCost.new();
+        cost.total_io_cost = 15.0;
+        cost.total_cpu_cost = 50.0;
+        cost.vector_io_cost = 10.0;
+        cost.vector_cpu_cost = 30.0;
+        cost.fulltext_io_cost = 5.0;
+        cost.fulltext_cpu_cost = 20.0;
+
+        breakdown := mut cost.engine_breakdown();
+        assert_eq(breakdown.len(), 2u64);
+        # Should have both Vector and FullText entries
+    });
+
+    it("three-engine cost breakdown sums to ~100%", || {
+        cost := mut HybridCost.new();
+        cost.total_io_cost = 30.0;
+        cost.total_cpu_cost = 60.0;
+        cost.sql_io_cost = 10.0;
+        cost.sql_cpu_cost = 20.0;
+        cost.vector_io_cost = 10.0;
+        cost.vector_cpu_cost = 20.0;
+        cost.graph_io_cost = 10.0;
+        cost.graph_cpu_cost = 20.0;
+
+        breakdown := mut cost.engine_breakdown();
+        assert_eq(breakdown.len(), 3u64);
+
+        # Sum of percentages should be ~100%
+        pct_sum := mut 0.0;
+        L i: 0..breakdown.len() {
+            pct_sum = pct_sum + breakdown[i].percentage;
+        }
+        assert_true(pct_sum > 99.0 && pct_sum < 101.0);
+    });
+
+    it("add combines cross-engine costs correctly", || {
+        # Vector scan cost
+        vector_cost := mut HybridCost.new();
+        vector_cost.total_io_cost = 10.0;
+        vector_cost.total_cpu_cost = 20.0;
+        vector_cost.vector_io_cost = 10.0;
+        vector_cost.vector_cpu_cost = 20.0;
+        vector_cost.vector_dimension = 768;
+        vector_cost.row_estimate = 100;
+
+        # Graph traverse cost
+        graph_cost := mut HybridCost.new();
+        graph_cost.total_io_cost = 5.0;
+        graph_cost.total_cpu_cost = 15.0;
+        graph_cost.graph_io_cost = 5.0;
+        graph_cost.graph_cpu_cost = 15.0;
+        graph_cost.graph_avg_degree = 8.0;
+        graph_cost.graph_max_depth = 3;
+        graph_cost.row_estimate = 50;
+
+        combined := mut vector_cost.add(&graph_cost);
+        assert_eq(combined.total_io_cost, 15.0);
+        assert_eq(combined.total_cpu_cost, 35.0);
+        assert_eq(combined.vector_io_cost, 10.0);
+        assert_eq(combined.graph_io_cost, 5.0);
+        # row_estimate keeps first operand
+        assert_eq(combined.row_estimate, 100u64);
+        # Engine-specific metrics propagated
+        assert_eq(combined.vector_dimension, 768u32);
+        assert_eq(combined.graph_max_depth, 3u32);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: FNV-1a hash used across planner cache + fulltext + RAG
+# ==========================================================================
+
+describe("FNV-1a hash — Cross-engine consistency", |t| {
+    it("same input produces same hash across call sites", || {
+        text := mut "SELECT * FROM docs WHERE content MATCH 'hello'";
+        h1 := mut fnv1a_hash(&text);
+        h2 := mut fnv1a_hash(&text);
+        assert_eq(h1, h2);
+    });
+
+    it("plan cache key uses same hash as fnv1a_hash", || {
+        sql := mut "SELECT id FROM t WHERE id = $1";
+        expected_hash := mut fnv1a_hash(&sql);
+        key := mut PlanCacheKey.new(sql.to_string());
+        assert_eq(key.hash, expected_hash);
+    });
+
+    it("different queries produce different cache keys", || {
+        key1 := mut PlanCacheKey.new("SELECT * FROM a".to_string());
+        key2 := mut PlanCacheKey.new("SELECT * FROM b".to_string());
+        assert_false(key1.eq(&key2));
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: RAG fusion config validation
+# ==========================================================================
+
+describe("RagFusionConfig — Cross-engine weight validation", |t| {
+    it("default weights are valid", || {
+        config := mut RagFusionConfig.default();
+        assert_true(config.validate().is_ok());
+    });
+
+    it("vector-only weight is valid", || {
+        config := mut RagFusionConfig.default();
+        config.vector_weight = 1.0;
+        config.fulltext_weight = 0.0;
+        config.graph_weight = 0.0;
+        assert_true(config.validate().is_ok());
+    });
+
+    it("all zero search weights fails validation", || {
+        config := mut RagFusionConfig.default();
+        config.vector_weight = 0.0;
+        config.fulltext_weight = 0.0;
+        config.graph_weight = 0.0;
+        assert_true(config.validate().is_err());
+    });
+
+    it("graph-only weight is valid", || {
+        config := mut RagFusionConfig.default();
+        config.vector_weight = 0.0;
+        config.fulltext_weight = 0.0;
+        config.graph_weight = 1.0;
+        assert_true(config.validate().is_ok());
+    });
+
+    it("zero top_k fails validation", || {
+        config := mut RagFusionConfig.default();
+        config.top_k = 0;
+        assert_true(config.validate().is_err());
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: MVCC metadata shared across graph/fulltext/RAG
+# ==========================================================================
+
+describe("MVCC metadata — Cross-engine consistency", |t| {
+    it("ChunkMeta and DocumentMeta follow same MVCC pattern", || {
+        # Both use txn_id_create/txn_id_expire/cmd_id_create/cmd_id_expire
+        chunk := mut ChunkMeta.new(1, 100);
+        doc := mut DocumentMeta.new(1, 100);
+
+        # Both should have same initial MVCC state
+        assert_eq(chunk.txn_id_create, doc.txn_id_create);
+        assert_eq(chunk.txn_id_expire, doc.txn_id_expire);
+        assert_eq(chunk.cmd_id_create, doc.cmd_id_create);
+        assert_eq(chunk.cmd_id_expire, doc.cmd_id_expire);
+    });
+
+    it("MVCC expiration works the same across types", || {
+        chunk := mut ChunkMeta.new(1, 100);
+        chunk.txn_id_expire = 200;
+        chunk.cmd_id_expire = 5;
+
+        doc := mut DocumentMeta.new(2, 100);
+        doc.txn_id_expire = 200;
+        doc.cmd_id_expire = 5;
+
+        # Both should report same visibility semantics
+        assert_eq(chunk.txn_id_expire, doc.txn_id_expire);
+        assert_eq(chunk.cmd_id_expire, doc.cmd_id_expire);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: RAG engine metadata interacts with all sub-engines
+# ==========================================================================
+
+describe("RagMeta — Cross-engine ID allocation", |t| {
+    it("doc/chunk/memory/session IDs are independent namespaces", || {
+        meta := mut RagMeta.new(4096);
+
+        # Allocate from each namespace
+        doc1 := mut meta.alloc_doc_id();
+        doc2 := mut meta.alloc_doc_id();
+        chunk1 := mut meta.alloc_chunk_id();
+        mem1 := mut meta.alloc_memory_id();
+        sess1 := mut meta.alloc_session_id();
+
+        # Each namespace starts at 1 independently
+        assert_eq(doc1, 1u64);
+        assert_eq(doc2, 2u64);
+        assert_eq(chunk1, 1u64);
+        assert_eq(mem1, 1u64);
+        assert_eq(sess1, 1u64);
+
+        # Verify counters advanced independently
+        assert_eq(meta.next_doc_id, 3u64);
+        assert_eq(meta.next_chunk_id, 2u64);
+        assert_eq(meta.next_memory_id, 2u64);
+        assert_eq(meta.next_session_id, 2u64);
+    });
+
+    it("config round-trip preserves all engine weights", || {
+        meta := mut RagMeta.new(4096);
+        meta.doc_count = 100;
+        meta.chunk_count = 500;
+        meta.active_model_id = 3;
+
+        buf := mut ByteBuffer.new(256);
+        meta.serialize(&buf);
+        buf.reset_read();
+        restored := mut RagMeta.deserialize(&buf, 4096).unwrap();
+
+        assert_eq(restored.doc_count, 100u64);
+        assert_eq(restored.chunk_count, 500u64);
+        assert_eq(restored.active_model_id, 3u32);
+        # Embedded config also survives
+        assert_eq(restored.config.chunk_strategy, meta.config.chunk_strategy);
+        assert_true(
+            restored.config.vector_weight > (DEFAULT_VECTOR_WEIGHT - 0.01)
+            && restored.config.vector_weight < (DEFAULT_VECTOR_WEIGHT + 0.01)
+        );
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: Statistics compare_values used across planner + SQL
+# ==========================================================================
+
+describe("compare_values — Cross-engine value comparison", |t| {
+    it("consistent ordering for integer values from any engine", || {
+        a := mut SqlValue.IntVal { v: 1 };
+        b := mut SqlValue.IntVal { v: 2 };
+        c := mut SqlValue.IntVal { v: 3 };
+
+        # Transitivity: a < b AND b < c implies a < c
+        assert_eq(compare_values(&a, &b).unwrap(), -1);
+        assert_eq(compare_values(&b, &c).unwrap(), -1);
+        assert_eq(compare_values(&a, &c).unwrap(), -1);
+    });
+
+    it("consistent ordering for float values", || {
+        a := mut SqlValue.FloatVal { v: 0.1 };
+        b := mut SqlValue.FloatVal { v: 0.5 };
+        assert_eq(compare_values(&a, &b).unwrap(), -1);
+        assert_eq(compare_values(&b, &a).unwrap(), 1);
+        assert_eq(compare_values(&a, &a).unwrap(), 0);
+    });
+
+    it("NULL handling is consistent", || {
+        null := mut SqlValue.Null;
+        int_val := mut SqlValue.IntVal { v: 42 };
+        str_val := mut SqlValue.StringVal { v: "test".to_string() };
+
+        # NULL sorts before any non-NULL value
+        assert_eq(compare_values(&null, &int_val).unwrap(), -1);
+        assert_eq(compare_values(&null, &str_val).unwrap(), -1);
+        assert_eq(compare_values(&int_val, &null).unwrap(), 1);
+        assert_eq(compare_values(&null, &null).unwrap(), 0);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: Query normalization for plan cache across engine types
+# ==========================================================================
+
+describe("Query normalization — Multi-engine queries", |t| {
+    it("normalizes hybrid SQL+vector query", || {
+        sql := mut "SELECT * FROM docs d JOIN VECTOR_SEARCH('emb', 128, 10) v ON d.id = v.row_id WHERE d.status = 'active'";
+        normalized := mut normalize_query(&sql);
+        # Literal values replaced; structure preserved
+        assert_true(normalized.contains("VECTOR_SEARCH"));
+        assert_true(normalized.contains("$"));
+    });
+
+    it("same structure with different literals normalizes equally", || {
+        q1 := mut normalize_query(&"SELECT * FROM t WHERE id = 1 AND name = 'alice'");
+        q2 := mut normalize_query(&"SELECT * FROM t WHERE id = 2 AND name = 'bob'");
+        assert_eq(q1, q2);
+    });
+
+    it("different table names produce different normalized forms", || {
+        q1 := mut normalize_query(&"SELECT * FROM users WHERE id = 1");
+        q2 := mut normalize_query(&"SELECT * FROM orders WHERE id = 1");
+        assert_ne(q1, q2);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: Planner FusionMethod and RAG FusionConfig alignment
+# ==========================================================================
+
+describe("FusionMethod — Planner-RAG alignment", |t| {
+    it("planner WeightedSum and RAG use same concept", || {
+        # Planner's FusionMethod
+        planner_ws := mut FusionMethod.default_weighted();
+        M planner_ws {
+            FusionMethod.WeightedSum { weight_a, weight_b } => {
+                # 50/50 equal weights
+                assert_true(weight_a > 0.49 && weight_a < 0.51);
+                assert_true(weight_b > 0.49 && weight_b < 0.51);
+            },
+            _ => assert_true(false),
+        }
+
+        # RAG's default weights (vector/fulltext/graph)
+        assert_true(DEFAULT_VECTOR_WEIGHT > 0.0);
+        assert_true(DEFAULT_FULLTEXT_WEIGHT > 0.0);
+        assert_true(DEFAULT_GRAPH_WEIGHT > 0.0);
+    });
+
+    it("planner RRF and fulltext RRF use same k default", || {
+        planner_rrf := mut FusionMethod.default_rrf();
+        M planner_rrf {
+            FusionMethod.ReciprocalRankFusion { k } => {
+                assert_eq(k, 60u32);  # Standard RRF k
+            },
+            _ => assert_true(false),
+        }
+
+        # RAG's default RRF k
+        rag_config := mut RagFusionConfig.default();
+        assert_eq(rag_config.rrf_k, 60u32);  # Same k value
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: RagSearchResult bridges vector+fulltext+graph results
+# ==========================================================================
+
+describe("RagSearchResult — Multi-engine result assembly", |t| {
+    it("basic result with context expansion", || {
+        result := mut RagSearchResult.new(1, 10, 0.95, "main content".to_string());
+        result = result.with_parent(5);
+        result = result.with_context(
+            "previous paragraph context".to_string(),
+            "next paragraph context".to_string(),
+        );
+
+        assert_eq(result.source_id, 1u64);
+        assert_eq(result.chunk_id, 10u64);
+        assert_eq(result.parent_doc_id, 5u64);
+        assert_true(result.score > 0.94 && result.score < 0.96);
+        assert_eq(result.source_engine, ENGINE_TAG_RAG);
+        assert_eq(result.source_text, "main content");
+        assert_eq(result.context_before, "previous paragraph context");
+        assert_eq(result.context_after, "next paragraph context");
+    });
+
+    it("scored chunks from different engines", || {
+        # Vector engine result
+        vec_chunk := mut ScoredChunk.new(10, 1, 0.9, ENGINE_TAG_RAG);
+        # Another scored chunk from same pipeline
+        ft_chunk := mut ScoredChunk.new(20, 2, 0.8, ENGINE_TAG_RAG);
+
+        assert_eq(vec_chunk.chunk_id, 10u64);
+        assert_eq(ft_chunk.chunk_id, 20u64);
+        assert_ne(vec_chunk.doc_id, ft_chunk.doc_id);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: ExplainOptions formatting for hybrid plans
+# ==========================================================================
+
+describe("ExplainOptions — Hybrid plan formatting", |t| {
+    it("default is text format without analysis", || {
+        opts := mut ExplainOptions.default();
+        assert_false(opts.analyze);
+        assert_false(opts.verbose);
+        M opts.format {
+            ExplainFormat.Text => assert_true(true),
+            _ => assert_true(false),
+        }
+    });
+
+    it("format_hybrid_cost produces readable output", || {
+        cost := mut HybridCost.new();
+        cost.total_io_cost = 10.5;
+        cost.total_cpu_cost = 20.3;
+        cost.total_memory_bytes = 4096;
+        cost.row_estimate = 500;
+
+        formatted := mut format_hybrid_cost(&cost);
+        assert_true(formatted.contains("IO="));
+        assert_true(formatted.contains("CPU="));
+        assert_true(formatted.contains("Mem="));
+        assert_true(formatted.contains("Rows="));
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: HybridExecStats tracks execution across engines
+# ==========================================================================
+
+describe("HybridExecStats — Cross-engine execution tracking", |t| {
+    it("models a vector + graph hybrid execution tree", || {
+        root := mut HybridExecStats.new(EngineType.Hybrid);
+        root.elapsed_us = 50;  # Fusion overhead
+
+        vec_stats := mut HybridExecStats.new(EngineType.Vector);
+        vec_stats.elapsed_us = 800;
+        vec_stats.rows_produced = 100;
+        vec_stats.rows_scanned = 10000;
+        vec_stats.pages_read = 50;
+
+        graph_stats := mut HybridExecStats.new(EngineType.Graph);
+        graph_stats.elapsed_us = 300;
+        graph_stats.rows_produced = 50;
+        graph_stats.rows_scanned = 200;
+        graph_stats.pages_read = 20;
+
+        root.children.push(vec_stats);
+        root.children.push(graph_stats);
+
+        # Total time: 50 (root) + 800 (vector) + 300 (graph) = 1150
+        assert_eq(root.total_elapsed_us(), 1150u64);
+        assert_eq(root.children.len(), 2u64);
+    });
+
+    it("models a three-engine execution tree", || {
+        root := mut HybridExecStats.new(EngineType.Hybrid);
+        root.elapsed_us = 10;
+
+        sql_stats := mut HybridExecStats.new(EngineType.Sql);
+        sql_stats.elapsed_us = 200;
+
+        vec_stats := mut HybridExecStats.new(EngineType.Vector);
+        vec_stats.elapsed_us = 400;
+
+        ft_stats := mut HybridExecStats.new(EngineType.FullText);
+        ft_stats.elapsed_us = 150;
+
+        root.children.push(sql_stats);
+        root.children.push(vec_stats);
+        root.children.push(ft_stats);
+
+        # 10 + 200 + 400 + 150 = 760
+        assert_eq(root.total_elapsed_us(), 760u64);
+    });
+});
+
+# ==========================================================================
+# Cross-Engine: PlanCacheStats tracks cache across engine types
+# ==========================================================================
+
+describe("PlanCacheStats — Cache performance metrics", |t| {
+    it("hit rate computation is correct", || {
+        stats := mut PlanCacheStats.new();
+        stats.hits = 90;
+        stats.misses = 10;
+        # 90/100 = 0.9
+        rate := mut stats.hit_rate();
+        assert_true(rate > 0.89 && rate < 0.91);
+    });
+
+    it("tracks evictions separately from misses", || {
+        stats := mut PlanCacheStats.new();
+        stats.hits = 50;
+        stats.misses = 50;
+        stats.evictions = 10;
+        # hit_rate only considers hits/(hits+misses)
+        rate := mut stats.hit_rate();
+        assert_true(rate > 0.49 && rate < 0.51);
+        assert_eq(stats.evictions, 10u64);
+    });
+});

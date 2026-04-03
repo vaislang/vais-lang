@@ -1,0 +1,531 @@
+# RAG Engine
+# Semantic chunking, context preservation, agent memory, RAG_SEARCH
+# Entry point and high-level facade for all RAG & AI-native operations
+
+# ============================================================================
+# Module exports
+# ============================================================================
+
+# Submodules (auto-discovered by filesystem)
+# types, embedding, chunking, wal, visibility, concurrency
+# context, search, memory
+
+# Core types
+U types.{
+    RagConfig, RagMeta, RagFusionConfig,
+    ChunkInfo, DocumentInfo, RagSearchResult, ScoredChunk,
+    RAG_FORMAT_VERSION, FILE_ID_RAG, FILE_NAME_RAG, ENGINE_TAG_RAG,
+    CHUNK_STRATEGY_FIXED_SIZE, CHUNK_STRATEGY_SENTENCE, CHUNK_STRATEGY_PARAGRAPH,
+    MEMORY_TYPE_EPISODIC, MEMORY_TYPE_SEMANTIC, MEMORY_TYPE_PROCEDURAL, MEMORY_TYPE_WORKING,
+    EDGE_TYPE_NEXT_CHUNK, EDGE_TYPE_SAME_SECTION, EDGE_TYPE_SAME_DOCUMENT,
+    EDGE_TYPE_CONTAINS, EDGE_TYPE_REFERENCES, EDGE_TYPE_SUPERSEDES, EDGE_TYPE_RELATED_TO,
+    LABEL_DOCUMENT, LABEL_SECTION, LABEL_PARAGRAPH, LABEL_CHUNK, LABEL_MEMORY, LABEL_SESSION,
+    err_rag_engine_closed, err_rag_doc_not_found, err_rag_chunk_not_found,
+    err_rag_model_not_found, err_rag_memory_not_found, err_rag_session_not_found,
+};
+U storage/hash.{fnv1a_hash};
+
+# Embedding management
+U embedding/model.{EmbeddingModelInfo, EmbeddingModelRegistry};
+U embedding/manager.{EmbeddingManager, ReindexProgress};
+
+# Chunking pipeline
+U chunking/chunker.{SemanticChunker, ChunkingConfig};
+U chunking/strategies.{FixedSizeChunker, SentenceChunker, ParagraphChunker};
+U chunking/graph.{ChunkGraphManager, ChunkEdgePlan};
+U chunking/hierarchy.{DocumentHierarchy, HierarchyNode, HierarchyLevel};
+
+# WAL manager
+U wal.{RagWalManager};
+
+# MVCC visibility
+U visibility.{
+    is_chunk_visible, is_doc_visible, is_memory_visible,
+    filter_visible_chunks, filter_visible_docs, filter_visible_memories,
+};
+
+# Concurrency control
+U concurrency.{RagDocLockManager, RagChunkLockManager, RagMemoryLockManager};
+
+# Context preservation
+U context/window.{ContextWindow, ContextExpander};
+U context/crossref.{CrossRefTracker, CrossReference};
+U context/versioning.{VersionTracker, ChunkVersion};
+
+# Search pipeline
+U search/rag_search.{RagSearchExecutor, RagSearchParams, EngineResultSet};
+U search/pipeline.{RagSearchPipeline, PipelineConfig};
+U search/attribution.{AttributionBuilder, Attribution, ScoreBreakdown};
+
+# Agent memory
+U memory/types.{MemoryEntry, ImportanceScorer, MemoryConfig};
+U memory/storage.{MemoryStore};
+U memory/search.{MemorySearchExecutor, MemorySearchParams, MemorySearchResult};
+U memory/retrieval.{HybridRetriever, HybridRetrievalConfig, HybridResult};
+U memory/session.{SessionManager, AgentSession};
+U memory/lifecycle.{MemoryLifecycleManager, LifecycleAction, LifecycleStats};
+
+# Dependencies
+U std/option.{Option, Some, None};
+U std/vec.Vec;
+U std/string.Str;
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+
+# ============================================================================
+# RagEngine — High-level facade for all RAG & AI-native operations
+# ============================================================================
+
+# RagEngine manages document ingestion (chunking + embedding + graph),
+# RAG_SEARCH (multi-engine fusion), agent memory (CRUD + lifecycle),
+# and session management
+S RagEngine {
+    config: RagConfig,
+    meta: RagMeta,
+    chunker: SemanticChunker,
+    embedding_mgr: EmbeddingManager,
+    hierarchy: DocumentHierarchy,
+    chunk_graph: ChunkGraphManager,
+    context_expander: ContextExpander,
+    crossref_tracker: CrossRefTracker,
+    version_tracker: VersionTracker,
+    wal_mgr: RagWalManager,
+    doc_lock: RagDocLockManager,
+    chunk_lock: RagChunkLockManager,
+    memory_lock: RagMemoryLockManager,
+    memory_store: MemoryStore,
+    session_mgr: SessionManager,
+    lifecycle_mgr: MemoryLifecycleManager,
+    search_pipeline: RagSearchPipeline,
+    is_open: bool,
+}
+
+X RagEngine {
+    # ========================================================================
+    # Constructor
+    # ========================================================================
+
+    ## Create new RagEngine instance (does not load from disk)
+    ## Call open() to initialize and load metadata
+    F new(config: RagConfig) -> RagEngine {
+        page_size := mut config.page_size;
+        meta := mut RagMeta.new(page_size);
+        chunking_config := mut ChunkingConfig.from_rag_config(&config);
+        memory_config := mut MemoryConfig.default();
+
+        RagEngine {
+            config,
+            meta,
+            chunker: SemanticChunker.new(chunking_config),
+            embedding_mgr: EmbeddingManager.new(),
+            hierarchy: DocumentHierarchy.new(),
+            chunk_graph: ChunkGraphManager.new(),
+            context_expander: ContextExpander.new(),
+            crossref_tracker: CrossRefTracker.new(),
+            version_tracker: VersionTracker.new(),
+            wal_mgr: RagWalManager.new(),
+            doc_lock: RagDocLockManager.new(64),
+            chunk_lock: RagChunkLockManager.new(128),
+            memory_lock: RagMemoryLockManager.new(64),
+            memory_store: MemoryStore.new(),
+            session_mgr: SessionManager.new(),
+            lifecycle_mgr: MemoryLifecycleManager.new(memory_config),
+            search_pipeline: RagSearchPipeline.new(PipelineConfig.default()),
+            is_open: false,
+        }
+    }
+
+    # ========================================================================
+    # Lifecycle — Open/Close
+    # ========================================================================
+
+    ## Open engine: load metadata, initialize subsystems
+    F open(mut self) -> Result<(), VaisError> {
+        I self.is_open {
+            R Ok(());
+        }
+
+        self.memory_store.open();
+        self.session_mgr.open();
+        self.is_open = true;
+        Ok(())
+    }
+
+    ## Close engine: flush state, release resources
+    F close(mut self) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Ok(());
+        }
+
+        self.session_mgr.close();
+        self.memory_store.close();
+        self.is_open = false;
+        Ok(())
+    }
+
+    # ========================================================================
+    # Document Ingestion
+    # ========================================================================
+
+    ## Ingest a document: chunk → embed → build hierarchy → build graph edges
+    ## Returns (doc_id, chunk_count)
+    F ingest_document(
+        mut self,
+        title: Str,
+        source_uri: Str,
+        content: &Str,
+        current_time: i64,
+    ) -> Result<(u64, u32), VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        # Allocate document ID
+        doc_id := mut self.meta.alloc_doc_id();
+
+        # Chunk the document
+        chunks := mut self.chunker.chunk(content);
+        chunk_count := mut chunks.len() as u32;
+
+        # Create ChunkInfo entries with IDs
+        chunk_infos := mut Vec.new();
+        ci: u32 := mut 0;
+        L ci < chunk_count {
+            chunk := mut chunks.get(ci as u64);
+            chunk_id := mut self.meta.alloc_chunk_id();
+
+            info := mut ChunkInfo {
+                chunk_id,
+                parent_doc_id: doc_id,
+                position_in_doc: ci,
+                chunk_text: chunk.text.clone(),
+                chunk_type: self.config.chunk_strategy,
+                token_count: chunk.token_count,
+                overlap_start: chunk.overlap_start,
+                overlap_end: chunk.overlap_end,
+                created_at: current_time,
+            };
+            chunk_infos.push(info);
+            ci = ci + 1;
+        }
+
+        # Build document hierarchy (if enabled)
+        I self.config.enable_hierarchy {
+            self.hierarchy.build_for_document(doc_id, &chunk_infos);
+        }
+
+        # Build chunk graph edges (NEXT_CHUNK, SAME_SECTION)
+        edge_plans := mut self.chunk_graph.build_edges(doc_id, &chunk_infos);
+
+        # WAL-log document insert
+        self.wal_mgr.log_doc_insert(doc_id, &title)?;
+
+        # WAL-log chunk inserts
+        wi: u32 := mut 0;
+        L wi < chunk_infos.len() as u32 {
+            info := mut chunk_infos.get(wi as u64);
+            self.wal_mgr.log_chunk_insert(info.chunk_id, doc_id)?;
+            wi = wi + 1;
+        }
+
+        # Create DocumentInfo
+        content_hash := mut fnv1a_hash(content);
+        doc_info := mut DocumentInfo {
+            doc_id,
+            title,
+            source_uri,
+            content_hash,
+            chunk_count,
+            total_tokens: 0,
+            embedding_model_id: self.meta.active_model_id,
+            ttl_seconds: 0,
+            created_at: current_time,
+            updated_at: current_time,
+        };
+
+        # Sum total tokens
+        ti: u32 := mut 0;
+        L ti < chunk_infos.len() as u32 {
+            doc_info.total_tokens = doc_info.total_tokens
+                + chunk_infos.get(ti as u64).token_count;
+            ti = ti + 1;
+        }
+
+        # Update metadata counters
+        self.meta.doc_count = self.meta.doc_count + 1;
+        self.meta.chunk_count = self.meta.chunk_count + chunk_count as u64;
+
+        Ok((doc_id, chunk_count))
+    }
+
+    ## Delete a document and its chunks
+    F delete_document(mut self, doc_id: u64) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        # WAL-log document deletion
+        self.wal_mgr.log_doc_delete(doc_id)?;
+
+        # Remove hierarchy and version tracking
+        self.hierarchy.remove_document(doc_id);
+        self.version_tracker.remove_doc_versions(doc_id);
+        self.crossref_tracker.remove_doc_refs(doc_id);
+
+        # Update counters
+        I self.meta.doc_count > 0 {
+            self.meta.doc_count = self.meta.doc_count - 1;
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # RAG Search
+    # ========================================================================
+
+    ## Execute a RAG_SEARCH query
+    ## Fuses results from vector, fulltext, and graph engines
+    F rag_search(
+        mut self,
+        query_text: &Str,
+        fusion_config: &RagFusionConfig,
+    ) -> Result<Vec<RagSearchResult>, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        # Validate fusion config
+        fusion_config.validate()?;
+
+        # Create search parameters
+        params := mut RagSearchParams.from_config(query_text.clone(), fusion_config);
+
+        # Execute via pipeline
+        executor := mut RagSearchExecutor.new(params);
+
+        # In a full implementation, this would:
+        # 1. Dispatch to vector engine for similarity search
+        # 2. Dispatch to fulltext engine for BM25 search
+        # 3. Compute graph proximity boosts
+        # 4. Fuse results using WeightedSum or RRF
+        # 5. Expand context via ContextExpander
+        # 6. Attach attribution metadata
+
+        Ok(Vec.new())
+    }
+
+    # ========================================================================
+    # Agent Memory Operations
+    # ========================================================================
+
+    ## Store a new memory entry
+    F store_memory(
+        mut self,
+        memory_type: u8,
+        content: Str,
+        embedding: Vec<f32>,
+        importance: f64,
+        session_id: u64,
+        current_time: i64,
+    ) -> Result<u64, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        memory_id := mut self.meta.alloc_memory_id();
+        config := mut MemoryConfig.default();
+        ttl := mut config.get_default_ttl(memory_type);
+
+        entry := mut MemoryEntry.new(
+            memory_id, memory_type, content, embedding,
+            HashMap.new(), importance, session_id, current_time, ttl,
+        );
+
+        self.memory_store.insert(entry);
+
+        # WAL-log memory write
+        self.wal_mgr.log_memory_write(memory_id, memory_type)?;
+
+        self.meta.memory_count = self.meta.memory_count + 1;
+        Ok(memory_id)
+    }
+
+    ## Search agent memories
+    F memory_search(
+        mut self,
+        params: MemorySearchParams,
+        similarity_scores: &Vec<(u64, f64)>,
+        current_time: i64,
+    ) -> Result<Vec<MemorySearchResult>, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        memories := mut self.memory_store.get_all();
+        executor := mut MemorySearchExecutor.new(params);
+        executor.open(memories, similarity_scores, current_time)?;
+
+        results := mut Vec.new();
+        running := mut true;
+        L running {
+            M executor.next() {
+                Some(result) => {
+                    results.push(MemorySearchResult.new(
+                        result.memory_id, result.memory_type,
+                        result.content.clone(), result.score,
+                    ));
+                },
+                None => {
+                    running = false;
+                },
+            }
+        }
+        executor.close();
+
+        Ok(results)
+    }
+
+    ## Run memory lifecycle maintenance
+    F run_memory_lifecycle(
+        mut self,
+        current_time: i64,
+    ) -> Result<LifecycleStats, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        I !self.lifecycle_mgr.should_run(current_time) {
+            R Ok(LifecycleStats.new());
+        }
+
+        memories := mut self.memory_store.get_all();
+        (actions, stats) := mut self.lifecycle_mgr.run(memories, current_time);
+
+        # Execute lifecycle actions
+        i: u32 := mut 0;
+        L i < actions.len() as u32 {
+            action := mut actions.get(i as u64);
+            M action.action_type {
+                0 => {
+                    # ACTION_EXPIRE: remove expired memory
+                    self.memory_store.remove(action.memory_id);
+                    I self.meta.memory_count > 0 {
+                        self.meta.memory_count = self.meta.memory_count - 1;
+                    }
+                },
+                1 => {
+                    # ACTION_EVICT: remove evicted working memory
+                    self.memory_store.remove(action.memory_id);
+                    I self.meta.memory_count > 0 {
+                        self.meta.memory_count = self.meta.memory_count - 1;
+                    }
+                },
+                2 => {
+                    # ACTION_CONSOLIDATE: promote working → semantic
+                    self.memory_store.update_type(action.memory_id, MEMORY_TYPE_SEMANTIC);
+                },
+                3 => {
+                    # ACTION_DECAY: handled by the scorer at query time
+                },
+                _ => {},
+            }
+            i = i + 1;
+        }
+
+        Ok(stats)
+    }
+
+    # ========================================================================
+    # Session Management
+    # ========================================================================
+
+    ## Create a new agent session
+    F create_session(
+        mut self,
+        agent_id: Str,
+        token_budget: u32,
+        current_time: i64,
+    ) -> Result<u64, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        session_id := mut self.session_mgr.create_session(
+            agent_id, token_budget, current_time,
+        )?;
+        self.meta.session_count = self.meta.session_count + 1;
+        Ok(session_id)
+    }
+
+    ## Close an agent session
+    F close_session(
+        mut self,
+        session_id: u64,
+        current_time: i64,
+    ) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+        self.session_mgr.close_session(session_id, current_time)
+    }
+
+    # ========================================================================
+    # Hybrid Retrieval (Document + Memory)
+    # ========================================================================
+
+    ## Merge document RAG results with memory search results
+    F hybrid_retrieve(
+        &self,
+        rag_results: &Vec<RagSearchResult>,
+        memory_results: &Vec<MemorySearchResult>,
+        config: HybridRetrievalConfig,
+    ) -> Vec<HybridResult> {
+        retriever := mut HybridRetriever.new(config);
+        retriever.merge(rag_results, memory_results)
+    }
+
+    # ========================================================================
+    # Statistics / Accessors
+    # ========================================================================
+
+    ## Get document count
+    F doc_count(self) -> u64 {
+        self.meta.doc_count
+    }
+
+    ## Get chunk count
+    F chunk_count(self) -> u64 {
+        self.meta.chunk_count
+    }
+
+    ## Get memory count
+    F memory_count(self) -> u64 {
+        self.meta.memory_count
+    }
+
+    ## Get session count
+    F session_count(self) -> u64 {
+        self.meta.session_count
+    }
+
+    ## Get active session count
+    F active_session_count(self) -> u32 {
+        self.session_mgr.active_session_count()
+    }
+
+    ## Check if engine is open
+    F is_engine_open(self) -> bool {
+        self.is_open
+    }
+
+    ## Get config reference
+    F get_config(self) -> &RagConfig {
+        &self.config
+    }
+
+    ## Get meta reference
+    F get_meta(self) -> &RagMeta {
+        &self.meta
+    }
+}

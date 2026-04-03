@@ -1,0 +1,957 @@
+# Schema Metadata Structures
+# Represents table, column, and index metadata in the catalog
+# Each structure supports serialization/deserialization for on-disk catalog B+Tree storage
+# Key encoding uses prefixed strings for type-safe namespace separation:
+#   "T:" + name        for tables
+#   "C:" + table_id + ":" + column_index  for columns
+#   "I:" + name        for indexes
+#   "IT:" + table_id   for table-to-index reverse lookup
+
+U std/bytes.{ByteBuffer};
+U storage/error.{VaisError, err_internal};
+U storage/bytes.{write_string, read_string};
+U sql/types.{SqlType};
+
+# ============================================================================
+# System Table ID Constants
+# ============================================================================
+
+# System tables have fixed IDs below FIRST_USER_TABLE_ID
+C SYSTEM_TABLE_ID_TABLES: u32 = 1;
+C SYSTEM_TABLE_ID_COLUMNS: u32 = 2;
+C SYSTEM_TABLE_ID_INDEXES: u32 = 3;
+C SYSTEM_TABLE_ID_MODELS: u32 = 4;
+C SYSTEM_TABLE_ID_CONFIG: u32 = 5;
+# Security system tables (Phase 10)
+C SYSTEM_TABLE_ID_USERS: u32 = 6;
+C SYSTEM_TABLE_ID_ROLES: u32 = 7;
+C SYSTEM_TABLE_ID_GRANTS: u32 = 8;
+C SYSTEM_TABLE_ID_POLICIES: u32 = 9;
+C FIRST_USER_TABLE_ID: u32 = 100;
+
+# ============================================================================
+# Catalog Entry Type Tags (for serialization disambiguation)
+# ============================================================================
+
+C CATALOG_TAG_TABLE: u8 = 0x01;
+C CATALOG_TAG_COLUMN: u8 = 0x02;
+C CATALOG_TAG_INDEX: u8 = 0x03;
+# Security catalog tags (Phase 10)
+C CATALOG_TAG_USER: u8 = 0x04;
+C CATALOG_TAG_ROLE: u8 = 0x05;
+C CATALOG_TAG_GRANT: u8 = 0x06;
+C CATALOG_TAG_POLICY: u8 = 0x07;
+
+# ============================================================================
+# TableInfo — Metadata for a single table
+# ============================================================================
+
+S TableInfo {
+    table_id: u32,
+    name: Str,
+    column_count: u16,
+    is_system: bool,
+    heap_file_id: u8,          # File where table data lives (0 = data.vdb)
+    first_page_id: u32,        # First heap page for this table
+    row_count_estimate: u64,   # Approximate row count for optimizer
+}
+
+X TableInfo {
+    # Create a new user table info
+    F new(table_id: u32, name: Str, column_count: u16, first_page_id: u32) -> TableInfo {
+        TableInfo {
+            table_id,
+            name,
+            column_count,
+            is_system: table_id < FIRST_USER_TABLE_ID,
+            heap_file_id: 0,
+            first_page_id,
+            row_count_estimate: 0,
+        }
+    }
+
+    # Create a system table info
+    F new_system(table_id: u32, name: Str, column_count: u16, first_page_id: u32) -> TableInfo {
+        TableInfo {
+            table_id,
+            name,
+            column_count,
+            is_system: true,
+            heap_file_id: 0,
+            first_page_id,
+            row_count_estimate: 0,
+        }
+    }
+
+    # Serialize TableInfo to ByteBuffer
+    # Format: tag(1B) + table_id(4B) + name(len-prefixed) + column_count(2B)
+    #         + is_system(1B) + heap_file_id(1B) + first_page_id(4B) + row_count_estimate(8B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_TABLE);
+        buf.put_u32_le(self.table_id);
+        write_string(buf, &self.name);
+        buf.put_u16_le(self.column_count);
+        buf.put_u8(I self.is_system { 1 } E { 0 });
+        buf.put_u8(self.heap_file_id);
+        buf.put_u32_le(self.first_page_id);
+        buf.put_u64_le(self.row_count_estimate);
+    }
+
+    # Deserialize TableInfo from ByteBuffer
+    # Expects the tag byte to have already been read or reads it
+    F deserialize(buf: &ByteBuffer) -> Result<TableInfo, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_TABLE {
+            R Err(err_internal("Expected TABLE catalog tag 0x01, got 0x{tag:02x}"));
+        }
+
+        table_id := mut buf.get_u32_le()?;
+        name := mut read_string(buf)?;
+        column_count := mut buf.get_u16_le()?;
+        is_system_byte := mut buf.get_u8()?;
+        heap_file_id := mut buf.get_u8()?;
+        first_page_id := mut buf.get_u32_le()?;
+        row_count_estimate := mut buf.get_u64_le()?;
+
+        Ok(TableInfo {
+            table_id,
+            name,
+            column_count,
+            is_system: is_system_byte != 0,
+            heap_file_id,
+            first_page_id,
+            row_count_estimate,
+        })
+    }
+
+    # Generate B+Tree key for catalog lookup
+    # Key format: "T:" + name
+    F to_catalog_key(self) -> Vec<u8> {
+        table_key(&self.name)
+    }
+
+    # Clone this TableInfo
+    F clone(self) -> TableInfo {
+        TableInfo {
+            table_id: self.table_id,
+            name: self.name.clone(),
+            column_count: self.column_count,
+            is_system: self.is_system,
+            heap_file_id: self.heap_file_id,
+            first_page_id: self.first_page_id,
+            row_count_estimate: self.row_count_estimate,
+        }
+    }
+}
+
+# ============================================================================
+# ColumnInfo — Metadata for a single column within a table
+# ============================================================================
+
+S ColumnInfo {
+    table_id: u32,
+    column_index: u16,         # 0-based position in row
+    name: Str,
+    data_type: SqlType,
+    nullable: bool,
+    default_value: Option<Str>,  # Default expression as string
+    is_primary_key: bool,
+}
+
+X ColumnInfo {
+    # Create a new column info
+    F new(table_id: u32, column_index: u16, name: Str, data_type: SqlType) -> ColumnInfo {
+        ColumnInfo {
+            table_id,
+            column_index,
+            name,
+            data_type,
+            nullable: true,
+            default_value: None,
+            is_primary_key: false,
+        }
+    }
+
+    # Create a column marked as primary key
+    F new_primary_key(table_id: u32, column_index: u16, name: Str, data_type: SqlType) -> ColumnInfo {
+        ColumnInfo {
+            table_id,
+            column_index,
+            name,
+            data_type,
+            nullable: false,
+            default_value: None,
+            is_primary_key: true,
+        }
+    }
+
+    # Serialize ColumnInfo to ByteBuffer
+    # Format: tag(1B) + table_id(4B) + column_index(2B) + name(len-prefixed)
+    #         + data_type(via SqlType.serialize) + nullable(1B)
+    #         + has_default(1B) + [default_value(len-prefixed)] + is_primary_key(1B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_COLUMN);
+        buf.put_u32_le(self.table_id);
+        buf.put_u16_le(self.column_index);
+        write_string(buf, &self.name);
+        self.data_type.serialize(buf);
+        buf.put_u8(I self.nullable { 1 } E { 0 });
+        M &self.default_value {
+            Some(ref dv) => {
+                buf.put_u8(1);
+                write_string(buf, dv);
+            },
+            None => {
+                buf.put_u8(0);
+            },
+        }
+        buf.put_u8(I self.is_primary_key { 1 } E { 0 });
+    }
+
+    # Deserialize ColumnInfo from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<ColumnInfo, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_COLUMN {
+            R Err(err_internal("Expected COLUMN catalog tag 0x02, got 0x{tag:02x}"));
+        }
+
+        table_id := mut buf.get_u32_le()?;
+        column_index := mut buf.get_u16_le()?;
+        name := mut read_string(buf)?;
+        data_type := mut SqlType.deserialize(buf)?;
+        nullable_byte := mut buf.get_u8()?;
+        has_default := mut buf.get_u8()?;
+        default_value := mut I has_default != 0 {
+            Some(read_string(buf)?)
+        } E {
+            None
+        };
+        is_pk_byte := mut buf.get_u8()?;
+
+        Ok(ColumnInfo {
+            table_id,
+            column_index,
+            name,
+            data_type,
+            nullable: nullable_byte != 0,
+            default_value,
+            is_primary_key: is_pk_byte != 0,
+        })
+    }
+
+    # Generate B+Tree key for catalog lookup
+    # Key format: "C:" + table_id(4 bytes LE) + ":" + column_index(2 bytes LE)
+    F to_catalog_key(self) -> Vec<u8> {
+        key := mut Vec.with_capacity(9);
+        # Prefix "C:"
+        key.push(0x43);  # 'C'
+        key.push(0x3A);  # ':'
+        # table_id as 4 bytes big-endian (for correct sort order)
+        key.push(((self.table_id >> 24) & 0xFF) as u8);
+        key.push(((self.table_id >> 16) & 0xFF) as u8);
+        key.push(((self.table_id >> 8) & 0xFF) as u8);
+        key.push((self.table_id & 0xFF) as u8);
+        # Separator
+        key.push(0x3A);  # ':'
+        # column_index as 2 bytes big-endian
+        key.push(((self.column_index >> 8) & 0xFF) as u8);
+        key.push((self.column_index & 0xFF) as u8);
+        key
+    }
+
+    # Clone this ColumnInfo
+    F clone(self) -> ColumnInfo {
+        ColumnInfo {
+            table_id: self.table_id,
+            column_index: self.column_index,
+            name: self.name.clone(),
+            data_type: self.data_type,
+            nullable: self.nullable,
+            default_value: M &self.default_value {
+                Some(ref dv) => Some(dv.clone()),
+                None => None,
+            },
+            is_primary_key: self.is_primary_key,
+        }
+    }
+}
+
+# ============================================================================
+# IndexInfo — Metadata for a single index
+# ============================================================================
+
+S IndexInfo {
+    index_id: u32,
+    name: Str,
+    table_id: u32,
+    columns: Vec<Str>,         # Column names in index order
+    is_unique: bool,
+    is_primary: bool,
+    root_page_id: u32,         # B+Tree root page for this index
+}
+
+X IndexInfo {
+    # Create a new index info
+    F new(index_id: u32, name: Str, table_id: u32, columns: Vec<Str>, root_page_id: u32) -> IndexInfo {
+        IndexInfo {
+            index_id,
+            name,
+            table_id,
+            columns,
+            is_unique: false,
+            is_primary: false,
+            root_page_id,
+        }
+    }
+
+    # Create a primary key index
+    F new_primary(index_id: u32, name: Str, table_id: u32, columns: Vec<Str>, root_page_id: u32) -> IndexInfo {
+        IndexInfo {
+            index_id,
+            name,
+            table_id,
+            columns,
+            is_unique: true,
+            is_primary: true,
+            root_page_id,
+        }
+    }
+
+    # Serialize IndexInfo to ByteBuffer
+    # Format: tag(1B) + index_id(4B) + name(len-prefixed) + table_id(4B)
+    #         + column_count(2B) + [column_name(len-prefixed)]...
+    #         + is_unique(1B) + is_primary(1B) + root_page_id(4B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_INDEX);
+        buf.put_u32_le(self.index_id);
+        write_string(buf, &self.name);
+        buf.put_u32_le(self.table_id);
+        buf.put_u16_le(self.columns.len() as u16);
+        L col: &self.columns {
+            write_string(buf, col);
+        }
+        buf.put_u8(I self.is_unique { 1 } E { 0 });
+        buf.put_u8(I self.is_primary { 1 } E { 0 });
+        buf.put_u32_le(self.root_page_id);
+    }
+
+    # Deserialize IndexInfo from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<IndexInfo, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_INDEX {
+            R Err(err_internal("Expected INDEX catalog tag 0x03, got 0x{tag:02x}"));
+        }
+
+        index_id := mut buf.get_u32_le()?;
+        name := mut read_string(buf)?;
+        table_id := mut buf.get_u32_le()?;
+        col_count := mut buf.get_u16_le()? as u64;
+        columns := mut Vec.with_capacity(col_count);
+        L _: 0..col_count {
+            columns.push(read_string(buf)?);
+        }
+        is_unique_byte := mut buf.get_u8()?;
+        is_primary_byte := mut buf.get_u8()?;
+        root_page_id := mut buf.get_u32_le()?;
+
+        Ok(IndexInfo {
+            index_id,
+            name,
+            table_id,
+            columns,
+            is_unique: is_unique_byte != 0,
+            is_primary: is_primary_byte != 0,
+            root_page_id,
+        })
+    }
+
+    # Generate B+Tree key for catalog lookup
+    # Key format: "I:" + name
+    F to_catalog_key(self) -> Vec<u8> {
+        index_key(&self.name)
+    }
+
+    # Generate secondary B+Tree key for table-to-index reverse lookup
+    # Key format: "IT:" + table_id(4 bytes BE) + ":" + index_name
+    F to_table_index_key(self) -> Vec<u8> {
+        key := mut Vec.with_capacity(8 + self.name.len());
+        # Prefix "IT:"
+        key.push(0x49);  # 'I'
+        key.push(0x54);  # 'T'
+        key.push(0x3A);  # ':'
+        # table_id as 4 bytes big-endian (for correct sort order)
+        key.push(((self.table_id >> 24) & 0xFF) as u8);
+        key.push(((self.table_id >> 16) & 0xFF) as u8);
+        key.push(((self.table_id >> 8) & 0xFF) as u8);
+        key.push((self.table_id & 0xFF) as u8);
+        # Separator
+        key.push(0x3A);  # ':'
+        # Index name
+        L b: self.name.as_bytes() {
+            key.push(b);
+        }
+        key
+    }
+
+    # Clone this IndexInfo
+    F clone(self) -> IndexInfo {
+        IndexInfo {
+            index_id: self.index_id,
+            name: self.name.clone(),
+            table_id: self.table_id,
+            columns: self.columns.clone(),
+            is_unique: self.is_unique,
+            is_primary: self.is_primary,
+            root_page_id: self.root_page_id,
+        }
+    }
+}
+
+# ============================================================================
+# Key Construction Helpers — file-level functions for building catalog keys
+# ============================================================================
+
+# Build lookup key for a table by name
+# Key format: "T:" + name (ASCII bytes)
+F table_key(name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(2 + name.len());
+    key.push(0x54);  # 'T'
+    key.push(0x3A);  # ':'
+    L b: name.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all columns of a table
+# Key format: "C:" + table_id(4 bytes BE)
+# Used as the start key in a range scan to find all columns for a table
+F columns_key_prefix(table_id: u32) -> Vec<u8> {
+    key := mut Vec.with_capacity(6);
+    key.push(0x43);  # 'C'
+    key.push(0x3A);  # ':'
+    # table_id as 4 bytes big-endian
+    key.push(((table_id >> 24) & 0xFF) as u8);
+    key.push(((table_id >> 16) & 0xFF) as u8);
+    key.push(((table_id >> 8) & 0xFF) as u8);
+    key.push((table_id & 0xFF) as u8);
+    key
+}
+
+# Build end key for column range scan (exclusive upper bound)
+# Key format: "C:" + (table_id + 1)(4 bytes BE)
+# This ensures we scan all columns for table_id but no columns for table_id+1
+F columns_key_end(table_id: u32) -> Vec<u8> {
+    next_id := mut table_id + 1;
+    key := mut Vec.with_capacity(6);
+    key.push(0x43);  # 'C'
+    key.push(0x3A);  # ':'
+    key.push(((next_id >> 24) & 0xFF) as u8);
+    key.push(((next_id >> 16) & 0xFF) as u8);
+    key.push(((next_id >> 8) & 0xFF) as u8);
+    key.push((next_id & 0xFF) as u8);
+    key
+}
+
+# Build lookup key for an index by name
+# Key format: "I:" + name (ASCII bytes)
+F index_key(name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(2 + name.len());
+    key.push(0x49);  # 'I'
+    key.push(0x3A);  # ':'
+    L b: name.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all indexes belonging to a table
+# Key format: "IT:" + table_id(4 bytes BE)
+# Used as start key in range scan to find all indexes for a table
+F index_key_prefix_for_table(table_id: u32) -> Vec<u8> {
+    key := mut Vec.with_capacity(7);
+    key.push(0x49);  # 'I'
+    key.push(0x54);  # 'T'
+    key.push(0x3A);  # ':'
+    # table_id as 4 bytes big-endian
+    key.push(((table_id >> 24) & 0xFF) as u8);
+    key.push(((table_id >> 16) & 0xFF) as u8);
+    key.push(((table_id >> 8) & 0xFF) as u8);
+    key.push((table_id & 0xFF) as u8);
+    key
+}
+
+# Build end key for index-by-table range scan (exclusive upper bound)
+# Key format: "IT:" + (table_id + 1)(4 bytes BE)
+F index_key_end_for_table(table_id: u32) -> Vec<u8> {
+    next_id := mut table_id + 1;
+    key := mut Vec.with_capacity(7);
+    key.push(0x49);  # 'I'
+    key.push(0x54);  # 'T'
+    key.push(0x3A);  # ':'
+    key.push(((next_id >> 24) & 0xFF) as u8);
+    key.push(((next_id >> 16) & 0xFF) as u8);
+    key.push(((next_id >> 8) & 0xFF) as u8);
+    key.push((next_id & 0xFF) as u8);
+    key
+}
+
+# ============================================================================
+# Security Catalog Entries (Phase 10)
+# Lightweight catalog records linking the SQL catalog B+Tree to the security
+# engine's detailed records (UserInfo, RoleInfo, GrantEntry, PolicyEntry).
+# ============================================================================
+
+# ============================================================================
+# UserCatalogEntry — Catalog record for a database user
+# ============================================================================
+
+S UserCatalogEntry {
+    user_id: u64,
+    username: Str,
+    is_superuser: bool,
+    can_login: bool,
+}
+
+X UserCatalogEntry {
+    F new(user_id: u64, username: Str, is_superuser: bool, can_login: bool) -> UserCatalogEntry {
+        UserCatalogEntry { user_id, username, is_superuser, can_login }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: tag(1B) + user_id(8B) + username(len-prefixed) + flags(1B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_USER);
+        buf.put_u64_le(self.user_id);
+        write_string(buf, &self.username);
+        flags: u8 := mut 0;
+        I self.is_superuser { flags = flags | 0x01; }
+        I self.can_login { flags = flags | 0x02; }
+        buf.put_u8(flags);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<UserCatalogEntry, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_USER {
+            R Err(err_internal("Expected USER catalog tag 0x04, got 0x{tag:02x}"));
+        }
+        user_id := mut buf.get_u64_le()?;
+        username := mut read_string(buf)?;
+        flags := mut buf.get_u8()?;
+        Ok(UserCatalogEntry {
+            user_id,
+            username,
+            is_superuser: (flags & 0x01) != 0,
+            can_login: (flags & 0x02) != 0,
+        })
+    }
+
+    # B+Tree key: "U:" + username
+    F to_catalog_key(self) -> Vec<u8> {
+        user_key(&self.username)
+    }
+
+    # Clone
+    F clone(self) -> UserCatalogEntry {
+        UserCatalogEntry {
+            user_id: self.user_id,
+            username: self.username.clone(),
+            is_superuser: self.is_superuser,
+            can_login: self.can_login,
+        }
+    }
+}
+
+# ============================================================================
+# RoleCatalogEntry — Catalog record for a database role
+# ============================================================================
+
+S RoleCatalogEntry {
+    role_id: u64,
+    role_name: Str,
+    is_system: bool,
+}
+
+X RoleCatalogEntry {
+    F new(role_id: u64, role_name: Str, is_system: bool) -> RoleCatalogEntry {
+        RoleCatalogEntry { role_id, role_name, is_system }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: tag(1B) + role_id(8B) + role_name(len-prefixed) + flags(1B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_ROLE);
+        buf.put_u64_le(self.role_id);
+        write_string(buf, &self.role_name);
+        flags: u8 := mut 0;
+        I self.is_system { flags = flags | 0x01; }
+        buf.put_u8(flags);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<RoleCatalogEntry, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_ROLE {
+            R Err(err_internal("Expected ROLE catalog tag 0x05, got 0x{tag:02x}"));
+        }
+        role_id := mut buf.get_u64_le()?;
+        role_name := mut read_string(buf)?;
+        flags := mut buf.get_u8()?;
+        Ok(RoleCatalogEntry {
+            role_id,
+            role_name,
+            is_system: (flags & 0x01) != 0,
+        })
+    }
+
+    # B+Tree key: "R:" + role_name
+    F to_catalog_key(self) -> Vec<u8> {
+        role_key(&self.role_name)
+    }
+
+    # Clone
+    F clone(self) -> RoleCatalogEntry {
+        RoleCatalogEntry {
+            role_id: self.role_id,
+            role_name: self.role_name.clone(),
+            is_system: self.is_system,
+        }
+    }
+}
+
+# ============================================================================
+# GrantCatalogEntry — Catalog record for a privilege grant
+# ============================================================================
+
+S GrantCatalogEntry {
+    grant_id: u64,
+    role_id: u64,
+    object_type: u8,          # OBJ_TYPE_* from security/types
+    object_name: Str,
+    privilege_mask: u8,        # PRIV_* bitmask from security/types
+    with_grant_option: bool,
+}
+
+X GrantCatalogEntry {
+    F new(
+        grant_id: u64,
+        role_id: u64,
+        object_type: u8,
+        object_name: Str,
+        privilege_mask: u8,
+        with_grant_option: bool,
+    ) -> GrantCatalogEntry {
+        GrantCatalogEntry {
+            grant_id, role_id, object_type,
+            object_name, privilege_mask, with_grant_option,
+        }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: tag(1B) + grant_id(8B) + role_id(8B) + object_type(1B) +
+    #         object_name(len-prefixed) + privilege_mask(1B) + flags(1B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_GRANT);
+        buf.put_u64_le(self.grant_id);
+        buf.put_u64_le(self.role_id);
+        buf.put_u8(self.object_type);
+        write_string(buf, &self.object_name);
+        buf.put_u8(self.privilege_mask);
+        flags: u8 := mut 0;
+        I self.with_grant_option { flags = flags | 0x01; }
+        buf.put_u8(flags);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<GrantCatalogEntry, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_GRANT {
+            R Err(err_internal("Expected GRANT catalog tag 0x06, got 0x{tag:02x}"));
+        }
+        grant_id := mut buf.get_u64_le()?;
+        role_id := mut buf.get_u64_le()?;
+        object_type := mut buf.get_u8()?;
+        object_name := mut read_string(buf)?;
+        privilege_mask := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        Ok(GrantCatalogEntry {
+            grant_id, role_id, object_type,
+            object_name, privilege_mask,
+            with_grant_option: (flags & 0x01) != 0,
+        })
+    }
+
+    # B+Tree key: "G:" + role_id(8B BE) + ":" + object_name
+    # Grouping by role_id allows efficient range scan of all grants for a role
+    F to_catalog_key(self) -> Vec<u8> {
+        grant_key(self.role_id, &self.object_name)
+    }
+
+    # Clone
+    F clone(self) -> GrantCatalogEntry {
+        GrantCatalogEntry {
+            grant_id: self.grant_id,
+            role_id: self.role_id,
+            object_type: self.object_type,
+            object_name: self.object_name.clone(),
+            privilege_mask: self.privilege_mask,
+            with_grant_option: self.with_grant_option,
+        }
+    }
+}
+
+# ============================================================================
+# PolicyCatalogEntry — Catalog record for a row-level security policy
+# ============================================================================
+
+S PolicyCatalogEntry {
+    policy_id: u64,
+    policy_name: Str,
+    table_name: Str,
+    policy_type: u8,           # POLICY_TYPE_* from security/types
+    cmd_scope: u8,             # POLICY_CMD_* bitmask from security/types
+    enabled: bool,
+}
+
+X PolicyCatalogEntry {
+    F new(
+        policy_id: u64,
+        policy_name: Str,
+        table_name: Str,
+        policy_type: u8,
+        cmd_scope: u8,
+    ) -> PolicyCatalogEntry {
+        PolicyCatalogEntry {
+            policy_id, policy_name, table_name,
+            policy_type, cmd_scope, enabled: true,
+        }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: tag(1B) + policy_id(8B) + policy_name(len-prefixed) +
+    #         table_name(len-prefixed) + policy_type(1B) + cmd_scope(1B) + flags(1B)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(CATALOG_TAG_POLICY);
+        buf.put_u64_le(self.policy_id);
+        write_string(buf, &self.policy_name);
+        write_string(buf, &self.table_name);
+        buf.put_u8(self.policy_type);
+        buf.put_u8(self.cmd_scope);
+        flags: u8 := mut 0;
+        I self.enabled { flags = flags | 0x01; }
+        buf.put_u8(flags);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<PolicyCatalogEntry, VaisError> {
+        tag := mut buf.get_u8()?;
+        I tag != CATALOG_TAG_POLICY {
+            R Err(err_internal("Expected POLICY catalog tag 0x07, got 0x{tag:02x}"));
+        }
+        policy_id := mut buf.get_u64_le()?;
+        policy_name := mut read_string(buf)?;
+        table_name := mut read_string(buf)?;
+        policy_type := mut buf.get_u8()?;
+        cmd_scope := mut buf.get_u8()?;
+        flags := mut buf.get_u8()?;
+        Ok(PolicyCatalogEntry {
+            policy_id, policy_name, table_name,
+            policy_type, cmd_scope,
+            enabled: (flags & 0x01) != 0,
+        })
+    }
+
+    # B+Tree key: "P:" + table_name + ":" + policy_name
+    # Grouping by table_name allows efficient lookup of all policies for a table
+    F to_catalog_key(self) -> Vec<u8> {
+        policy_key(&self.table_name, &self.policy_name)
+    }
+
+    # Clone
+    F clone(self) -> PolicyCatalogEntry {
+        PolicyCatalogEntry {
+            policy_id: self.policy_id,
+            policy_name: self.policy_name.clone(),
+            table_name: self.table_name.clone(),
+            policy_type: self.policy_type,
+            cmd_scope: self.cmd_scope,
+            enabled: self.enabled,
+        }
+    }
+}
+
+# ============================================================================
+# Security Key Construction Helpers
+# ============================================================================
+
+# Build lookup key for a user by username
+# Key format: "U:" + username (ASCII bytes)
+F user_key(username: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(2 + username.len());
+    key.push(0x55);  # 'U'
+    key.push(0x3A);  # ':'
+    L b: username.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all users (for range scan)
+# Key format: "U:"
+F user_key_prefix() -> Vec<u8> {
+    Vec.from([0x55, 0x3A])  # "U:"
+}
+
+# Build end key for user range scan (exclusive upper bound)
+# Key format: "U;" (next byte after ':')
+F user_key_end() -> Vec<u8> {
+    Vec.from([0x55, 0x3B])  # "U;"
+}
+
+# Build lookup key for a role by name
+# Key format: "R:" + role_name (ASCII bytes)
+F role_key(role_name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(2 + role_name.len());
+    key.push(0x52);  # 'R'
+    key.push(0x3A);  # ':'
+    L b: role_name.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all roles (for range scan)
+# Key format: "R:"
+F role_key_prefix() -> Vec<u8> {
+    Vec.from([0x52, 0x3A])  # "R:"
+}
+
+# Build end key for role range scan (exclusive upper bound)
+# Key format: "R;"
+F role_key_end() -> Vec<u8> {
+    Vec.from([0x52, 0x3B])  # "R;"
+}
+
+# Build lookup key for a grant: role_id + object_name
+# Key format: "G:" + role_id(8B BE) + ":" + object_name
+F grant_key(role_id: u64, object_name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(11 + object_name.len());
+    key.push(0x47);  # 'G'
+    key.push(0x3A);  # ':'
+    # role_id as 8 bytes big-endian (for correct sort order)
+    key.push(((role_id >> 56) & 0xFF) as u8);
+    key.push(((role_id >> 48) & 0xFF) as u8);
+    key.push(((role_id >> 40) & 0xFF) as u8);
+    key.push(((role_id >> 32) & 0xFF) as u8);
+    key.push(((role_id >> 24) & 0xFF) as u8);
+    key.push(((role_id >> 16) & 0xFF) as u8);
+    key.push(((role_id >> 8) & 0xFF) as u8);
+    key.push((role_id & 0xFF) as u8);
+    key.push(0x3A);  # ':'
+    L b: object_name.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all grants of a specific role
+# Key format: "G:" + role_id(8B BE)
+F grant_key_prefix_for_role(role_id: u64) -> Vec<u8> {
+    key := mut Vec.with_capacity(10);
+    key.push(0x47);  # 'G'
+    key.push(0x3A);  # ':'
+    key.push(((role_id >> 56) & 0xFF) as u8);
+    key.push(((role_id >> 48) & 0xFF) as u8);
+    key.push(((role_id >> 40) & 0xFF) as u8);
+    key.push(((role_id >> 32) & 0xFF) as u8);
+    key.push(((role_id >> 24) & 0xFF) as u8);
+    key.push(((role_id >> 16) & 0xFF) as u8);
+    key.push(((role_id >> 8) & 0xFF) as u8);
+    key.push((role_id & 0xFF) as u8);
+    key
+}
+
+# Build end key for grant range scan for a role (exclusive upper bound)
+# Key format: "G:" + (role_id + 1)(8B BE)
+F grant_key_end_for_role(role_id: u64) -> Vec<u8> {
+    next_id := mut role_id + 1;
+    key := mut Vec.with_capacity(10);
+    key.push(0x47);  # 'G'
+    key.push(0x3A);  # ':'
+    key.push(((next_id >> 56) & 0xFF) as u8);
+    key.push(((next_id >> 48) & 0xFF) as u8);
+    key.push(((next_id >> 40) & 0xFF) as u8);
+    key.push(((next_id >> 32) & 0xFF) as u8);
+    key.push(((next_id >> 24) & 0xFF) as u8);
+    key.push(((next_id >> 16) & 0xFF) as u8);
+    key.push(((next_id >> 8) & 0xFF) as u8);
+    key.push((next_id & 0xFF) as u8);
+    key
+}
+
+# Build prefix key for all grants (for full grant scan)
+# Key format: "G:"
+F grant_key_prefix() -> Vec<u8> {
+    Vec.from([0x47, 0x3A])  # "G:"
+}
+
+# Build end key for all grants range scan
+# Key format: "G;"
+F grant_key_end() -> Vec<u8> {
+    Vec.from([0x47, 0x3B])  # "G;"
+}
+
+# Build lookup key for a policy by table + policy name
+# Key format: "P:" + table_name + ":" + policy_name
+F policy_key(table_name: &Str, policy_name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(3 + table_name.len() + policy_name.len());
+    key.push(0x50);  # 'P'
+    key.push(0x3A);  # ':'
+    L b: table_name.as_bytes() {
+        key.push(b);
+    }
+    key.push(0x3A);  # ':'
+    L b: policy_name.as_bytes() {
+        key.push(b);
+    }
+    key
+}
+
+# Build prefix key for all policies on a table
+# Key format: "P:" + table_name + ":"
+F policy_key_prefix_for_table(table_name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(3 + table_name.len());
+    key.push(0x50);  # 'P'
+    key.push(0x3A);  # ':'
+    L b: table_name.as_bytes() {
+        key.push(b);
+    }
+    key.push(0x3A);  # ':'
+    key
+}
+
+# Build end key for policy range scan for a table (exclusive upper bound)
+# Key format: "P:" + table_name + ";"
+F policy_key_end_for_table(table_name: &Str) -> Vec<u8> {
+    key := mut Vec.with_capacity(3 + table_name.len());
+    key.push(0x50);  # 'P'
+    key.push(0x3A);  # ':'
+    L b: table_name.as_bytes() {
+        key.push(b);
+    }
+    key.push(0x3B);  # ';' (next byte after ':')
+    key
+}
+
+# Build prefix key for all policies (for full scan)
+# Key format: "P:"
+F policy_key_prefix() -> Vec<u8> {
+    Vec.from([0x50, 0x3A])  # "P:"
+}
+
+# Build end key for all policies range scan
+# Key format: "P;"
+F policy_key_end() -> Vec<u8> {
+    Vec.from([0x50, 0x3B])  # "P;"
+}

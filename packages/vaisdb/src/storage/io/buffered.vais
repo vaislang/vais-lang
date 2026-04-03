@@ -1,0 +1,76 @@
+# Buffered I/O fallback for page access
+# Uses pread/pwrite for positioned I/O (no seek needed)
+# Fallback when mmap is unavailable or undesirable
+
+U std/file.{File};
+U storage/constants.{DEFAULT_PAGE_SIZE};
+U storage/error.{VaisError, err_io, err_disk_io};
+
+# Buffered I/O page access
+S BufferedIO {
+    file: File,
+    page_size: u32,
+}
+
+X BufferedIO {
+    # Create buffered I/O wrapper for a file
+    F new(file: File, page_size: u32) -> BufferedIO {
+        BufferedIO { file, page_size }
+    }
+
+    # Read a page at the given page_id
+    F read_page(self, page_id: u32) -> Result<Vec<u8>, VaisError> {
+        offset := mut (page_id as u64) * (self.page_size as u64);
+        self.file.read_at(offset, self.page_size as u64)
+    }
+
+    # Write a page at the given page_id
+    F write_page(self, page_id: u32, data: &[u8]) -> Result<(), VaisError> {
+        offset := mut (page_id as u64) * (self.page_size as u64);
+        self.file.write_at(offset, data)?;
+        Ok(())
+    }
+
+    # Sync written data to disk
+    F sync(self) -> Result<(), VaisError> {
+        self.file.fsync()
+    }
+
+    # Sync data only (no metadata) - faster than fsync
+    F datasync(self) -> Result<(), VaisError> {
+        self.file.fdatasync()
+    }
+
+    # Read multiple contiguous pages (for read-ahead)
+    F read_pages(self, start_page_id: u32, count: u32) -> Result<Vec<u8>, VaisError> {
+        offset := mut (start_page_id as u64) * (self.page_size as u64);
+        total_size := mut (count as u64) * (self.page_size as u64);
+        self.file.read_at(offset, total_size as u64)
+    }
+
+    # Write multiple contiguous pages
+    F write_pages(self, start_page_id: u32, data: &[u8]) -> Result<(), VaisError> {
+        offset := mut (start_page_id as u64) * (self.page_size as u64);
+        self.file.write_at(offset, data)?;
+        Ok(())
+    }
+
+    # Get file size in pages
+    F page_count(self) -> Result<u32, VaisError> {
+        file_size := mut self.file.size()?;
+        Ok((file_size / self.page_size as u64) as u32)
+    }
+
+    # Extend file by N pages
+    F extend(self, additional_pages: u32) -> Result<(), VaisError> {
+        current_size := mut self.file.size()?;
+        new_size := mut current_size + (additional_pages as u64) * (self.page_size as u64);
+        self.file.truncate(new_size)?;
+        Ok(())
+    }
+
+    # Get underlying file reference
+    F get_file(self) -> &File {
+        &self.file
+    }
+}

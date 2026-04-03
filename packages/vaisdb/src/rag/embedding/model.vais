@@ -1,0 +1,276 @@
+# Embedding Model Registry
+# Tracks embedding models, versions, and prevents mixed-model vectors
+# Each vector index is bound to a specific model version
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U rag/types.{
+    DISTANCE_COSINE, DISTANCE_L2, DISTANCE_DOT_PRODUCT,
+    err_rag_model_not_found, err_rag_model_version_mismatch,
+    err_rag_dimension_mismatch, err_rag_invalid_embedding_config
+};
+
+# ============================================================================
+# EmbeddingModelInfo — Metadata for a registered embedding model
+# ============================================================================
+
+S EmbeddingModelInfo {
+    model_id: u32,              # Unique identifier within this database
+    model_name: Str,            # e.g., "openai:text-embedding-3-small"
+    model_version: u32,         # Incremented on model change
+    dimensions: u32,            # Vector dimensionality (e.g., 1536)
+    distance_metric: u8,        # DISTANCE_COSINE / L2 / DOT_PRODUCT
+    is_active: bool,            # Currently active model for new embeddings
+    provider: Str,              # "openai", "local", "precomputed"
+    api_endpoint: Str,          # API URL for external models (empty for local/precomputed)
+    created_at: i64,            # Registration timestamp
+}
+
+X EmbeddingModelInfo {
+    ## Create a precomputed model entry (no external API needed)
+    F precomputed(model_id: u32, dimensions: u32, distance: u8) -> EmbeddingModelInfo {
+        EmbeddingModelInfo {
+            model_id,
+            model_name: "precomputed",
+            model_version: 1,
+            dimensions,
+            distance_metric: distance,
+            is_active: true,
+            provider: "precomputed",
+            api_endpoint: Str.new(),
+            created_at: 0,
+        }
+    }
+
+    ## Create an external API model entry
+    F external(
+        model_id: u32,
+        name: Str,
+        dimensions: u32,
+        distance: u8,
+        provider: Str,
+        endpoint: Str,
+    ) -> EmbeddingModelInfo {
+        EmbeddingModelInfo {
+            model_id,
+            model_name: name,
+            model_version: 1,
+            dimensions,
+            distance_metric: distance,
+            is_active: true,
+            provider,
+            api_endpoint: endpoint,
+            created_at: 0,
+        }
+    }
+
+    ## Validate that a vector matches this model's expected dimensions
+    F validate_vector(self, vector: &Vec<f32>) -> Result<(), VaisError> {
+        I vector.len() as u32 != self.dimensions {
+            R Err(err_rag_dimension_mismatch(self.dimensions, vector.len() as u32));
+        }
+        Ok(())
+    }
+
+    ## Check if this model requires external API for embedding
+    F requires_api(self) -> bool {
+        self.provider != "precomputed" && self.provider != "local"
+    }
+
+    ## Distance metric name for display
+    F distance_name(self) -> Str {
+        M self.distance_metric {
+            0 => "cosine",
+            1 => "l2",
+            2 => "dot_product",
+            _ => "unknown",
+        }
+    }
+
+    ## Serialize fixed metadata (32 bytes, excluding variable-length strings)
+    F serialize_meta(self, buf: &mut ByteBuffer) {
+        buf.put_u32_le(self.model_id);
+        buf.put_u32_le(self.model_version);
+        buf.put_u32_le(self.dimensions);
+        buf.put_u8(self.distance_metric);
+        buf.put_u8(I self.is_active { 1 } E { 0 });
+        buf.put_u16_le(0);  # reserved
+        buf.put_i64_le(self.created_at);
+        buf.put_u64_le(0);  # reserved for future
+    }
+
+    ## Deserialize fixed metadata (32 bytes)
+    F deserialize_meta(buf: &ByteBuffer) -> Result<EmbeddingModelInfo, VaisError> {
+        model_id := mut buf.get_u32_le()?;
+        model_version := mut buf.get_u32_le()?;
+        dimensions := mut buf.get_u32_le()?;
+        distance_metric := mut buf.get_u8()?;
+        is_active := mut buf.get_u8()? != 0;
+        buf.get_u16_le()?;  # reserved
+        created_at := mut buf.get_i64_le()?;
+        buf.get_u64_le()?;  # reserved
+        Ok(EmbeddingModelInfo {
+            model_id, model_name: Str.new(), model_version, dimensions,
+            distance_metric, is_active, provider: Str.new(),
+            api_endpoint: Str.new(), created_at,
+        })
+    }
+}
+
+# ============================================================================
+# EmbeddingModelRegistry — Manage registered models
+# ============================================================================
+
+S EmbeddingModelRegistry {
+    models: Vec<EmbeddingModelInfo>,
+    next_model_id: u32,
+}
+
+X EmbeddingModelRegistry {
+    F new() -> EmbeddingModelRegistry {
+        EmbeddingModelRegistry {
+            models: Vec.new(),
+            next_model_id: 1,
+        }
+    }
+
+    ## Register a new embedding model
+    F register_model(mut self, name: Str, dimensions: u32, distance: u8,
+                     provider: Str, endpoint: Str) -> Result<u32, VaisError> {
+        # Validate dimensions
+        I dimensions == 0 {
+            R Err(err_rag_invalid_embedding_config("Dimensions must be > 0"));
+        }
+        I distance > DISTANCE_DOT_PRODUCT {
+            R Err(err_rag_invalid_embedding_config("Invalid distance metric"));
+        }
+
+        model_id := mut self.next_model_id;
+        self.next_model_id = self.next_model_id + 1;
+
+        # Deactivate all other models
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            self.models.get_mut(i as u64).is_active = false;
+            i = i + 1;
+        }
+
+        model := mut EmbeddingModelInfo {
+            model_id,
+            model_name: name,
+            model_version: 1,
+            dimensions,
+            distance_metric: distance,
+            is_active: true,
+            provider,
+            api_endpoint: endpoint,
+            created_at: 0,  # Set by caller with actual timestamp
+        };
+
+        self.models.push(model);
+        Ok(model_id)
+    }
+
+    ## Get the currently active model
+    F get_active_model(self) -> Option<&EmbeddingModelInfo> {
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            model := mut self.models.get(i as u64);
+            I model.is_active {
+                R Some(model);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Get model by ID
+    F get_model(self, model_id: u32) -> Option<&EmbeddingModelInfo> {
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            model := mut self.models.get(i as u64);
+            I model.model_id == model_id {
+                R Some(model);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Get model by name
+    F get_model_by_name(self, name: &Str) -> Option<&EmbeddingModelInfo> {
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            model := mut self.models.get(i as u64);
+            I model.model_name == *name {
+                R Some(model);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
+    ## Check if a vector is compatible with the given model
+    F validate_compatibility(self, model_id: u32, vector: &Vec<f32>) -> Result<(), VaisError> {
+        M self.get_model(model_id) {
+            Some(model) => model.validate_vector(vector),
+            None => Err(err_rag_model_not_found(&"unknown")),
+        }
+    }
+
+    ## Check version compatibility between index model and current model
+    F check_version(self, index_model_id: u32, index_model_version: u32) -> Result<(), VaisError> {
+        M self.get_model(index_model_id) {
+            Some(model) => {
+                I model.model_version != index_model_version {
+                    Err(err_rag_model_version_mismatch(model.model_version, index_model_version))
+                } E {
+                    Ok(())
+                }
+            },
+            None => Err(err_rag_model_not_found(&"unknown")),
+        }
+    }
+
+    ## Increment model version (for model change + reindex)
+    F bump_version(mut self, model_id: u32) -> Result<u32, VaisError> {
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            model := mut self.models.get_mut(i as u64);
+            I model.model_id == model_id {
+                model.model_version = model.model_version + 1;
+                R Ok(model.model_version);
+            }
+            i = i + 1;
+        }
+        Err(err_rag_model_not_found(&"unknown"))
+    }
+
+    ## Set active model (deactivate others)
+    F set_active(mut self, model_id: u32) -> Result<(), VaisError> {
+        found := mut false;
+        i: u32 := mut 0;
+        L i < self.models.len() as u32 {
+            model := mut self.models.get_mut(i as u64);
+            I model.model_id == model_id {
+                model.is_active = true;
+                found = true;
+            } E {
+                model.is_active = false;
+            }
+            i = i + 1;
+        }
+        I !found {
+            R Err(err_rag_model_not_found(&"unknown"));
+        }
+        Ok(())
+    }
+
+    ## Get total registered models
+    F model_count(self) -> u32 {
+        self.models.len() as u32
+    }
+}

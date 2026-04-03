@@ -1,0 +1,423 @@
+## Agent Memory Type System
+##
+## Defines the type system for AI agent memories in VaisDB:
+## - Episodic: Event-based memories (conversations, actions)
+## - Semantic: Fact-based knowledge (entities, concepts)
+## - Procedural: Task patterns and workflows
+## - Working: Short-term context (current session state)
+##
+## Includes importance scoring with exponential decay,
+## TTL management, and serialization for on-disk storage.
+
+U std/bytes.{ByteBuffer}
+U std/vec.Vec
+U std/string.Str
+U std/option.{Option, Some, None}
+U std/hashmap.HashMap
+U std/result.{Result, Ok, Err}
+U storage/error.{VaisError}
+U rag/types.{
+    MEMORY_TYPE_EPISODIC, MEMORY_TYPE_SEMANTIC,
+    MEMORY_TYPE_PROCEDURAL, MEMORY_TYPE_WORKING,
+    DEFAULT_TTL_EPISODIC, DEFAULT_TTL_SEMANTIC,
+    DEFAULT_TTL_PROCEDURAL, DEFAULT_TTL_WORKING,
+    DEFAULT_DECAY_HALF_LIFE,
+    err_rag_memory_not_found, err_rag_ttl_expired
+}
+
+## Memory entry with MVCC-compatible metadata and importance scoring
+S MemoryEntry {
+    memory_id: u64,
+    memory_type: u8,
+    content: Str,
+    embedding: Vec<f32>,
+    metadata: HashMap<Str, Str>,
+    importance: f64,
+    access_count: u32,
+    last_accessed: i64,
+    created_at: i64,
+    ttl_seconds: u64,
+    session_id: u64,
+    # MVCC tuple metadata (set by storage layer on persist)
+    txn_id_create: u64,
+    txn_id_expire: u64,
+    cmd_id_create: u32,
+    cmd_id_expire: u32,
+}
+
+X MemoryEntry {
+    ## Create a new memory entry
+    F new(
+        memory_id: u64,
+        memory_type: u8,
+        content: Str,
+        embedding: Vec<f32>,
+        metadata: HashMap<Str, Str>,
+        importance: f64,
+        session_id: u64,
+        current_time: i64,
+        ttl_seconds: u64,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            memory_id: memory_id,
+            memory_type: memory_type,
+            content: content,
+            embedding: embedding,
+            metadata: metadata,
+            importance: importance,
+            access_count: 0,
+            last_accessed: current_time,
+            created_at: current_time,
+            ttl_seconds: ttl_seconds,
+            session_id: session_id,
+            txn_id_create: 0,
+            txn_id_expire: 0,
+            cmd_id_create: 0,
+            cmd_id_expire: 0,
+        }
+    }
+
+    ## Serialize metadata to fixed 72-byte format
+    ##
+    ## Layout (72 bytes):
+    ## - memory_id: 8 bytes (u64 LE)
+    ## - memory_type: 1 byte (u8)
+    ## - pad: 3 bytes
+    ## - importance_fixed: 4 bytes (u32 = importance * 10000)
+    ## - access_count: 4 bytes (u32 LE)
+    ## - pad: 4 bytes
+    ## - last_accessed: 8 bytes (i64 LE)
+    ## - created_at: 8 bytes (i64 LE)
+    ## - ttl_seconds: 8 bytes (u64 LE)
+    ## - session_id: 8 bytes (u64 LE)
+    ## - embedding_dim: 4 bytes (u32 LE)
+    ## - content_len: 4 bytes (u32 LE)
+    ## - metadata_count: 4 bytes (u32 LE)
+    ## - pad: 4 bytes
+    F serialize_meta(self) -> Vec<u8> {
+        buf := mut ByteBuffer.with_capacity(72)
+
+        # memory_id (8 bytes)
+        buf.write_u64_le(self.memory_id)
+
+        # memory_type (1 byte) + pad (3 bytes)
+        buf.write_u8(self.memory_type)
+        buf.write_u8(0)
+        buf.write_u8(0)
+        buf.write_u8(0)
+
+        # importance as fixed-point u32 (4 bytes)
+        importance_fixed := mut (self.importance * 10000.0) as u32
+        buf.write_u32_le(importance_fixed)
+
+        # access_count (4 bytes)
+        buf.write_u32_le(self.access_count)
+
+        # pad (4 bytes)
+        buf.write_u32_le(0)
+
+        # last_accessed (8 bytes)
+        buf.write_i64_le(self.last_accessed)
+
+        # created_at (8 bytes)
+        buf.write_i64_le(self.created_at)
+
+        # ttl_seconds (8 bytes)
+        buf.write_u64_le(self.ttl_seconds)
+
+        # session_id (8 bytes)
+        buf.write_u64_le(self.session_id)
+
+        # embedding_dim (4 bytes)
+        embedding_dim := mut self.embedding.len() as u32
+        buf.write_u32_le(embedding_dim)
+
+        # content_len (4 bytes)
+        content_len := mut self.content.len() as u32
+        buf.write_u32_le(content_len)
+
+        # metadata_count (4 bytes)
+        metadata_count := mut self.metadata.len() as u32
+        buf.write_u32_le(metadata_count)
+
+        # pad (4 bytes)
+        buf.write_u32_le(0)
+
+        buf.into_vec()
+    }
+
+    ## Deserialize metadata from 72-byte format
+    F deserialize_meta(data: &[u8]) -> Result<MemoryEntry, VaisError> {
+        I data.len() < 72 {
+            R Err(VaisError.new("MemoryEntry metadata too short"))
+        }
+
+        buf := mut ByteBuffer.from_slice(data)
+
+        # memory_id (8 bytes)
+        memory_id := mut buf.read_u64_le()?
+
+        # memory_type (1 byte) + skip pad (3 bytes)
+        memory_type := mut buf.read_u8()?
+        buf.skip(3)?
+
+        # importance_fixed (4 bytes)
+        importance_fixed := mut buf.read_u32_le()?
+        importance := mut (importance_fixed as f64) / 10000.0
+
+        # access_count (4 bytes)
+        access_count := mut buf.read_u32_le()?
+
+        # skip pad (4 bytes)
+        buf.skip(4)?
+
+        # last_accessed (8 bytes)
+        last_accessed := mut buf.read_i64_le()?
+
+        # created_at (8 bytes)
+        created_at := mut buf.read_i64_le()?
+
+        # ttl_seconds (8 bytes)
+        ttl_seconds := mut buf.read_u64_le()?
+
+        # session_id (8 bytes)
+        session_id := mut buf.read_u64_le()?
+
+        # embedding_dim (4 bytes)
+        embedding_dim := mut buf.read_u32_le()?
+
+        # content_len (4 bytes)
+        content_len := mut buf.read_u32_le()?
+
+        # metadata_count (4 bytes)
+        metadata_count := mut buf.read_u32_le()?
+
+        # Create placeholder entry (content/embedding/metadata loaded separately)
+        # MVCC fields are set by storage layer on persist, default to 0 here.
+        Ok(MemoryEntry {
+            memory_id: memory_id,
+            memory_type: memory_type,
+            content: Str.new(),
+            embedding: Vec.new(),
+            metadata: HashMap.new(),
+            importance: importance,
+            access_count: access_count,
+            last_accessed: last_accessed,
+            created_at: created_at,
+            ttl_seconds: ttl_seconds,
+            session_id: session_id,
+            txn_id_create: 0,
+            txn_id_expire: 0,
+            cmd_id_create: 0,
+            cmd_id_expire: 0,
+        })
+    }
+
+    ## Update last_accessed timestamp and increment access_count
+    F touch(mut self, current_time: i64) {
+        self.last_accessed = current_time
+        self.access_count = self.access_count + 1
+    }
+
+    ## Check if memory has expired based on TTL
+    F is_expired(self, current_time: i64) -> bool {
+        I self.ttl_seconds == 0 {
+            R false  # TTL=0 means never expire
+        }
+
+        elapsed := mut (current_time - self.created_at) as u64
+        elapsed >= self.ttl_seconds
+    }
+
+    ## Calculate importance with exponential decay
+    ##
+    ## Decay formula: importance * exp(-ln(2) * elapsed / half_life)
+    ## Where elapsed is time since last access in seconds.
+    F importance_with_decay(self, current_time: i64, half_life: f64) -> f64 {
+        I half_life <= 0.0 {
+            R self.importance
+        }
+
+        elapsed := mut (current_time - self.last_accessed) as f64
+        I elapsed <= 0.0 {
+            R self.importance
+        }
+
+        # Exponential decay: base * exp(-ln(2) * t / half_life)
+        decay_factor := mut (-0.693147 * elapsed / half_life).exp()
+        self.importance * decay_factor
+    }
+}
+
+## Importance scorer with configurable weights
+S ImportanceScorer {
+    base_access_weight: f64,
+    base_recency_weight: f64,
+    base_crossref_weight: f64,
+    base_explicit_weight: f64,
+}
+
+X ImportanceScorer {
+    ## Create scorer with default weights
+    F default() -> ImportanceScorer {
+        ImportanceScorer {
+            base_access_weight: 0.25,
+            base_recency_weight: 0.25,
+            base_crossref_weight: 0.25,
+            base_explicit_weight: 0.25,
+        }
+    }
+
+    ## Create scorer with custom weights
+    F new(
+        access_weight: f64,
+        recency_weight: f64,
+        crossref_weight: f64,
+        explicit_weight: f64,
+    ) -> ImportanceScorer {
+        ImportanceScorer {
+            base_access_weight: access_weight,
+            base_recency_weight: recency_weight,
+            base_crossref_weight: crossref_weight,
+            base_explicit_weight: explicit_weight,
+        }
+    }
+
+    ## Calculate importance score [0.0, 1.0]
+    ##
+    ## Combines four factors:
+    ## - Access frequency (normalized to [0,1] using sigmoid)
+    ## - Recency (time since access, normalized)
+    ## - Cross-reference count (how many other memories link to this)
+    ## - Explicit mark (user-assigned importance override)
+    F calculate_importance(
+        &self,
+        access_count: u32,
+        last_accessed: i64,
+        crossref_count: u32,
+        explicit_mark: Option<f64>,
+        current_time: i64,
+    ) -> f64 {
+        # If explicit mark provided, use it directly
+        M explicit_mark {
+            Some(mark) => {
+                # Clamp to [0, 1]
+                I mark < 0.0 {
+                    R 0.0
+                }
+                I mark > 1.0 {
+                    R 1.0
+                }
+                R mark
+            }
+            None => {}
+        }
+
+        # Access score: sigmoid normalization
+        access_score := mut self.sigmoid_normalize(access_count as f64, 10.0)
+
+        # Recency score: exponential decay over 30 days
+        elapsed_seconds := mut (current_time - last_accessed) as f64
+        recency_score := mut (-elapsed_seconds / (30.0 * 86400.0)).exp()
+
+        # Crossref score: sigmoid normalization
+        crossref_score := mut self.sigmoid_normalize(crossref_count as f64, 5.0)
+
+        # Weighted combination
+        importance := mut             self.base_access_weight * access_score +
+            self.base_recency_weight * recency_score +
+            self.base_crossref_weight * crossref_score
+
+        # Clamp to [0, 1]
+        I importance < 0.0 {
+            importance = 0.0
+        }
+        I importance > 1.0 {
+            importance = 1.0
+        }
+
+        importance
+    }
+
+    ## Apply exponential decay to current importance
+    F decay_importance(
+        &self,
+        current_importance: f64,
+        elapsed_seconds: f64,
+        half_life: f64,
+    ) -> f64 {
+        I half_life <= 0.0 {
+            R current_importance
+        }
+        I elapsed_seconds <= 0.0 {
+            R current_importance
+        }
+
+        decay_factor := mut (-0.693147 * elapsed_seconds / half_life).exp()
+        decayed := mut current_importance * decay_factor
+
+        # Clamp to [0, 1]
+        I decayed < 0.0 {
+            decayed = 0.0
+        }
+        I decayed > 1.0 {
+            decayed = 1.0
+        }
+
+        decayed
+    }
+
+    ## Sigmoid normalization: 1 / (1 + exp(-k * (x - midpoint)))
+    F sigmoid_normalize(self, x: f64, midpoint: f64) -> f64 {
+        k := mut 0.5  # Steepness parameter
+        1.0 / (1.0 + (-k * (x - midpoint)).exp())
+    }
+}
+
+## Memory configuration with per-type TTLs
+S MemoryConfig {
+    ttl_episodic: u64,
+    ttl_semantic: u64,
+    ttl_procedural: u64,
+    ttl_working: u64,
+    decay_half_life: f64,
+    consolidation_threshold: f64,
+    max_working_memory_entries: u32,
+}
+
+X MemoryConfig {
+    ## Create default configuration
+    F default() -> MemoryConfig {
+        MemoryConfig {
+            ttl_episodic: DEFAULT_TTL_EPISODIC,
+            ttl_semantic: DEFAULT_TTL_SEMANTIC,
+            ttl_procedural: DEFAULT_TTL_PROCEDURAL,
+            ttl_working: DEFAULT_TTL_WORKING,
+            decay_half_life: DEFAULT_DECAY_HALF_LIFE,
+            consolidation_threshold: 0.7,
+            max_working_memory_entries: 100,
+        }
+    }
+
+    ## Get default TTL for memory type
+    F get_default_ttl(self, memory_type: u8) -> u64 {
+        M memory_type {
+            MEMORY_TYPE_EPISODIC => self.ttl_episodic,
+            MEMORY_TYPE_SEMANTIC => self.ttl_semantic,
+            MEMORY_TYPE_PROCEDURAL => self.ttl_procedural,
+            MEMORY_TYPE_WORKING => self.ttl_working,
+            _ => DEFAULT_TTL_EPISODIC,  # Fallback
+        }
+    }
+}
+
+## Get human-readable name for memory type
+F memory_type_name(memory_type: u8) -> Str {
+    M memory_type {
+        MEMORY_TYPE_EPISODIC => Str.from("episodic"),
+        MEMORY_TYPE_SEMANTIC => Str.from("semantic"),
+        MEMORY_TYPE_PROCEDURAL => Str.from("procedural"),
+        MEMORY_TYPE_WORKING => Str.from("working"),
+        _ => Str.from("unknown"),
+    }
+}

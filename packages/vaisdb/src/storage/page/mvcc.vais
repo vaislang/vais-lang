@@ -1,0 +1,91 @@
+# MVCC Tuple Metadata (32 bytes)
+# Every row/tuple carries this metadata for multi-version concurrency control
+# Based on Stage 1 Section 5 and Stage 7 Pattern 5
+
+U std/bytes.{ByteBuffer};
+U storage/constants.{MVCC_TUPLE_META_SIZE, INVALID_TXN_ID, NULL_UNDO_PTR};
+U storage/error.{VaisError};
+
+S MvccTupleMeta {
+    txn_id_create: u64,    # Transaction that created this version
+    txn_id_expire: u64,    # Transaction that deleted/updated (0 = active)
+    undo_ptr: u64,         # Pointer to previous version in undo log
+    cmd_id: u32,           # Command sequence within creating transaction
+    expire_cmd_id: u32,    # Command sequence within deleting/updating transaction
+}
+
+X MvccTupleMeta {
+    # Create metadata for a new tuple (INSERT)
+    F new_insert(txn_id: u64, cmd_id: u32) -> MvccTupleMeta {
+        MvccTupleMeta {
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            undo_ptr: NULL_UNDO_PTR,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Create an empty/default metadata
+    F empty() -> MvccTupleMeta {
+        MvccTupleMeta {
+            txn_id_create: INVALID_TXN_ID,
+            txn_id_expire: INVALID_TXN_ID,
+            undo_ptr: NULL_UNDO_PTR,
+            cmd_id: 0,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Serialize to ByteBuffer (32 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_u64_le(self.undo_ptr);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+    }
+
+    # Deserialize from ByteBuffer (32 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<MvccTupleMeta, VaisError> {
+        Ok(MvccTupleMeta {
+            txn_id_create: buf.get_u64_le()?,
+            txn_id_expire: buf.get_u64_le()?,
+            undo_ptr: buf.get_u64_le()?,
+            cmd_id: buf.get_u32_le()?,
+            expire_cmd_id: buf.get_u32_le()?,
+        })
+    }
+
+    # Check if tuple is current (not deleted/updated)
+    F is_current(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Check if tuple has a previous version
+    F has_previous_version(self) -> bool {
+        self.undo_ptr != NULL_UNDO_PTR
+    }
+
+    # Mark tuple as expired by a transaction (DELETE or UPDATE)
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Set undo pointer to previous version
+    F set_undo_ptr(mut self, ptr: u64) {
+        self.undo_ptr = ptr;
+    }
+
+    # Clear expiration (used during rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Get size in bytes (constant 32)
+    F size() -> u32 {
+        MVCC_TUPLE_META_SIZE
+    }
+}

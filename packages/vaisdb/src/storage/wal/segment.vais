@@ -1,0 +1,141 @@
+# WAL Segment Header (32 bytes)
+# Based on Stage 2: WAL Design
+# Segment files are named {segment_number:06}.wal (e.g., 000001.wal, 000002.wal)
+
+U storage/error.{VaisError, err_wal_segment_corrupt, err_invalid_magic};
+U storage/constants.{WAL_SEGMENT_MAGIC, WAL_FORMAT_VERSION, WAL_SEGMENT_HEADER_SIZE};
+U storage/checksum.{calculate_segment_header_checksum, verify_segment_header_checksum};
+U std/bytes.{ByteBuffer};
+
+# WAL Segment Header Structure (32 bytes)
+S WalSegmentHeader {
+    magic: u32,             # 0-3:   0x56414C57 ("VALW")
+    segment_number: u32,    # 4-7:   Monotonically increasing segment ID
+    first_lsn: u64,         # 8-15:  LSN of first record in this segment
+    last_lsn: u64,          # 16-23: LSN of last record (updated on close)
+    format_version: u32,    # 24-27: WAL format version
+    checksum: u32,          # 28-31: CRC32C of segment header
+}
+
+X WalSegmentHeader {
+    # Create a new segment header
+    F new(segment_number: u32, first_lsn: u64) -> WalSegmentHeader {
+        WalSegmentHeader {
+            magic: WAL_SEGMENT_MAGIC,
+            segment_number,
+            first_lsn,
+            last_lsn: first_lsn,  # Updated as records are written
+            format_version: WAL_FORMAT_VERSION,
+            checksum: 0,  # Computed after serialization
+        }
+    }
+
+    # Serialize header to ByteBuffer (little-endian)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u32_le(self.magic);
+        buf.put_u32_le(self.segment_number);
+        buf.put_u64_le(self.first_lsn);
+        buf.put_u64_le(self.last_lsn);
+        buf.put_u32_le(self.format_version);
+        buf.put_u32_le(self.checksum);
+    }
+
+    # Deserialize header from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<WalSegmentHeader, VaisError> {
+        magic := mut buf.get_u32_le()?;
+        segment_number := mut buf.get_u32_le()?;
+        first_lsn := mut buf.get_u64_le()?;
+        last_lsn := mut buf.get_u64_le()?;
+        format_version := mut buf.get_u32_le()?;
+        checksum := mut buf.get_u32_le()?;
+
+        Ok(WalSegmentHeader {
+            magic,
+            segment_number,
+            first_lsn,
+            last_lsn,
+            format_version,
+            checksum,
+        })
+    }
+
+    # Serialize header to byte array (32 bytes)
+    F to_bytes(self) -> [u8; 32] {
+        buf := mut ByteBuffer.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
+        self.serialize(&mut buf);
+        bytes := mut [0u8; 32];
+        buf.as_slice().copy_to(&mut bytes, 0);
+        bytes
+    }
+
+    # Deserialize header from byte array
+    F from_bytes(data: &[u8; 32]) -> Result<WalSegmentHeader, VaisError> {
+        buf := mut ByteBuffer.from_slice(data);
+        WalSegmentHeader.deserialize(&buf)
+    }
+
+    # Verify header integrity
+    F verify(self) -> Result<(), VaisError> {
+        # Check magic number
+        I self.magic != WAL_SEGMENT_MAGIC {
+            R Err(err_invalid_magic());
+        }
+
+        # Verify checksum
+        bytes := mut self.to_bytes();
+        I !verify_segment_header_checksum(&bytes) {
+            R Err(err_wal_segment_corrupt(self.segment_number, 0));
+        }
+
+        Ok(())
+    }
+
+    # Compute and set checksum
+    F compute_checksum(&mut self) {
+        bytes := mut self.to_bytes();
+        self.checksum = calculate_segment_header_checksum(&bytes);
+    }
+
+    # Update last_lsn (called when new record is written)
+    F update_last_lsn(&mut self, lsn: u64) {
+        self.last_lsn = lsn;
+    }
+
+    # Get segment file name (e.g., "000001.wal")
+    F segment_filename(segment_number: u32) -> Str {
+        format!("{:06}.wal", segment_number)
+    }
+
+    # Parse segment number from filename
+    F parse_segment_number(filename: &Str) -> Result<u32, VaisError> {
+        # Expected format: NNNNNN.wal
+        I !filename.ends_with(".wal") {
+            R Err(VaisError.new(
+                "VAIS-0005001",
+                "Invalid WAL segment filename: {filename}"
+            ));
+        }
+
+        parts: Vec<&str> := mut filename.split('.').collect();
+        I parts.len() != 2 {
+            R Err(VaisError.new(
+                "VAIS-0005001",
+                "Invalid WAL segment filename: {filename}"
+            ));
+        }
+
+        number_str := mut parts[0];
+        M number_str.parse.<u32>() {
+            Ok(num) => Ok(num),
+            Err(_) => Err(VaisError.new(
+                "VAIS-0005001",
+                "Invalid segment number in filename: {filename}"
+            )),
+        }
+    }
+
+    # Get size in bytes
+    F size() -> u32 {
+        WAL_SEGMENT_HEADER_SIZE
+    }
+}

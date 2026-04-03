@@ -1,0 +1,431 @@
+# Row-Level Security Evaluator
+# Applies RLS policies to different query types:
+#   - SQL scan: injects WHERE clause conditions
+#   - Vector search: post-filter HNSW results by policy
+#   - Graph traversal: edge/node visibility based on policy
+# Provides current_user_tenant() SQL function for multi-tenant RLS
+# Error codes: EE=09 (security), CC=09 (privilege)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError};
+U security/types.{
+    SessionContext,
+    POLICY_CMD_SELECT, POLICY_CMD_INSERT,
+    POLICY_CMD_UPDATE, POLICY_CMD_DELETE,
+};
+U security/policy.{PolicyEngine};
+
+# ============================================================================
+# RlsEvaluator — Applies RLS policies to queries
+# ============================================================================
+
+S RlsEvaluator {
+    policy_engine: &PolicyEngine,
+    enabled: bool,
+}
+
+X RlsEvaluator {
+    F new(policy_engine: &PolicyEngine, enabled: bool) -> RlsEvaluator {
+        RlsEvaluator { policy_engine, enabled }
+    }
+
+    # Create disabled evaluator (no RLS enforcement)
+    F disabled() -> RlsEvaluator {
+        RlsEvaluator {
+            policy_engine: &PolicyEngine.new(),
+            enabled: false,
+        }
+    }
+
+    # ========================================================================
+    # SQL Scan RLS — Inject WHERE conditions
+    # ========================================================================
+
+    # Apply RLS to a SQL table scan
+    # Returns: additional WHERE clause expression (None if no policy applies)
+    # The caller must AND this with the existing WHERE clause
+    F apply_rls_to_scan(
+        self,
+        table_name: &Str,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        I !self.enabled {
+            R None;
+        }
+
+        # Superuser bypasses RLS
+        I session.is_superuser {
+            R None;
+        }
+
+        # Get combined policy expression for SELECT
+        expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_SELECT, session,
+        );
+
+        # Substitute current_user_tenant() with actual user_id
+        M expr {
+            Some(raw_expr) => {
+                resolved := mut substitute_user_functions(&raw_expr, session);
+                Some(resolved)
+            },
+            None => None,
+        }
+    }
+
+    # Apply RLS to INSERT validation (WITH CHECK expression)
+    F apply_rls_to_insert(
+        self,
+        table_name: &Str,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        I !self.enabled || session.is_superuser {
+            R None;
+        }
+
+        expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_INSERT, session,
+        );
+        M expr {
+            Some(raw) => Some(substitute_user_functions(&raw, session)),
+            None => None,
+        }
+    }
+
+    # Apply RLS to UPDATE (both USING for visibility and WITH CHECK for new values)
+    F apply_rls_to_update(
+        self,
+        table_name: &Str,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        I !self.enabled || session.is_superuser {
+            R None;
+        }
+
+        expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_UPDATE, session,
+        );
+        M expr {
+            Some(raw) => Some(substitute_user_functions(&raw, session)),
+            None => None,
+        }
+    }
+
+    # Apply RLS to DELETE
+    F apply_rls_to_delete(
+        self,
+        table_name: &Str,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        I !self.enabled || session.is_superuser {
+            R None;
+        }
+
+        expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_DELETE, session,
+        );
+        M expr {
+            Some(raw) => Some(substitute_user_functions(&raw, session)),
+            None => None,
+        }
+    }
+
+    # ========================================================================
+    # Vector Search RLS — Post-filter HNSW results
+    # ========================================================================
+
+    # Apply RLS to vector search results
+    # Takes a list of (doc_id, score) pairs and filters out rows that
+    # violate the RLS policy for the given table
+    #
+    # Design: HNSW returns approximate nearest neighbors first, then
+    # we post-filter. This is necessary because HNSW doesn't support
+    # arbitrary WHERE clause filtering during search.
+    #
+    # Parameters:
+    #   table_name: the table being searched
+    #   results: (doc_id, score) pairs from HNSW
+    #   row_tenant_ids: parallel array of tenant_id values for each result
+    #   session: current user session
+    # Returns: filtered list of (doc_id, score) pairs
+    F apply_rls_to_vector_search(
+        self,
+        table_name: &Str,
+        results: &Vec<(u64, f32)>,
+        row_tenant_ids: &Vec<u64>,
+        session: &SessionContext,
+    ) -> Vec<(u64, f32)> {
+        I !self.enabled || session.is_superuser {
+            R results.clone();
+        }
+
+        # Get the policy expression
+        policy_expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_SELECT, session,
+        );
+
+        M policy_expr {
+            Some(expr) => {
+                # Check if it's a simple tenant_id comparison
+                # Pattern: "tenant_id = <user_id>"
+                user_id := mut session.current_user_id();
+
+                # Simple policy optimization: if policy is
+                # "tenant_id = current_user_tenant()", just filter by user_id
+                I is_tenant_id_policy(&expr) {
+                    filtered := mut Vec.new();
+                    i: u64 := mut 0;
+                    L i < results.len() && i < row_tenant_ids.len() {
+                        I row_tenant_ids[i] == user_id {
+                            filtered.push(results[i]);
+                        }
+                        i = i + 1;
+                    }
+                    R filtered;
+                }
+
+                # For complex policies, we'd need to evaluate the expression
+                # against each row. For now, return all results
+                # (full expression evaluation requires SQL expression evaluator integration)
+                results.clone()
+            },
+            None => {
+                # No policy: return all results
+                results.clone()
+            },
+        }
+    }
+
+    # ========================================================================
+    # Graph Traversal RLS — Edge/Node visibility
+    # ========================================================================
+
+    # Apply RLS to graph traversal
+    # Checks if a specific node is visible to the current user
+    # based on RLS policies on the node's source table
+    #
+    # Parameters:
+    #   table_name: the graph node/edge source table
+    #   node_tenant_id: tenant_id of the node
+    #   session: current user session
+    # Returns: true if the node is visible
+    F apply_rls_to_graph_node(
+        self,
+        table_name: &Str,
+        node_tenant_id: u64,
+        session: &SessionContext,
+    ) -> bool {
+        I !self.enabled || session.is_superuser {
+            R true;
+        }
+
+        policy_expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_SELECT, session,
+        );
+
+        M policy_expr {
+            Some(expr) => {
+                # Simple tenant_id check optimization
+                I is_tenant_id_policy(&expr) {
+                    R node_tenant_id == session.current_user_id();
+                }
+                # For complex policies, default to visible
+                # (full expression evaluation would be needed)
+                true
+            },
+            None => true,  # No policy: visible
+        }
+    }
+
+    # Filter a list of graph edges by RLS policy
+    # edge_tenant_ids: parallel array of tenant_ids for each edge
+    # Returns: boolean mask (true = visible)
+    F apply_rls_to_graph_traverse(
+        self,
+        table_name: &Str,
+        edge_tenant_ids: &Vec<u64>,
+        session: &SessionContext,
+    ) -> Vec<bool> {
+        mask := mut Vec.with_capacity(edge_tenant_ids.len());
+
+        I !self.enabled || session.is_superuser {
+            i: u64 := mut 0;
+            L i < edge_tenant_ids.len() {
+                mask.push(true);
+                i = i + 1;
+            }
+            R mask;
+        }
+
+        policy_expr := mut self.policy_engine.evaluate_policy(
+            table_name, POLICY_CMD_SELECT, session,
+        );
+
+        M policy_expr {
+            Some(expr) => {
+                user_id := mut session.current_user_id();
+                I is_tenant_id_policy(&expr) {
+                    i: u64 := mut 0;
+                    L i < edge_tenant_ids.len() {
+                        mask.push(edge_tenant_ids[i] == user_id);
+                        i = i + 1;
+                    }
+                } E {
+                    # Complex policy: default to all visible
+                    i: u64 := mut 0;
+                    L i < edge_tenant_ids.len() {
+                        mask.push(true);
+                        i = i + 1;
+                    }
+                }
+            },
+            None => {
+                i: u64 := mut 0;
+                L i < edge_tenant_ids.len() {
+                    mask.push(true);
+                    i = i + 1;
+                }
+            },
+        };
+
+        mask
+    }
+
+    # ========================================================================
+    # Helpers
+    # ========================================================================
+
+    # Check if RLS is enabled
+    F is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    # Check if a specific table has any RLS policies
+    F table_has_rls(self, table_name: &Str) -> bool {
+        I !self.enabled {
+            R false;
+        }
+        self.policy_engine.has_policies(table_name)
+    }
+}
+
+# ============================================================================
+# SQL Function: current_user_tenant()
+# Registered in the query planner for use in RLS policy expressions
+# Returns the current session's user_id as an integer (for tenant isolation)
+# ============================================================================
+
+# Resolve current_user_tenant() to the session's user_id
+F current_user_tenant(session: &SessionContext) -> u64 {
+    session.current_user_id()
+}
+
+# Resolve current_user() to the session's username
+F current_user(session: &SessionContext) -> Str {
+    session.username.clone()
+}
+
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
+# Substitute user-related SQL functions in a policy expression
+# Replaces:
+#   current_user_tenant() -> user_id as string
+#   current_user() -> 'username'
+F substitute_user_functions(expr: &Str, session: &SessionContext) -> Str {
+    result := mut expr.clone();
+
+    # Replace current_user_tenant() with user_id
+    tenant_fn := mut "current_user_tenant()";
+    user_id_str := mut u64_to_str(session.current_user_id());
+    result = string_replace(&result, tenant_fn, &user_id_str);
+
+    # Replace current_user() with quoted username
+    user_fn := mut "current_user()";
+    quoted_user := mut Str.new();
+    quoted_user.push_byte(0x27);  # '
+    quoted_user.push_str(&session.username);
+    quoted_user.push_byte(0x27);  # '
+    result = string_replace(&result, user_fn, &quoted_user);
+
+    result
+}
+
+# Check if a policy expression is a simple tenant_id comparison
+# Pattern: contains "tenant_id" and "current_user_tenant()"
+F is_tenant_id_policy(expr: &Str) -> bool {
+    bytes := mut expr.as_bytes();
+    has_tenant_id := mut security/sanitizer.contains_pattern_ci(bytes, "tenant_id");
+    has_function := mut security/sanitizer.contains_pattern(bytes, "current_user_tenant()");
+    has_tenant_id && has_function
+}
+
+# Simple string replacement
+F string_replace(haystack: &Str, needle: &Str, replacement: &Str) -> Str {
+    h_bytes := mut haystack.as_bytes();
+    n_bytes := mut needle.as_bytes();
+    n_len := mut n_bytes.len();
+    h_len := mut h_bytes.len();
+
+    I h_len < n_len {
+        R haystack.clone();
+    }
+
+    result := mut Str.with_capacity(h_len);
+    i: u64 := mut 0;
+
+    L i < h_len {
+        I i + n_len <= h_len {
+            # Check for match
+            found := mut true;
+            j: u64 := mut 0;
+            L j < n_len {
+                I h_bytes[i + j] != n_bytes[j] {
+                    found = false;
+                    j = n_len;  # break
+                } E {
+                    j = j + 1;
+                }
+            }
+
+            I found {
+                result.push_str(replacement);
+                i = i + n_len;
+            } E {
+                result.push_byte(h_bytes[i]);
+                i = i + 1;
+            }
+        } E {
+            result.push_byte(h_bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    result
+}
+
+# Convert u64 to decimal string
+F u64_to_str(value: u64) -> Str {
+    I value == 0 {
+        R "0";
+    }
+    digits := mut Vec.new();
+    remaining := mut value;
+    L remaining > 0 {
+        digit := mut (remaining % 10) as u8;
+        digits.push(digit + 0x30);
+        remaining = remaining / 10;
+    }
+
+    result := mut Str.with_capacity(digits.len());
+    i := mut digits.len();
+    L i > 0 {
+        i = i - 1;
+        result.push_byte(digits[i]);
+    }
+    result
+}

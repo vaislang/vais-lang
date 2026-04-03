@@ -1,0 +1,547 @@
+# Full-Text Engine Core Types
+# Inverted index structures: PostingEntry, DictEntry, page headers, config, metadata
+# Based on Phase 0 Stage 3 MVCC strategy: PostingEntry with 24B MVCC overhead
+# Error codes: EE=04 (fulltext), CC=01-10
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/constants.{
+    PAGE_HEADER_SIZE, INVALID_TXN_ID, NULL_PAGE,
+    FILE_ID_FULLTEXT, MVCC_TUPLE_META_SIZE
+};
+U storage/error.{VaisError, ErrorSeverity};
+U storage/page/header.{PageHeader};
+U storage/hash.{fnv1a_hash};
+U storage/page/types.{
+    PAGE_TYPE_INVERTED_DICT, PAGE_TYPE_INVERTED_POSTING,
+    PAGE_TYPE_INVERTED_META, ENGINE_TAG_FULLTEXT
+};
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Full-text format version
+C FULLTEXT_FORMAT_VERSION: u8 = 1;
+
+# BM25 default parameters
+C DEFAULT_BM25_K1: f64 = 1.2;
+C DEFAULT_BM25_B: f64 = 0.75;
+
+# Tokenizer defaults
+C DEFAULT_MAX_TOKEN_LENGTH: u32 = 256;
+C DEFAULT_MIN_TOKEN_LENGTH: u32 = 1;
+
+# PostingEntry serialized size (fixed part, before variable-length positions)
+# doc_id(8) + term_freq(4) + position_count(4) + MVCC(24) = 40 bytes fixed
+C POSTING_ENTRY_FIXED_SIZE: u32 = 40;
+
+# Posting page body header (after 48B page header)
+# term_hash(8) + entry_count(2) + next_posting_page(4) + flags(2) = 16 bytes
+C POSTING_PAGE_HEADER_SIZE: u32 = 16;
+
+# Dictionary entry serialized size (fixed part, before variable-length term)
+# term_hash(8) + posting_head_page(4) + doc_freq(4) + total_term_freq(8) = 24 bytes fixed
+C DICT_ENTRY_FIXED_SIZE: u32 = 24;
+
+# Posting page flags
+C POSTING_FLAG_HAS_DELETION_BITMAP: u16 = 0x0001;
+C POSTING_FLAG_COMPRESSED: u16 = 0x0002;
+
+# Maximum positions per posting entry (safety limit)
+C MAX_POSITIONS_PER_ENTRY: u32 = 65536;
+
+# ============================================================================
+# Error Codes: EE=04 (fulltext)
+# ============================================================================
+
+F err_fulltext_term_not_found(term: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0410001",
+        "Full-text term not found: {term}"
+    )
+}
+
+F err_fulltext_index_not_found(index_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0410002",
+        "Full-text index {index_id} not found"
+    )
+}
+
+F err_fulltext_posting_corrupt(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0405001",
+        "Posting list page {page_id} corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_fulltext_dict_corrupt(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0405002",
+        "Dictionary page {page_id} corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_fulltext_page_full(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0403001",
+        "Full-text page {page_id} is full"
+    )
+}
+
+F err_fulltext_token_too_long(len: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0409001",
+        "Token length {len} exceeds maximum {DEFAULT_MAX_TOKEN_LENGTH}"
+    )
+}
+
+F err_fulltext_too_many_positions(count: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0402001",
+        "Position count {count} exceeds maximum {MAX_POSITIONS_PER_ENTRY}"
+    )
+}
+
+F err_fulltext_engine_closed() -> VaisError {
+    VaisError.new(
+        "VAIS-0410003",
+        "Full-text engine is not open"
+    )
+}
+
+F err_fulltext_invalid_query(msg: &Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0401001",
+        "Invalid full-text query: {msg}"
+    )
+}
+
+F err_fulltext_doc_not_found(doc_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0410004",
+        "Document {doc_id} not found in full-text index"
+    )
+}
+
+# ============================================================================
+# FullTextConfig — Immutable configuration
+# ============================================================================
+
+S FullTextConfig {
+    bm25_k1: f64,               # BM25 term frequency saturation (default 1.2)
+    bm25_b: f64,                # BM25 document length normalization (default 0.75)
+    max_token_length: u32,      # Max token length in bytes (default 256)
+    min_token_length: u32,      # Min token length in bytes (default 1)
+    enable_stop_words: bool,    # Enable stop word removal (default true)
+    enable_positions: bool,     # Store positions for phrase search (default true)
+    page_size: u32,             # Page size (inherited from database)
+}
+
+X FullTextConfig {
+    F default(page_size: u32) -> FullTextConfig {
+        FullTextConfig {
+            bm25_k1: DEFAULT_BM25_K1,
+            bm25_b: DEFAULT_BM25_B,
+            max_token_length: DEFAULT_MAX_TOKEN_LENGTH,
+            min_token_length: DEFAULT_MIN_TOKEN_LENGTH,
+            enable_stop_words: true,
+            enable_positions: true,
+            page_size,
+        }
+    }
+
+    # Serialize (24 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_f64_le(self.bm25_k1);
+        buf.put_f64_le(self.bm25_b);
+        buf.put_u32_le(self.max_token_length);
+        buf.put_u32_le(self.min_token_length);
+        buf.put_u8(I self.enable_stop_words { 1 } E { 0 });
+        buf.put_u8(I self.enable_positions { 1 } E { 0 });
+        buf.put_u16_le(0);  # reserved
+    }
+
+    # Deserialize (24 bytes)
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<FullTextConfig, VaisError> {
+        Ok(FullTextConfig {
+            bm25_k1: buf.get_f64_le()?,
+            bm25_b: buf.get_f64_le()?,
+            max_token_length: buf.get_u32_le()?,
+            min_token_length: buf.get_u32_le()?,
+            enable_stop_words: buf.get_u8()? != 0,
+            enable_positions: buf.get_u8()? != 0,
+            page_size: { buf.get_u16_le()?; page_size },
+        })
+    }
+}
+
+# ============================================================================
+# FullTextMeta — Full-text engine metadata (stored in meta page)
+# ============================================================================
+
+S FullTextMeta {
+    format_version: u8,
+    total_docs: u64,           # Total indexed documents
+    total_terms: u64,          # Total unique terms in dictionary
+    total_tokens: u64,         # Total token occurrences across all docs
+    avg_doc_length: f64,       # Average document length in tokens
+    next_doc_id: u64,          # Monotonic document ID allocator (internal)
+    dict_root_page: u32,       # Root page of dictionary B+Tree
+    config: FullTextConfig,
+}
+
+X FullTextMeta {
+    F new(config: FullTextConfig) -> FullTextMeta {
+        FullTextMeta {
+            format_version: FULLTEXT_FORMAT_VERSION,
+            total_docs: 0,
+            total_terms: 0,
+            total_tokens: 0,
+            avg_doc_length: 0.0,
+            next_doc_id: 1,  # Start from 1
+            dict_root_page: NULL_PAGE,
+            config,
+        }
+    }
+
+    # Update average document length after insert/delete
+    F update_avg_doc_length(mut self, doc_token_count: u64, is_insert: bool) {
+        I is_insert {
+            old_total := mut self.avg_doc_length * (self.total_docs as f64);
+            self.total_docs += 1;
+            self.total_tokens += doc_token_count;
+            self.avg_doc_length = (old_total + doc_token_count as f64) / (self.total_docs as f64);
+        } E {
+            I self.total_docs <= 1 {
+                self.total_docs = 0;
+                self.total_tokens = 0;
+                self.avg_doc_length = 0.0;
+            } E {
+                old_total := mut self.avg_doc_length * (self.total_docs as f64);
+                self.total_docs -= 1;
+                self.total_tokens -= doc_token_count;
+                self.avg_doc_length = (old_total - doc_token_count as f64) / (self.total_docs as f64);
+            }
+        }
+    }
+
+    # Serialize to ByteBuffer
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u8(self.format_version);
+        buf.put_u64_le(self.total_docs);
+        buf.put_u64_le(self.total_terms);
+        buf.put_u64_le(self.total_tokens);
+        buf.put_f64_le(self.avg_doc_length);
+        buf.put_u64_le(self.next_doc_id);
+        buf.put_u32_le(self.dict_root_page);
+        self.config.serialize(buf);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<FullTextMeta, VaisError> {
+        format_version := mut buf.get_u8()?;
+        Ok(FullTextMeta {
+            format_version,
+            total_docs: buf.get_u64_le()?,
+            total_terms: buf.get_u64_le()?,
+            total_tokens: buf.get_u64_le()?,
+            avg_doc_length: buf.get_f64_le()?,
+            next_doc_id: buf.get_u64_le()?,
+            dict_root_page: buf.get_u32_le()?,
+            config: FullTextConfig.deserialize(buf, page_size)?,
+        })
+    }
+}
+
+# ============================================================================
+# PostingEntry — Single entry in a posting list (variable size)
+# Per Stage 3: doc_id + term_freq + positions + MVCC 24B
+# ============================================================================
+
+S PostingEntry {
+    doc_id: u64,                # Document ID
+    term_freq: u32,             # Term frequency in this document
+    positions: Vec<u32>,        # Token positions within document (for phrase search)
+
+    # MVCC metadata (24 bytes)
+    txn_id_create: u64,         # Transaction that created this entry
+    txn_id_expire: u64,         # Transaction that deleted this entry (0 = active)
+    cmd_id: u32,                # Command ID within creating transaction
+    expire_cmd_id: u32,         # Command ID within deleting transaction
+}
+
+X PostingEntry {
+    # Create new posting entry for document indexing
+    F new(
+        doc_id: u64,
+        term_freq: u32,
+        positions: Vec<u32>,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> PostingEntry {
+        PostingEntry {
+            doc_id,
+            term_freq,
+            positions,
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            cmd_id,
+            expire_cmd_id: 0,
+        }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: doc_id(8) + term_freq(4) + position_count(4) + positions(4 each)
+    #         + txn_id_create(8) + txn_id_expire(8) + cmd_id(4) + expire_cmd_id(4)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.doc_id);
+        buf.put_u32_le(self.term_freq);
+        buf.put_u32_le(self.positions.len() as u32);
+
+        # Positions
+        i: u64 := mut 0;
+        L i < self.positions.len() {
+            buf.put_u32_le(self.positions[i]);
+            i += 1;
+        }
+
+        # MVCC metadata (24 bytes)
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<PostingEntry, VaisError> {
+        doc_id := mut buf.get_u64_le()?;
+        term_freq := mut buf.get_u32_le()?;
+        position_count := mut buf.get_u32_le()? as u64;
+
+        I position_count > MAX_POSITIONS_PER_ENTRY as u64 {
+            R Err(err_fulltext_too_many_positions(position_count as u32));
+        }
+
+        # Positions
+        positions := mut Vec.with_capacity(position_count);
+        i: u64 := mut 0;
+        L i < position_count {
+            positions.push(buf.get_u32_le()?);
+            i += 1;
+        }
+
+        # MVCC metadata
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+
+        Ok(PostingEntry {
+            doc_id,
+            term_freq,
+            positions,
+            txn_id_create,
+            txn_id_expire,
+            cmd_id,
+            expire_cmd_id,
+        })
+    }
+
+    # Mark as expired (soft delete)
+    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if entry is active (not expired)
+    F is_active(self) -> bool {
+        self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Clear expiration (rollback)
+    F clear_expired(mut self) {
+        self.txn_id_expire = INVALID_TXN_ID;
+        self.expire_cmd_id = 0;
+    }
+
+    # Calculate serialized size (variable due to positions)
+    F serialized_size(self) -> u32 {
+        POSTING_ENTRY_FIXED_SIZE + (self.positions.len() as u32 * 4)
+    }
+
+    # Serialize to standalone byte vector (for WAL payload)
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.new(self.serialized_size() as u64);
+        self.serialize(&buf);
+        buf.to_vec()
+    }
+
+    # Deserialize from standalone byte vector (for WAL redo)
+    F from_bytes(data: &[u8]) -> Result<PostingEntry, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(data);
+        PostingEntry.deserialize(&buf)
+    }
+}
+
+# ============================================================================
+# PostingPageHeader — Header for posting list pages (16 bytes)
+# Sits after the 48B unified page header
+# ============================================================================
+
+S PostingPageHeader {
+    term_hash: u64,             # Hash of the term this posting list belongs to
+    entry_count: u16,           # Number of entries on this page
+    next_posting_page: u32,     # Next page in chain (0 = last page)
+    flags: u16,                 # POSTING_FLAG_* bit field
+}
+
+X PostingPageHeader {
+    F new(term_hash: u64) -> PostingPageHeader {
+        PostingPageHeader {
+            term_hash,
+            entry_count: 0,
+            next_posting_page: NULL_PAGE,
+            flags: 0,
+        }
+    }
+
+    # Serialize (16 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.term_hash);
+        buf.put_u16_le(self.entry_count);
+        buf.put_u32_le(self.next_posting_page);
+        buf.put_u16_le(self.flags);
+    }
+
+    # Deserialize (16 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<PostingPageHeader, VaisError> {
+        Ok(PostingPageHeader {
+            term_hash: buf.get_u64_le()?,
+            entry_count: buf.get_u16_le()?,
+            next_posting_page: buf.get_u32_le()?,
+            flags: buf.get_u16_le()?,
+        })
+    }
+
+    # Check if page has a deletion bitmap
+    F has_deletion_bitmap(self) -> bool {
+        (self.flags & POSTING_FLAG_HAS_DELETION_BITMAP) != 0
+    }
+
+    # Check if entries are compressed
+    F is_compressed(self) -> bool {
+        (self.flags & POSTING_FLAG_COMPRESSED) != 0
+    }
+
+    # Available space for entries on this page
+    F available_space(self, page_size: u32) -> u32 {
+        page_size - PAGE_HEADER_SIZE - POSTING_PAGE_HEADER_SIZE
+    }
+}
+
+# ============================================================================
+# DictEntry — Dictionary entry mapping term to posting list
+# ============================================================================
+
+S DictEntry {
+    term: Str,                  # The term text
+    term_hash: u64,             # FNV-1a hash for fast lookup
+    posting_head_page: u32,     # First page of posting list chain
+    doc_freq: u32,              # Number of documents containing this term
+    total_term_freq: u64,       # Total occurrences across all documents
+}
+
+X DictEntry {
+    F new(term: Str, term_hash: u64, posting_head_page: u32) -> DictEntry {
+        DictEntry {
+            term,
+            term_hash,
+            posting_head_page,
+            doc_freq: 0,
+            total_term_freq: 0,
+        }
+    }
+
+    # Serialize to ByteBuffer
+    # Format: term_hash(8) + posting_head_page(4) + doc_freq(4) + total_term_freq(8) + term(var)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.term_hash);
+        buf.put_u32_le(self.posting_head_page);
+        buf.put_u32_le(self.doc_freq);
+        buf.put_u64_le(self.total_term_freq);
+        buf.put_string(&self.term);
+    }
+
+    # Deserialize from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<DictEntry, VaisError> {
+        Ok(DictEntry {
+            term_hash: buf.get_u64_le()?,
+            posting_head_page: buf.get_u32_le()?,
+            doc_freq: buf.get_u32_le()?,
+            total_term_freq: buf.get_u64_le()?,
+            term: buf.get_string()?,
+        })
+    }
+
+    # Increment doc frequency
+    F inc_doc_freq(mut self, term_freq: u32) {
+        self.doc_freq += 1;
+        self.total_term_freq += term_freq as u64;
+    }
+
+    # Decrement doc frequency
+    F dec_doc_freq(mut self, term_freq: u32) {
+        I self.doc_freq > 0 {
+            self.doc_freq -= 1;
+        }
+        I self.total_term_freq >= term_freq as u64 {
+            self.total_term_freq -= term_freq as u64;
+        } E {
+            self.total_term_freq = 0;
+        }
+    }
+}
+
+# ============================================================================
+# TokenInfo — Result of tokenizing text
+# ============================================================================
+
+S TokenInfo {
+    term: Str,                  # Normalized term text (lowercased, etc.)
+    position: u32,              # Position index within document
+    offset_start: u32,          # Byte offset of original text start
+    offset_end: u32,            # Byte offset of original text end
+}
+
+X TokenInfo {
+    F new(term: Str, position: u32, offset_start: u32, offset_end: u32) -> TokenInfo {
+        TokenInfo { term, position, offset_start, offset_end }
+    }
+}
+
+# ============================================================================
+# DocumentStats — Per-document statistics for indexing
+# ============================================================================
+
+S DocumentStats {
+    doc_id: u64,
+    token_count: u32,           # Total tokens in document
+    unique_terms: u32,          # Number of unique terms
+}
+
+X DocumentStats {
+    F new(doc_id: u64) -> DocumentStats {
+        DocumentStats {
+            doc_id,
+            token_count: 0,
+            unique_terms: 0,
+        }
+    }
+}
+
+# Re-export fnv1a_hash from storage/hash for backwards compatibility
+# (imported at top: U storage/hash.{fnv1a_hash})

@@ -1,0 +1,464 @@
+# Graph Traversal SQL Function
+# SQL function interface: GRAPH_TRAVERSE(start_node_id, max_depth, direction, edge_type_filter, return_paths)
+# Maps to BFS/DFS traversal engines with MVCC snapshot isolation
+# Returns traversal result rows for SQL query execution
+# Error codes: EE=03 (graph), CC=10 (query functions)
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/buffer/pool.{BufferPool};
+U graph/types.{
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+    INVALID_NODE_ID, EdgeTypeTable
+};
+U graph/traversal/bfs.{BfsTraversal, TraversalConfig, TraversalResult, TraversalStep};
+U graph/traversal/dfs.{DfsTraversal};
+U graph/edge/adj.{AdjacencyManager};
+U graph/node/storage.{NodeStore};
+
+# ============================================================================
+# Error Codes: EE=03 (graph), CC=10 (query functions)
+# ============================================================================
+
+F err_traverse_invalid_params(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0310001",
+        "Invalid GRAPH_TRAVERSE parameters: {reason}"
+    )
+}
+
+F err_traverse_node_not_found(node_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0310002",
+        "Start node {node_id} not found for traversal"
+    )
+}
+
+F err_traverse_invalid_direction(direction: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0310003",
+        "Invalid direction value: {direction} (must be 0=out, 1=in, 2=both)"
+    )
+}
+
+F err_traverse_execution_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0310004",
+        "Traversal execution failed: {reason}"
+    )
+}
+
+# ============================================================================
+# GraphTraverseParams — Parameters for GRAPH_TRAVERSE() function
+# ============================================================================
+
+S GraphTraverseParams {
+    start_node_id: u64,                  # Starting node for traversal
+    max_depth: u32,                      # Maximum traversal depth (0 = unlimited)
+    direction: u8,                        # DIRECTION_OUTGOING, INCOMING, or BOTH
+    edge_type_filter: Option<Vec<Str>>,  # Filter by edge type names (None = all types)
+    return_paths: bool,                   # Whether to R full path information
+    use_dfs: bool,                        # true = DFS, false = BFS (default BFS)
+}
+
+X GraphTraverseParams {
+    # Create default parameters (BFS, unlimited depth, outgoing, all edge types, no paths)
+    F default(start_node_id: u64) -> GraphTraverseParams {
+        GraphTraverseParams {
+            start_node_id,
+            max_depth: 0,
+            direction: DIRECTION_OUTGOING,
+            edge_type_filter: None,
+            return_paths: false,
+            use_dfs: false,
+        }
+    }
+
+    # Create with all parameters
+    F new(
+        start_node_id: u64,
+        max_depth: u32,
+        direction: u8,
+        edge_type_filter: Option<Vec<Str>>,
+        return_paths: bool,
+        use_dfs: bool
+    ) -> Result<GraphTraverseParams, VaisError> {
+        # Validate start node
+        I start_node_id == INVALID_NODE_ID {
+            R Err(err_traverse_invalid_params("start_node_id cannot be 0".to_string()));
+        }
+
+        # Validate direction
+        I direction != DIRECTION_OUTGOING &&
+           direction != DIRECTION_INCOMING &&
+           direction != DIRECTION_BOTH {
+            R Err(err_traverse_invalid_direction(direction));
+        }
+
+        Ok(GraphTraverseParams {
+            start_node_id,
+            max_depth,
+            direction,
+            edge_type_filter,
+            return_paths,
+            use_dfs,
+        })
+    }
+
+    # Validate parameters before execution
+    F validate(self) -> Result<(), VaisError> {
+        I self.start_node_id == INVALID_NODE_ID {
+            R Err(err_traverse_invalid_params("start_node_id is invalid".to_string()));
+        }
+
+        I self.direction != DIRECTION_OUTGOING &&
+           self.direction != DIRECTION_INCOMING &&
+           self.direction != DIRECTION_BOTH {
+            R Err(err_traverse_invalid_direction(self.direction));
+        }
+
+        Ok(())
+    }
+
+    # Convert edge type names to IDs using edge type table
+    F resolve_edge_types(
+        self,
+        edge_type_table: &EdgeTypeTable
+    ) -> Result<Option<Vec<u16>>, VaisError> {
+        M self.edge_type_filter {
+            None => Ok(None),
+            Some(ref names) => {
+                ids := mut Vec.with_capacity(names.len());
+                i: u64 := mut 0;
+                L i < names.len() {
+                    M edge_type_table.get_or_create(&names[i]) {
+                        Ok(id) => ids.push(id),
+                        Err(e) => R Err(e),
+                    }
+                    i += 1;
+                }
+                Ok(Some(ids))
+            }
+        }
+    }
+}
+
+# ============================================================================
+# TraverseRow — Single row in traversal result
+# ============================================================================
+
+S TraverseRow {
+    node_id: u64,           # Node ID
+    depth: u32,             # Depth from start node
+    path: Vec<u64>,         # Path from start node (I return_paths=true)
+    edge_types: Vec<u16>,   # Edge types along path (I return_paths=true)
+}
+
+X TraverseRow {
+    # Create row from traversal step (without path info)
+    F from_step(step: &TraversalStep) -> TraverseRow {
+        TraverseRow {
+            node_id: step.node_id,
+            depth: step.depth,
+            path: Vec.new(),
+            edge_types: Vec.new(),
+        }
+    }
+
+    # Create row with full path information
+    F from_step_with_path(
+        step: &TraversalStep,
+        path: Vec<u64>,
+        edge_types: Vec<u16>
+    ) -> TraverseRow {
+        TraverseRow {
+            node_id: step.node_id,
+            depth: step.depth,
+            path,
+            edge_types,
+        }
+    }
+
+    # Create root row (start node)
+    F root(node_id: u64) -> TraverseRow {
+        TraverseRow {
+            node_id,
+            depth: 0,
+            path: Vec.new(),
+            edge_types: Vec.new(),
+        }
+    }
+}
+
+# ============================================================================
+# GraphTraverseResult — Result of GRAPH_TRAVERSE() function
+# ============================================================================
+
+S GraphTraverseResult {
+    rows: Vec<TraverseRow>,  # Result rows
+}
+
+X GraphTraverseResult {
+    F new() -> GraphTraverseResult {
+        GraphTraverseResult {
+            rows: Vec.new(),
+        }
+    }
+
+    F add_row(mut self, row: TraverseRow) {
+        self.rows.push(row);
+    }
+
+    F row_count(self) -> u64 {
+        self.rows.len()
+    }
+
+    # Convert from internal TraversalResult to SQL function result
+    F from_traversal_result(
+        result: &TraversalResult,
+        return_paths: bool
+    ) -> GraphTraverseResult {
+        sql_result := mut GraphTraverseResult.new();
+
+        I !return_paths {
+            # Simple mode: just node_id and depth
+            i: u64 := mut 0;
+            L i < result.steps.len() {
+                sql_result.add_row(TraverseRow.from_step(&result.steps[i]));
+                i += 1;
+            }
+        } E {
+            # Path mode: reconstruct paths from traversal steps
+            sql_result = GraphTraverseResult.build_paths_from_steps(&result.steps);
+        }
+
+        sql_result
+    }
+
+    # Build path information from traversal steps
+    # This reconstructs the full path by following parent_node pointers
+    F build_paths_from_steps(steps: &Vec<TraversalStep>) -> GraphTraverseResult {
+        result := mut GraphTraverseResult.new();
+
+        i: u64 := mut 0;
+        L i < steps.len() {
+            step := mut &steps[i];
+
+            I step.depth == 0 {
+                # Root node - no path
+                result.add_row(TraverseRow.root(step.node_id));
+            } E {
+                # Build path by walking back through parent nodes
+                path := mut Vec.with_capacity(step.depth as u64 + 1);
+                edge_types := mut Vec.with_capacity(step.depth as u64);
+
+                # Walk back from current step to root
+                current_step := mut step;
+                depth := mut step.depth;
+
+                path_failed := mut false;
+                L depth > 0 && !path_failed {
+                    # Find parent step
+                    parent_found := mut false;
+                    j: u64 := mut 0;
+                    L j < i && !parent_found {
+                        I steps[j].node_id == current_step.parent_node &&
+                           steps[j].depth == depth - 1 {
+                            # Add edge type (prepend to front)
+                            edge_types.insert(0, current_step.edge_type);
+                            # Add node to path (prepend to front)
+                            path.insert(0, steps[j].node_id);
+                            current_step = &steps[j];
+                            parent_found = true;
+                        }
+                        j += 1;
+                    }
+
+                    I !parent_found {
+                        # Path reconstruction failed - fall back to simple mode
+                        path = Vec.new();
+                        edge_types = Vec.new();
+                        path_failed = true;
+                    } E {
+                        depth -= 1;
+                    }
+                }
+
+                # Add current node to end of path
+                path.push(step.node_id);
+
+                result.add_row(TraverseRow.from_step_with_path(
+                    step,
+                    path,
+                    edge_types
+                ));
+            }
+
+            i += 1;
+        }
+
+        result
+    }
+}
+
+# ============================================================================
+# GraphTraverseFunction — SQL function executor
+# ============================================================================
+
+S GraphTraverseFunction {
+    pool: &BufferPool,
+    node_store: &NodeStore,
+    adj_mgr: &AdjacencyManager,
+    edge_type_table: &EdgeTypeTable,
+}
+
+X GraphTraverseFunction {
+    F new(
+        pool: &BufferPool,
+        node_store: &NodeStore,
+        adj_mgr: &AdjacencyManager,
+        edge_type_table: &EdgeTypeTable
+    ) -> GraphTraverseFunction {
+        GraphTraverseFunction {
+            pool,
+            node_store,
+            adj_mgr,
+            edge_type_table,
+        }
+    }
+
+    # Execute GRAPH_TRAVERSE() function with MVCC snapshot isolation
+    F execute(
+        self,
+        params: &GraphTraverseParams,
+        snapshot: &Snapshot,
+        clog: &Clog
+    ) -> Result<GraphTraverseResult, VaisError> {
+        # Validate parameters
+        params.validate()?;
+
+        # Resolve edge type filter names to IDs
+        edge_type_ids := mut params.resolve_edge_types(self.edge_type_table)?;
+
+        # Build traversal configuration
+        config := mut TraversalConfig {
+            max_depth: params.max_depth,
+            edge_types: edge_type_ids,
+            direction: params.direction,
+        };
+
+        # Execute traversal (BFS or DFS)
+        traversal_result := mut I params.use_dfs {
+            dfs := mut DfsTraversal.new(self.pool, snapshot.clone(), clog);
+            dfs.traverse(params.start_node_id, self.adj_mgr, &config)?
+        } E {
+            bfs := mut BfsTraversal.new(self.pool, snapshot.clone(), clog);
+            bfs.traverse(params.start_node_id, self.adj_mgr, &config)?
+        };
+
+        # Convert to SQL function result format
+        sql_result := mut GraphTraverseResult.from_traversal_result(
+            &traversal_result,
+            params.return_paths
+        );
+
+        Ok(sql_result)
+    }
+
+    # Execute with error wrapping for SQL layer
+    F execute_safe(
+        self,
+        params: &GraphTraverseParams,
+        snapshot: &Snapshot,
+        clog: &Clog
+    ) -> Result<GraphTraverseResult, VaisError> {
+        M self.execute(params, snapshot, clog) {
+            Ok(result) => Ok(result),
+            Err(e) => Err(err_traverse_execution_failed(e.message)),
+        }
+    }
+}
+
+# ============================================================================
+# Helper Functions — SQL function parameter parsing
+# ============================================================================
+
+# Parse GRAPH_TRAVERSE() parameters from SQL function call arguments
+# Expected signature: GRAPH_TRAVERSE(start_node_id, max_depth, direction, edge_type_filter, return_paths)
+F parse_traverse_params(
+    start_node_id: u64,
+    max_depth_opt: Option<u32>,
+    direction_opt: Option<u8>,
+    edge_type_filter_opt: Option<Vec<Str>>,
+    return_paths_opt: Option<bool>,
+    use_dfs_opt: Option<bool>
+) -> Result<GraphTraverseParams, VaisError> {
+    max_depth := mut M max_depth_opt {
+        Some(d) => d,
+        None => 0,
+    };
+
+    direction := mut M direction_opt {
+        Some(d) => d,
+        None => DIRECTION_OUTGOING,
+    };
+
+    return_paths := mut M return_paths_opt {
+        Some(r) => r,
+        None => false,
+    };
+
+    use_dfs := mut M use_dfs_opt {
+        Some(u) => u,
+        None => false,
+    };
+
+    GraphTraverseParams.new(
+        start_node_id,
+        max_depth,
+        direction,
+        edge_type_filter_opt,
+        return_paths,
+        use_dfs
+    )
+}
+
+# Parse direction string to u8 constant
+# Accepts: "out", "outgoing", "in", "incoming", "both", "any"
+F parse_direction_string(direction_str: &Str) -> Result<u8, VaisError> {
+    lower := mut direction_str.to_lowercase();
+
+    I lower == "out" || lower == "outgoing" {
+        Ok(DIRECTION_OUTGOING)
+    } E I lower == "in" || lower == "incoming" {
+        Ok(DIRECTION_INCOMING)
+    } E I lower == "both" || lower == "any" {
+        Ok(DIRECTION_BOTH)
+    } E {
+        Err(err_traverse_invalid_params("direction must be 'out', 'in', or 'both'".to_string()))
+    }
+}
+
+# Parse edge type filter from comma-separated string
+# Example: "FOLLOWS,LIKES" -> vec!["FOLLOWS", "LIKES"]
+F parse_edge_type_filter(filter_str: &Str) -> Vec<Str> {
+    I filter_str.is_empty() {
+        R Vec.new();
+    }
+
+    types := mut Vec.new();
+    parts := mut filter_str.split(",");
+    i: u64 := mut 0;
+    L i < parts.len() {
+        trimmed := mut parts[i].trim();
+        I !trimmed.is_empty() {
+            types.push(trimmed.to_string());
+        }
+        i += 1;
+    }
+    types
+}

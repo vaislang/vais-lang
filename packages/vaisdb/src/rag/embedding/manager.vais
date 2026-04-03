@@ -1,0 +1,418 @@
+# Embedding Manager
+# Handles auto-embedding on INSERT, model change + reindex,
+# dual-embed during reindex, progress tracking
+# Coordinates with VectorEngine for index operations
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/sync.{Mutex};
+U storage/error.{VaisError};
+U rag/types.{
+    REINDEX_STATUS_IDLE, REINDEX_STATUS_RUNNING,
+    REINDEX_STATUS_COMPLETE, REINDEX_STATUS_FAILED,
+    REINDEX_STRATEGY_BACKGROUND, REINDEX_STRATEGY_IMMEDIATE,
+    err_rag_reindex_in_progress, err_rag_model_not_found,
+    err_rag_dimension_mismatch, err_rag_invalid_embedding_config,
+    err_rag_engine_closed
+};
+U rag/embedding/model.{EmbeddingModelInfo, EmbeddingModelRegistry};
+
+# ============================================================================
+# EmbeddingRequest — Request to embed text
+# ============================================================================
+
+S EmbeddingRequest {
+    text: Str,
+    doc_id: u64,
+    chunk_id: u64,
+}
+
+X EmbeddingRequest {
+    F new(text: Str, doc_id: u64, chunk_id: u64) -> EmbeddingRequest {
+        EmbeddingRequest { text, doc_id, chunk_id }
+    }
+}
+
+# ============================================================================
+# EmbeddingResult — Result of embedding operation
+# ============================================================================
+
+S EmbeddingResult {
+    chunk_id: u64,
+    vector: Vec<f32>,
+    model_id: u32,
+    model_version: u32,
+}
+
+# ============================================================================
+# ReindexProgress — Track background reindex progress
+# ============================================================================
+
+S ReindexProgress {
+    index_id: u32,
+    old_model_id: u32,
+    new_model_id: u32,
+    total_vectors: u64,
+    processed_vectors: u64,
+    status: u8,                 # REINDEX_STATUS_*
+    strategy: u8,               # REINDEX_STRATEGY_*
+    started_at: i64,
+    error_message: Str,
+}
+
+X ReindexProgress {
+    F new(index_id: u32, old_model_id: u32, new_model_id: u32,
+          total: u64, strategy: u8) -> ReindexProgress {
+        ReindexProgress {
+            index_id,
+            old_model_id,
+            new_model_id,
+            total_vectors: total,
+            processed_vectors: 0,
+            status: REINDEX_STATUS_RUNNING,
+            strategy,
+            started_at: 0,
+            error_message: Str.new(),
+        }
+    }
+
+    ## Calculate completion percentage
+    F percent_complete(self) -> f64 {
+        I self.total_vectors == 0 {
+            R 100.0;
+        }
+        (self.processed_vectors as f64 / self.total_vectors as f64) * 100.0
+    }
+
+    ## Estimate remaining time based on current rate (seconds)
+    F estimated_remaining_seconds(self, current_time: i64) -> u64 {
+        I self.processed_vectors == 0 || self.started_at == 0 {
+            R 0;
+        }
+        elapsed := mut (current_time - self.started_at) as u64;
+        I elapsed == 0 {
+            R 0;
+        }
+        rate := mut self.processed_vectors as f64 / elapsed as f64;
+        I rate < 0.001 {
+            R 0;
+        }
+        remaining := mut self.total_vectors - self.processed_vectors;
+        (remaining as f64 / rate) as u64
+    }
+
+    ## Mark as complete
+    F mark_complete(mut self) {
+        self.status = REINDEX_STATUS_COMPLETE;
+        self.processed_vectors = self.total_vectors;
+    }
+
+    ## Mark as failed
+    F mark_failed(mut self, error: Str) {
+        self.status = REINDEX_STATUS_FAILED;
+        self.error_message = error;
+    }
+
+    ## Check if reindex is still running
+    F is_running(self) -> bool {
+        self.status == REINDEX_STATUS_RUNNING
+    }
+}
+
+# ============================================================================
+# EmbeddingManager — Orchestrate embedding operations
+# ============================================================================
+
+S EmbeddingManager {
+    registry: EmbeddingModelRegistry,
+    reindex_progress: Option<ReindexProgress>,
+    is_open: bool,
+    dual_embed_enabled: bool,   # True during reindex: embed with both old and new model
+}
+
+X EmbeddingManager {
+    F new() -> EmbeddingManager {
+        EmbeddingManager {
+            registry: EmbeddingModelRegistry.new(),
+            reindex_progress: None,
+            is_open: false,
+            dual_embed_enabled: false,
+        }
+    }
+
+    ## Open the embedding manager
+    F open(mut self) {
+        self.is_open = true;
+    }
+
+    ## Close the embedding manager
+    F close(mut self) {
+        self.is_open = false;
+        self.dual_embed_enabled = false;
+    }
+
+    ## Register a new embedding model
+    ## SET EMBEDDING_MODEL = 'openai:text-embedding-3-small'
+    F register_model(mut self, model_spec: &Str) -> Result<u32, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        # Parse model spec: "provider:model_name" or "provider:model_name:dimensions"
+        parts := mut model_spec.split(":");
+        I parts.len() < 2 {
+            R Err(err_rag_invalid_embedding_config(
+                "Model spec must be 'provider:model_name' (e.g., 'openai:text-embedding-3-small')"
+            ));
+        }
+
+        provider := mut parts.get(0).clone();
+        name := mut parts.get(1).clone();
+
+        # Determine dimensions based on known models
+        dimensions := mut resolve_model_dimensions(&provider, &name)?;
+
+        # Default to cosine distance
+        distance: u8 := mut 0;  # DISTANCE_COSINE
+
+        # Build API endpoint based on provider
+        endpoint := mut resolve_api_endpoint(&provider);
+
+        self.registry.register_model(
+            model_spec.clone(),
+            dimensions,
+            distance,
+            provider,
+            endpoint,
+        )
+    }
+
+    ## Get the currently active model
+    F active_model(self) -> Option<&EmbeddingModelInfo> {
+        self.registry.get_active_model()
+    }
+
+    ## Get model by ID
+    F get_model(self, model_id: u32) -> Option<&EmbeddingModelInfo> {
+        self.registry.get_model(model_id)
+    }
+
+    ## Embed text using the active model
+    ## For precomputed embeddings, this is a no-op (caller provides vector)
+    ## For external API models, this prepares the request (actual API call is external)
+    F prepare_embedding(self, text: &Str) -> Result<EmbeddingRequest, VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        M self.registry.get_active_model() {
+            Some(model) => {
+                I model.requires_api() {
+                    # External API: create request for the text
+                    Ok(EmbeddingRequest.new(text.clone(), 0, 0))
+                } E {
+                    # Precomputed or local: caller must provide vector
+                    Ok(EmbeddingRequest.new(text.clone(), 0, 0))
+                }
+            },
+            None => Err(err_rag_model_not_found(&"No active model")),
+        }
+    }
+
+    ## Validate a pre-computed vector against the active model
+    F validate_vector(self, vector: &Vec<f32>) -> Result<(), VaisError> {
+        M self.registry.get_active_model() {
+            Some(model) => model.validate_vector(vector),
+            None => Err(err_rag_model_not_found(&"No active model")),
+        }
+    }
+
+    ## Start background reindex after model change
+    ## ALTER EMBEDDING MODEL ... REINDEX STRATEGY = BACKGROUND
+    F start_reindex(mut self, index_id: u32, new_model_id: u32,
+                    total_vectors: u64, strategy: u8,
+                    current_time: i64) -> Result<(), VaisError> {
+        I !self.is_open {
+            R Err(err_rag_engine_closed());
+        }
+
+        # Check if reindex is already running
+        M &self.reindex_progress {
+            Some(progress) => {
+                I progress.is_running() {
+                    R Err(err_rag_reindex_in_progress(index_id));
+                }
+            },
+            None => {},
+        }
+
+        # Get current active model as old model
+        old_model_id: u32 := mut 0;
+        M self.registry.get_active_model() {
+            Some(model) => { old_model_id = model.model_id; },
+            None => {},
+        }
+
+        # Activate new model
+        self.registry.set_active(new_model_id)?;
+
+        # Bump version on new model
+        self.registry.bump_version(new_model_id)?;
+
+        # Enable dual embedding during reindex
+        self.dual_embed_enabled = true;
+
+        # Create progress tracker
+        progress := mut ReindexProgress.new(
+            index_id, old_model_id, new_model_id, total_vectors, strategy
+        );
+        progress.started_at = current_time;
+        self.reindex_progress = Some(progress);
+
+        Ok(())
+    }
+
+    ## Update reindex progress (called by background worker)
+    F update_reindex_progress(mut self, processed: u64) {
+        M &mut self.reindex_progress {
+            Some(progress) => {
+                progress.processed_vectors = processed;
+            },
+            None => {},
+        }
+    }
+
+    ## Complete the reindex
+    F complete_reindex(mut self) {
+        M &mut self.reindex_progress {
+            Some(progress) => {
+                progress.mark_complete();
+            },
+            None => {},
+        }
+        self.dual_embed_enabled = false;
+    }
+
+    ## Fail the reindex
+    F fail_reindex(mut self, error: Str) {
+        M &mut self.reindex_progress {
+            Some(progress) => {
+                progress.mark_failed(error);
+            },
+            None => {},
+        }
+        self.dual_embed_enabled = false;
+    }
+
+    ## Get reindex status for SHOW REINDEX STATUS
+    F get_reindex_status(self) -> Option<&ReindexProgress> {
+        M &self.reindex_progress {
+            Some(progress) => Some(progress),
+            None => None,
+        }
+    }
+
+    ## Check if dual embedding is active (during reindex)
+    F is_dual_embed_active(self) -> bool {
+        self.dual_embed_enabled
+    }
+
+    ## Get the old model ID during reindex (for dual embedding)
+    F get_reindex_old_model_id(self) -> Option<u32> {
+        M &self.reindex_progress {
+            Some(progress) => {
+                I progress.is_running() {
+                    Some(progress.old_model_id)
+                } E {
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
+    ## Access the registry directly
+    F registry(self) -> &EmbeddingModelRegistry {
+        &self.registry
+    }
+
+    ## Access the registry mutably
+    F registry_mut(mut self) -> &mut EmbeddingModelRegistry {
+        &mut self.registry
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+## Resolve model dimensions from known model names
+F resolve_model_dimensions(provider: &Str, name: &Str) -> Result<u32, VaisError> {
+    # OpenAI models
+    I *provider == "openai" {
+        I name.contains("text-embedding-3-small") {
+            R Ok(1536);
+        }
+        I name.contains("text-embedding-3-large") {
+            R Ok(3072);
+        }
+        I name.contains("text-embedding-ada-002") {
+            R Ok(1536);
+        }
+    }
+
+    # Cohere models
+    I *provider == "cohere" {
+        I name.contains("embed-english-v3") {
+            R Ok(1024);
+        }
+        I name.contains("embed-multilingual-v3") {
+            R Ok(1024);
+        }
+    }
+
+    # For unknown models, require explicit dimensions
+    Err(err_rag_invalid_embedding_config(
+        "Unknown model. Specify dimensions explicitly: 'provider:name:dimensions'"
+    ))
+}
+
+## Resolve API endpoint from provider
+F resolve_api_endpoint(provider: &Str) -> Str {
+    I *provider == "openai" {
+        R "https://api.openai.com/v1/embeddings";
+    }
+    I *provider == "cohere" {
+        R "https://api.cohere.ai/v1/embed";
+    }
+    I *provider == "local" || *provider == "precomputed" {
+        R Str.new();
+    }
+    Str.new()
+}
+
+## Format reindex status as human-readable string (for SHOW REINDEX STATUS)
+F format_reindex_status(progress: &ReindexProgress, current_time: i64) -> Str {
+    status_str := mut M progress.status {
+        0 => "IDLE",
+        1 => "RUNNING",
+        2 => "COMPLETE",
+        3 => "FAILED",
+        _ => "UNKNOWN",
+    };
+
+    pct := mut progress.percent_complete();
+    eta := mut progress.estimated_remaining_seconds(current_time);
+
+    I progress.status == 3 {
+        # Failed
+        "Reindex status: {status_str}\nIndex: {progress.index_id}\nError: {progress.error_message}"
+    } E I progress.status == 1 {
+        # Running
+        "Reindex status: {status_str}\nIndex: {progress.index_id}\nProgress: {progress.processed_vectors}/{progress.total_vectors} ({pct:.1}%)\nEstimated remaining: {eta}s"
+    } E {
+        "Reindex status: {status_str}\nIndex: {progress.index_id}\nProcessed: {progress.processed_vectors}/{progress.total_vectors}"
+    }
+}

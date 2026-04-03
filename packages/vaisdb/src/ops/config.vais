@@ -1,0 +1,450 @@
+# Production Operations — Configuration
+# Configurable settings for backup, metrics, profiling, VACUUM, log rotation
+# All configs use builder pattern consistent with other modules
+
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U ops/types.{
+    VACUUM_MODE_STANDARD, LOG_ROTATE_SIZE,
+    LogRotationConfig,
+};
+
+# ============================================================================
+# BackupConfig — Configuration for physical backup operations
+# ============================================================================
+
+S BackupConfig {
+    backup_dir: Str,                 # Directory to store backup files
+    archive_wal: bool,               # Include WAL segments in backup (for PITR)
+    wal_archive_dir: Str,            # WAL archive directory (separate from backup)
+    parallel_workers: u32,           # Parallel file copy workers (default 1)
+    checkpoint_before_backup: bool,  # Force checkpoint before backup starts
+    compress: bool,                  # Compress backup files (default false)
+    io_limit_mbps: u32,             # I/O throttle during backup (0 = unlimited)
+    verify_checksum: bool,           # Verify checksums after backup (default true)
+    label_prefix: Str,               # Prefix for auto-generated backup labels
+}
+
+X BackupConfig {
+    F default() -> BackupConfig {
+        BackupConfig {
+            backup_dir: "./backups",
+            archive_wal: true,
+            wal_archive_dir: "./wal_archive",
+            parallel_workers: 1,
+            checkpoint_before_backup: true,
+            compress: false,
+            io_limit_mbps: 0,
+            verify_checksum: true,
+            label_prefix: "backup",
+        }
+    }
+
+    ## Builder: set backup directory
+    F with_backup_dir(mut self, dir: Str) -> BackupConfig {
+        self.backup_dir = dir;
+        self
+    }
+
+    ## Builder: set WAL archiving
+    F with_wal_archive(mut self, enabled: bool, dir: Str) -> BackupConfig {
+        self.archive_wal = enabled;
+        self.wal_archive_dir = dir;
+        self
+    }
+
+    ## Builder: set parallel workers
+    F with_parallel_workers(mut self, count: u32) -> BackupConfig {
+        self.parallel_workers = I count < 1 { 1 } E { count };
+        self
+    }
+
+    ## Builder: set compression
+    F with_compress(mut self, compress: bool) -> BackupConfig {
+        self.compress = compress;
+        self
+    }
+
+    ## Builder: set I/O throttle
+    F with_io_limit(mut self, mbps: u32) -> BackupConfig {
+        self.io_limit_mbps = mbps;
+        self
+    }
+
+    ## Builder: set checksum verification
+    F with_verify_checksum(mut self, verify: bool) -> BackupConfig {
+        self.verify_checksum = verify;
+        self
+    }
+
+    ## Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        I self.backup_dir.len() == 0 {
+            R Err(VaisError.new(
+                "VAIS-0701006",
+                "Backup directory cannot be empty"
+            ));
+        }
+        I self.archive_wal && self.wal_archive_dir.len() == 0 {
+            R Err(VaisError.new(
+                "VAIS-0701007",
+                "WAL archive directory required when archive_wal is enabled"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# MetricsConfig — Configuration for metrics collection
+# ============================================================================
+
+S MetricsConfig {
+    enabled: bool,                   # Enable metrics collection (default true)
+    collection_interval_sec: u32,    # Interval between metric snapshots (default 10)
+    retention_seconds: u32,          # How long to keep metrics in memory (default 3600)
+    expose_http: bool,               # Expose /metrics HTTP endpoint (default true)
+    health_endpoint: bool,           # Expose /health endpoint (default true)
+    readiness_endpoint: bool,        # Expose /ready endpoint (default true)
+    # Per-engine collection toggles
+    collect_buffer_pool: bool,       # Collect buffer pool metrics (default true)
+    collect_wal: bool,               # Collect WAL metrics (default true)
+    collect_txn: bool,               # Collect transaction metrics (default true)
+    collect_vector: bool,            # Collect vector engine metrics (default true)
+    collect_graph: bool,             # Collect graph engine metrics (default true)
+    collect_fulltext: bool,          # Collect full-text metrics (default true)
+    # Latency histogram configuration
+    latency_buckets_ms: u32,         # Number of histogram buckets (default 20)
+    latency_max_ms: u64,             # Maximum latency bucket (default 60000 = 60s)
+}
+
+X MetricsConfig {
+    F default() -> MetricsConfig {
+        MetricsConfig {
+            enabled: true,
+            collection_interval_sec: 10,
+            retention_seconds: 3600,
+            expose_http: true,
+            health_endpoint: true,
+            readiness_endpoint: true,
+            collect_buffer_pool: true,
+            collect_wal: true,
+            collect_txn: true,
+            collect_vector: true,
+            collect_graph: true,
+            collect_fulltext: true,
+            latency_buckets_ms: 20,
+            latency_max_ms: 60000,
+        }
+    }
+
+    ## Builder: set collection interval
+    F with_interval(mut self, secs: u32) -> MetricsConfig {
+        self.collection_interval_sec = I secs < 1 { 1 } E { secs };
+        self
+    }
+
+    ## Builder: set retention
+    F with_retention(mut self, secs: u32) -> MetricsConfig {
+        self.retention_seconds = secs;
+        self
+    }
+
+    ## Builder: disable all engine metrics
+    F with_engines_disabled(mut self) -> MetricsConfig {
+        self.collect_buffer_pool = false;
+        self.collect_wal = false;
+        self.collect_txn = false;
+        self.collect_vector = false;
+        self.collect_graph = false;
+        self.collect_fulltext = false;
+        self
+    }
+
+    ## Builder: set HTTP endpoint toggle
+    F with_http(mut self, enabled: bool) -> MetricsConfig {
+        self.expose_http = enabled;
+        self
+    }
+
+    ## Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        I self.collection_interval_sec == 0 {
+            R Err(VaisError.new(
+                "VAIS-0710004",
+                "Metrics collection interval must be > 0"
+            ));
+        }
+        I self.latency_buckets_ms == 0 {
+            R Err(VaisError.new(
+                "VAIS-0710005",
+                "Latency histogram buckets must be > 0"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# VacuumConfig — Configuration for VACUUM operations
+# ============================================================================
+
+S VacuumConfig {
+    mode: u8,                        # VACUUM_MODE_* (default STANDARD)
+    io_limit_mbps: u32,             # I/O throttle (0 = use server gc_io_limit_mbps)
+    min_dead_tuple_percent: f64,    # Skip tables below this threshold (default 10.0)
+    skip_locked: bool,               # Skip tables with conflicting locks
+    truncate: bool,                  # Truncate file after vacuum (default true)
+    undo_retention_txns: u32,        # Keep undo for last N committed txns (default 100)
+    parallel_workers: u32,           # Parallel workers (VACUUM FULL only, default 1)
+}
+
+X VacuumConfig {
+    F default() -> VacuumConfig {
+        VacuumConfig {
+            mode: VACUUM_MODE_STANDARD,
+            io_limit_mbps: 0,
+            min_dead_tuple_percent: 10.0,
+            skip_locked: false,
+            truncate: true,
+            undo_retention_txns: 100,
+            parallel_workers: 1,
+        }
+    }
+
+    ## Builder: set mode
+    F with_mode(mut self, mode: u8) -> VacuumConfig {
+        self.mode = mode;
+        self
+    }
+
+    ## Builder: set I/O throttle
+    F with_io_limit(mut self, mbps: u32) -> VacuumConfig {
+        self.io_limit_mbps = mbps;
+        self
+    }
+
+    ## Builder: set dead tuple threshold
+    F with_dead_tuple_threshold(mut self, percent: f64) -> VacuumConfig {
+        self.min_dead_tuple_percent = percent;
+        self
+    }
+
+    ## Builder: set skip_locked
+    F with_skip_locked(mut self, skip: bool) -> VacuumConfig {
+        self.skip_locked = skip;
+        self
+    }
+
+    ## Builder: set truncate
+    F with_truncate(mut self, truncate: bool) -> VacuumConfig {
+        self.truncate = truncate;
+        self
+    }
+
+    ## Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        I self.min_dead_tuple_percent < 0.0 || self.min_dead_tuple_percent > 100.0 {
+            R Err(VaisError.new(
+                "VAIS-0702005",
+                "min_dead_tuple_percent must be between 0.0 and 100.0"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# ReindexConfig — Configuration for REINDEX operations
+# ============================================================================
+
+S ReindexConfig {
+    concurrently: bool,              # Build new index concurrently (non-blocking)
+    io_limit_mbps: u32,             # I/O throttle (0 = unlimited)
+    tablespace: Option<Str>,         # Target tablespace (future use)
+}
+
+X ReindexConfig {
+    F default() -> ReindexConfig {
+        ReindexConfig {
+            concurrently: false,
+            io_limit_mbps: 0,
+            tablespace: None,
+        }
+    }
+
+    ## Builder: set concurrent mode
+    F with_concurrently(mut self, concurrently: bool) -> ReindexConfig {
+        self.concurrently = concurrently;
+        self
+    }
+
+    ## Builder: set I/O throttle
+    F with_io_limit(mut self, mbps: u32) -> ReindexConfig {
+        self.io_limit_mbps = mbps;
+        self
+    }
+}
+
+# ============================================================================
+# CompactionConfig — Configuration for database file compaction
+# ============================================================================
+
+S CompactionConfig {
+    io_limit_mbps: u32,             # I/O throttle (0 = unlimited)
+    min_fragmentation_percent: f64, # Only compact if fragmentation >= this (default 20.0)
+    compact_data: bool,              # Compact data.vdb (default true)
+    compact_vectors: bool,           # Compact vectors.vdb (default true)
+    compact_graph: bool,             # Compact graph.vdb (default true)
+    compact_fulltext: bool,          # Compact fulltext.vdb (default true)
+}
+
+X CompactionConfig {
+    F default() -> CompactionConfig {
+        CompactionConfig {
+            io_limit_mbps: 0,
+            min_fragmentation_percent: 20.0,
+            compact_data: true,
+            compact_vectors: true,
+            compact_graph: true,
+            compact_fulltext: true,
+        }
+    }
+
+    ## Builder: set I/O throttle
+    F with_io_limit(mut self, mbps: u32) -> CompactionConfig {
+        self.io_limit_mbps = mbps;
+        self
+    }
+
+    ## Builder: set fragmentation threshold
+    F with_min_fragmentation(mut self, percent: f64) -> CompactionConfig {
+        self.min_fragmentation_percent = percent;
+        self
+    }
+
+    ## Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        I self.min_fragmentation_percent < 0.0 || self.min_fragmentation_percent > 100.0 {
+            R Err(VaisError.new(
+                "VAIS-0702006",
+                "min_fragmentation_percent must be between 0.0 and 100.0"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# SlowQueryConfig — Configuration for slow query logging
+# ============================================================================
+
+S SlowQueryConfig {
+    enabled: bool,                   # Enable slow query logging (default true)
+    threshold_ms: u32,               # Queries slower than this are logged (default 1000)
+    log_plan: bool,                  # Include query plan in log (default true)
+    log_parameters: bool,            # Include query parameters (default false, privacy)
+    max_query_length: u32,           # Truncate query text beyond this (default 4096)
+    ring_buffer_size: u32,           # Max entries in memory ring buffer (default 1000)
+    log_to_file: bool,               # Also write to slow query log file (default true)
+    file_path: Str,                  # Slow query log file path
+}
+
+X SlowQueryConfig {
+    F default() -> SlowQueryConfig {
+        SlowQueryConfig {
+            enabled: true,
+            threshold_ms: 1000,
+            log_plan: true,
+            log_parameters: false,
+            max_query_length: 4096,
+            ring_buffer_size: 1000,
+            log_to_file: true,
+            file_path: "slow_query.log",
+        }
+    }
+
+    ## Builder: set threshold
+    F with_threshold(mut self, ms: u32) -> SlowQueryConfig {
+        self.threshold_ms = ms;
+        self
+    }
+
+    ## Builder: set plan logging
+    F with_log_plan(mut self, log: bool) -> SlowQueryConfig {
+        self.log_plan = log;
+        self
+    }
+
+    ## Builder: set ring buffer size
+    F with_ring_buffer(mut self, size: u32) -> SlowQueryConfig {
+        self.ring_buffer_size = I size < 10 { 10 } E { size };
+        self
+    }
+
+    ## Builder: set file path
+    F with_file_path(mut self, path: Str) -> SlowQueryConfig {
+        self.file_path = path;
+        self
+    }
+
+    ## Validate configuration
+    F validate(self) -> Result<(), VaisError> {
+        I self.threshold_ms == 0 {
+            R Err(VaisError.new(
+                "VAIS-0703003",
+                "Slow query threshold must be > 0ms"
+            ));
+        }
+        I self.max_query_length < 64 {
+            R Err(VaisError.new(
+                "VAIS-0703004",
+                "max_query_length must be >= 64"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# OpsConfig — Top-level operations configuration (aggregates all sub-configs)
+# ============================================================================
+
+## Aggregates all production operations configurations.
+## Typically constructed once from server config + defaults and shared
+## across the ops module.
+S OpsConfig {
+    backup: BackupConfig,
+    metrics: MetricsConfig,
+    vacuum: VacuumConfig,
+    reindex: ReindexConfig,
+    compaction: CompactionConfig,
+    slow_query: SlowQueryConfig,
+    log_rotation: LogRotationConfig,
+}
+
+X OpsConfig {
+    ## Create default operations configuration
+    F default() -> OpsConfig {
+        OpsConfig {
+            backup: BackupConfig.default(),
+            metrics: MetricsConfig.default(),
+            vacuum: VacuumConfig.default(),
+            reindex: ReindexConfig.default(),
+            compaction: CompactionConfig.default(),
+            slow_query: SlowQueryConfig.default(),
+            log_rotation: LogRotationConfig.default(),
+        }
+    }
+
+    ## Validate all sub-configurations
+    F validate(self) -> Result<(), VaisError> {
+        self.backup.validate()?;
+        self.metrics.validate()?;
+        self.vacuum.validate()?;
+        self.compaction.validate()?;
+        self.slow_query.validate()?;
+        Ok(())
+    }
+}

@@ -1,0 +1,744 @@
+# Hybrid Query Planner — Cross-Engine Optimizer
+# Transforms an initial hybrid plan into an optimized plan via rewrite rules.
+#
+# Optimization passes:
+# 1. Predicate pushdown into engine-specific nodes
+# 2. Score fusion method selection (WeightedSum vs RRF)
+# 3. Join ordering for cross-engine joins (smaller side as build)
+# 4. Plan enumeration — generate candidate plans and pick cheapest
+# 5. Engine selection — choose best index type per predicate
+#
+# The optimizer works on HybridPlanNode trees, applying rewrites bottom-up.
+
+U storage/error.{VaisError};
+U sql/parser/ast.{Expr, BinOp, JoinType};
+U sql/planner/mod.{CostEstimate, PlanNode, estimate_selectivity};
+U planner/types.{
+    HybridPlanNode, HybridCost, EngineType, FusionMethod,
+    VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+    QueryProfile, err_hybrid_plan_failed, err_hybrid_unsupported_combo
+};
+U planner/cost_model.{
+    HybridStats, VectorIndexStats, GraphStats, FullTextStats,
+    estimate_vector_scan_cost, estimate_graph_traverse_cost,
+    estimate_fulltext_scan_cost, estimate_fusion_cost,
+    estimate_cross_engine_join_cost, estimate_hybrid_cost,
+    is_cheaper
+};
+
+# ============================================================================
+# Optimizer Configuration
+# ============================================================================
+
+S OptimizerConfig {
+    max_plan_candidates: u32,          # Max candidate plans to enumerate
+    enable_predicate_pushdown: bool,
+    enable_join_reorder: bool,
+    enable_fusion_selection: bool,
+    default_fusion_method: FusionMethod,
+    memory_budget: u64,                # Memory budget in bytes for plan selection
+}
+
+X OptimizerConfig {
+    F default() -> OptimizerConfig {
+        OptimizerConfig {
+            max_plan_candidates: 16,
+            enable_predicate_pushdown: true,
+            enable_join_reorder: true,
+            enable_fusion_selection: true,
+            default_fusion_method: FusionMethod.ReciprocalRankFusion { k: 60 },
+            memory_budget: 256 * 1024 * 1024,  # 256MB
+        }
+    }
+}
+
+# ============================================================================
+# Main Optimizer Entry Point
+# ============================================================================
+
+# Optimize a hybrid plan using all available rewrite rules
+F optimize_plan(
+    plan: HybridPlanNode,
+    stats: &HybridStats,
+    config: &OptimizerConfig,
+) -> Result<HybridPlanNode, VaisError> {
+    optimized := mut plan;
+
+    # Pass 1: Predicate pushdown — push filters into engine scan nodes
+    I config.enable_predicate_pushdown {
+        optimized = push_predicates_down(optimized)?;
+    }
+
+    # Pass 2: Score fusion method selection
+    I config.enable_fusion_selection {
+        optimized = select_fusion_method(optimized, stats)?;
+    }
+
+    # Pass 3: Cross-engine join reordering
+    I config.enable_join_reorder {
+        optimized = reorder_joins(optimized)?;
+    }
+
+    # Pass 4: Recalculate costs after all rewrites
+    optimized = recalculate_costs(optimized, stats)?;
+
+    Ok(optimized)
+}
+
+# ============================================================================
+# Pass 1: Predicate Pushdown
+# ============================================================================
+
+# Push HybridFilter predicates down into engine-specific scan nodes
+# If the predicate only references columns from a single engine scan,
+# merge it into that scan's filter field
+F push_predicates_down(plan: HybridPlanNode) -> Result<HybridPlanNode, VaisError> {
+    M plan {
+        # Filter on top of a VectorScan → push into pre/post filter
+        HybridPlanNode.HybridFilter { input, predicate, cost } => {
+            M *input {
+                HybridPlanNode.VectorScan { params, alias, cost: scan_cost } => {
+                    sel := mut estimate_selectivity(&predicate);
+                    new_params := mut params;
+
+                    I sel < 0.01 {
+                        # Very selective → pre-filter (bitmap scan before HNSW)
+                        new_params.pre_filter = Some(merge_predicates(new_params.pre_filter, predicate));
+                    } E {
+                        # Not very selective → post-filter (filter after HNSW search)
+                        new_params.post_filter = Some(merge_predicates(new_params.post_filter, predicate));
+                    }
+
+                    Ok(HybridPlanNode.VectorScan {
+                        params: new_params,
+                        alias,
+                        cost: scan_cost,
+                    })
+                },
+
+                HybridPlanNode.GraphTraverse { params, alias, cost: scan_cost } => {
+                    # Push filter into graph traversal's filter field
+                    new_params := mut params;
+                    new_params.filter = Some(merge_predicates(new_params.filter, predicate));
+
+                    Ok(HybridPlanNode.GraphTraverse {
+                        params: new_params,
+                        alias,
+                        cost: scan_cost,
+                    })
+                },
+
+                HybridPlanNode.FullTextScan { params, alias, cost: scan_cost } => {
+                    # Push filter into full-text scan's filter field
+                    new_params := mut params;
+                    new_params.filter = Some(merge_predicates(new_params.filter, predicate));
+
+                    Ok(HybridPlanNode.FullTextScan {
+                        params: new_params,
+                        alias,
+                        cost: scan_cost,
+                    })
+                },
+
+                # Can't push down into other node types — keep filter
+                other => {
+                    child := mut push_predicates_down(other)?;
+                    Ok(HybridPlanNode.HybridFilter {
+                        input: Box.new(child),
+                        predicate,
+                        cost,
+                    })
+                },
+            }
+        },
+
+        # Recursively push down through other node types
+        HybridPlanNode.HybridProject { input, columns, cost } => {
+            child := mut push_predicates_down(*input)?;
+            Ok(HybridPlanNode.HybridProject {
+                input: Box.new(child),
+                columns,
+                cost,
+            })
+        },
+
+        HybridPlanNode.HybridSort { input, order_by, cost } => {
+            child := mut push_predicates_down(*input)?;
+            Ok(HybridPlanNode.HybridSort {
+                input: Box.new(child),
+                order_by,
+                cost,
+            })
+        },
+
+        HybridPlanNode.HybridLimit { input, limit, offset, cost } => {
+            child := mut push_predicates_down(*input)?;
+            Ok(HybridPlanNode.HybridLimit {
+                input: Box.new(child),
+                limit,
+                offset,
+                cost,
+            })
+        },
+
+        HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, cost } => {
+            child := mut push_predicates_down(*input)?;
+            Ok(HybridPlanNode.HybridAggregate {
+                input: Box.new(child),
+                group_by,
+                aggregates,
+                having,
+                cost,
+            })
+        },
+
+        HybridPlanNode.ScoreFusion { left, right, method, top_k, cost } => {
+            new_left := mut push_predicates_down(*left)?;
+            new_right := mut push_predicates_down(*right)?;
+            Ok(HybridPlanNode.ScoreFusion {
+                left: Box.new(new_left),
+                right: Box.new(new_right),
+                method,
+                top_k,
+                cost,
+            })
+        },
+
+        HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, cost } => {
+            new_left := mut push_predicates_down(*left)?;
+            new_right := mut push_predicates_down(*right)?;
+            Ok(HybridPlanNode.CrossEngineJoin {
+                left: Box.new(new_left),
+                right: Box.new(new_right),
+                join_type,
+                condition,
+                cost,
+            })
+        },
+
+        # Leaf nodes — no pushdown needed
+        other => Ok(other),
+    }
+}
+
+# Merge a new predicate with an existing optional predicate using AND
+F merge_predicates(existing: Option<Expr>, new_pred: Expr) -> Expr {
+    M existing {
+        Some(old) => {
+            Expr.BinaryOp {
+                left: Box.new(old),
+                op: BinOp.And,
+                right: Box.new(new_pred),
+            }
+        },
+        None => new_pred,
+    }
+}
+
+# ============================================================================
+# Pass 2: Score Fusion Method Selection
+# ============================================================================
+
+# Choose the best fusion method based on engine characteristics:
+# - Vector + FullText: RRF (heterogeneous score distributions)
+# - Vector + Graph: WeightedSum (both produce similarity/proximity in [0,1])
+# - FullText + Graph: RRF (heterogeneous)
+# - Any 3+ engines: RRF (always safe for heterogeneous)
+F select_fusion_method(
+    plan: HybridPlanNode,
+    stats: &HybridStats,
+) -> Result<HybridPlanNode, VaisError> {
+    M plan {
+        HybridPlanNode.ScoreFusion { left, right, method, top_k, cost } => {
+            new_left := mut select_fusion_method(*left, stats)?;
+            new_right := mut select_fusion_method(*right, stats)?;
+
+            # Determine engines involved in left and right
+            left_engine := mut new_left.engine_type();
+            right_engine := mut new_right.engine_type();
+
+            selected_method := mut choose_fusion_for_engines(left_engine, right_engine);
+
+            Ok(HybridPlanNode.ScoreFusion {
+                left: Box.new(new_left),
+                right: Box.new(new_right),
+                method: selected_method,
+                top_k,
+                cost,
+            })
+        },
+
+        # Recurse into children
+        HybridPlanNode.HybridFilter { input, predicate, cost } => {
+            child := mut select_fusion_method(*input, stats)?;
+            Ok(HybridPlanNode.HybridFilter { input: Box.new(child), predicate, cost })
+        },
+        HybridPlanNode.HybridProject { input, columns, cost } => {
+            child := mut select_fusion_method(*input, stats)?;
+            Ok(HybridPlanNode.HybridProject { input: Box.new(child), columns, cost })
+        },
+        HybridPlanNode.HybridSort { input, order_by, cost } => {
+            child := mut select_fusion_method(*input, stats)?;
+            Ok(HybridPlanNode.HybridSort { input: Box.new(child), order_by, cost })
+        },
+        HybridPlanNode.HybridLimit { input, limit, offset, cost } => {
+            child := mut select_fusion_method(*input, stats)?;
+            Ok(HybridPlanNode.HybridLimit { input: Box.new(child), limit, offset, cost })
+        },
+        HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, cost } => {
+            child := mut select_fusion_method(*input, stats)?;
+            Ok(HybridPlanNode.HybridAggregate { input: Box.new(child), group_by, aggregates, having, cost })
+        },
+        HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, cost } => {
+            new_left := mut select_fusion_method(*left, stats)?;
+            new_right := mut select_fusion_method(*right, stats)?;
+            Ok(HybridPlanNode.CrossEngineJoin { left: Box.new(new_left), right: Box.new(new_right), join_type, condition, cost })
+        },
+
+        other => Ok(other),
+    }
+}
+
+# Choose fusion method based on engine pair
+F choose_fusion_for_engines(left: EngineType, right: EngineType) -> FusionMethod {
+    M (left, right) {
+        # Vector + Graph: both produce [0,1] similarity scores → weighted sum works well
+        (EngineType.Vector, EngineType.Graph) | (EngineType.Graph, EngineType.Vector) => {
+            FusionMethod.WeightedSum { weight_a: 0.7, weight_b: 0.3 }
+        },
+
+        # Vector + FullText: heterogeneous (distance vs BM25) → RRF is more robust
+        (EngineType.Vector, EngineType.FullText) | (EngineType.FullText, EngineType.Vector) => {
+            FusionMethod.ReciprocalRankFusion { k: 60 }
+        },
+
+        # FullText + Graph: heterogeneous → RRF
+        (EngineType.FullText, EngineType.Graph) | (EngineType.Graph, EngineType.FullText) => {
+            FusionMethod.ReciprocalRankFusion { k: 60 }
+        },
+
+        # Same engine or hybrid: weighted sum (equal weights)
+        _ => {
+            FusionMethod.WeightedSum { weight_a: 0.5, weight_b: 0.5 }
+        },
+    }
+}
+
+# ============================================================================
+# Pass 3: Cross-Engine Join Reordering
+# ============================================================================
+
+# Reorder cross-engine joins so the smaller side is the build side.
+# For engine scans, "smaller" means fewer estimated output rows.
+F reorder_joins(plan: HybridPlanNode) -> Result<HybridPlanNode, VaisError> {
+    M plan {
+        HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, cost } => {
+            new_left := mut reorder_joins(*left)?;
+            new_right := mut reorder_joins(*right)?;
+
+            left_rows := mut new_left.row_estimate();
+            right_rows := mut new_right.row_estimate();
+
+            # For INNER joins, put smaller side on left (build side of hash join)
+            M join_type {
+                JoinType.Inner | JoinType.Cross => {
+                    I right_rows < left_rows {
+                        # Swap: smaller on left
+                        Ok(HybridPlanNode.CrossEngineJoin {
+                            left: Box.new(new_right),
+                            right: Box.new(new_left),
+                            join_type,
+                            condition,
+                            cost,
+                        })
+                    } E {
+                        Ok(HybridPlanNode.CrossEngineJoin {
+                            left: Box.new(new_left),
+                            right: Box.new(new_right),
+                            join_type,
+                            condition,
+                            cost,
+                        })
+                    }
+                },
+                # LEFT/RIGHT joins: cannot reorder (semantics change)
+                _ => {
+                    Ok(HybridPlanNode.CrossEngineJoin {
+                        left: Box.new(new_left),
+                        right: Box.new(new_right),
+                        join_type,
+                        condition,
+                        cost,
+                    })
+                },
+            }
+        },
+
+        HybridPlanNode.ScoreFusion { left, right, method, top_k, cost } => {
+            new_left := mut reorder_joins(*left)?;
+            new_right := mut reorder_joins(*right)?;
+            Ok(HybridPlanNode.ScoreFusion { left: Box.new(new_left), right: Box.new(new_right), method, top_k, cost })
+        },
+
+        HybridPlanNode.HybridFilter { input, predicate, cost } => {
+            child := mut reorder_joins(*input)?;
+            Ok(HybridPlanNode.HybridFilter { input: Box.new(child), predicate, cost })
+        },
+        HybridPlanNode.HybridProject { input, columns, cost } => {
+            child := mut reorder_joins(*input)?;
+            Ok(HybridPlanNode.HybridProject { input: Box.new(child), columns, cost })
+        },
+        HybridPlanNode.HybridSort { input, order_by, cost } => {
+            child := mut reorder_joins(*input)?;
+            Ok(HybridPlanNode.HybridSort { input: Box.new(child), order_by, cost })
+        },
+        HybridPlanNode.HybridLimit { input, limit, offset, cost } => {
+            child := mut reorder_joins(*input)?;
+            Ok(HybridPlanNode.HybridLimit { input: Box.new(child), limit, offset, cost })
+        },
+        HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, cost } => {
+            child := mut reorder_joins(*input)?;
+            Ok(HybridPlanNode.HybridAggregate { input: Box.new(child), group_by, aggregates, having, cost })
+        },
+
+        other => Ok(other),
+    }
+}
+
+# ============================================================================
+# Pass 4: Cost Recalculation
+# ============================================================================
+
+# Recalculate costs bottom-up after all rewrites have been applied
+F recalculate_costs(
+    plan: HybridPlanNode,
+    stats: &HybridStats,
+) -> Result<HybridPlanNode, VaisError> {
+    M plan {
+        HybridPlanNode.VectorScan { params, alias, .. } => {
+            # Find matching vector stats
+            vs := mut M stats.find_vector_stats(0) {
+                Some(s) => s,
+                None => &VectorIndexStats.default(1536),  # Reasonable default
+            };
+            cost := mut estimate_vector_scan_cost(&params, vs);
+            Ok(HybridPlanNode.VectorScan { params, alias, cost })
+        },
+
+        HybridPlanNode.GraphTraverse { params, alias, .. } => {
+            gs := mut M &stats.graph_stats {
+                Some(s) => s,
+                None => &GraphStats.default(),
+            };
+            cost := mut estimate_graph_traverse_cost(&params, gs);
+            Ok(HybridPlanNode.GraphTraverse { params, alias, cost })
+        },
+
+        HybridPlanNode.FullTextScan { params, alias, .. } => {
+            fs := mut M &stats.fulltext_stats {
+                Some(s) => s,
+                None => &FullTextStats.default(),
+            };
+            cost := mut estimate_fulltext_scan_cost(&params, fs);
+            Ok(HybridPlanNode.FullTextScan { params, alias, cost })
+        },
+
+        HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
+            new_left := mut recalculate_costs(*left, stats)?;
+            new_right := mut recalculate_costs(*right, stats)?;
+            cost := mut estimate_fusion_cost(
+                new_left.get_cost(),
+                new_right.get_cost(),
+                &method,
+                top_k,
+            );
+            Ok(HybridPlanNode.ScoreFusion {
+                left: Box.new(new_left),
+                right: Box.new(new_right),
+                method,
+                top_k,
+                cost,
+            })
+        },
+
+        HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, .. } => {
+            new_left := mut recalculate_costs(*left, stats)?;
+            new_right := mut recalculate_costs(*right, stats)?;
+            cost := mut estimate_cross_engine_join_cost(
+                new_left.get_cost(),
+                new_right.get_cost(),
+            );
+            Ok(HybridPlanNode.CrossEngineJoin {
+                left: Box.new(new_left),
+                right: Box.new(new_right),
+                join_type,
+                condition,
+                cost,
+            })
+        },
+
+        HybridPlanNode.HybridFilter { input, predicate, .. } => {
+            child := mut recalculate_costs(*input, stats)?;
+            child_cost := mut child.get_cost().clone();
+            sel := mut estimate_selectivity(&predicate);
+            cost := mut HybridCost {
+                row_estimate: (child_cost.row_estimate as f64 * sel) as u64,
+                total_cpu_cost: child_cost.total_cpu_cost + child_cost.row_estimate as f64 * 0.01,
+                ..child_cost
+            };
+            Ok(HybridPlanNode.HybridFilter { input: Box.new(child), predicate, cost })
+        },
+
+        HybridPlanNode.HybridProject { input, columns, .. } => {
+            child := mut recalculate_costs(*input, stats)?;
+            cost := mut child.get_cost().clone();
+            cost.total_cpu_cost += cost.row_estimate as f64 * 0.001;
+            Ok(HybridPlanNode.HybridProject { input: Box.new(child), columns, cost })
+        },
+
+        HybridPlanNode.HybridSort { input, order_by, .. } => {
+            child := mut recalculate_costs(*input, stats)?;
+            cost := mut child.get_cost().clone();
+            n := mut cost.row_estimate as f64;
+            I n > 1.0 {
+                cost.total_cpu_cost += n * n.log2() * 0.01;
+            }
+            cost.total_memory_bytes += cost.row_estimate * 128;
+            Ok(HybridPlanNode.HybridSort { input: Box.new(child), order_by, cost })
+        },
+
+        HybridPlanNode.HybridLimit { input, limit, offset, .. } => {
+            child := mut recalculate_costs(*input, stats)?;
+            cost := mut child.get_cost().clone();
+            I limit.is_some() {
+                lim := mut limit!;
+                I lim < cost.row_estimate {
+                    cost.row_estimate = lim;
+                }
+            }
+            Ok(HybridPlanNode.HybridLimit { input: Box.new(child), limit, offset, cost })
+        },
+
+        HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, .. } => {
+            child := mut recalculate_costs(*input, stats)?;
+            cost := mut child.get_cost().clone();
+            n := mut cost.row_estimate as f64;
+            cost.total_cpu_cost += n * 0.05;
+            groups := mut I group_by.len() == 0 { 1u64 } E { (n * 0.1) as u64 };
+            I groups < 1 { groups = 1; }
+            cost.row_estimate = groups;
+            cost.total_memory_bytes += groups * 128;
+            Ok(HybridPlanNode.HybridAggregate { input: Box.new(child), group_by, aggregates, having, cost })
+        },
+
+        # SqlPlan: cost already set by SQL planner, pass through
+        other => Ok(other),
+    }
+}
+
+# ============================================================================
+# Plan Building from QueryProfile
+# ============================================================================
+
+# Build an initial (unoptimized) HybridPlanNode from a QueryProfile
+# This is the entry point before optimization passes
+F build_initial_plan(
+    profile: &QueryProfile,
+    stats: &HybridStats,
+) -> Result<HybridPlanNode, VaisError> {
+    # Collect engine scan nodes
+    engine_nodes: Vec<HybridPlanNode> := mut Vec.new();
+
+    # Build vector scan nodes
+    L vp: profile.vector_calls.iter() {
+        vs := mut M stats.find_vector_stats(0) {
+            Some(s) => s,
+            None => &VectorIndexStats.default(1536),
+        };
+        cost := mut estimate_vector_scan_cost(vp, vs);
+        engine_nodes.push(HybridPlanNode.VectorScan {
+            params: vp.clone(),
+            alias: None,
+            cost,
+        });
+    }
+
+    # Build graph traverse nodes
+    L gp: profile.graph_calls.iter() {
+        gs := mut M &stats.graph_stats {
+            Some(s) => s,
+            None => &GraphStats.default(),
+        };
+        cost := mut estimate_graph_traverse_cost(gp, gs);
+        engine_nodes.push(HybridPlanNode.GraphTraverse {
+            params: gp.clone(),
+            alias: None,
+            cost,
+        });
+    }
+
+    # Build fulltext scan nodes
+    L fp: profile.fulltext_calls.iter() {
+        fs := mut M &stats.fulltext_stats {
+            Some(s) => s,
+            None => &FullTextStats.default(),
+        };
+        cost := mut estimate_fulltext_scan_cost(fp, fs);
+        engine_nodes.push(HybridPlanNode.FullTextScan {
+            params: fp.clone(),
+            alias: None,
+            cost,
+        });
+    }
+
+    # Combine engine nodes
+    I engine_nodes.len() == 0 {
+        R Err(err_hybrid_plan_failed("No engine scan nodes detected".to_string()));
+    }
+
+    I engine_nodes.len() == 1 {
+        R Ok(engine_nodes.remove(0));
+    }
+
+    # Multiple engines: combine with score fusion (for ranking queries)
+    # or cross-engine join (for relational queries)
+    combined := mut engine_nodes.remove(0);
+    L node: engine_nodes.drain(..) {
+        # Default: score fusion for hybrid search, join for relational
+        left_cost := mut combined.get_cost().clone();
+        right_cost := mut node.get_cost().clone();
+
+        I profile.needs_score_fusion() {
+            fusion_cost := mut estimate_fusion_cost(&left_cost, &right_cost, &FusionMethod.default_rrf(), 10);
+            combined = HybridPlanNode.ScoreFusion {
+                left: Box.new(combined),
+                right: Box.new(node),
+                method: FusionMethod.default_rrf(),
+                top_k: 10,
+                cost: fusion_cost,
+            };
+        } E {
+            join_cost := mut estimate_cross_engine_join_cost(&left_cost, &right_cost);
+            combined = HybridPlanNode.CrossEngineJoin {
+                left: Box.new(combined),
+                right: Box.new(node),
+                join_type: JoinType.Inner,
+                condition: None,
+                cost: join_cost,
+            };
+        }
+    }
+
+    Ok(combined)
+}
+
+# ============================================================================
+# Index Selection — Choose Best Index per Predicate
+# ============================================================================
+
+# Engine-aware index selection: given a predicate, determine which engine index to use
+L IndexChoice {
+    BTreeIndex { table: Str, index_name: Str },
+    HnswIndex { table: Str, column: Str },
+    FullTextIndex { table: Str, column: Str },
+    SeqScan { table: Str },
+}
+
+# Select the best index for a predicate based on available indexes and selectivity
+F select_index(
+    predicate: &Expr,
+    table_name: &Str,
+    stats: &HybridStats,
+) -> IndexChoice {
+    sel := mut estimate_selectivity(predicate);
+
+    # If selectivity is very low (non-selective), prefer seq scan
+    I sel > 0.5 {
+        R IndexChoice.SeqScan { table: table_name.clone() };
+    }
+
+    # Check for vector search patterns (distance comparisons)
+    I is_vector_predicate(predicate) {
+        R IndexChoice.HnswIndex {
+            table: table_name.clone(),
+            column: extract_vector_column(predicate),
+        };
+    }
+
+    # Check for full-text search patterns (MATCH, CONTAINS)
+    I is_fulltext_predicate(predicate) {
+        R IndexChoice.FullTextIndex {
+            table: table_name.clone(),
+            column: extract_fulltext_column(predicate),
+        };
+    }
+
+    # Default: B+Tree for equality/range predicates
+    I sel <= 0.3 {
+        R IndexChoice.BTreeIndex {
+            table: table_name.clone(),
+            index_name: "auto".to_string(),
+        };
+    }
+
+    IndexChoice.SeqScan { table: table_name.clone() }
+}
+
+# Check I a predicate involves vector distance operations
+F is_vector_predicate(expr: &Expr) -> bool {
+    M expr {
+        Expr.FunctionCall { name, .. } => {
+            upper := mut name.to_uppercase();
+            upper == "VECTOR_SEARCH" || upper == "COSINE_DISTANCE" ||
+            upper == "L2_DISTANCE" || upper == "DOT_PRODUCT"
+        },
+        _ => false,
+    }
+}
+
+# Check I a predicate involves full-text search
+F is_fulltext_predicate(expr: &Expr) -> bool {
+    M expr {
+        Expr.FunctionCall { name, .. } => {
+            upper := mut name.to_uppercase();
+            upper == "FULLTEXT_MATCH" || upper == "MATCH" || upper == "CONTAINS"
+        },
+        _ => false,
+    }
+}
+
+# Extract vector column name from a vector predicate
+F extract_vector_column(expr: &Expr) -> Str {
+    M expr {
+        Expr.FunctionCall { args, .. } => {
+            I args.len() >= 2 {
+                M &args[1] {
+                    Expr.Literal { value } => value.to_string(),
+                    Expr.ColumnRef { column, .. } => column.clone(),
+                    _ => "embedding".to_string(),
+                }
+            } E {
+                "embedding".to_string()
+            }
+        },
+        _ => "embedding".to_string(),
+    }
+}
+
+# Extract full-text column name from a fulltext predicate
+F extract_fulltext_column(expr: &Expr) -> Str {
+    M expr {
+        Expr.FunctionCall { args, .. } => {
+            I args.len() >= 2 {
+                M &args[1] {
+                    Expr.Literal { value } => value.to_string(),
+                    Expr.ColumnRef { column, .. } => column.clone(),
+                    _ => "content".to_string(),
+                }
+            } E {
+                "content".to_string()
+            }
+        },
+        _ => "content".to_string(),
+    }
+}

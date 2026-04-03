@@ -1,0 +1,223 @@
+# WAL Truncation & Archiving
+# Based on Stage 2 Section 8 - WAL Truncation & Archiving
+#
+# After a successful checkpoint, WAL segments whose last LSN < checkpoint LSN
+# can be deleted. Also ensure no active transaction references records in those segments.
+#
+# Archiving: optionally copy old segments to archive path before deletion
+
+U std/file.{File, remove_file, copy_file, create_dir_all, read_dir};
+U std/sync.{Mutex};
+
+U storage/error.{VaisError, err_internal};
+U storage/wal/segment.{WalSegmentHeader, segment_filename};
+U storage/wal/lsn.{NULL_LSN, lsn_segment, lsn_compare};
+U storage/constants.{WAL_SEGMENT_HEADER_SIZE};
+U std/bytes.{ByteBuffer};
+
+# WAL archive mode
+L ArchiveMode = Off | On;
+
+# Truncation configuration
+S TruncationConfig {
+    archive_mode: ArchiveMode,
+    archive_path: Option<Str>,     # Path to archive directory
+    min_segments_to_keep: u32,     # Always keep at least N segments (default 2)
+}
+
+X TruncationConfig {
+    F default() -> TruncationConfig {
+        TruncationConfig {
+            archive_mode: ArchiveMode.Off,
+            archive_path: None,
+            min_segments_to_keep: 2,
+        }
+    }
+
+    F with_archive(archive_path: Str) -> TruncationConfig {
+        TruncationConfig {
+            archive_mode: ArchiveMode.On,
+            archive_path: Some(archive_path),
+            min_segments_to_keep: 2,
+        }
+    }
+}
+
+# Truncation result
+S TruncationResult {
+    segments_deleted: u32,
+    segments_archived: u32,
+    oldest_remaining_segment: u32,
+}
+
+# WAL Truncation Manager
+S TruncationManager {
+    wal_dir: Str,
+    config: TruncationConfig,
+    lock: Mutex,
+}
+
+X TruncationManager {
+    F new(wal_dir: Str, config: TruncationConfig) -> TruncationManager {
+        TruncationManager {
+            wal_dir,
+            config,
+            lock: Mutex.new(),
+        }
+    }
+
+    # Truncate WAL segments that are no longer needed
+    # Safe to delete segments where last_lsn < checkpoint_lsn
+    # AND no active transaction references records in those segments
+    F truncate(
+        mut self,
+        checkpoint_lsn: u64,
+        min_active_lsn: u64,  # Minimum LSN referenced by any active txn
+    ) -> Result<TruncationResult, VaisError> {
+        guard := mut self.lock.lock();
+
+        safe_lsn := mut I min_active_lsn != NULL_LSN && lsn_compare(min_active_lsn, checkpoint_lsn) < 0 {
+            min_active_lsn
+        } E {
+            checkpoint_lsn
+        };
+
+        safe_segment := mut lsn_segment(safe_lsn);
+
+        # Find all WAL segment files
+        segments := mut self.find_all_segments()?;
+        segments_deleted: u32 := mut 0;
+        segments_archived: u32 := mut 0;
+        oldest_remaining := mut safe_segment;
+
+        # Keep at least min_segments_to_keep
+        I segments.len() as u32 <= self.config.min_segments_to_keep {
+            drop(guard);
+            R Ok(TruncationResult {
+                segments_deleted: 0,
+                segments_archived: 0,
+                oldest_remaining_segment: M segments.first() {
+                    Some(&seg) => seg,
+                    None => 0,
+                },
+            });
+        }
+
+        L &seg_num: &segments {
+            # Check if segment is safe to remove
+            should_skip := mut false;
+            I seg_num >= safe_segment {
+                should_skip = true;  # Still needed
+            }
+
+            # Verify by reading segment header
+            I !should_skip {
+                seg_path := mut self.segment_path(seg_num);
+                M self.read_segment_last_lsn(&seg_path) {
+                    Ok(last_lsn) => {
+                        I lsn_compare(last_lsn, safe_lsn) >= 0 {
+                            should_skip = true;  # Segment contains records still needed
+                        }
+                    },
+                    Err(_) => { should_skip = true; },  # Can't read header, skip
+                }
+            }
+
+            I !should_skip {
+                # Archive before deletion if configured
+                seg_path := mut self.segment_path(seg_num);
+                M self.config.archive_mode {
+                    ArchiveMode.On => {
+                        M &self.config.archive_path {
+                            Some(ref archive_dir) => {
+                                self.archive_segment(seg_num, archive_dir)?;
+                                segments_archived += 1;
+                            },
+                            None => {},
+                        }
+                    },
+                    ArchiveMode.Off => {},
+                }
+
+                # Delete the segment file
+                remove_file(&seg_path)?;
+                segments_deleted += 1;
+            }
+        }
+
+        # Find oldest remaining segment
+        found_oldest := mut false;
+        L &seg_num: &segments {
+            I !found_oldest && seg_num >= safe_segment {
+                oldest_remaining = seg_num;
+                found_oldest = true;
+            }
+        }
+
+        drop(guard);
+        Ok(TruncationResult {
+            segments_deleted,
+            segments_archived,
+            oldest_remaining_segment: oldest_remaining,
+        })
+    }
+
+    # Archive a segment file to the archive directory
+    F archive_segment(self, segment_num: u32, archive_dir: &str) -> Result<(), VaisError> {
+        create_dir_all(archive_dir)?;
+        src := mut self.segment_path(segment_num);
+        filename := mut segment_filename(segment_num);
+        dst := mut archive_dir.to_string() + "/" + &filename;
+        copy_file(&src, &dst)?;
+        Ok(())
+    }
+
+    # Find all WAL segment files, sorted by segment number
+    F find_all_segments(self) -> Result<Vec<u32>, VaisError> {
+        entries := mut read_dir(&self.wal_dir)?;
+        segments: Vec<u32> := mut Vec.new();
+
+        L entry: &entries {
+            name := mut entry.file_name();
+            I name.ends_with(".wal") && name.len() == 10 {
+                M name[0..6].parse_u32() {
+                    Ok(num) => segments.push(num),
+                    Err(_) => {},
+                }
+            }
+        }
+
+        segments.sort();
+        Ok(segments)
+    }
+
+    # Read the last_lsn from a segment file's header
+    F read_segment_last_lsn(self, path: &str) -> Result<u64, VaisError> {
+        file := mut File.open(path, std/file.OpenMode.ReadOnly)?;
+        header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
+        header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8);
+        file.read_at(0, &header_buf)?;
+        buf := mut ByteBuffer.wrap_readonly(&header_buf);
+        seg_header := mut WalSegmentHeader.deserialize(&buf)?;
+        Ok(seg_header.last_lsn)
+    }
+
+    # Build segment file path
+    F segment_path(self, segment_num: u32) -> Str {
+        self.wal_dir.clone() + "/" + &segment_filename(segment_num)
+    }
+}
+
+# Calculate the minimum LSN referenced by any active transaction
+# Used to determine safe truncation point
+F min_active_txn_lsn(active_txns: &[(u64, u64)]) -> u64 {
+    min_lsn := mut NULL_LSN;
+
+    L &(_, first_lsn): active_txns {
+        I min_lsn == NULL_LSN || lsn_compare(first_lsn, min_lsn) < 0 {
+            min_lsn = first_lsn;
+        }
+    }
+
+    min_lsn
+}

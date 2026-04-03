@@ -1,0 +1,176 @@
+# WAL Record Serializer
+# Unified serialization/deserialization for all WAL record types
+# Based on Stage 2: WAL Design
+
+U storage/error.{VaisError, err_wal_corruption};
+U storage/wal/header.{WalRecordHeader};
+U storage/wal/record_types.*;
+U storage/wal/record_rel.*;
+U storage/wal/record_vector.*;
+U storage/wal/record_graph.*;
+U storage/wal/record_fulltext.*;
+U storage/checksum.{calculate_wal_checksum};
+U storage/constants.{WAL_RECORD_HEADER_SIZE};
+U std/bytes.{ByteBuffer};
+
+# WalRecord - Full WAL record (header + payload)
+S WalRecord {
+    header: WalRecordHeader,
+    payload: Vec<u8>,       # Serialized payload (varies by record_type)
+}
+
+X WalRecord {
+    # Create a new WAL record with payload
+    F new(header: WalRecordHeader, payload: Vec<u8>) -> WalRecord {
+        WalRecord { header, payload }
+    }
+
+    # Serialize full record to bytes (header + payload)
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.with_capacity(self.header.record_length as u64);
+        self.header.serialize(&mut buf);
+        buf.put_bytes(&self.payload);
+        buf.to_vec()
+    }
+
+    # Deserialize full record from bytes
+    F from_bytes(data: &[u8]) -> Result<WalRecord, VaisError> {
+        buf := mut ByteBuffer.from_slice(data);
+        header := mut WalRecordHeader.deserialize(&buf)?;
+
+        # Read payload (remaining bytes after header)
+        payload_len := mut (header.record_length as u64) - (WalRecordHeader.size() as u64);
+        payload := mut buf.get_bytes(payload_len)?;
+
+        Ok(WalRecord { header, payload })
+    }
+
+    # Verify checksum
+    F verify_checksum(self) -> bool {
+        full_record := mut self.to_bytes();
+        self.header.verify_checksum(&full_record)
+    }
+
+    # Compute and update checksum
+    F compute_checksum(&mut self) {
+        full_record := mut self.to_bytes();
+        self.header.set_checksum(&full_record);
+    }
+}
+
+# ============================================================================
+# WalRecordSerializer - Unified serializer for header + payload
+# ============================================================================
+
+S WalRecordSerializer {}
+
+X WalRecordSerializer {
+    # Serialize a complete WAL record (header + payload + checksum)
+    # Returns the full serialized record ready to write to WAL
+    F serialize_record(header: &WalRecordHeader, payload: &[u8]) -> Vec<u8> {
+        # Allocate buffer for header + payload
+        total_len := mut (WAL_RECORD_HEADER_SIZE as u64) + payload.len();
+        buf := mut ByteBuffer.with_capacity(total_len);
+
+        # Write header (checksum will be 0 initially)
+        header.serialize(&mut buf);
+
+        # Write payload
+        buf.put_bytes(payload);
+
+        # Get the full record bytes
+        record_bytes := mut buf.to_vec();
+
+        # Calculate checksum over the full record
+        checksum := mut calculate_wal_checksum(&record_bytes);
+
+        # Update checksum in the header (bytes 36-39)
+        record_bytes[36] = (checksum & 0xFF) as u8;
+        record_bytes[37] = ((checksum >> 8) & 0xFF) as u8;
+        record_bytes[38] = ((checksum >> 16) & 0xFF) as u8;
+        record_bytes[39] = ((checksum >> 24) & 0xFF) as u8;
+
+        record_bytes
+    }
+
+    # Deserialize a complete WAL record, splitting into header and payload
+    # Verifies checksum before returning
+    F deserialize_record(data: &[u8]) -> Result<(WalRecordHeader, Vec<u8>), VaisError> {
+        # Minimum size check
+        I data.len() < (WAL_RECORD_HEADER_SIZE as u64) {
+            R Err(err_wal_corruption(0));
+        }
+
+        # Parse header
+        buf := mut ByteBuffer.from_slice(data);
+        header := mut WalRecordHeader.deserialize(&buf)?;
+
+        # Verify record length matches data length
+        I (header.record_length as u64) != data.len() {
+            R Err(err_wal_corruption(header.lsn));
+        }
+
+        # Verify checksum
+        I !header.verify_checksum(data) {
+            R Err(err_wal_corruption(header.lsn));
+        }
+
+        # Extract payload (everything after header)
+        payload_len := mut data.len() - (WAL_RECORD_HEADER_SIZE as u64);
+        payload := mut buf.get_bytes(payload_len)?;
+
+        Ok((header, payload))
+    }
+
+    # Get human-readable name for a record type (for logging/debugging)
+    F record_type_name(record_type: u8) -> Str {
+        M record_type {
+            # Meta records (0x00-0x0F)
+            TXN_BEGIN => "TXN_BEGIN",
+            TXN_COMMIT => "TXN_COMMIT",
+            TXN_ABORT => "TXN_ABORT",
+            CHECKPOINT_BEGIN => "CHECKPOINT_BEGIN",
+            CHECKPOINT_END => "CHECKPOINT_END",
+            SCHEMA_CHANGE => "SCHEMA_CHANGE",
+            CLR => "CLR",
+            PAGE_ALLOC => "PAGE_ALLOC",
+            PAGE_DEALLOC => "PAGE_DEALLOC",
+            FPI => "FPI",
+
+            # Relational records (0x10-0x1F)
+            PAGE_WRITE => "PAGE_WRITE",
+            TUPLE_INSERT => "TUPLE_INSERT",
+            TUPLE_DELETE => "TUPLE_DELETE",
+            TUPLE_UPDATE => "TUPLE_UPDATE",
+            BTREE_SPLIT => "BTREE_SPLIT",
+            BTREE_MERGE => "BTREE_MERGE",
+            BTREE_INSERT => "BTREE_INSERT",
+            BTREE_DELETE => "BTREE_DELETE",
+
+            # Vector records (0x20-0x2F)
+            HNSW_INSERT_NODE => "HNSW_INSERT_NODE",
+            HNSW_DELETE_NODE => "HNSW_DELETE_NODE",
+            HNSW_UPDATE_EDGES => "HNSW_UPDATE_EDGES",
+            HNSW_LAYER_PROMOTE => "HNSW_LAYER_PROMOTE",
+            VECTOR_DATA_WRITE => "VECTOR_DATA_WRITE",
+            QUANTIZATION_UPDATE => "QUANTIZATION_UPDATE",
+
+            # Graph records (0x30-0x3F)
+            GRAPH_NODE_INSERT => "GRAPH_NODE_INSERT",
+            GRAPH_NODE_DELETE => "GRAPH_NODE_DELETE",
+            GRAPH_EDGE_INSERT => "GRAPH_EDGE_INSERT",
+            GRAPH_EDGE_DELETE => "GRAPH_EDGE_DELETE",
+            GRAPH_PROPERTY_UPDATE => "GRAPH_PROPERTY_UPDATE",
+            ADJ_LIST_PAGE_SPLIT => "ADJ_LIST_PAGE_SPLIT",
+
+            # Full-text records (0x40-0x4F)
+            POSTING_LIST_APPEND => "POSTING_LIST_APPEND",
+            POSTING_LIST_DELETE => "POSTING_LIST_DELETE",
+            DICTIONARY_INSERT => "DICTIONARY_INSERT",
+            DICTIONARY_DELETE => "DICTIONARY_DELETE",
+            TERM_FREQ_UPDATE => "TERM_FREQ_UPDATE",
+
+            _ => "UNKNOWN",
+        }
+    }
+}

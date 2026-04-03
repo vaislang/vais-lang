@@ -1,0 +1,543 @@
+# Security Engine — Unified facade for VaisDB security subsystem
+# Coordinates: user/role management, privilege checking, RLS policies,
+#              encryption, TLS, audit logging, and WAL integration.
+#
+# Architecture:
+#   SecurityEngine
+#     +-- UserManager       (user CRUD, authentication)
+#     +-- RoleManager       (role CRUD, inheritance resolution)
+#     +-- GrantManager      (GRANT/REVOKE, privilege storage)
+#     +-- PrivilegeChecker  (pre-query privilege middleware)
+#     +-- PolicyEngine      (RLS policy definitions)
+#     +-- RlsEvaluator      (RLS application to SQL/vector/graph)
+#     +-- KeyManager        (encryption keys, rotation)
+#     +-- TlsManager        (TLS connections)
+#     +-- AuditLogger       (append-only audit with checksum chain)
+#     +-- SecurityWalManager(WAL records 0x60-0x65)
+#     +-- InputSanitizer    (SQL injection defense)
+#     +-- ErrorSanitizer    (error message sanitization)
+#
+# Error codes: EE=09 (security engine), WAL types: 0x60-0x65
+# ENGINE_TAG_SECURITY = 0x06
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U storage/buffer/pool.{BufferPool};
+U storage/wal/group_commit.{GroupCommitManager};
+U sql/catalog/manager.{CatalogManager};
+U sql/parser/ast.{
+    CreateUserStmt, AlterUserStmt, CreateRoleStmt,
+    GrantStmt, RevokeStmt, CreatePolicyStmt,
+};
+U security/types.{
+    SecurityConfig, SecurityMeta, SessionContext,
+    UserInfo, RoleInfo, GrantEntry, PolicyEntry,
+    AuditEntry, EncryptionKeyInfo, PrivilegeCheck,
+    AUDIT_RESULT_SUCCESS, AUDIT_RESULT_FAILURE, AUDIT_RESULT_DENIED,
+    err_security_engine_closed,
+};
+U security/user.{UserManager};
+U security/role.{RoleManager};
+U security/grant.{GrantManager};
+U security/privilege.{PrivilegeChecker};
+U security/policy.{PolicyEngine};
+U security/rls.{RlsEvaluator};
+U security/encryption.{KeyManager, PageEncryptor, WalEncryptor};
+U security/tls.{TlsManager, TlsConfig, TlsConnection};
+U security/audit.{AuditLogger};
+U security/wal.{SecurityWalManager};
+U security/sanitizer.{InputSanitizer, ErrorSanitizer};
+
+# ============================================================================
+# SecurityEngine — Main facade for all security operations
+# ============================================================================
+
+S SecurityEngine {
+    config: SecurityConfig,
+    meta: SecurityMeta,
+    user_mgr: UserManager,
+    role_mgr: RoleManager,
+    grant_mgr: GrantManager,
+    policy_engine: PolicyEngine,
+    key_mgr: KeyManager,
+    tls_mgr: TlsManager,
+    audit_logger: AuditLogger,
+    input_sanitizer: InputSanitizer,
+    error_sanitizer: ErrorSanitizer,
+    initialized: bool,
+}
+
+X SecurityEngine {
+    ## Create a new security engine (not yet initialized)
+    F new(page_size: u32) -> SecurityEngine {
+        config := mut SecurityConfig.default(page_size);
+        meta := mut SecurityMeta.new(page_size);
+        SecurityEngine {
+            config: config,
+            meta,
+            user_mgr: UserManager.new(),
+            role_mgr: RoleManager.new(),
+            grant_mgr: GrantManager.new(),
+            policy_engine: PolicyEngine.new(),
+            key_mgr: KeyManager.disabled(),
+            tls_mgr: TlsManager.disabled(),
+            audit_logger: AuditLogger.disabled(),
+            input_sanitizer: InputSanitizer.new(),
+            error_sanitizer: ErrorSanitizer.new(),
+            initialized: false,
+        }
+    }
+
+    ## Initialize (open) the security engine
+    ## Loads user/role/grant/policy data from the catalog
+    F open(
+        mut self,
+        catalog: &CatalogManager,
+        config: SecurityConfig,
+        tls_config: TlsConfig,
+        encryption_key: Option<Vec<u8>>,
+    ) -> Result<(), VaisError> {
+        self.config = config;
+
+        # Load subsystems from catalog
+        self.user_mgr = UserManager.load_from_catalog(catalog, &self.config);
+        self.role_mgr = RoleManager.load_from_catalog(catalog);
+        self.grant_mgr = GrantManager.load_from_catalog(catalog);
+        self.policy_engine = PolicyEngine.load_from_catalog(catalog);
+
+        # Initialize encryption
+        M encryption_key {
+            Some(key_data) => {
+                self.key_mgr = KeyManager.from_key(self.config.encrypt_algo, key_data)?;
+            },
+            None => {
+                self.key_mgr = KeyManager.disabled();
+            },
+        };
+
+        # Initialize TLS
+        self.tls_mgr = TlsManager.init(tls_config)?;
+
+        # Initialize audit logger
+        self.audit_logger = AuditLogger.from_config(&self.config);
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    ## Shutdown the security engine
+    F close(mut self) -> Result<(), VaisError> {
+        # Verify audit log integrity before shutdown
+        I self.audit_logger.is_enabled() {
+            self.audit_logger.verify_chain()?;
+        }
+        self.initialized = false;
+        Ok(())
+    }
+
+    # ========================================================================
+    # Authentication
+    # ========================================================================
+
+    ## Authenticate a user and return a SessionContext
+    F authenticate(
+        mut self,
+        username: &Str,
+        password: &Str,
+        client_addr: Str,
+        database_name: Str,
+    ) -> Result<SessionContext, VaisError> {
+        self.require_initialized()?;
+
+        # Authenticate credentials
+        user_id := mut M self.user_mgr.authenticate(username, password, &self.config) {
+            Ok(id) => {
+                # Log successful auth
+                system_ctx := mut SessionContext.system();
+                self.audit_logger.log_auth_event(
+                    &self.meta, &system_ctx,
+                    &"Login successful",
+                    AUDIT_RESULT_SUCCESS,
+                )?;
+                id
+            },
+            Err(e) => {
+                # Log failed auth attempt
+                system_ctx := mut SessionContext.system();
+                self.audit_logger.log_auth_event(
+                    &self.meta, &system_ctx,
+                    &"Login failed",
+                    AUDIT_RESULT_FAILURE,
+                )?;
+                R Err(e);
+            },
+        };
+
+        # Build session context
+        session := mut self.user_mgr.build_session(username, client_addr, database_name)?;
+
+        # Resolve effective roles (including inherited roles)
+        effective := mut self.role_mgr.resolve_effective_roles(&session.active_roles);
+        session.set_active_roles(effective);
+
+        Ok(session)
+    }
+
+    # ========================================================================
+    # Privilege Checking
+    # ========================================================================
+
+    ## Check if session has a table-level privilege
+    F check_privilege(
+        self,
+        session: &SessionContext,
+        table_name: &Str,
+        priv_type: u8,
+    ) -> Result<PrivilegeCheck, VaisError> {
+        self.require_initialized()?;
+        checker := mut PrivilegeChecker.new(&self.grant_mgr, &self.role_mgr);
+        checker.check_table_privilege(session, table_name, priv_type)
+    }
+
+    ## Check if session has a column-level privilege
+    F check_column_privilege(
+        self,
+        session: &SessionContext,
+        table_name: &Str,
+        column_name: &Str,
+        priv_type: u8,
+    ) -> Result<PrivilegeCheck, VaisError> {
+        self.require_initialized()?;
+        checker := mut PrivilegeChecker.new(&self.grant_mgr, &self.role_mgr);
+        checker.check_column_privilege(session, table_name, column_name, priv_type)
+    }
+
+    # ========================================================================
+    # RLS (Row-Level Security)
+    # ========================================================================
+
+    ## Apply RLS to a SQL scan -- returns additional WHERE clause
+    F apply_rls(
+        self,
+        table_name: &Str,
+        session: &SessionContext,
+    ) -> Option<Str> {
+        I !self.initialized || !self.config.enable_rls {
+            R None;
+        }
+        evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
+        evaluator.apply_rls_to_scan(table_name, session)
+    }
+
+    # Apply RLS to vector search results
+    F apply_rls_to_vector(
+        self,
+        table_name: &Str,
+        results: &Vec<(u64, f32)>,
+        row_tenant_ids: &Vec<u64>,
+        session: &SessionContext,
+    ) -> Vec<(u64, f32)> {
+        I !self.initialized || !self.config.enable_rls {
+            R results.clone();
+        }
+        evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
+        evaluator.apply_rls_to_vector_search(table_name, results, row_tenant_ids, session)
+    }
+
+    # Apply RLS to graph traversal
+    F apply_rls_to_graph(
+        self,
+        table_name: &Str,
+        edge_tenant_ids: &Vec<u64>,
+        session: &SessionContext,
+    ) -> Vec<bool> {
+        I !self.initialized || !self.config.enable_rls {
+            mask := mut Vec.with_capacity(edge_tenant_ids.len());
+            i: u64 := mut 0;
+            L i < edge_tenant_ids.len() {
+                mask.push(true);
+                i = i + 1;
+            }
+            R mask;
+        }
+        evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
+        evaluator.apply_rls_to_graph_traverse(table_name, edge_tenant_ids, session)
+    }
+
+    # ========================================================================
+    # Encryption
+    # ========================================================================
+
+    # Encrypt a page
+    F encrypt_page(self, page_data: &mut Vec<u8>, page_id: u32) -> Result<(), VaisError> {
+        self.key_mgr.page_encryptor().encrypt_page(page_data, page_id)
+    }
+
+    # Decrypt a page
+    F decrypt_page(self, page_data: &mut Vec<u8>, page_id: u32, key_id: u32) -> Result<(), VaisError> {
+        self.key_mgr.page_encryptor().decrypt_page(page_data, page_id, key_id)
+    }
+
+    # Check if encryption is enabled
+    F is_encrypted(self) -> bool {
+        self.key_mgr.is_encrypted()
+    }
+
+    # Get active encryption key ID
+    F active_key_id(self) -> u32 {
+        self.key_mgr.page_encryptor().active_key_id()
+    }
+
+    # ========================================================================
+    # Audit Logging
+    # ========================================================================
+
+    # Log an audit event
+    F log_audit(
+        mut self,
+        session: &SessionContext,
+        event_type: u8,
+        result: u8,
+        object_name: &Str,
+        statement: &Str,
+        detail: &Str,
+    ) -> Result<(), VaisError> {
+        I !self.initialized {
+            R Ok(());
+        }
+        self.audit_logger.append_entry(
+            &self.meta, session, event_type, result,
+            object_name, statement, detail,
+        )
+    }
+
+    # ========================================================================
+    # DDL Execution (delegated to submodules)
+    # ========================================================================
+
+    # Execute CREATE USER
+    F execute_create_user(
+        mut self,
+        stmt: &CreateUserStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<u64, VaisError> {
+        self.require_initialized()?;
+        self.user_mgr.execute_create_user(
+            stmt, &self.meta, &self.config, session,
+            catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute ALTER USER
+    F execute_alter_user(
+        mut self,
+        stmt: &AlterUserStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.user_mgr.execute_alter_user(
+            stmt, &self.meta, &self.config, session,
+            catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute DROP USER
+    F execute_drop_user(
+        mut self,
+        username: &Str,
+        if_exists: bool,
+        cascade: bool,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.user_mgr.execute_drop_user(
+            username, if_exists, cascade, &self.meta,
+            session, catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute CREATE ROLE
+    F execute_create_role(
+        mut self,
+        stmt: &CreateRoleStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<u64, VaisError> {
+        self.require_initialized()?;
+        self.role_mgr.execute_create_role(
+            stmt, &self.meta, session, catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute DROP ROLE
+    F execute_drop_role(
+        mut self,
+        role_name: &Str,
+        if_exists: bool,
+        cascade: bool,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.role_mgr.execute_drop_role(
+            role_name, if_exists, cascade, &self.meta,
+            session, catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute GRANT
+    F execute_grant(
+        mut self,
+        stmt: &GrantStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.grant_mgr.execute_grant(
+            stmt, &self.meta, session,
+            &self.role_mgr, &self.user_mgr,
+            catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute REVOKE
+    F execute_revoke(
+        mut self,
+        stmt: &RevokeStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.grant_mgr.execute_revoke(
+            stmt, &self.meta, session,
+            &self.role_mgr, &self.user_mgr,
+            catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute CREATE POLICY
+    F execute_create_policy(
+        mut self,
+        stmt: &CreatePolicyStmt,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<u64, VaisError> {
+        self.require_initialized()?;
+        self.policy_engine.execute_create_policy(
+            stmt, &self.meta, session, catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # Execute DROP POLICY
+    F execute_drop_policy(
+        mut self,
+        policy_name: &Str,
+        table_name: &Str,
+        if_exists: bool,
+        session: &SessionContext,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        self.require_initialized()?;
+        self.policy_engine.execute_drop_policy(
+            policy_name, table_name, if_exists, &self.meta,
+            session, catalog, pool, gcm, txn_id, cmd_id,
+        )
+    }
+
+    # ========================================================================
+    # Input Sanitization
+    # ========================================================================
+
+    # Validate a SQL identifier
+    F validate_identifier(self, name: &Str) -> Result<(), VaisError> {
+        self.input_sanitizer.validate_identifier(name)
+    }
+
+    # Escape a string literal
+    F escape_string(self, value: &Str) -> Str {
+        self.input_sanitizer.escape_string_literal(value)
+    }
+
+    # Sanitize error for client
+    F sanitize_error(self, err: &VaisError) -> VaisError {
+        self.error_sanitizer.sanitize_error(err)
+    }
+
+    # ========================================================================
+    # TLS
+    # ========================================================================
+
+    # Get TLS manager reference
+    F tls_manager(self) -> &TlsManager {
+        &self.tls_mgr
+    }
+
+    # Check if TLS is enabled
+    F is_tls_enabled(self) -> bool {
+        self.tls_mgr.is_enabled()
+    }
+
+    # ========================================================================
+    # Metadata Access
+    # ========================================================================
+
+    F get_meta(self) -> &SecurityMeta {
+        &self.meta
+    }
+
+    F get_config(self) -> &SecurityConfig {
+        &self.config
+    }
+
+    # ========================================================================
+    # Internal Helpers
+    # ========================================================================
+
+    F require_initialized(self) -> Result<(), VaisError> {
+        I !self.initialized {
+            R Err(err_security_engine_closed());
+        }
+        Ok(())
+    }
+}

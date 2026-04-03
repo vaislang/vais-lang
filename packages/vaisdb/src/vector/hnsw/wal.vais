@@ -1,0 +1,424 @@
+# src/vector/hnsw/wal.vais
+# HNSW WAL Integration - Write helpers, redo/undo handlers for crash recovery
+# Error codes: EE=02 (vector), CC=09 (WAL)
+
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{
+    HNSW_INSERT_NODE, HNSW_DELETE_NODE, HNSW_UPDATE_EDGES,
+    HNSW_LAYER_PROMOTE, VECTOR_DATA_WRITE, QUANTIZATION_UPDATE
+};
+U storage/wal/record_vector.{
+    HnswInsertNodePayload, HnswDeleteNodePayload, HnswUpdateEdgesPayload,
+    HnswLayerPromotePayload, VectorDataWritePayload, QuantizationUpdatePayload
+};
+U storage/buffer/pool.{BufferPool};
+U vector/hnsw/types.{HnswNode, HnswNeighbor, HnswMeta};
+U vector/hnsw/insert.{NodeStore};
+U std/result.{Result, Ok, Err};
+U storage/error.{VaisError};
+
+# WAL manager for HNSW operations
+# Coordinates WAL writes with GroupCommitManager for crash recovery
+S HnswWalManager {
+    gcm: &GroupCommitManager,
+}
+
+X HnswWalManager {
+    # Create new WAL manager with reference to GroupCommitManager
+    F new(gcm: &GroupCommitManager) -> HnswWalManager {
+        HnswWalManager { gcm }
+    }
+
+    # Log node insertion (WAL-first, before page mutation)
+    # Writes HNSW_INSERT_NODE record with node metadata and affected pages
+    F log_insert_node(
+        mut self,
+        txn_id: u64,
+        node: &HnswNode,
+        file_id: u8,
+        page_id: u32,
+        affected_pages: &[(u8, u32)]
+    ) -> Result<u64, VaisError> {
+        # Build neighbor list from node
+        L neighbors: Vec<(u64, f32)> := mut Vec.new();
+        L i: u64 = 0;
+        layer_count := mut node.neighbors.len();
+        L i < layer_count {
+            layer_neighbors := mut &node.neighbors[i];
+            L j: u64 = 0;
+            L j < layer_neighbors.len() {
+                nb := mut &layer_neighbors[j];
+                neighbors.push((nb.node_id, nb.distance));
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        # Create payload
+        payload := mut HnswInsertNodePayload {
+            node_id: node.node_id,
+            layer: node.max_layer,
+            neighbors,
+            file_id,
+            page_id,
+            affected_pages: affected_pages.to_vec()
+        };
+
+        # Serialize and write
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, HNSW_INSERT_NODE, 0, &payload_bytes)
+    }
+
+    # Log node deletion (WAL-first, before page mutation)
+    # Records which layers are affected for rollback
+    F log_delete_node(
+        mut self,
+        txn_id: u64,
+        node_id: u64,
+        layers: &[u8],
+        file_id: u8,
+        page_id: u32
+    ) -> Result<u64, VaisError> {
+        payload := mut HnswDeleteNodePayload {
+            node_id,
+            layers_affected: layers.to_vec(),
+            file_id,
+            page_id
+        };
+
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, HNSW_DELETE_NODE, 0, &payload_bytes)
+    }
+
+    # Log edge update (WAL-first, before page mutation)
+    # Stores both old and new neighbor sets for undo/redo
+    F log_update_edges(
+        mut self,
+        txn_id: u64,
+        node_id: u64,
+        layer: u8,
+        old_neighbors: &[u64],
+        new_neighbors: &[u64],
+        file_id: u8,
+        page_id: u32
+    ) -> Result<u64, VaisError> {
+        payload := mut HnswUpdateEdgesPayload {
+            node_id,
+            layer,
+            old_neighbors: old_neighbors.to_vec(),
+            new_neighbors: new_neighbors.to_vec(),
+            file_id,
+            page_id
+        };
+
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, HNSW_UPDATE_EDGES, 0, &payload_bytes)
+    }
+
+    # Log layer promotion (WAL-first, before page mutation)
+    # Records node_id and new max_layer for hierarchy updates
+    F log_layer_promote(
+        mut self,
+        txn_id: u64,
+        node_id: u64,
+        new_max_layer: u8,
+        file_id: u8,
+        page_id: u32
+    ) -> Result<u64, VaisError> {
+        payload := mut HnswLayerPromotePayload {
+            node_id,
+            new_max_layer,
+            file_id,
+            page_id
+        };
+
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, HNSW_LAYER_PROMOTE, 0, &payload_bytes)
+    }
+
+    # Log vector data write (WAL-first, before page mutation)
+    # Used for raw vector storage updates
+    F log_vector_data_write(
+        mut self,
+        txn_id: u64,
+        file_id: u8,
+        page_id: u32,
+        offset: u16,
+        data: &[u8]
+    ) -> Result<u64, VaisError> {
+        payload := mut VectorDataWritePayload {
+            file_id,
+            page_id,
+            offset,
+            vector_data: data.to_vec()
+        };
+
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, VECTOR_DATA_WRITE, 0, &payload_bytes)
+    }
+
+    # Log quantization codebook update (WAL-first, before page mutation)
+    # Used for PQ/SQ codebook changes
+    F log_quantization_update(
+        mut self,
+        txn_id: u64,
+        index_id: u32,
+        codebook: &[u8]
+    ) -> Result<u64, VaisError> {
+        payload := mut QuantizationUpdatePayload {
+            index_id,
+            codebook: codebook.to_vec()
+        };
+
+        payload_bytes := mut payload.serialize();
+        self.gcm.write_record(txn_id, QUANTIZATION_UPDATE, 0, &payload_bytes)
+    }
+}
+
+# Redo handler for node insertion (crash recovery REDO phase)
+# Applies logged insert operation to NodeStore
+F redo_hnsw_insert(
+    payload: &HnswInsertNodePayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Reconstruct HnswNode from payload
+    node := mut HnswNode {
+        node_id: payload.node_id,
+        vector_page_id: payload.page_id,
+        max_layer: payload.layer,
+        neighbors: Vec.new()
+    };
+
+    # Build neighbor layers
+    L i: u64 = 0;
+    L i <= payload.layer as u64 {
+        L layer_neighbors: Vec<HnswNeighbor> := mut Vec.new();
+
+        # Filter neighbors for this layer
+        L j: u64 = 0;
+        L j < payload.neighbors.len() {
+            L (nid, dist) = payload.neighbors[j];
+            layer_neighbors.push(HnswNeighbor { node_id: nid, distance: dist });
+            j = j + 1;
+        }
+
+        node.neighbors.push(layer_neighbors);
+        i = i + 1;
+    }
+
+    # Insert node into store (idempotent)
+    store.insert_node(&node)
+}
+
+# Redo handler for node deletion (crash recovery REDO phase)
+# Removes node from NodeStore
+F redo_hnsw_delete(
+    payload: &HnswDeleteNodePayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Delete node (idempotent if already deleted)
+    store.delete_node(payload.node_id)
+}
+
+# Redo handler for edge update (crash recovery REDO phase)
+# Applies new neighbor set to node at specified layer
+F redo_hnsw_update_edges(
+    payload: &HnswUpdateEdgesPayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Load node
+    node := mut store.get_node(payload.node_id)?;
+
+    # Update neighbors at layer
+    I payload.layer as u64 >= node.neighbors.len() {
+        # Error: invalid layer
+        R Err(VaisError.new(0x020900, "REDO: invalid layer for edge update"));
+    }
+
+    # Build new neighbor list
+    L new_neighbors: Vec<HnswNeighbor> := mut Vec.new();
+    L i: u64 = 0;
+    L i < payload.new_neighbors.len() {
+        nid := mut payload.new_neighbors[i];
+        # Distance not stored in payload, use placeholder (will be recalculated)
+        new_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 });
+        i = i + 1;
+    }
+
+    node.neighbors[payload.layer as u64] = new_neighbors;
+
+    # Write back
+    store.update_node(&node)
+}
+
+# Redo handler for layer promotion (crash recovery REDO phase)
+# Updates node's max_layer field
+F redo_hnsw_layer_promote(
+    payload: &HnswLayerPromotePayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Load node
+    node := mut store.get_node(payload.node_id)?;
+
+    # Update max_layer
+    node.max_layer = payload.new_max_layer;
+
+    # Ensure neighbors vector has enough layers
+    L node.neighbors.len() <= payload.new_max_layer as u64 {
+        node.neighbors.push(Vec.new());
+    }
+
+    # Write back
+    store.update_node(&node)
+}
+
+# Redo handler for vector data write (crash recovery REDO phase)
+# Writes raw vector data to page at offset
+F redo_vector_data_write(
+    payload: &VectorDataWritePayload,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    # Pin page
+    frame := mut pool.pin_page(payload.file_id, payload.page_id)?;
+
+    # Write data at offset
+    page_data := mut frame.get_page_data_mut();
+    I payload.offset as u64 + payload.vector_data.len() > page_data.len() {
+        pool.unpin_page(payload.file_id, payload.page_id, false);
+        R Err(VaisError.new(0x020901, "REDO: vector data write out of bounds"));
+    }
+
+    L i: u64 = 0;
+    L i < payload.vector_data.len() {
+        page_data[payload.offset as u64 + i] = payload.vector_data[i];
+        i = i + 1;
+    }
+
+    # Mark dirty and unpin
+    pool.unpin_page(payload.file_id, payload.page_id, true);
+    Ok(())
+}
+
+# Undo handler for node insertion (rollback/crash recovery UNDO phase)
+# Reverses insert by deleting the node
+F undo_hnsw_insert(
+    payload: &HnswInsertNodePayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Undo insert = delete node
+    store.delete_node(payload.node_id)
+}
+
+# Undo handler for node deletion (rollback/crash recovery UNDO phase)
+# Reverses delete by re-inserting the node (requires node data in payload)
+F undo_hnsw_delete(
+    payload: &HnswDeleteNodePayload,
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    # Note: Full undo of delete would require storing node snapshot in payload
+    # Current design assumption: DELETE is physical (no undo needed in MVCC)
+    # For MVCC: delete marks tuple as expired, undo restores visibility
+
+    # Physical undo not supported (would need node snapshot)
+    # Return error to indicate missing undo data
+    Err(VaisError.new(0x020902, "UNDO: delete requires node snapshot (MVCC mode only)"))
+}
+
+# Dispatcher for vector REDO operations
+# Routes WAL record to appropriate redo handler based on record_type
+F dispatch_vector_redo(
+    record_type: u8,
+    payload_data: &[u8],
+    store: &mut dyn NodeStore,
+    pool: &mut BufferPool
+) -> Result<(), VaisError> {
+    M record_type {
+        HNSW_INSERT_NODE => {
+            payload := mut HnswInsertNodePayload.deserialize(payload_data)?;
+            redo_hnsw_insert(&payload, store)
+        },
+        HNSW_DELETE_NODE => {
+            payload := mut HnswDeleteNodePayload.deserialize(payload_data)?;
+            redo_hnsw_delete(&payload, store)
+        },
+        HNSW_UPDATE_EDGES => {
+            payload := mut HnswUpdateEdgesPayload.deserialize(payload_data)?;
+            redo_hnsw_update_edges(&payload, store)
+        },
+        HNSW_LAYER_PROMOTE => {
+            payload := mut HnswLayerPromotePayload.deserialize(payload_data)?;
+            redo_hnsw_layer_promote(&payload, store)
+        },
+        VECTOR_DATA_WRITE => {
+            payload := mut VectorDataWritePayload.deserialize(payload_data)?;
+            redo_vector_data_write(&payload, pool)
+        },
+        QUANTIZATION_UPDATE => {
+            # Quantization redo: write codebook to meta page
+            # Not implemented yet (requires codebook storage design)
+            Ok(())
+        },
+        _ => {
+            Err(VaisError.new(0x020903, "Unknown vector WAL record type"))
+        }
+    }
+}
+
+# Dispatcher for vector UNDO operations
+# Routes WAL record to appropriate undo handler based on record_type
+F dispatch_vector_undo(
+    record_type: u8,
+    payload_data: &[u8],
+    store: &mut dyn NodeStore
+) -> Result<(), VaisError> {
+    M record_type {
+        HNSW_INSERT_NODE => {
+            payload := mut HnswInsertNodePayload.deserialize(payload_data)?;
+            undo_hnsw_insert(&payload, store)
+        },
+        HNSW_DELETE_NODE => {
+            payload := mut HnswDeleteNodePayload.deserialize(payload_data)?;
+            undo_hnsw_delete(&payload, store)
+        },
+        HNSW_UPDATE_EDGES => {
+            # Undo edge update: restore old neighbors
+            payload := mut HnswUpdateEdgesPayload.deserialize(payload_data)?;
+
+            # Load node
+            node := mut store.get_node(payload.node_id)?;
+
+            I payload.layer as u64 >= node.neighbors.len() {
+                R Err(VaisError.new(0x020904, "UNDO: invalid layer for edge update"));
+            }
+
+            # Restore old neighbors
+            L old_neighbors: Vec<HnswNeighbor> := mut Vec.new();
+            L i: u64 = 0;
+            L i < payload.old_neighbors.len() {
+                nid := mut payload.old_neighbors[i];
+                old_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 });
+                i = i + 1;
+            }
+
+            node.neighbors[payload.layer as u64] = old_neighbors;
+            store.update_node(&node)
+        },
+        HNSW_LAYER_PROMOTE => {
+            # Undo layer promote: would need old_max_layer in payload
+            # Current design: layer promote is monotonic (no undo)
+            Err(VaisError.new(0x020905, "UNDO: layer promote requires old_max_layer"))
+        },
+        VECTOR_DATA_WRITE => {
+            # Undo vector write: would need old data in payload
+            # Current design: use undo log for physical undo
+            Err(VaisError.new(0x020906, "UNDO: vector write requires old data snapshot"))
+        },
+        QUANTIZATION_UPDATE => {
+            # Undo quantization: would need old codebook
+            Err(VaisError.new(0x020907, "UNDO: quantization update requires old codebook"))
+        },
+        _ => {
+            Err(VaisError.new(0x020908, "Unknown vector WAL record type for undo"))
+        }
+    }
+}

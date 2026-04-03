@@ -1,0 +1,645 @@
+# Grant/Revoke Executor
+# Implements GRANT/REVOKE privilege management and role membership
+# Coordinates with CatalogManager for persistent storage
+# WAL-first: all mutations write WAL before modifying catalog
+# Error codes: EE=09 (security), CC=09 (privilege), CC=02 (constraint)
+
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError, err_internal};
+U storage/constants.{INVALID_TXN_ID};
+U storage/buffer/pool.{BufferPool};
+U storage/wal/group_commit.{GroupCommitManager};
+U storage/wal/record_types.{SECURITY_GRANT_CHANGE};
+U sql/catalog/manager.{CatalogManager};
+U sql/catalog/schema.{GrantCatalogEntry};
+U sql/parser/ast.{
+    GrantStmt, RevokeStmt, GrantType, RevokeType,
+    PrivilegeKind, ObjectKind,
+};
+U security/types.{
+    SecurityMeta, GrantEntry, SessionContext,
+    SUPERUSER_ROLE_ID, PUBLIC_ROLE_ID, SYSTEM_USER_ID,
+    ENGINE_TAG_SECURITY,
+    PRIV_SELECT, PRIV_INSERT, PRIV_UPDATE, PRIV_DELETE,
+    PRIV_CREATE, PRIV_DROP, PRIV_ALTER, PRIV_ALL,
+    OBJ_TYPE_TABLE, OBJ_TYPE_DATABASE, OBJ_TYPE_SCHEMA,
+    privilege_name,
+    err_privilege_denied, err_privilege_insufficient,
+    err_privilege_superuser_required, err_privilege_grant_option_required,
+    err_privilege_revoke_cascade, err_grant_not_found,
+    err_role_not_found, err_user_not_found,
+};
+U security/role.{RoleManager};
+U security/user.{UserManager};
+
+# ============================================================================
+# GrantManager — Manages privilege grants and revocations
+# ============================================================================
+
+S GrantManager {
+    grants: Vec<GrantEntry>,               # All active grants (in-memory cache)
+}
+
+X GrantManager {
+    F new() -> GrantManager {
+        GrantManager {
+            grants: Vec.new(),
+        }
+    }
+
+    # Load grants from catalog at startup
+    F load_from_catalog(catalog: &CatalogManager) -> GrantManager {
+        mgr := mut GrantManager.new();
+
+        cat_grants := mut catalog.all_grants();
+        i: u64 := mut 0;
+        L i < cat_grants.len() {
+            entry := mut cat_grants[i];
+            grant := mut GrantEntry.new(
+                entry.grant_id,
+                entry.role_id,
+                0,  # grantor_id (not stored in catalog, reconstructed from WAL if needed)
+                entry.object_type,
+                entry.object_name.clone(),
+                "",  # column_name (not in catalog entry)
+                entry.privilege_mask,
+                entry.with_grant_option,
+                0,  # txn_id (committed)
+                0,  # cmd_id
+            );
+            mgr.grants.push(grant);
+            i = i + 1;
+        }
+
+        mgr
+    }
+
+    # ========================================================================
+    # Execute GRANT (privileges)
+    # ========================================================================
+
+    # Execute GRANT privileges ON object TO role [WITH GRANT OPTION]
+    F execute_grant_privileges(
+        mut self,
+        privileges: &Vec<PrivilegeKind>,
+        object_kind: &ObjectKind,
+        object_name: &Str,
+        grantee: &Str,
+        with_grant_option: bool,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        role_mgr: &RoleManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        # 1. Resolve privilege mask from list
+        priv_mask: u8 := mut 0;
+        i: u64 := mut 0;
+        L i < privileges.len() {
+            priv_mask = priv_mask | privilege_kind_to_mask(&privileges[i]);
+            i = i + 1;
+        }
+
+        # 2. Resolve object type
+        obj_type := mut object_kind_to_type(object_kind);
+
+        # 3. Permission check: grantor must have the privilege WITH GRANT OPTION
+        #    or be superuser
+        I !session.is_superuser {
+            self.check_grant_permission(session, priv_mask, obj_type, object_name)?;
+        }
+
+        # 4. Resolve grantee role_id
+        grantee_role_id := mut M role_mgr.get_role_id(grantee) {
+            Some(id) => id,
+            None => { R Err(err_role_not_found(grantee)); },
+        };
+
+        # 5. Check for existing grant and merge if found
+        found_idx: i64 := mut -1;
+        j: u64 := mut 0;
+        L j < self.grants.len() {
+            g := mut &self.grants[j];
+            I g.is_active() && g.role_id == grantee_role_id
+                && g.object_type == obj_type && g.object_name == *object_name {
+                found_idx = j as i64;
+            }
+            j = j + 1;
+        }
+
+        I found_idx >= 0 {
+            # Merge: add new privileges to existing grant
+            existing := mut &self.grants[found_idx as u64];
+            merged_mask := mut existing.privilege_mask | priv_mask;
+            merged_grant_option := mut existing.with_grant_option || with_grant_option;
+
+            # Create updated grant entry
+            grant_id := mut existing.grant_id;
+            new_grant := mut GrantEntry.new(
+                grant_id,
+                grantee_role_id,
+                session.user_id,
+                obj_type,
+                object_name.clone(),
+                "",  # column_name (whole object)
+                merged_mask,
+                merged_grant_option,
+                txn_id,
+                cmd_id,
+            );
+
+            # Write WAL
+            wal_payload := mut new_grant.to_bytes();
+            gcm.write_record(txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &wal_payload)?;
+
+            # Update catalog
+            catalog.unregister_grant(grantee_role_id, object_name, pool, gcm, txn_id)?;
+            cat_entry := mut GrantCatalogEntry.new(
+                grant_id, grantee_role_id, obj_type,
+                object_name.clone(), merged_mask, merged_grant_option,
+            );
+            catalog.register_grant(cat_entry, pool, gcm, txn_id)?;
+
+            # Update in-memory
+            self.grants[found_idx as u64] = new_grant;
+        } E {
+            # New grant
+            grant_id := mut meta.alloc_grant_id();
+            new_grant := mut GrantEntry.new(
+                grant_id,
+                grantee_role_id,
+                session.user_id,
+                obj_type,
+                object_name.clone(),
+                "",
+                priv_mask,
+                with_grant_option,
+                txn_id,
+                cmd_id,
+            );
+
+            # Write WAL
+            wal_payload := mut new_grant.to_bytes();
+            gcm.write_record(txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &wal_payload)?;
+
+            # Register in catalog
+            cat_entry := mut GrantCatalogEntry.new(
+                grant_id, grantee_role_id, obj_type,
+                object_name.clone(), priv_mask, with_grant_option,
+            );
+            catalog.register_grant(cat_entry, pool, gcm, txn_id)?;
+
+            # Update in-memory
+            meta.grant_count = meta.grant_count + 1;
+            self.grants.push(new_grant);
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Execute GRANT ROLE
+    # ========================================================================
+
+    # Execute GRANT ROLE role_name TO grantee
+    F execute_grant_role(
+        mut self,
+        role_name: &Str,
+        grantee: &Str,
+        session: &SessionContext,
+        role_mgr: &mut RoleManager,
+        user_mgr: &mut UserManager,
+    ) -> Result<(), VaisError> {
+        # 1. Permission check
+        I !session.is_superuser {
+            R Err(err_privilege_superuser_required());
+        }
+
+        # 2. Check the target role exists
+        I !role_mgr.role_exists(role_name) {
+            R Err(err_role_not_found(role_name));
+        }
+
+        role_id := mut role_mgr.get_role_id(role_name).unwrap();
+
+        # 3. Try granting to user first, then to role
+        I user_mgr.user_exists(grantee) {
+            # Grant role to user
+            user_mgr.add_role_to_user(grantee, role_id)?;
+        } E I role_mgr.role_exists(grantee) {
+            # Grant role to role (role inheritance)
+            role_mgr.add_role_member(role_name, grantee)?;
+        } E {
+            R Err(err_role_not_found(grantee));
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Execute REVOKE (privileges)
+    # ========================================================================
+
+    # Execute REVOKE privileges ON object FROM role [CASCADE]
+    F execute_revoke_privileges(
+        mut self,
+        privileges: &Vec<PrivilegeKind>,
+        object_kind: &ObjectKind,
+        object_name: &Str,
+        grantee: &Str,
+        cascade: bool,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        role_mgr: &RoleManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        # 1. Permission check
+        I !session.is_superuser {
+            priv_mask: u8 := mut 0;
+            k: u64 := mut 0;
+            L k < privileges.len() {
+                priv_mask = priv_mask | privilege_kind_to_mask(&privileges[k]);
+                k = k + 1;
+            }
+            self.check_grant_permission(session, priv_mask, object_kind_to_type(object_kind), object_name)?;
+        }
+
+        # 2. Resolve privilege mask
+        revoke_mask: u8 := mut 0;
+        i: u64 := mut 0;
+        L i < privileges.len() {
+            revoke_mask = revoke_mask | privilege_kind_to_mask(&privileges[i]);
+            i = i + 1;
+        }
+
+        obj_type := mut object_kind_to_type(object_kind);
+
+        # 3. Resolve grantee role_id
+        grantee_role_id := mut M role_mgr.get_role_id(grantee) {
+            Some(id) => id,
+            None => { R Err(err_role_not_found(grantee)); },
+        };
+
+        # 4. Find matching grant
+        found_idx: i64 := mut -1;
+        j: u64 := mut 0;
+        L j < self.grants.len() {
+            g := mut &self.grants[j];
+            I g.is_active() && g.role_id == grantee_role_id
+                && g.object_type == obj_type && g.object_name == *object_name {
+                found_idx = j as i64;
+            }
+            j = j + 1;
+        }
+
+        I found_idx < 0 {
+            R Err(err_grant_not_found(grantee, object_name));
+        }
+
+        # 5. Compute remaining privileges after revocation
+        existing := mut &self.grants[found_idx as u64];
+        remaining_mask := mut existing.privilege_mask & (!revoke_mask);
+
+        # 6. Check for dependent grants (grants made using GRANT OPTION)
+        I !cascade {
+            has_dependents := mut self.has_dependent_grants(
+                grantee_role_id, obj_type, object_name, revoke_mask,
+            );
+            I has_dependents {
+                R Err(err_privilege_revoke_cascade(object_name));
+            }
+        }
+
+        # 7. Write WAL for revocation
+        wal_buf := mut ByteBuffer.new(128);
+        wal_buf.put_u64_le(grantee_role_id);
+        wal_buf.put_u8(obj_type);
+        wal_buf.put_u8(revoke_mask);
+        wal_buf.put_string(object_name);
+        wal_bytes := mut wal_buf.to_vec();
+        gcm.write_record(txn_id, SECURITY_GRANT_CHANGE, ENGINE_TAG_SECURITY, &wal_bytes)?;
+
+        # 8. Update catalog + in-memory
+        I remaining_mask == 0 {
+            # Complete revocation: remove grant entirely
+            catalog.unregister_grant(grantee_role_id, object_name, pool, gcm, txn_id)?;
+            self.grants.remove(found_idx as u64);
+            meta.grant_count = meta.grant_count - 1;
+        } E {
+            # Partial revocation: update privilege mask
+            catalog.unregister_grant(grantee_role_id, object_name, pool, gcm, txn_id)?;
+            grant_id := mut existing.grant_id;
+            cat_entry := mut GrantCatalogEntry.new(
+                grant_id, grantee_role_id, obj_type,
+                object_name.clone(), remaining_mask, existing.with_grant_option,
+            );
+            catalog.register_grant(cat_entry, pool, gcm, txn_id)?;
+
+            # Update in-memory
+            updated := mut GrantEntry.new(
+                grant_id, grantee_role_id, existing.grantor_id,
+                obj_type, object_name.clone(), "",
+                remaining_mask, existing.with_grant_option,
+                txn_id, cmd_id,
+            );
+            self.grants[found_idx as u64] = updated;
+        }
+
+        # 9. CASCADE: revoke dependent grants recursively
+        I cascade {
+            self.cascade_revoke(
+                grantee_role_id, obj_type, object_name, revoke_mask,
+                meta, catalog, pool, gcm, txn_id, cmd_id,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Execute REVOKE ROLE
+    # ========================================================================
+
+    # Execute REVOKE ROLE role_name FROM grantee
+    F execute_revoke_role(
+        mut self,
+        role_name: &Str,
+        grantee: &Str,
+        session: &SessionContext,
+        role_mgr: &mut RoleManager,
+        user_mgr: &mut UserManager,
+    ) -> Result<(), VaisError> {
+        # 1. Permission check
+        I !session.is_superuser {
+            R Err(err_privilege_superuser_required());
+        }
+
+        role_id := mut M role_mgr.get_role_id(role_name) {
+            Some(id) => id,
+            None => { R Err(err_role_not_found(role_name)); },
+        };
+
+        # 2. Try revoking from user first, then from role
+        I user_mgr.user_exists(grantee) {
+            user_mgr.remove_role_from_user(grantee, role_id)?;
+        } E I role_mgr.role_exists(grantee) {
+            role_mgr.remove_role_member(role_name, grantee)?;
+        } E {
+            R Err(err_role_not_found(grantee));
+        }
+
+        Ok(())
+    }
+
+    # ========================================================================
+    # Execute GRANT/REVOKE Statement Dispatch
+    # ========================================================================
+
+    # Dispatch GRANT statement to appropriate handler
+    F execute_grant(
+        mut self,
+        stmt: &GrantStmt,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        role_mgr: &mut RoleManager,
+        user_mgr: &mut UserManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        M &stmt.grant_type {
+            GrantType.Privileges {
+                privileges, object_type, object_name, grantee, with_grant_option
+            } => {
+                self.execute_grant_privileges(
+                    privileges, object_type, object_name, grantee, *with_grant_option,
+                    meta, session, role_mgr, catalog, pool, gcm, txn_id, cmd_id,
+                )
+            },
+            GrantType.RoleMembership { role_name, grantee } => {
+                self.execute_grant_role(role_name, grantee, session, role_mgr, user_mgr)
+            },
+        }
+    }
+
+    # Dispatch REVOKE statement to appropriate handler
+    F execute_revoke(
+        mut self,
+        stmt: &RevokeStmt,
+        meta: &mut SecurityMeta,
+        session: &SessionContext,
+        role_mgr: &mut RoleManager,
+        user_mgr: &mut UserManager,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        M &stmt.revoke_type {
+            RevokeType.Privileges {
+                privileges, object_type, object_name, grantee, cascade
+            } => {
+                self.execute_revoke_privileges(
+                    privileges, object_type, object_name, grantee, *cascade,
+                    meta, session, role_mgr, catalog, pool, gcm, txn_id, cmd_id,
+                )
+            },
+            RevokeType.RoleMembership { role_name, grantee } => {
+                self.execute_revoke_role(role_name, grantee, session, role_mgr, user_mgr)
+            },
+        }
+    }
+
+    # ========================================================================
+    # Lookup Helpers
+    # ========================================================================
+
+    # Get all grants for a role
+    F get_grants_for_role(self, role_id: u64) -> Vec<&GrantEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.grants.len() {
+            I self.grants[i].is_active() && self.grants[i].role_id == role_id {
+                result.push(&self.grants[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Get all grants on a specific object
+    F get_grants_for_object(self, object_name: &Str) -> Vec<&GrantEntry> {
+        result := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.grants.len() {
+            I self.grants[i].is_active() && self.grants[i].object_name == *object_name {
+                result.push(&self.grants[i]);
+            }
+            i = i + 1;
+        }
+        result
+    }
+
+    # Get grant count
+    F grant_count(self) -> u64 {
+        self.grants.len()
+    }
+
+    # ========================================================================
+    # Internal Helpers
+    # ========================================================================
+
+    # Check if the session user has GRANT OPTION for the specified privileges
+    F check_grant_permission(
+        self,
+        session: &SessionContext,
+        priv_mask: u8,
+        obj_type: u8,
+        object_name: &Str,
+    ) -> Result<(), VaisError> {
+        # Check all roles the user has
+        i: u64 := mut 0;
+        L i < session.active_roles.len() {
+            role_id := mut session.active_roles[i];
+            j: u64 := mut 0;
+            L j < self.grants.len() {
+                g := mut &self.grants[j];
+                I g.is_active() && g.role_id == role_id
+                    && g.object_type == obj_type && g.object_name == *object_name
+                    && g.with_grant_option
+                    && (g.privilege_mask & priv_mask) == priv_mask {
+                    R Ok(());
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        priv_name := mut privilege_name(priv_mask);
+        Err(err_privilege_grant_option_required(&priv_name))
+    }
+
+    # Check if there are dependent grants (grants made by the grantee to others)
+    F has_dependent_grants(
+        self,
+        grantor_role_id: u64,
+        obj_type: u8,
+        object_name: &Str,
+        priv_mask: u8,
+    ) -> bool {
+        i: u64 := mut 0;
+        L i < self.grants.len() {
+            g := mut &self.grants[i];
+            I g.is_active() && g.grantor_id == grantor_role_id
+                && g.object_type == obj_type && g.object_name == *object_name
+                && (g.privilege_mask & priv_mask) != 0 {
+                R true;
+            }
+            i = i + 1;
+        }
+        false
+    }
+
+    # Cascade revoke: recursively revoke grants made by the revoked grantee
+    F cascade_revoke(
+        mut self,
+        grantor_role_id: u64,
+        obj_type: u8,
+        object_name: &Str,
+        priv_mask: u8,
+        meta: &mut SecurityMeta,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        txn_id: u64,
+        cmd_id: u32,
+    ) -> Result<(), VaisError> {
+        # Find all grants made by the revoked role on this object
+        to_revoke := mut Vec.new();
+        i: u64 := mut 0;
+        L i < self.grants.len() {
+            g := mut &self.grants[i];
+            I g.is_active() && g.grantor_id == grantor_role_id
+                && g.object_type == obj_type && g.object_name == *object_name
+                && (g.privilege_mask & priv_mask) != 0 {
+                to_revoke.push(i);
+            }
+            i = i + 1;
+        }
+
+        # Process in reverse order to maintain valid indices
+        k := mut to_revoke.len();
+        L k > 0 {
+            k = k - 1;
+            idx := mut to_revoke[k];
+            dependent_role_id := mut self.grants[idx].role_id;
+            remaining := mut self.grants[idx].privilege_mask & (!priv_mask);
+
+            I remaining == 0 {
+                # Complete removal
+                catalog.unregister_grant(dependent_role_id, object_name, pool, gcm, txn_id)?;
+                self.grants.remove(idx);
+                meta.grant_count = meta.grant_count - 1;
+            } E {
+                # Partial removal: update mask
+                grant_id := mut self.grants[idx].grant_id;
+                catalog.unregister_grant(dependent_role_id, object_name, pool, gcm, txn_id)?;
+                cat_entry := mut GrantCatalogEntry.new(
+                    grant_id, dependent_role_id, obj_type,
+                    object_name.clone(), remaining, self.grants[idx].with_grant_option,
+                );
+                catalog.register_grant(cat_entry, pool, gcm, txn_id)?;
+                self.grants[idx].privilege_mask = remaining;
+            }
+
+            # Recurse for cascading revocation
+            self.cascade_revoke(
+                dependent_role_id, obj_type, object_name, priv_mask,
+                meta, catalog, pool, gcm, txn_id, cmd_id,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Convert AST PrivilegeKind to bitmask
+F privilege_kind_to_mask(kind: &PrivilegeKind) -> u8 {
+    M kind {
+        PrivilegeKind.Select => PRIV_SELECT,
+        PrivilegeKind.Insert => PRIV_INSERT,
+        PrivilegeKind.Update => PRIV_UPDATE,
+        PrivilegeKind.Delete => PRIV_DELETE,
+        PrivilegeKind.Create => PRIV_CREATE,
+        PrivilegeKind.Drop => PRIV_DROP,
+        PrivilegeKind.Alter => PRIV_ALTER,
+        PrivilegeKind.All => PRIV_ALL,
+    }
+}
+
+# Convert AST ObjectKind to object type constant
+F object_kind_to_type(kind: &ObjectKind) -> u8 {
+    M kind {
+        ObjectKind.Table => OBJ_TYPE_TABLE,
+        ObjectKind.Database => OBJ_TYPE_DATABASE,
+        ObjectKind.Schema => OBJ_TYPE_SCHEMA,
+    }
+}

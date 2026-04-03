@@ -1,0 +1,195 @@
+# B+Tree Structure
+# Manages the tree with root page tracking and basic operations
+# Delegates to buffer pool for page access
+
+U storage/constants.{NULL_PAGE, PAGE_HEADER_SIZE};
+U storage/error.{VaisError, err_internal};
+U storage/page/header.{PageHeader};
+U storage/page/types.{PAGE_TYPE_BTREE_INTERNAL, PAGE_TYPE_BTREE_LEAF};
+U storage/buffer/pool.{BufferPool};
+U storage/btree/node.{BTreeInternalNode, BTreeLeafNode};
+U storage/btree/entry.{BTreeLeafEntry};
+U storage/btree/latch.{LatchTable, LatchGuard};
+
+# Default latch table capacity (one latch per buffer pool slot)
+C DEFAULT_LATCH_CAPACITY: u32 = 4096;
+
+# B+Tree index structure
+S BTree {
+    root_page_id: u32,       # Page ID of root node
+    file_id: u8,             # File where tree lives (usually data.vdb = 0)
+    page_size: u32,
+    height: u32,             # Tree height (1 = root is leaf)
+    entry_count: u64,        # Total entries in the tree
+    latch_table: LatchTable, # Per-page latches for concurrent access
+}
+
+X BTree {
+    # Create a new empty B+Tree with a single leaf root
+    F new(root_page_id: u32, file_id: u8, page_size: u32) -> BTree {
+        BTree {
+            root_page_id,
+            file_id,
+            page_size,
+            height: 1,
+            entry_count: 0,
+            latch_table: LatchTable.new(DEFAULT_LATCH_CAPACITY),
+        }
+    }
+
+    # Create with custom latch table capacity
+    F with_latch_capacity(root_page_id: u32, file_id: u8, page_size: u32, latch_capacity: u32) -> BTree {
+        BTree {
+            root_page_id,
+            file_id,
+            page_size,
+            height: 1,
+            entry_count: 0,
+            latch_table: LatchTable.new(latch_capacity),
+        }
+    }
+
+    # Search for a key, returns (page_id, slot_id) via TID or None
+    # Read latch crabbing through internal nodes is handled by find_leaf()
+    F search(self, key: &[u8], pool: &mut BufferPool) -> Result<Option<u32>, VaisError> {
+        leaf_frame := mut self.find_leaf(key, pool)?;
+        page_data := mut pool.get_page(leaf_frame);
+        leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
+
+        result := mut leaf.get_tid(key);
+        pool.unpin_page(leaf_frame, false);
+        Ok(result)
+    }
+
+    # Find the leaf page containing the given key
+    # Returns the buffer pool frame_id (page is pinned in buffer pool)
+    # Uses latch crabbing through internal nodes (acquire child, release parent)
+    # Note: leaf read latch is acquired and immediately released — the buffer pin
+    # provides logical protection for read-only callers. Write callers (insert/delete)
+    # acquire their own write latch on the leaf independently.
+    F find_leaf(self, key: &[u8], pool: &mut BufferPool) -> Result<u32, VaisError> {
+        current_page := mut self.root_page_id;
+        parent_guard: Option<LatchGuard> := mut None;
+
+        L level: 0..(self.height - 1) {
+            # Acquire read latch on current node
+            guard := mut LatchGuard.new_read(&self.latch_table, current_page);
+
+            # Load internal node
+            frame_id := mut pool.fetch_page(self.file_id, current_page)?;
+            page_data := mut pool.get_page(frame_id);
+            internal := mut BTreeInternalNode.from_page_data(page_data, self.page_size)?;
+
+            # Find child to descend to
+            next_page := mut internal.find_child(key);
+            pool.unpin_page(frame_id, false);
+
+            # Release parent latch (if any) — child latch already held via next iteration
+            M parent_guard {
+                Some(mut pg) => { pg.release(); },
+                None => {},
+            }
+
+            parent_guard = Some(guard);
+            current_page = next_page;
+        }
+
+        # Acquire read latch on the target leaf
+        leaf_guard := mut LatchGuard.new_read(&self.latch_table, current_page);
+
+        # Release the last internal node latch
+        M parent_guard {
+            Some(mut pg) => { pg.release(); },
+            None => {},
+        }
+
+        # Leaf read latch released immediately — the buffer pin (pin_count >= 1)
+        # prevents eviction, ensuring page data stability for read-only callers.
+        # Write callers (btree_insert, btree_delete) acquire independent write latches.
+        leaf_guard.release();
+
+        pool.fetch_page(self.file_id, current_page)
+    }
+
+    # Range scan: find all entries with keys in [start_key, end_key]
+    # Returns Vec<(key, tid)>
+    # Uses latch crabbing on leaf chain: acquire next leaf latch before releasing current
+    F range_scan(self, start_key: &[u8], end_key: &[u8], pool: &mut BufferPool) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
+        results := mut Vec.new();
+
+        # Find starting leaf (find_leaf handles internal node latch crabbing)
+        frame_id := mut self.find_leaf(start_key, pool)?;
+        page_data := mut pool.get_page(frame_id);
+        leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
+        current_page := mut leaf.header.page_id;
+        current_guard := mut LatchGuard.new_read(&self.latch_table, current_page);
+
+        # Find starting position within leaf
+        start_idx := mut leaf.lower_bound(start_key);
+
+        # Scan current leaf from start position
+        i := mut start_idx;
+        has_next := mut true;
+        L has_next {
+            L i < leaf.entry_count() as u64 {
+                key := mut leaf.get_key(i).to_vec();
+                I key_greater_than(&key, end_key) {
+                    current_guard.release();
+                    pool.unpin_page(frame_id, false);
+                    R Ok(results);
+                }
+                results.push((key, leaf.entries[i].tid));
+                i += 1;
+            }
+
+            # Follow next_page link with latch crabbing
+            next := mut leaf.next_leaf();
+
+            I next == NULL_PAGE {
+                current_guard.release();
+                pool.unpin_page(frame_id, false);
+                has_next = false;
+            } E {
+                # Acquire next leaf's read latch before releasing current
+                next_guard := mut LatchGuard.new_read(&self.latch_table, next);
+                current_guard.release();
+                pool.unpin_page(frame_id, false);
+
+                frame_id = pool.fetch_page(self.file_id, next)?;
+                page_data = pool.get_page(frame_id);
+                leaf = BTreeLeafNode.from_page_data(page_data, self.page_size)?;
+                current_guard = next_guard;
+                i = 0;
+            }
+        }
+
+        Ok(results)
+    }
+
+    # Access the latch table (for insert/delete/cursor operations)
+    F get_latch_table(self) -> &LatchTable { &self.latch_table }
+
+    # Get tree statistics
+    F get_root_page(self) -> u32 { self.root_page_id }
+    F get_height(self) -> u32 { self.height }
+    F get_entry_count(self) -> u64 { self.entry_count }
+
+    # Update root after split
+    F set_root(mut self, new_root_page: u32) {
+        self.root_page_id = new_root_page;
+        self.height += 1;
+    }
+
+    # Increment entry count
+    F inc_entries(mut self) { self.entry_count += 1; }
+    F dec_entries(mut self) { I self.entry_count > 0 { self.entry_count -= 1; } }
+}
+
+# Helper: check if a > b
+F key_greater_than(a: &[u8], b: &[u8]) -> bool {
+    use storage/btree/entry.{compare_keys, KeyCmp};
+    M compare_keys(a, b) {
+        KeyCmp.Greater => true,
+        _ => false,
+    }
+}

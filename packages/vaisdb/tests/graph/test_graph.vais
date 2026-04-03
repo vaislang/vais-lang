@@ -1,0 +1,558 @@
+# Phase 11: Graph Engine Unit Tests
+# Tests: GraphConfig, GraphMeta, EdgeTypeTable, AdjEntry, GraphNode,
+#         PropertyValue, PropertyMap, PropertyEntry, serialization round-trips,
+#         constants validation
+
+U std/test.{assert_eq, assert_eq_str, assert_ne, assert_true, assert_false, describe, it};
+U std/bytes.{ByteBuffer};
+
+U graph/types.{
+    GraphConfig, GraphMeta, EdgeTypeTable, AdjEntry, GraphNode,
+    PropertyValue, PropertyEntry, PropertyMap,
+    GRAPH_FORMAT_VERSION, MAX_LABELS_PER_NODE, MAX_EDGE_TYPES,
+    ADJ_ENTRY_SIZE, GRAPH_NODE_HEADER_SIZE, ADJ_PAGE_HEADER_SIZE, PROP_PAGE_HEADER_SIZE,
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+    ENTITY_TYPE_NODE, ENTITY_TYPE_EDGE,
+    NODE_FLAG_ACTIVE, NODE_FLAG_HAS_PROPERTIES,
+    INVALID_NODE_ID, INVALID_EDGE_ID,
+};
+# Inline constants (avoid cross-module import for monolithic build)
+C PROP_TYPE_NULL: u8 = 0
+C PROP_TYPE_INT: u8 = 1
+C PROP_TYPE_FLOAT: u8 = 2
+C PROP_TYPE_STRING: u8 = 3
+C PROP_TYPE_BOOL: u8 = 4
+C DEFAULT_PAGE_SIZE: u32 = 8192
+C INVALID_TXN_ID: u64 = 0
+C NULL_PAGE: u32 = 0
+C NULL_UNDO_PTR: u64 = 0
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+describe("Graph Constants") {
+    it("should have correct format version") {
+        assert_eq(GRAPH_FORMAT_VERSION, 1);
+    }
+
+    it("should have correct size constants") {
+        assert_eq(ADJ_ENTRY_SIZE, 42);
+        assert_eq(GRAPH_NODE_HEADER_SIZE, 56);
+        assert_eq(ADJ_PAGE_HEADER_SIZE, 16);
+        assert_eq(PROP_PAGE_HEADER_SIZE, 16);
+    }
+
+    it("should have correct limits") {
+        assert_eq(MAX_LABELS_PER_NODE, 64);
+        assert_eq(MAX_EDGE_TYPES, 4096);
+    }
+
+    it("should have correct direction constants") {
+        assert_eq(DIRECTION_OUTGOING, 0);
+        assert_eq(DIRECTION_INCOMING, 1);
+        assert_eq(DIRECTION_BOTH, 2);
+    }
+
+    it("should have correct invalid IDs") {
+        assert_eq(INVALID_NODE_ID, 0);
+        assert_eq(INVALID_EDGE_ID, 0);
+    }
+}
+
+# ============================================================================
+# GraphConfig
+# ============================================================================
+
+describe("GraphConfig") {
+    it("should create default config") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        assert_eq(config.max_labels_per_node, MAX_LABELS_PER_NODE);
+        assert_eq(config.max_edge_types, MAX_EDGE_TYPES);
+        assert_false(config.allow_self_loops as i64);
+        assert_eq(config.page_size, DEFAULT_PAGE_SIZE);
+    }
+
+    it("should serialize/deserialize round-trip") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        buf := mut ByteBuffer.new();
+        config.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut GraphConfig.deserialize(&read_buf, DEFAULT_PAGE_SIZE)!;
+
+        assert_eq(restored.max_labels_per_node, config.max_labels_per_node);
+        assert_eq(restored.max_edge_types, config.max_edge_types);
+        assert_eq(restored.allow_self_loops as i64, config.allow_self_loops as i64);
+    }
+}
+
+# ============================================================================
+# GraphMeta
+# ============================================================================
+
+describe("GraphMeta") {
+    it("should initialize empty graph metadata") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        meta := mut GraphMeta.new(config);
+
+        assert_eq(meta.format_version, GRAPH_FORMAT_VERSION);
+        assert_eq(meta.total_nodes, 0);
+        assert_eq(meta.total_edges, 0);
+        assert_eq(meta.next_node_id, 1);
+        assert_eq(meta.next_edge_id, 1);
+        assert_eq(meta.edge_type_count, 0);
+    }
+
+    it("should allocate monotonically increasing node IDs") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        meta := mut GraphMeta.new(config);
+
+        id1 := mut meta.alloc_node_id();
+        id2 := mut meta.alloc_node_id();
+        id3 := mut meta.alloc_node_id();
+
+        assert_eq(id1, 1);
+        assert_eq(id2, 2);
+        assert_eq(id3, 3);
+        assert_eq(meta.next_node_id, 4);
+    }
+
+    it("should allocate monotonically increasing edge IDs") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        meta := mut GraphMeta.new(config);
+
+        id1 := mut meta.alloc_edge_id();
+        id2 := mut meta.alloc_edge_id();
+
+        assert_eq(id1, 1);
+        assert_eq(id2, 2);
+    }
+
+    it("should serialize/deserialize round-trip") {
+        config := mut GraphConfig.default(DEFAULT_PAGE_SIZE);
+        meta := mut GraphMeta.new(config);
+        meta.total_nodes = 100;
+        meta.total_edges = 250;
+        meta.next_node_id = 101;
+        meta.next_edge_id = 251;
+        meta.edge_type_count = 5;
+
+        buf := mut ByteBuffer.new();
+        meta.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut GraphMeta.deserialize(&read_buf, DEFAULT_PAGE_SIZE)!;
+
+        assert_eq(restored.format_version, GRAPH_FORMAT_VERSION);
+        assert_eq(restored.total_nodes, 100);
+        assert_eq(restored.total_edges, 250);
+        assert_eq(restored.next_node_id, 101);
+        assert_eq(restored.next_edge_id, 251);
+        assert_eq(restored.edge_type_count, 5);
+    }
+}
+
+# ============================================================================
+# EdgeTypeTable
+# ============================================================================
+
+describe("EdgeTypeTable") {
+    it("should start empty") {
+        table := mut EdgeTypeTable.new();
+        assert_true(table.get_name(0).is_none());
+    }
+
+    it("should allocate new edge types") {
+        table := mut EdgeTypeTable.new();
+        id1 := mut table.get_or_create(&"KNOWS")!;
+        id2 := mut table.get_or_create(&"FOLLOWS")!;
+
+        assert_eq(id1, 0);
+        assert_eq(id2, 1);
+    }
+
+    it("should return existing ID for known type") {
+        table := mut EdgeTypeTable.new();
+        id1 := mut table.get_or_create(&"KNOWS")!;
+        id2 := mut table.get_or_create(&"KNOWS")!;
+        assert_eq(id1, id2);
+    }
+
+    it("should look up type name by ID") {
+        table := mut EdgeTypeTable.new();
+        table.get_or_create(&"LIKES")!;
+        name := mut table.get_name(0);
+        M name {
+            Some(n) => assert_eq_str(n, "LIKES"),
+            None => panic!("Expected Some"),
+        }
+    }
+
+    it("should return None for unknown ID") {
+        table := mut EdgeTypeTable.new();
+        assert_true(table.get_name(999).is_none());
+    }
+
+    it("should serialize/deserialize round-trip") {
+        table := mut EdgeTypeTable.new();
+        table.get_or_create(&"KNOWS")!;
+        table.get_or_create(&"FOLLOWS")!;
+        table.get_or_create(&"LIKES")!;
+
+        buf := mut ByteBuffer.new();
+        table.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut EdgeTypeTable.deserialize(&read_buf)!;
+
+        M restored.get_name(0) { Some(n) => assert_eq_str(n, "KNOWS"), _ => panic!("name 0") }
+        M restored.get_name(1) { Some(n) => assert_eq_str(n, "FOLLOWS"), _ => panic!("name 1") }
+        M restored.get_name(2) { Some(n) => assert_eq_str(n, "LIKES"), _ => panic!("name 2") }
+    }
+}
+
+# ============================================================================
+# AdjEntry
+# ============================================================================
+
+describe("AdjEntry") {
+    it("should create new active entry") {
+        entry := mut AdjEntry.new(100, 200, 1, 10, 0);
+
+        assert_eq(entry.target_node, 100);
+        assert_eq(entry.edge_id, 200);
+        assert_eq(entry.edge_type, 1);
+        assert_eq(entry.txn_id_create, 10);
+        assert_eq(entry.txn_id_expire, INVALID_TXN_ID);
+        assert_true(entry.is_active() as i64);
+    }
+
+    it("should mark as expired") {
+        entry := mut AdjEntry.new(100, 200, 1, 10, 0);
+        assert_true(entry.is_active() as i64);
+
+        entry.set_expired(20, 1);
+        assert_false(entry.is_active() as i64);
+        assert_eq(entry.txn_id_expire, 20);
+        assert_eq(entry.expire_cmd_id, 1);
+    }
+
+    it("should clear expiration (rollback)") {
+        entry := mut AdjEntry.new(100, 200, 1, 10, 0);
+        entry.set_expired(20, 1);
+        assert_false(entry.is_active() as i64);
+
+        entry.clear_expired();
+        assert_true(entry.is_active() as i64);
+        assert_eq(entry.txn_id_expire, INVALID_TXN_ID);
+    }
+
+    it("should serialize/deserialize round-trip (42 bytes)") {
+        entry := mut AdjEntry.new(12345, 67890, 42, 100, 5);
+        entry.set_expired(200, 3);
+
+        buf := mut ByteBuffer.new();
+        entry.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut AdjEntry.deserialize(&read_buf)!;
+
+        assert_eq(restored.target_node, 12345);
+        assert_eq(restored.edge_id, 67890);
+        assert_eq(restored.edge_type, 42);
+        assert_eq(restored.txn_id_create, 100);
+        assert_eq(restored.txn_id_expire, 200);
+        assert_eq(restored.cmd_id, 5);
+        assert_eq(restored.expire_cmd_id, 3);
+    }
+}
+
+# ============================================================================
+# GraphNode
+# ============================================================================
+
+describe("GraphNode") {
+    it("should create new active node") {
+        labels := mut vec![1u16, 2u16, 3u16];
+        node := mut GraphNode.new(42, labels, 10, 0);
+
+        assert_eq(node.node_id, 42);
+        assert_eq(node.out_adj_page, NULL_PAGE);
+        assert_eq(node.in_adj_page, NULL_PAGE);
+        assert_eq(node.property_page, NULL_PAGE);
+        assert_eq(node.labels.len(), 3);
+        assert_true(node.is_active() as i64);
+        assert_false(node.has_properties() as i64);
+    }
+
+    it("should have correct flags") {
+        node := mut GraphNode.new(1, Vec.new(), 10, 0);
+        assert_true(((node.flags & NODE_FLAG_ACTIVE) != 0) as i64);
+    }
+
+    it("should mark as deleted") {
+        node := mut GraphNode.new(1, Vec.new(), 10, 0);
+        assert_true(node.is_active() as i64);
+
+        node.mark_deleted(20, 1);
+        assert_false(node.is_active() as i64);
+        assert_eq(node.txn_id_expire, 20);
+        assert_eq(node.expire_cmd_id, 1);
+    }
+
+    it("should detect label membership") {
+        labels := mut vec![10u16, 20u16, 30u16];
+        node := mut GraphNode.new(1, labels, 10, 0);
+
+        assert_true(node.has_label(10) as i64);
+        assert_true(node.has_label(20) as i64);
+        assert_true(node.has_label(30) as i64);
+        assert_false(node.has_label(40) as i64);
+    }
+
+    it("should compute serialized size correctly") {
+        labels := mut vec![1u16, 2u16, 3u16];
+        node := mut GraphNode.new(1, labels, 10, 0);
+        # GRAPH_NODE_HEADER_SIZE(56) + labels(3 * 2) = 62
+        assert_eq(node.serialized_size(), 62);
+    }
+
+    it("should serialize/deserialize round-trip") {
+        labels := mut vec![10u16, 20u16, 30u16];
+        node := mut GraphNode.new(42, labels, 100, 5);
+
+        buf := mut ByteBuffer.new();
+        node.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut GraphNode.deserialize(&read_buf)!;
+
+        assert_eq(restored.node_id, 42);
+        assert_eq(restored.out_adj_page, NULL_PAGE);
+        assert_eq(restored.in_adj_page, NULL_PAGE);
+        assert_eq(restored.property_page, NULL_PAGE);
+        assert_eq(restored.labels.len(), 3);
+        assert_eq(restored.labels[0], 10);
+        assert_eq(restored.labels[1], 20);
+        assert_eq(restored.labels[2], 30);
+        assert_eq(restored.txn_id_create, 100);
+        assert_eq(restored.cmd_id, 5);
+        assert_true(restored.is_active() as i64);
+    }
+
+    it("should serialize deleted node correctly") {
+        node := mut GraphNode.new(1, Vec.new(), 10, 0);
+        node.mark_deleted(20, 3);
+
+        buf := mut ByteBuffer.new();
+        node.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut GraphNode.deserialize(&read_buf)!;
+
+        assert_false(restored.is_active());
+        assert_eq(restored.txn_id_expire, 20);
+        assert_eq(restored.expire_cmd_id, 3);
+    }
+}
+
+# ============================================================================
+# PropertyValue
+# ============================================================================
+
+describe("PropertyValue") {
+    it("should create null property") {
+        pv := mut PropertyValue.null();
+        assert_eq(pv.prop_type, PROP_TYPE_NULL);
+    }
+
+    it("should create int property") {
+        pv := mut PropertyValue.from_int(42);
+        assert_eq(pv.prop_type, PROP_TYPE_INT);
+        assert_eq(pv.int_val, 42);
+    }
+
+    it("should create float property") {
+        pv := mut PropertyValue.from_float(3.14);
+        assert_eq(pv.prop_type, PROP_TYPE_FLOAT);
+        assert_true((pv.float_val > 3.13 && pv.float_val < 3.15) as i64);
+    }
+
+    it("should create string property") {
+        pv := mut PropertyValue.from_string("hello");
+        assert_eq(pv.prop_type, PROP_TYPE_STRING);
+        assert_eq_str(pv.string_val, "hello");
+    }
+
+    it("should create bool property") {
+        pv := mut PropertyValue.from_bool(1);
+        assert_eq(pv.prop_type, PROP_TYPE_BOOL);
+        assert_true(pv.bool_val as i64);
+    }
+
+    it("should serialize/deserialize null round-trip") {
+        pv := mut PropertyValue.null();
+        buf := mut ByteBuffer.new();
+        pv.serialize(&buf);
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyValue.deserialize(&read_buf)!;
+        assert_eq(restored.prop_type, PROP_TYPE_NULL);
+    }
+
+    it("should serialize/deserialize int round-trip") {
+        pv := mut PropertyValue.from_int(-999);
+        buf := mut ByteBuffer.new();
+        pv.serialize(&buf);
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyValue.deserialize(&read_buf)!;
+        assert_eq(restored.prop_type, PROP_TYPE_INT);
+        assert_eq(restored.int_val, -999);
+    }
+
+    it("should serialize/deserialize float round-trip") {
+        pv := mut PropertyValue.from_float(2.718);
+        buf := mut ByteBuffer.new();
+        pv.serialize(&buf);
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyValue.deserialize(&read_buf)!;
+        assert_eq(restored.prop_type, PROP_TYPE_FLOAT);
+        assert_true((restored.float_val > 2.717 && restored.float_val < 2.719) as i64);
+    }
+
+    it("should serialize/deserialize string round-trip") {
+        pv := mut PropertyValue.from_string("test value");
+        buf := mut ByteBuffer.new();
+        pv.serialize(&buf);
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyValue.deserialize(&read_buf)!;
+        assert_eq(restored.prop_type, PROP_TYPE_STRING);
+        assert_eq_str(restored.string_val, "test value");
+    }
+
+    it("should serialize/deserialize bool round-trip") {
+        pv := mut PropertyValue.from_bool(0);
+        buf := mut ByteBuffer.new();
+        pv.serialize(&buf);
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyValue.deserialize(&read_buf)!;
+        assert_eq(restored.prop_type, PROP_TYPE_BOOL);
+        assert_false(restored.bool_val as i64);
+    }
+}
+
+# ============================================================================
+# PropertyMap
+# ============================================================================
+
+describe("PropertyMap") {
+    it("should start empty") {
+        map := mut PropertyMap.new();
+        assert_eq(map.len(), 0);
+        assert_true(map.is_empty());
+    }
+
+    it("should set and get properties") {
+        map := mut PropertyMap.new();
+        map.set("name", PropertyValue.from_string("Alice"));
+        map.set("age", PropertyValue.from_int(30));
+
+        assert_eq(map.len(), 2);
+        assert_false(map.is_empty());
+
+        assert_true(map.get(&"name").is_some());
+        assert_true(map.get(&"age").is_some());
+    }
+
+    it("should update existing property") {
+        map := mut PropertyMap.new();
+        map.set("score", PropertyValue.from_float(1.0));
+        map.set("score", PropertyValue.from_float(2.0));
+
+        assert_eq(map.len(), 1);
+        assert_true(map.get(&"score").is_some());
+    }
+
+    it("should remove properties") {
+        map := mut PropertyMap.new();
+        map.set("key1", PropertyValue.from_int(1));
+        map.set("key2", PropertyValue.from_int(2));
+
+        removed := mut map.remove(&"key1");
+        assert_true(removed as i64);
+        assert_eq(map.len(), 1);
+        assert_true(map.get(&"key1").is_none());
+    }
+
+    it("should return false when removing non-existent key") {
+        map := mut PropertyMap.new();
+        assert_false(map.remove(&"nonexistent"));
+    }
+
+    it("should serialize/deserialize round-trip") {
+        map := mut PropertyMap.new();
+        map.set("name", PropertyValue.from_string("Bob"));
+        map.set("age", PropertyValue.from_int(25));
+        map.set("active", PropertyValue.from_bool(1));
+
+        buf := mut ByteBuffer.new();
+        map.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyMap.deserialize(&read_buf)!;
+
+        assert_eq(restored.len(), 3);
+        assert_true(restored.get(&"name").is_some());
+        assert_true(restored.get(&"age").is_some());
+        assert_true(restored.get(&"active").is_some());
+    }
+
+    it("should serialize/deserialize via to_bytes/from_bytes") {
+        map := mut PropertyMap.new();
+        map.set("x", PropertyValue.from_float(1.5));
+
+        bytes := mut map.to_bytes();
+        restored := mut PropertyMap.from_bytes(&bytes)!;
+
+        assert_eq(restored.len(), 1);
+        assert_true(restored.get(&"x").is_some());
+    }
+
+    it("should handle empty map serialization") {
+        map := mut PropertyMap.new();
+
+        buf := mut ByteBuffer.new();
+        map.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyMap.deserialize(&read_buf)!;
+
+        assert_eq(restored.len(), 0);
+        assert_true(restored.is_empty());
+    }
+}
+
+# ============================================================================
+# PropertyEntry
+# ============================================================================
+
+describe("PropertyEntry") {
+    it("should create with key and value") {
+        entry := mut PropertyEntry.new("status", PropertyValue.from_string("active"));
+        assert_eq_str(entry.key, "status");
+        assert_eq(entry.value.prop_type, PROP_TYPE_STRING);
+    }
+
+    it("should serialize/deserialize round-trip") {
+        entry := mut PropertyEntry.new("count", PropertyValue.from_int(42));
+
+        buf := mut ByteBuffer.new();
+        entry.serialize(&buf);
+
+        read_buf := mut ByteBuffer.from_buf(&buf);
+        restored := mut PropertyEntry.deserialize(&read_buf)!;
+
+        assert_eq_str(restored.key, "count");
+        assert_eq(restored.value.int_val, 42);
+    }
+}

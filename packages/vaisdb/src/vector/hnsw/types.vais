@@ -1,0 +1,579 @@
+# HNSW Core Data Structures and Meta Page
+# Hierarchical Navigable Small Worlds index types for VaisDB vector engine
+# Based on HNSW paper by Malkov & Yashunin 2018
+
+U std/bytes.{ByteBuffer};
+U storage/constants.{PAGE_HEADER_SIZE, INVALID_TXN_ID, NULL_UNDO_PTR};
+U storage/error.{VaisError};
+U storage/page/header.{PageHeader};
+U storage/page/types.{PAGE_TYPE_HNSW_META, PAGE_TYPE_HNSW_NODE, ENGINE_TAG_VECTOR};
+
+# Distance metric types
+C DISTANCE_COSINE: u8 = 0;
+C DISTANCE_L2: u8 = 1;
+C DISTANCE_DOT_PRODUCT: u8 = 2;
+
+# HNSW format version
+C HNSW_FORMAT_VERSION: u8 = 1;
+
+# Default configuration values
+C DEFAULT_M: u16 = 16;
+C DEFAULT_M_MAX_0: u16 = 32;
+C DEFAULT_EF_CONSTRUCTION: u32 = 200;
+C DEFAULT_EF_SEARCH: u32 = 50;
+
+# Invalid node ID sentinel
+C INVALID_NODE_ID: u64 = 0;
+
+# Error codes: EE=02 (vector), CC=01 (HNSW), NNN=001-005
+F err_hnsw_invalid_config(detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0201001",
+        "Invalid HNSW configuration: {detail}"
+    )
+}
+
+F err_hnsw_meta_corrupt(page_id: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0201002",
+        "HNSW meta page {page_id} is corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_hnsw_node_corrupt(node_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0201003",
+        "HNSW node {node_id} is corrupted"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_hnsw_index_full(max_elements: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0201004",
+        "HNSW index full: max capacity {max_elements} reached"
+    )
+}
+
+F err_hnsw_invalid_layer(layer: u8, max_layer: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0201005",
+        "Invalid layer {layer}: max layer is {max_layer}"
+    )
+}
+
+# HNSW Configuration (immutable after creation)
+# Size: 2 + 2 + 4 + 4 + 8 + 1 = 21 bytes
+S HnswConfig {
+    m: u16,                    # Max neighbors per layer (default 16)
+    m_max_0: u16,              # Max neighbors at layer 0 (default 32)
+    ef_construction: u32,      # Construction beam width (default 200)
+    ef_search: u32,            # Search beam width (default 50)
+    max_elements: u64,         # Maximum capacity
+    distance_metric: u8,       # 0=Cosine, 1=L2, 2=DotProduct
+}
+
+X HnswConfig {
+    # Create default configuration
+    F default(max_elements: u64) -> HnswConfig {
+        HnswConfig {
+            m: DEFAULT_M,
+            m_max_0: DEFAULT_M_MAX_0,
+            ef_construction: DEFAULT_EF_CONSTRUCTION,
+            ef_search: DEFAULT_EF_SEARCH,
+            max_elements,
+            distance_metric: DISTANCE_COSINE,
+        }
+    }
+
+    # Create custom configuration
+    F new(
+        m: u16,
+        m_max_0: u16,
+        ef_construction: u32,
+        ef_search: u32,
+        max_elements: u64,
+        distance_metric: u8
+    ) -> Result<HnswConfig, VaisError> {
+        # Validate parameters
+        I m == 0 {
+            R Err(err_hnsw_invalid_config("m must be > 0"));
+        }
+        I m_max_0 < m {
+            R Err(err_hnsw_invalid_config("m_max_0 must be >= m"));
+        }
+        I ef_construction < m {
+            R Err(err_hnsw_invalid_config("ef_construction must be >= m"));
+        }
+        I ef_search == 0 {
+            R Err(err_hnsw_invalid_config("ef_search must be > 0"));
+        }
+        I distance_metric > DISTANCE_DOT_PRODUCT {
+            R Err(err_hnsw_invalid_config("invalid distance_metric"));
+        }
+
+        Ok(HnswConfig {
+            m,
+            m_max_0,
+            ef_construction,
+            ef_search,
+            max_elements,
+            distance_metric,
+        })
+    }
+
+    # Calculate layer normalization factor mL = 1/ln(M)
+    F get_ml(self) -> f64 {
+        1.0 / (self.m as f64).ln()
+    }
+
+    # Serialize to ByteBuffer (21 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u16_le(self.m);
+        buf.put_u16_le(self.m_max_0);
+        buf.put_u32_le(self.ef_construction);
+        buf.put_u32_le(self.ef_search);
+        buf.put_u64_le(self.max_elements);
+        buf.put_u8(self.distance_metric);
+    }
+
+    # Deserialize from ByteBuffer (21 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<HnswConfig, VaisError> {
+        Ok(HnswConfig {
+            m: buf.get_u16_le()?,
+            m_max_0: buf.get_u16_le()?,
+            ef_construction: buf.get_u32_le()?,
+            ef_search: buf.get_u32_le()?,
+            max_elements: buf.get_u64_le()?,
+            distance_metric: buf.get_u8()?,
+        })
+    }
+
+    # Get human-readable distance metric name
+    F distance_metric_name(self) -> Str {
+        M self.distance_metric {
+            DISTANCE_COSINE => "Cosine",
+            DISTANCE_L2 => "L2",
+            DISTANCE_DOT_PRODUCT => "DotProduct",
+            _ => "Unknown",
+        }
+    }
+}
+
+# HNSW Index Metadata
+# Stored in page type 0x20 (PAGE_TYPE_HNSW_META)
+# Size: 1 + 8 + 1 + 8 + 8 + 21 + 4 = 51 bytes (plus page header)
+S HnswMeta {
+    format_version: u8,        # HNSW format version (currently 1)
+    entry_point: u64,          # Node ID of entry point (top layer)
+    max_layer: u8,             # Current maximum layer in index
+    total_nodes: u64,          # Total active nodes
+    total_deleted: u64,        # Soft-deleted nodes (pending GC)
+    config: HnswConfig,        # Immutable configuration
+    index_id: u32,             # Catalog index ID
+}
+
+X HnswMeta {
+    # Create new metadata for empty index
+    F new(config: HnswConfig, index_id: u32) -> HnswMeta {
+        HnswMeta {
+            format_version: HNSW_FORMAT_VERSION,
+            entry_point: INVALID_NODE_ID,
+            max_layer: 0,
+            total_nodes: 0,
+            total_deleted: 0,
+            config,
+            index_id,
+        }
+    }
+
+    # Serialize to page (writes page header + metadata)
+    F serialize_to_page(self, page_data: &mut [u8], page_id: u32, lsn: u64) {
+        # Write page header
+        header := mut PageHeader.new(page_id, PAGE_TYPE_HNSW_META, ENGINE_TAG_VECTOR);
+        header.page_lsn = lsn;
+        header.write_to_page(page_data);
+
+        # Write metadata after page header
+        buf := mut ByteBuffer.wrap(&page_data[PAGE_HEADER_SIZE as u64..]);
+        buf.put_u8(self.format_version);
+        buf.put_u64_le(self.entry_point);
+        buf.put_u8(self.max_layer);
+        buf.put_u64_le(self.total_nodes);
+        buf.put_u64_le(self.total_deleted);
+        self.config.serialize(&buf);
+        buf.put_u32_le(self.index_id);
+
+        # Update checksum
+        PageHeader.update_checksum(page_data);
+    }
+
+    # Deserialize from page (reads page header + metadata)
+    F deserialize_from_page(page_data: &[u8]) -> Result<HnswMeta, VaisError> {
+        # Read and validate page header
+        header := mut PageHeader.read_from_page(page_data)?;
+        I header.page_type != PAGE_TYPE_HNSW_META {
+            R Err(err_hnsw_meta_corrupt(header.page_id));
+        }
+
+        # Read metadata after page header
+        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
+        format_version := mut buf.get_u8()?;
+        I format_version != HNSW_FORMAT_VERSION {
+            R Err(err_hnsw_meta_corrupt(header.page_id));
+        }
+
+        Ok(HnswMeta {
+            format_version,
+            entry_point: buf.get_u64_le()?,
+            max_layer: buf.get_u8()?,
+            total_nodes: buf.get_u64_le()?,
+            total_deleted: buf.get_u64_le()?,
+            config: HnswConfig.deserialize(&buf)?,
+            index_id: buf.get_u32_le()?,
+        })
+    }
+
+    # Check if index is empty
+    F is_empty(self) -> bool {
+        self.total_nodes == 0
+    }
+
+    # Update entry point and max layer
+    F update_entry_point(mut self, node_id: u64, layer: u8) {
+        self.entry_point = node_id;
+        I layer > self.max_layer {
+            self.max_layer = layer;
+        }
+    }
+
+    # Increment active node count
+    F add_node(mut self) {
+        self.total_nodes += 1;
+    }
+
+    # Increment deleted node count
+    F delete_node(mut self) {
+        self.total_deleted += 1;
+    }
+
+    # Get active node count (excludes soft-deleted)
+    F active_nodes(self) -> u64 {
+        self.total_nodes - self.total_deleted
+    }
+}
+
+# HNSW Node with MVCC metadata
+# Stored in page type 0x21 (PAGE_TYPE_HNSW_NODE)
+# Fixed header: 8 + 4 + 2 + 1 + 1 + 32 = 48 bytes
+# Variable: neighbor lists per layer
+S HnswNode {
+    node_id: u64,              # Unique node identifier
+    vector_page_id: u32,       # Page where vector data lives
+    vector_offset: u16,        # Offset within page
+    max_layer: u8,             # Highest layer this node appears in
+    is_deleted: bool,          # Soft-delete flag (IS_TOMBSTONE)
+
+    # MVCC metadata (32 bytes)
+    txn_id_create: u64,        # Transaction that created this node
+    txn_id_expire: u64,        # Transaction that deleted/updated (0 = active)
+    undo_ptr: u64,             # Pointer to previous version in undo log
+    cmd_id: u32,               # Command sequence within creating transaction
+    expire_cmd_id: u32,        # Command sequence within deleting transaction
+
+    # Neighbor lists per layer (layer 0 has up to M_max_0, others up to M)
+    # neighbors[i] contains neighbors for layer i
+    neighbors: Vec<Vec<HnswNeighbor>>,
+}
+
+X HnswNode {
+    # Create new node for insertion
+    F new(
+        node_id: u64,
+        vector_page_id: u32,
+        vector_offset: u16,
+        max_layer: u8,
+        txn_id: u64,
+        cmd_id: u32
+    ) -> HnswNode {
+        # Initialize neighbor lists for all layers (0..=max_layer)
+        neighbors := mut Vec.with_capacity((max_layer + 1) as u64);
+        i := mut 0;
+        L i <= max_layer {
+            neighbors.push(Vec.new());
+            i += 1;
+        }
+
+        HnswNode {
+            node_id,
+            vector_page_id,
+            vector_offset,
+            max_layer,
+            is_deleted: false,
+            txn_id_create: txn_id,
+            txn_id_expire: INVALID_TXN_ID,
+            undo_ptr: NULL_UNDO_PTR,
+            cmd_id,
+            expire_cmd_id: 0,
+            neighbors,
+        }
+    }
+
+    # Serialize node to ByteBuffer
+    # Format: fixed header (48B) + per-layer neighbor lists
+    F serialize(self, buf: &mut ByteBuffer) {
+        # Fixed header (48 bytes)
+        buf.put_u64_le(self.node_id);
+        buf.put_u32_le(self.vector_page_id);
+        buf.put_u16_le(self.vector_offset);
+        buf.put_u8(self.max_layer);
+        buf.put_u8(I self.is_deleted { 1 } E { 0 });
+
+        # MVCC metadata (32 bytes)
+        buf.put_u64_le(self.txn_id_create);
+        buf.put_u64_le(self.txn_id_expire);
+        buf.put_u64_le(self.undo_ptr);
+        buf.put_u32_le(self.cmd_id);
+        buf.put_u32_le(self.expire_cmd_id);
+
+        # Neighbor lists (variable size)
+        # Format per layer: neighbor_count(u16) + [node_id(u64) + distance(f32)] * count
+        layer := mut 0;
+        L layer <= self.max_layer {
+            layer_neighbors := mut &self.neighbors[layer as u64];
+            buf.put_u16_le(layer_neighbors.len() as u16);
+
+            i := mut 0;
+            L i < layer_neighbors.len() {
+                layer_neighbors[i].serialize(buf);
+                i += 1;
+            }
+
+            layer += 1;
+        }
+    }
+
+    # Deserialize node from ByteBuffer
+    F deserialize(buf: &ByteBuffer) -> Result<HnswNode, VaisError> {
+        # Fixed header (48 bytes)
+        node_id := mut buf.get_u64_le()?;
+        vector_page_id := mut buf.get_u32_le()?;
+        vector_offset := mut buf.get_u16_le()?;
+        max_layer := mut buf.get_u8()?;
+        is_deleted_byte := mut buf.get_u8()?;
+
+        # MVCC metadata (32 bytes)
+        txn_id_create := mut buf.get_u64_le()?;
+        txn_id_expire := mut buf.get_u64_le()?;
+        undo_ptr := mut buf.get_u64_le()?;
+        cmd_id := mut buf.get_u32_le()?;
+        expire_cmd_id := mut buf.get_u32_le()?;
+
+        # Neighbor lists
+        neighbors := mut Vec.with_capacity((max_layer + 1) as u64);
+        layer := mut 0;
+        L layer <= max_layer {
+            count := mut buf.get_u16_le()? as u64;
+            layer_neighbors := mut Vec.with_capacity(count);
+
+            i := mut 0;
+            L i < count {
+                layer_neighbors.push(HnswNeighbor.deserialize(buf)?);
+                i += 1;
+            }
+
+            neighbors.push(layer_neighbors);
+            layer += 1;
+        }
+
+        Ok(HnswNode {
+            node_id,
+            vector_page_id,
+            vector_offset,
+            max_layer,
+            is_deleted: is_deleted_byte != 0,
+            txn_id_create,
+            txn_id_expire,
+            undo_ptr,
+            cmd_id,
+            expire_cmd_id,
+            neighbors,
+        })
+    }
+
+    # Mark node as deleted (soft delete)
+    F mark_deleted(mut self, txn_id: u64, cmd_id: u32) {
+        self.is_deleted = true;
+        self.txn_id_expire = txn_id;
+        self.expire_cmd_id = cmd_id;
+    }
+
+    # Check if node is current (not deleted/expired)
+    F is_current(self) -> bool {
+        !self.is_deleted && self.txn_id_expire == INVALID_TXN_ID
+    }
+
+    # Get neighbors at specific layer
+    F get_neighbors(self, layer: u8) -> Result<&Vec<HnswNeighbor>, VaisError> {
+        I layer > self.max_layer {
+            R Err(err_hnsw_invalid_layer(layer, self.max_layer));
+        }
+        Ok(&self.neighbors[layer as u64])
+    }
+
+    # Get mutable neighbors at specific layer
+    F get_neighbors_mut(mut self, layer: u8) -> Result<&mut Vec<HnswNeighbor>, VaisError> {
+        I layer > self.max_layer {
+            R Err(err_hnsw_invalid_layer(layer, self.max_layer));
+        }
+        Ok(&mut self.neighbors[layer as u64])
+    }
+
+    # Add neighbor at specific layer
+    F add_neighbor(mut self, layer: u8, neighbor: HnswNeighbor) -> Result<(), VaisError> {
+        I layer > self.max_layer {
+            R Err(err_hnsw_invalid_layer(layer, self.max_layer));
+        }
+        self.neighbors[layer as u64].push(neighbor);
+        Ok(())
+    }
+
+    # Set undo pointer
+    F set_undo_ptr(mut self, ptr: u64) {
+        self.undo_ptr = ptr;
+    }
+
+    # Calculate serialized size
+    F serialized_size(self) -> u64 {
+        size := mut 48;  # Fixed header
+        layer := mut 0;
+        L layer <= self.max_layer {
+            size += 2;  # neighbor_count
+            size += self.neighbors[layer as u64].len() * 12;  # (u64 + f32) per neighbor
+            layer += 1;
+        }
+        size
+    }
+}
+
+# HNSW Neighbor (node_id + distance)
+# Size: 8 + 4 = 12 bytes
+S HnswNeighbor {
+    node_id: u64,              # Neighbor node ID
+    distance: f32,             # Distance to this neighbor
+}
+
+X HnswNeighbor {
+    # Create new neighbor
+    F new(node_id: u64, distance: f32) -> HnswNeighbor {
+        HnswNeighbor { node_id, distance }
+    }
+
+    # Serialize to ByteBuffer (12 bytes)
+    F serialize(self, buf: &mut ByteBuffer) {
+        buf.put_u64_le(self.node_id);
+        buf.put_f32_le(self.distance);
+    }
+
+    # Deserialize from ByteBuffer (12 bytes)
+    F deserialize(buf: &ByteBuffer) -> Result<HnswNeighbor, VaisError> {
+        Ok(HnswNeighbor {
+            node_id: buf.get_u64_le()?,
+            distance: buf.get_f32_le()?,
+        })
+    }
+}
+
+# Search candidate for priority queue usage
+# Used during HNSW search and construction
+S SearchCandidate {
+    node_id: u64,              # Candidate node ID
+    distance: f32,             # Distance to query point
+}
+
+X SearchCandidate {
+    # Create new search candidate
+    F new(node_id: u64, distance: f32) -> SearchCandidate {
+        SearchCandidate { node_id, distance }
+    }
+
+    # Compare by distance (for min-heap: smaller distance = higher priority)
+    F cmp_min(self, other: &SearchCandidate) -> i8 {
+        I self.distance < other.distance {
+            -1
+        } E I self.distance > other.distance {
+            1
+        } E {
+            0
+        }
+    }
+
+    # Compare by distance (for max-heap: larger distance = higher priority)
+    F cmp_max(self, other: &SearchCandidate) -> i8 {
+        I self.distance > other.distance {
+            -1
+        } E I self.distance < other.distance {
+            1
+        } E {
+            0
+        }
+    }
+
+    # Check if this candidate is closer than other
+    F is_closer_than(self, other: &SearchCandidate) -> bool {
+        self.distance < other.distance
+    }
+}
+
+# Layer probability calculation using exponential distribution
+# Layer = floor(-ln(uniform(0,1)) * mL) where mL = 1/ln(M)
+# Simple LCG random generator for layer selection
+S LayerRng {
+    seed: u64,                 # Current seed state
+}
+
+X LayerRng {
+    # Create new RNG with seed
+    F new(seed: u64) -> LayerRng {
+        LayerRng { seed }
+    }
+
+    # Generate next random u64 using LCG (Linear Congruential Generator)
+    # Constants from Knuth's MMIX
+    F next_u64(mut self) -> u64 {
+        self.seed = self.seed.wrapping_mul(6364136223846793005u64)
+            .wrapping_add(1442695040888963407u64);
+        self.seed
+    }
+
+    # Generate uniform random f64 in range [0.0, 1.0)
+    F next_f64(mut self) -> f64 {
+        u := mut self.next_u64();
+        # Use upper 53 bits for mantissa
+        (u >> 11) as f64 / 9007199254740992.0  # 2^53
+    }
+
+    # Calculate random layer using exponential distribution
+    # layer = floor(-ln(uniform(0,1)) * mL)
+    # Note: Does NOT clamp to current max_layer. New nodes can promote the graph
+    # to a higher layer. Caller is responsible for updating HnswMeta.max_layer.
+    # Clamps to absolute maximum of 255 (u8) to prevent overflow.
+    F random_layer(mut self, m: u16) -> u8 {
+        ml := mut 1.0 / (m as f64).ln();
+        uniform := mut self.next_f64();
+
+        # Avoid ln(0) by clamping to small positive value
+        I uniform < 0.000001 {
+            uniform = 0.000001;
+        }
+
+        layer := mut (-uniform.ln() * ml).floor() as u8;
+
+        # Clamp to reasonable hard maximum to prevent runaway layers
+        # For M=16, layer > 30 is astronomically unlikely (mut 10^-36)
+        I layer > 30 {
+            30
+        } E {
+            layer
+        }
+    }
+}

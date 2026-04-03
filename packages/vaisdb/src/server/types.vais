@@ -1,0 +1,733 @@
+# Server Types
+# Wire protocol messages, connection state, server configuration
+# Error codes: EE=06 (server), CC=01-10
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError, ErrorSeverity};
+
+# ============================================================================
+# Wire Protocol Message Type Tags (1 byte)
+# ============================================================================
+
+# Client → Server: Initial handshake
+C MSG_TYPE_STARTUP: u8 = 0x01;
+
+# Server → Client: Request credentials
+C MSG_TYPE_AUTH_REQUEST: u8 = 0x02;
+
+# Client → Server: Credentials
+C MSG_TYPE_AUTH_RESPONSE: u8 = 0x03;
+
+# Server → Client: Authentication success
+C MSG_TYPE_AUTH_OK: u8 = 0x04;
+
+# Client → Server: Simple query (SQL string)
+C MSG_TYPE_QUERY: u8 = 0x10;
+
+# Client → Server: Prepared statement parse
+C MSG_TYPE_PARSE: u8 = 0x11;
+
+# Client → Server: Bind parameters
+C MSG_TYPE_BIND: u8 = 0x12;
+
+# Client → Server: Execute prepared statement
+C MSG_TYPE_EXECUTE: u8 = 0x13;
+
+# Client → Server: Describe prepared statement
+C MSG_TYPE_DESCRIBE: u8 = 0x14;
+
+# Client → Server: Close prepared statement
+C MSG_TYPE_CLOSE_STMT: u8 = 0x15;
+
+# Server → Client: Query result (rows)
+C MSG_TYPE_RESULT: u8 = 0x20;
+
+# Server → Client: Single row in result
+C MSG_TYPE_ROW_DATA: u8 = 0x21;
+
+# Server → Client: DML complete (affected rows)
+C MSG_TYPE_COMMAND_COMPLETE: u8 = 0x22;
+
+# Server → Client: Ready for query
+C MSG_TYPE_READY: u8 = 0x23;
+
+# Server → Client: Error response
+C MSG_TYPE_ERROR: u8 = 0x30;
+
+# Server → Client: Warning/info notice
+C MSG_TYPE_NOTICE: u8 = 0x31;
+
+# Server → Client: Parameter description
+C MSG_TYPE_PARAM_DESC: u8 = 0x32;
+
+# Server → Client: Row description (column metadata)
+C MSG_TYPE_ROW_DESC: u8 = 0x33;
+
+# Server → Client: Ready for COPY data
+C MSG_TYPE_COPY_IN: u8 = 0x40;
+
+# Server → Client: COPY data outgoing
+C MSG_TYPE_COPY_OUT: u8 = 0x41;
+
+# Both: COPY data chunk
+C MSG_TYPE_COPY_DATA: u8 = 0x42;
+
+# Both: COPY complete
+C MSG_TYPE_COPY_DONE: u8 = 0x43;
+
+# Client → Server: COPY failed
+C MSG_TYPE_COPY_FAIL: u8 = 0x44;
+
+# Client → Server: Disconnect
+C MSG_TYPE_TERMINATE: u8 = 0x50;
+
+# Client → Server: Sync (end of extended query)
+C MSG_TYPE_SYNC: u8 = 0x51;
+
+# ============================================================================
+# Protocol Constants
+# ============================================================================
+
+# Protocol version
+C PROTOCOL_VERSION_MAJOR: u16 = 1;
+C PROTOCOL_VERSION_MINOR: u16 = 0;
+
+# Default server port
+C DEFAULT_PORT: u16 = 5433;
+
+# Default max connections
+C DEFAULT_MAX_CONNECTIONS: u32 = 100;
+
+# ============================================================================
+# Connection State
+# ============================================================================
+
+# Connection state machine
+L ConnectionState =
+    New |               # Just accepted, no handshake yet
+    Authenticating |    # Startup received, waiting for auth
+    Ready |            # Authenticated, ready for queries
+    InQuery |          # Processing a query
+    InTransaction |    # Inside explicit BEGIN...COMMIT
+    CopyIn |           # Receiving COPY data
+    CopyOut |          # Sending COPY data
+    Closing;           # Graceful shutdown in progress
+
+# Transaction state for ReadyForQuery indicator
+L TransactionState =
+    Idle |             # Not in a transaction block
+    InBlock |          # In a transaction block (BEGIN issued)
+    Failed;            # In a failed transaction block (error occurred, need ROLLBACK)
+
+# ============================================================================
+# Wire Protocol Message Structures
+# ============================================================================
+
+# Wire protocol message header (5 bytes: 1 type + 4 length)
+S MessageHeader {
+    msg_type: u8,      # MSG_TYPE_* constant
+    length: u32,       # Payload length (NOT including type byte, INCLUDING length field itself)
+}
+
+X MessageHeader {
+    F new(msg_type: u8, length: u32) -> MessageHeader {
+        MessageHeader { msg_type, length }
+    }
+
+    # Total wire size = 1 (type) + 4 (length)
+    F wire_size() -> u32 {
+        5
+    }
+}
+
+# ============================================================================
+# Startup & Authentication
+# ============================================================================
+
+# Startup message payload
+S StartupPayload {
+    protocol_major: u16,
+    protocol_minor: u16,
+    params: Vec<KeyValue>,  # Key-value pairs (user, database, application_name, etc.)
+}
+
+X StartupPayload {
+    F new(params: Vec<KeyValue>) -> StartupPayload {
+        StartupPayload {
+            protocol_major: PROTOCOL_VERSION_MAJOR,
+            protocol_minor: PROTOCOL_VERSION_MINOR,
+            params,
+        }
+    }
+
+    # Find parameter by key
+    F get_param(self, key: &Str) -> Option<&Str> {
+        i := mut 0;
+        found := mut None;
+        done := mut false;
+
+        L !done {
+            I i >= self.params.len() {
+                done = true;
+            } E I self.params[i].key == *key {
+                found = Some(&self.params[i].value);
+                done = true;
+            } E {
+                i = i + 1;
+            }
+        }
+
+        found
+    }
+}
+
+# Simple key-value pair
+S KeyValue {
+    key: Str,
+    value: Str,
+}
+
+X KeyValue {
+    F new(key: Str, value: Str) -> KeyValue {
+        KeyValue { key, value }
+    }
+}
+
+# ============================================================================
+# Query Result Structures
+# ============================================================================
+
+# Column description in result set
+S ColumnDesc {
+    name: Str,          # Column name
+    table_oid: u32,     # Table OID (0 if computed column)
+    column_index: u16,  # Column position in table
+    type_tag: u8,       # SqlType tag (TYPE_TAG_* from sql/types.vais)
+    type_size: i16,     # Type size (-1 for variable length)
+    type_modifier: i32, # Type modifier (e.g., varchar max length)
+}
+
+X ColumnDesc {
+    F new(name: Str, type_tag: u8, type_size: i16) -> ColumnDesc {
+        ColumnDesc {
+            name,
+            table_oid: 0,
+            column_index: 0,
+            type_tag,
+            type_size,
+            type_modifier: -1,
+        }
+    }
+
+    F with_table_oid(mut self, table_oid: u32) -> ColumnDesc {
+        self.table_oid = table_oid;
+        self
+    }
+
+    F with_column_index(mut self, column_index: u16) -> ColumnDesc {
+        self.column_index = column_index;
+        self
+    }
+
+    F with_type_modifier(mut self, type_modifier: i32) -> ColumnDesc {
+        self.type_modifier = type_modifier;
+        self
+    }
+}
+
+# Row description (column metadata for result set)
+S RowDescription {
+    columns: Vec<ColumnDesc>,
+}
+
+X RowDescription {
+    F new(columns: Vec<ColumnDesc>) -> RowDescription {
+        RowDescription { columns }
+    }
+
+    F column_count(self) -> u64 {
+        self.columns.len()
+    }
+
+    F get_column(self, index: u64) -> Option<&ColumnDesc> {
+        I index < self.columns.len() {
+            Some(&self.columns[index])
+        } E {
+            None
+        }
+    }
+}
+
+# Command completion result
+S CommandComplete {
+    tag: Str,           # e.g., "SELECT 42", "INSERT 0 1", "UPDATE 3", "DELETE 1"
+}
+
+X CommandComplete {
+    F new(tag: Str) -> CommandComplete {
+        CommandComplete { tag }
+    }
+
+    F select(row_count: u64) -> CommandComplete {
+        CommandComplete { tag: "SELECT {row_count}" }
+    }
+
+    F insert(row_count: u64) -> CommandComplete {
+        CommandComplete { tag: "INSERT 0 {row_count}" }
+    }
+
+    F update(row_count: u64) -> CommandComplete {
+        CommandComplete { tag: "UPDATE {row_count}" }
+    }
+
+    F delete(row_count: u64) -> CommandComplete {
+        CommandComplete { tag: "DELETE {row_count}" }
+    }
+
+    F create_table() -> CommandComplete {
+        CommandComplete { tag: "CREATE TABLE" }
+    }
+
+    F drop_table() -> CommandComplete {
+        CommandComplete { tag: "DROP TABLE" }
+    }
+}
+
+# ============================================================================
+# Error & Notice Responses
+# ============================================================================
+
+# Error/Notice fields
+S ErrorResponse {
+    severity: Str,      # "ERROR", "WARNING", "FATAL"
+    code: Str,          # "VAIS-EECCNNN" format
+    message: Str,       # Human-readable message
+    detail: Str,        # Additional detail (empty if none)
+    hint: Str,          # Suggested fix (empty if none)
+}
+
+X ErrorResponse {
+    # Convert from VaisError (with error sanitization for client safety)
+    # Removes internal file paths, page references, and memory addresses
+    # from error messages before sending to client
+    F from_vais_error(err: &VaisError) -> ErrorResponse {
+        severity := mut "ERROR";
+
+        I err.is_fatal() {
+            severity = "FATAL";
+        }
+
+        # Apply sanitization to remove internal details
+        sanitizer := mut security/sanitizer.ErrorSanitizer.new();
+        clean_err := mut sanitizer.sanitize_error(err);
+
+        ErrorResponse {
+            severity,
+            code: clean_err.code.clone(),
+            message: clean_err.message.clone(),
+            detail: clean_err.detail.clone(),
+            hint: clean_err.hint.clone(),
+        }
+    }
+
+    # Convert from VaisError without sanitization (for internal/debug logging)
+    F from_vais_error_raw(err: &VaisError) -> ErrorResponse {
+        severity := mut "ERROR";
+
+        I err.is_fatal() {
+            severity = "FATAL";
+        }
+
+        ErrorResponse {
+            severity,
+            code: err.code.clone(),
+            message: err.message.clone(),
+            detail: err.detail.clone(),
+            hint: err.hint.clone(),
+        }
+    }
+
+    # Create new error response
+    F new_error(code: Str, message: Str) -> ErrorResponse {
+        ErrorResponse {
+            severity: "ERROR",
+            code,
+            message,
+            detail: "",
+            hint: "",
+        }
+    }
+
+    # Create new fatal error
+    F new_fatal(code: Str, message: Str) -> ErrorResponse {
+        ErrorResponse {
+            severity: "FATAL",
+            code,
+            message,
+            detail: "",
+            hint: "",
+        }
+    }
+
+    # Create new warning
+    F new_warning(code: Str, message: Str) -> ErrorResponse {
+        ErrorResponse {
+            severity: "WARNING",
+            code,
+            message,
+            detail: "",
+            hint: "",
+        }
+    }
+
+    F with_detail(mut self, detail: Str) -> ErrorResponse {
+        self.detail = detail;
+        self
+    }
+
+    F with_hint(mut self, hint: Str) -> ErrorResponse {
+        self.hint = hint;
+        self
+    }
+}
+
+# ============================================================================
+# Prepared Statement Structures
+# ============================================================================
+
+# Prepared statement info (server-side)
+S PreparedStmtInfo {
+    name: Str,           # Statement name (empty string = unnamed)
+    query: Str,          # Original SQL text
+    param_types: Vec<u8>,  # Parameter type tags
+    result_columns: Vec<ColumnDesc>,  # Result column descriptions (empty if unknown)
+}
+
+X PreparedStmtInfo {
+    F new(name: Str, query: Str) -> PreparedStmtInfo {
+        PreparedStmtInfo {
+            name,
+            query,
+            param_types: Vec.new(),
+            result_columns: Vec.new(),
+        }
+    }
+
+    F with_param_types(mut self, param_types: Vec<u8>) -> PreparedStmtInfo {
+        self.param_types = param_types;
+        self
+    }
+
+    F with_result_columns(mut self, result_columns: Vec<ColumnDesc>) -> PreparedStmtInfo {
+        self.result_columns = result_columns;
+        self
+    }
+
+    F param_count(self) -> u64 {
+        self.param_types.len()
+    }
+
+    F has_result_columns(self) -> bool {
+        self.result_columns.len() > 0
+    }
+}
+
+# Bind parameters for prepared stmt execution
+S BindParams {
+    stmt_name: Str,      # Which prepared statement
+    portal_name: Str,    # Portal name (empty = unnamed)
+    param_values: Vec<ParamValue>,  # Bound parameter values
+}
+
+X BindParams {
+    F new(stmt_name: Str, portal_name: Str, param_values: Vec<ParamValue>) -> BindParams {
+        BindParams {
+            stmt_name,
+            portal_name,
+            param_values,
+        }
+    }
+
+    F param_count(self) -> u64 {
+        self.param_values.len()
+    }
+}
+
+# Parameter value (nullable)
+S ParamValue {
+    is_null: bool,
+    data: Vec<u8>,       # Serialized value (empty if null)
+}
+
+X ParamValue {
+    F null() -> ParamValue {
+        ParamValue {
+            is_null: true,
+            data: Vec.new(),
+        }
+    }
+
+    F from_bytes(data: Vec<u8>) -> ParamValue {
+        ParamValue {
+            is_null: false,
+            data,
+        }
+    }
+
+    F is_null(self) -> bool {
+        self.is_null
+    }
+
+    F get_data(self) -> &Vec<u8> {
+        &self.data
+    }
+}
+
+# ============================================================================
+# Session Configuration
+# ============================================================================
+
+# Per-connection session configuration overrides
+S SessionConfig {
+    hnsw_ef_search: Option<u32>,
+    oversample_factor: Option<f64>,
+    query_memory_limit: Option<u64>,   # bytes
+    query_timeout_sec: Option<u32>,
+    transaction_timeout_sec: Option<u32>,
+    default_isolation: Option<Str>,    # "snapshot" or "read_committed"
+}
+
+X SessionConfig {
+    F new() -> SessionConfig {
+        SessionConfig {
+            hnsw_ef_search: None,
+            oversample_factor: None,
+            query_memory_limit: None,
+            query_timeout_sec: None,
+            transaction_timeout_sec: None,
+            default_isolation: None,
+        }
+    }
+
+    # Get effective ef_search value (session override or global default)
+    F effective_ef_search(self, global_default: u32) -> u32 {
+        M self.hnsw_ef_search {
+            Some(v) => v,
+            None => global_default,
+        }
+    }
+
+    # Get effective query timeout (session override or global default)
+    F effective_query_timeout(self, global_default: u32) -> u32 {
+        M self.query_timeout_sec {
+            Some(v) => v,
+            None => global_default,
+        }
+    }
+
+    # Get effective transaction timeout (session override or global default)
+    F effective_txn_timeout(self, global_default: u32) -> u32 {
+        M self.transaction_timeout_sec {
+            Some(v) => v,
+            None => global_default,
+        }
+    }
+
+    # Get effective query memory limit (session override or global default)
+    F effective_query_memory_limit(self, global_default: u64) -> u64 {
+        M self.query_memory_limit {
+            Some(v) => v,
+            None => global_default,
+        }
+    }
+
+    # Get effective isolation level (session override or global default)
+    F effective_isolation(self, global_default: &Str) -> Str {
+        M &self.default_isolation {
+            Some(v) => v.clone(),
+            None => global_default.clone(),
+        }
+    }
+
+    # Get effective oversample factor (session override or global default)
+    F effective_oversample_factor(self, global_default: f64) -> f64 {
+        M self.oversample_factor {
+            Some(v) => v,
+            None => global_default,
+        }
+    }
+
+    # Set ef_search override
+    F set_ef_search(mut self, value: u32) {
+        self.hnsw_ef_search = Some(value);
+    }
+
+    # Set oversample factor override
+    F set_oversample_factor(mut self, value: f64) {
+        self.oversample_factor = Some(value);
+    }
+
+    # Set query memory limit override
+    F set_query_memory_limit(mut self, value: u64) {
+        self.query_memory_limit = Some(value);
+    }
+
+    # Set query timeout override
+    F set_query_timeout(mut self, value: u32) {
+        self.query_timeout_sec = Some(value);
+    }
+
+    # Set transaction timeout override
+    F set_txn_timeout(mut self, value: u32) {
+        self.transaction_timeout_sec = Some(value);
+    }
+
+    # Set isolation level override
+    F set_isolation(mut self, value: Str) {
+        self.default_isolation = Some(value);
+    }
+
+    # Clear all overrides
+    F reset(mut self) {
+        self.hnsw_ef_search = None;
+        self.oversample_factor = None;
+        self.query_memory_limit = None;
+        self.query_timeout_sec = None;
+        self.transaction_timeout_sec = None;
+        self.default_isolation = None;
+    }
+}
+
+# ============================================================================
+# Server Error Constructors (EE=06)
+# ============================================================================
+
+# Protocol error (CC=01)
+F err_protocol_error(detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0601001",
+        "Protocol error: {detail}"
+    )
+}
+
+# Protocol version mismatch
+F err_protocol_version(client_major: u16, client_minor: u16) -> VaisError {
+    VaisError.new(
+        "VAIS-0601002",
+        "Protocol version mismatch: client={client_major}.{client_minor}, server={PROTOCOL_VERSION_MAJOR}.{PROTOCOL_VERSION_MINOR}"
+    )
+}
+
+# Invalid message type
+F err_invalid_message_type(msg_type: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0601003",
+        "Invalid message type: 0x{msg_type:02x}"
+    )
+}
+
+# Server overloaded (CC=03)
+F err_server_overloaded(active_queries: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0603001",
+        "Server overloaded: {active_queries} active queries"
+    )
+}
+
+# Max connections exceeded
+F err_max_connections(max: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0003003",
+        "Maximum connections ({max}) exceeded"
+    )
+}
+
+# Connection reset (CC=08)
+F err_connection_reset() -> VaisError {
+    VaisError.new(
+        "VAIS-0608001",
+        "Connection reset by peer"
+    )
+}
+
+# TLS error
+F err_tls_error(detail: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0608002",
+        "TLS error: {detail}"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+# Authentication failed (CC=06)
+F err_auth_failed(user: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0006001",
+        "Authentication failed for user '{user}'"
+    )
+}
+
+# Invalid startup parameter
+F err_invalid_startup_param(key: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0601004",
+        "Invalid startup parameter: '{key}'"
+    )
+}
+
+# Missing required parameter
+F err_missing_required_param(key: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0601005",
+        "Missing required parameter: '{key}'"
+    )
+}
+
+# Prepared statement not found (CC=10)
+F err_prepared_stmt_not_found(name: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0610001",
+        "Prepared statement '{name}' not found"
+    )
+}
+
+# Portal not found
+F err_portal_not_found(name: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0610002",
+        "Portal '{name}' not found"
+    )
+}
+
+# Parameter count mismatch
+F err_param_count_mismatch(expected: u64, actual: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0602001",
+        "Parameter count mismatch: expected {expected}, got {actual}"
+    )
+}
+
+# Query timeout (CC=04)
+F err_query_timeout(seconds: u32) -> VaisError {
+    VaisError.new(
+        "VAIS-0604001",
+        "Query timeout after {seconds} seconds"
+    )
+}
+
+# Connection closed
+F err_connection_closed() -> VaisError {
+    VaisError.new(
+        "VAIS-0610003",
+        "Connection is closed"
+    )
+}
+
+# Invalid state transition
+F err_invalid_state(current: Str, attempted: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0601006",
+        "Invalid state transition: current={current}, attempted={attempted}"
+    )
+}

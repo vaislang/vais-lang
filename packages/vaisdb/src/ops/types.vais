@@ -1,0 +1,1432 @@
+# Production Operations — Core Types
+# Backup/restore, metrics, profiling, VACUUM, REINDEX, compaction
+# Error codes: EE=07 (ops), CC=01-10
+
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+U std/hashmap.HashMap;
+U storage/error.{VaisError, ErrorSeverity};
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Ops module format version
+C OPS_FORMAT_VERSION: u8 = 1;
+
+# Backup types
+C BACKUP_TYPE_PHYSICAL: u8 = 0;
+C BACKUP_TYPE_LOGICAL: u8 = 1;
+
+# Backup states
+C BACKUP_STATE_STARTING: u8 = 0;
+C BACKUP_STATE_IN_PROGRESS: u8 = 1;
+C BACKUP_STATE_CHECKSUM_VERIFY: u8 = 2;
+C BACKUP_STATE_COMPLETE: u8 = 3;
+C BACKUP_STATE_FAILED: u8 = 4;
+
+# Restore states
+C RESTORE_STATE_VALIDATING: u8 = 0;
+C RESTORE_STATE_RESTORING: u8 = 1;
+C RESTORE_STATE_RECOVERING: u8 = 2;
+C RESTORE_STATE_VERIFYING: u8 = 3;
+C RESTORE_STATE_COMPLETE: u8 = 4;
+C RESTORE_STATE_FAILED: u8 = 5;
+
+# Health status
+C HEALTH_HEALTHY: u8 = 0;
+C HEALTH_DEGRADED: u8 = 1;
+C HEALTH_UNHEALTHY: u8 = 2;
+
+# VACUUM modes
+C VACUUM_MODE_STANDARD: u8 = 0;   # Reclaim space, compact undo
+C VACUUM_MODE_FULL: u8 = 1;       # Full rewrite (exclusive lock)
+C VACUUM_MODE_ANALYZE: u8 = 2;    # VACUUM + update statistics
+
+# REINDEX targets
+C REINDEX_TARGET_TABLE: u8 = 0;
+C REINDEX_TARGET_INDEX: u8 = 1;
+C REINDEX_TARGET_DATABASE: u8 = 2;
+
+# Metric types
+C METRIC_TYPE_COUNTER: u8 = 0;    # Monotonically increasing
+C METRIC_TYPE_GAUGE: u8 = 1;      # Arbitrary value (can go up or down)
+C METRIC_TYPE_HISTOGRAM: u8 = 2;  # Distribution of values
+
+# Log rotation modes
+C LOG_ROTATE_SIZE: u8 = 0;        # Rotate when file exceeds size threshold
+C LOG_ROTATE_TIME: u8 = 1;        # Rotate at time interval
+C LOG_ROTATE_BOTH: u8 = 2;        # Rotate on whichever threshold is hit first
+
+# Slow query sort order
+C SLOW_QUERY_SORT_DURATION: u8 = 0;
+C SLOW_QUERY_SORT_TIMESTAMP: u8 = 1;
+C SLOW_QUERY_SORT_ROWS_SCANNED: u8 = 2;
+
+# ============================================================================
+# Error Codes: EE=07 (ops)
+# ============================================================================
+
+F err_backup_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0701001",
+        "Backup failed: {reason}"
+    )
+}
+
+F err_backup_already_running() -> VaisError {
+    VaisError.new(
+        "VAIS-0701002",
+        "Another backup operation is already in progress"
+    )
+}
+
+F err_restore_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0701003",
+        "Restore failed: {reason}"
+    )
+}
+
+F err_restore_checksum_mismatch(file: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0705001",
+        "Restore checksum mismatch for file: {file}"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_pitr_target_not_found(target_time: i64) -> VaisError {
+    VaisError.new(
+        "VAIS-0701004",
+        "PITR target timestamp {target_time} not found in WAL archive"
+    )
+}
+
+F err_pitr_wal_gap(start_lsn: u64, end_lsn: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0705002",
+        "WAL gap detected between LSN {start_lsn} and {end_lsn}"
+    ).with_severity(ErrorSeverity.Fatal)
+}
+
+F err_vacuum_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0702001",
+        "VACUUM failed: {reason}"
+    )
+}
+
+F err_vacuum_already_running() -> VaisError {
+    VaisError.new(
+        "VAIS-0702002",
+        "VACUUM is already in progress"
+    )
+}
+
+F err_reindex_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0702003",
+        "REINDEX failed: {reason}"
+    )
+}
+
+F err_reindex_invalid_target(name: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0710001",
+        "REINDEX target not found: {name}"
+    )
+}
+
+F err_compaction_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0702004",
+        "Database compaction failed: {reason}"
+    )
+}
+
+F err_metrics_not_available(name: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0710002",
+        "Metrics not available: {name}"
+    )
+}
+
+F err_health_check_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0710003",
+        "Health check failed: {reason}"
+    )
+}
+
+F err_slow_query_log_full() -> VaisError {
+    VaisError.new(
+        "VAIS-0703001",
+        "Slow query log ring buffer is full"
+    )
+}
+
+F err_log_rotation_failed(reason: Str) -> VaisError {
+    VaisError.new(
+        "VAIS-0703002",
+        "Log rotation failed: {reason}"
+    )
+}
+
+# ============================================================================
+# BackupManifest — Metadata describing a backup
+# ============================================================================
+
+## Backup manifest: records all files, checksums, and WAL position
+## Written as the last file in the backup directory
+S BackupManifest {
+    backup_id: u64,                  # Unique backup identifier
+    backup_type: u8,                 # BACKUP_TYPE_PHYSICAL | BACKUP_TYPE_LOGICAL
+    db_format_version: u32,          # DB format version at time of backup
+    start_lsn: u64,                  # WAL LSN at backup start (checkpoint)
+    end_lsn: u64,                    # WAL LSN at backup end
+    start_time: i64,                 # Epoch seconds when backup started
+    end_time: i64,                   # Epoch seconds when backup completed
+    data_file_size: u64,             # Size of data.vdb in bytes
+    data_file_checksum: u64,         # FNV-1a checksum of data.vdb
+    vectors_file_size: u64,          # Size of vectors.vdb (0 if no vector data)
+    vectors_file_checksum: u64,
+    graph_file_size: u64,            # Size of graph.vdb (0 if no graph data)
+    graph_file_checksum: u64,
+    fulltext_file_size: u64,         # Size of fulltext.vdb (0 if no fulltext data)
+    fulltext_file_checksum: u64,
+    meta_file_size: u64,             # Size of meta.vdb
+    meta_file_checksum: u64,
+    wal_segments_archived: u32,      # Number of WAL segments included
+    total_pages: u64,                # Total pages across all files
+    page_size: u32,                  # Page size (for restore validation)
+    label: Str,                      # User-provided label (e.g., "pre-migration")
+}
+
+X BackupManifest {
+    F new(backup_id: u64, backup_type: u8, page_size: u32) -> BackupManifest {
+        BackupManifest {
+            backup_id,
+            backup_type,
+            db_format_version: 1,
+            start_lsn: 0,
+            end_lsn: 0,
+            start_time: 0,
+            end_time: 0,
+            data_file_size: 0,
+            data_file_checksum: 0,
+            vectors_file_size: 0,
+            vectors_file_checksum: 0,
+            graph_file_size: 0,
+            graph_file_checksum: 0,
+            fulltext_file_size: 0,
+            fulltext_file_checksum: 0,
+            meta_file_size: 0,
+            meta_file_checksum: 0,
+            wal_segments_archived: 0,
+            total_pages: 0,
+            page_size,
+            label: "",
+        }
+    }
+
+    ## Set backup LSN range
+    F set_lsn_range(mut self, start: u64, end: u64) {
+        self.start_lsn = start;
+        self.end_lsn = end;
+    }
+
+    ## Set backup time range
+    F set_time_range(mut self, start: i64, end: i64) {
+        self.start_time = start;
+        self.end_time = end;
+    }
+
+    ## Set label
+    F set_label(mut self, label: Str) {
+        self.label = label;
+    }
+
+    ## Duration in seconds
+    F duration_secs(self) -> i64 {
+        self.end_time - self.start_time
+    }
+
+    ## Total file sizes in bytes
+    F total_size_bytes(self) -> u64 {
+        self.data_file_size + self.vectors_file_size
+            + self.graph_file_size + self.fulltext_file_size
+            + self.meta_file_size
+    }
+}
+
+# ============================================================================
+# BackupProgress — Live progress tracking during backup
+# ============================================================================
+
+S BackupProgress {
+    state: u8,                       # BACKUP_STATE_*
+    total_pages: u64,                # Total pages to copy
+    pages_copied: u64,               # Pages copied so far
+    bytes_written: u64,              # Bytes written so far
+    current_file: Str,               # File currently being copied
+    elapsed_ms: u64,                 # Milliseconds since start
+}
+
+X BackupProgress {
+    F new() -> BackupProgress {
+        BackupProgress {
+            state: BACKUP_STATE_STARTING,
+            total_pages: 0,
+            pages_copied: 0,
+            bytes_written: 0,
+            current_file: "",
+            elapsed_ms: 0,
+        }
+    }
+
+    ## Compute progress as percentage (0-100)
+    F percent_complete(self) -> u32 {
+        I self.total_pages == 0 {
+            R 0;
+        }
+        ((self.pages_copied * 100) / self.total_pages) as u32
+    }
+
+    ## Estimated remaining time in milliseconds
+    F estimated_remaining_ms(self) -> u64 {
+        I self.pages_copied == 0 || self.elapsed_ms == 0 {
+            R 0;
+        }
+        pages_remaining := mut self.total_pages - self.pages_copied;
+        ms_per_page := mut self.elapsed_ms / self.pages_copied;
+        pages_remaining * ms_per_page
+    }
+}
+
+# ============================================================================
+# RestoreProgress — Live progress during restore
+# ============================================================================
+
+S RestoreProgress {
+    state: u8,                       # RESTORE_STATE_*
+    total_files: u32,                # Total files to restore
+    files_restored: u32,             # Files restored so far
+    bytes_restored: u64,             # Bytes restored so far
+    wal_records_replayed: u64,       # WAL records replayed (for PITR)
+    current_file: Str,               # File currently being restored
+}
+
+X RestoreProgress {
+    F new() -> RestoreProgress {
+        RestoreProgress {
+            state: RESTORE_STATE_VALIDATING,
+            total_files: 0,
+            files_restored: 0,
+            bytes_restored: 0,
+            wal_records_replayed: 0,
+            current_file: "",
+        }
+    }
+}
+
+# ============================================================================
+# PitrTarget — Point-in-Time Recovery target
+# ============================================================================
+
+## Specifies the target for PITR: either a timestamp or a specific LSN
+S PitrTarget {
+    target_time: Option<i64>,        # Recover to this timestamp (epoch seconds)
+    target_lsn: Option<u64>,         # Recover to this LSN (exact)
+    target_txn_id: Option<u64>,      # Recover to just before this transaction
+}
+
+X PitrTarget {
+    ## Create PITR target by timestamp
+    F by_time(ts: i64) -> PitrTarget {
+        PitrTarget {
+            target_time: Some(ts),
+            target_lsn: None,
+            target_txn_id: None,
+        }
+    }
+
+    ## Create PITR target by LSN
+    F by_lsn(lsn: u64) -> PitrTarget {
+        PitrTarget {
+            target_time: None,
+            target_lsn: Some(lsn),
+            target_txn_id: None,
+        }
+    }
+
+    ## Create PITR target by transaction ID
+    F by_txn(txn_id: u64) -> PitrTarget {
+        PitrTarget {
+            target_time: None,
+            target_lsn: None,
+            target_txn_id: Some(txn_id),
+        }
+    }
+
+    ## Validate that exactly one target is specified
+    F validate(self) -> Result<(), VaisError> {
+        count: u32 := mut 0;
+        I self.target_time.is_some() { count = count + 1; }
+        I self.target_lsn.is_some() { count = count + 1; }
+        I self.target_txn_id.is_some() { count = count + 1; }
+
+        I count != 1 {
+            R Err(VaisError.new(
+                "VAIS-0701005",
+                "PITR target must specify exactly one of: timestamp, LSN, or transaction ID"
+            ));
+        }
+        Ok(())
+    }
+}
+
+# ============================================================================
+# VacuumResult — Result of a VACUUM operation
+# ============================================================================
+
+S VacuumResult {
+    pages_scanned: u64,              # Total pages scanned
+    dead_tuples_removed: u64,        # Dead tuples physically removed
+    pages_freed: u64,                # Pages returned to freelist
+    undo_entries_reclaimed: u64,     # Undo log entries cleaned up
+    bytes_reclaimed: u64,            # Total bytes reclaimed
+    duration_ms: u64,                # Operation duration in milliseconds
+    tables_vacuumed: u32,            # Number of tables processed
+}
+
+X VacuumResult {
+    F new() -> VacuumResult {
+        VacuumResult {
+            pages_scanned: 0,
+            dead_tuples_removed: 0,
+            pages_freed: 0,
+            undo_entries_reclaimed: 0,
+            bytes_reclaimed: 0,
+            duration_ms: 0,
+            tables_vacuumed: 0,
+        }
+    }
+
+    ## Add stats from vacuuming a single table
+    F merge(mut self, other: &VacuumResult) {
+        self.pages_scanned = self.pages_scanned + other.pages_scanned;
+        self.dead_tuples_removed = self.dead_tuples_removed + other.dead_tuples_removed;
+        self.pages_freed = self.pages_freed + other.pages_freed;
+        self.undo_entries_reclaimed = self.undo_entries_reclaimed + other.undo_entries_reclaimed;
+        self.bytes_reclaimed = self.bytes_reclaimed + other.bytes_reclaimed;
+    }
+}
+
+# ============================================================================
+# VacuumTarget — Specifies what to VACUUM
+# ============================================================================
+
+S VacuumTarget {
+    table_name: Option<Str>,         # Specific table (None = all tables)
+    mode: u8,                        # VACUUM_MODE_*
+    skip_locked: bool,               # Skip tables with conflicting locks
+    io_limit_mbps: u32,              # I/O throttle (0 = unlimited)
+}
+
+X VacuumTarget {
+    ## VACUUM all tables in standard mode
+    F all() -> VacuumTarget {
+        VacuumTarget {
+            table_name: None,
+            mode: VACUUM_MODE_STANDARD,
+            skip_locked: false,
+            io_limit_mbps: 0,
+        }
+    }
+
+    ## VACUUM a specific table
+    F table(name: Str) -> VacuumTarget {
+        VacuumTarget {
+            table_name: Some(name),
+            mode: VACUUM_MODE_STANDARD,
+            skip_locked: false,
+            io_limit_mbps: 0,
+        }
+    }
+
+    ## Set mode
+    F with_mode(mut self, mode: u8) -> VacuumTarget {
+        self.mode = mode;
+        self
+    }
+
+    ## Set skip_locked
+    F with_skip_locked(mut self, skip: bool) -> VacuumTarget {
+        self.skip_locked = skip;
+        self
+    }
+
+    ## Set I/O throttle
+    F with_io_limit(mut self, mbps: u32) -> VacuumTarget {
+        self.io_limit_mbps = mbps;
+        self
+    }
+}
+
+# ============================================================================
+# ReindexTarget — Specifies what to REINDEX
+# ============================================================================
+
+S ReindexTarget {
+    target_type: u8,                 # REINDEX_TARGET_*
+    name: Str,                       # Table name, index name, or empty for database
+    concurrently: bool,              # Build new index concurrently (non-blocking)
+}
+
+X ReindexTarget {
+    ## REINDEX a specific table (all indexes on that table)
+    F table(name: Str) -> ReindexTarget {
+        ReindexTarget {
+            target_type: REINDEX_TARGET_TABLE,
+            name,
+            concurrently: false,
+        }
+    }
+
+    ## REINDEX a specific index
+    F index(name: Str) -> ReindexTarget {
+        ReindexTarget {
+            target_type: REINDEX_TARGET_INDEX,
+            name,
+            concurrently: false,
+        }
+    }
+
+    ## REINDEX entire database
+    F database() -> ReindexTarget {
+        ReindexTarget {
+            target_type: REINDEX_TARGET_DATABASE,
+            name: "",
+            concurrently: false,
+        }
+    }
+
+    ## Set concurrent mode
+    F with_concurrently(mut self, concurrently: bool) -> ReindexTarget {
+        self.concurrently = concurrently;
+        self
+    }
+}
+
+# ============================================================================
+# ReindexResult — Result of REINDEX operation
+# ============================================================================
+
+S ReindexResult {
+    indexes_rebuilt: u32,            # Number of indexes rebuilt
+    total_entries: u64,              # Total entries across all rebuilt indexes
+    pages_allocated: u64,            # New pages allocated for rebuilt indexes
+    pages_freed: u64,               # Old pages freed
+    duration_ms: u64,               # Operation duration in milliseconds
+}
+
+X ReindexResult {
+    F new() -> ReindexResult {
+        ReindexResult {
+            indexes_rebuilt: 0,
+            total_entries: 0,
+            pages_allocated: 0,
+            pages_freed: 0,
+            duration_ms: 0,
+        }
+    }
+}
+
+# ============================================================================
+# CompactionResult — Result of database file compaction
+# ============================================================================
+
+S CompactionResult {
+    files_compacted: u32,            # Number of files compacted
+    pages_moved: u64,               # Pages relocated during defragmentation
+    pages_freed: u64,               # Free pages reclaimed
+    bytes_before: u64,              # Total file size before compaction
+    bytes_after: u64,               # Total file size after compaction
+    duration_ms: u64,               # Operation duration in milliseconds
+}
+
+X CompactionResult {
+    F new() -> CompactionResult {
+        CompactionResult {
+            files_compacted: 0,
+            pages_moved: 0,
+            pages_freed: 0,
+            bytes_before: 0,
+            bytes_after: 0,
+            duration_ms: 0,
+        }
+    }
+
+    ## Bytes saved by compaction
+    F bytes_saved(self) -> u64 {
+        I self.bytes_before > self.bytes_after {
+            self.bytes_before - self.bytes_after
+        } E {
+            0
+        }
+    }
+}
+
+# ============================================================================
+# MetricValue — A single metric measurement
+# ============================================================================
+
+S MetricValue {
+    name: Str,                       # Metric name (e.g., "buffer_pool.hit_rate")
+    metric_type: u8,                 # METRIC_TYPE_*
+    value_f64: f64,                  # Float value (for gauges, histograms)
+    value_u64: u64,                  # Integer value (for counters)
+    timestamp: i64,                  # Epoch seconds when sampled
+}
+
+X MetricValue {
+    ## Create counter metric
+    F counter(name: Str, value: u64, ts: i64) -> MetricValue {
+        MetricValue {
+            name,
+            metric_type: METRIC_TYPE_COUNTER,
+            value_f64: 0.0,
+            value_u64: value,
+            timestamp: ts,
+        }
+    }
+
+    ## Create gauge metric
+    F gauge(name: Str, value: f64, ts: i64) -> MetricValue {
+        MetricValue {
+            name,
+            metric_type: METRIC_TYPE_GAUGE,
+            value_f64: value,
+            value_u64: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# SystemMetrics — Server-wide system metrics
+# ============================================================================
+
+S SystemMetrics {
+    uptime_secs: u64,                # Seconds since server start
+    active_connections: u32,         # Currently active connections
+    total_connections: u64,          # Total connections since start (counter)
+    memory_used_bytes: u64,          # Current memory usage
+    memory_budget_bytes: u64,        # Configured memory budget
+    disk_used_bytes: u64,            # Total disk usage of all DB files
+    disk_data_bytes: u64,            # Size of data files (excluding WAL)
+    disk_wal_bytes: u64,             # Size of WAL segments
+    total_queries: u64,              # Total queries executed (counter)
+    total_transactions: u64,         # Total transactions (counter)
+    total_errors: u64,               # Total errors (counter)
+    timestamp: i64,                  # When these metrics were sampled
+}
+
+X SystemMetrics {
+    F new(ts: i64) -> SystemMetrics {
+        SystemMetrics {
+            uptime_secs: 0,
+            active_connections: 0,
+            total_connections: 0,
+            memory_used_bytes: 0,
+            memory_budget_bytes: 0,
+            disk_used_bytes: 0,
+            disk_data_bytes: 0,
+            disk_wal_bytes: 0,
+            total_queries: 0,
+            total_transactions: 0,
+            total_errors: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# BufferPoolMetrics — Buffer pool health metrics
+# ============================================================================
+
+S BufferPoolMetrics {
+    total_pages: u64,                # Total pages in buffer pool
+    used_pages: u64,                 # Pages currently in use
+    dirty_pages: u64,                # Pages with unflushed writes
+    hit_count: u64,                  # Cache hits (counter)
+    miss_count: u64,                 # Cache misses (counter)
+    eviction_count: u64,             # Pages evicted (counter)
+    flush_count: u64,                # Dirty pages flushed (counter)
+    read_count: u64,                 # Disk reads (counter)
+    write_count: u64,                # Disk writes (counter)
+    hit_rate: f64,                   # hit_count / (hit_count + miss_count)
+    evictions_per_sec: f64,          # Evictions per second (gauge)
+    timestamp: i64,
+}
+
+X BufferPoolMetrics {
+    F new(ts: i64) -> BufferPoolMetrics {
+        BufferPoolMetrics {
+            total_pages: 0,
+            used_pages: 0,
+            dirty_pages: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+            flush_count: 0,
+            read_count: 0,
+            write_count: 0,
+            hit_rate: 0.0,
+            evictions_per_sec: 0.0,
+            timestamp: ts,
+        }
+    }
+
+    ## Compute hit rate from counters
+    F compute_hit_rate(mut self) {
+        total := mut self.hit_count + self.miss_count;
+        I total > 0 {
+            self.hit_rate = (self.hit_count as f64) / (total as f64);
+        } E {
+            self.hit_rate = 0.0;
+        }
+    }
+}
+
+# ============================================================================
+# WalMetrics — WAL subsystem metrics
+# ============================================================================
+
+S WalMetrics {
+    total_size_bytes: u64,           # Current WAL total size
+    segment_count: u32,              # Number of active WAL segments
+    write_rate_bytes_sec: f64,       # WAL write rate (gauge)
+    records_written: u64,            # Total WAL records written (counter)
+    bytes_written: u64,              # Total bytes written to WAL (counter)
+    fsync_count: u64,                # Number of fsyncs (counter)
+    fsync_duration_avg_us: f64,      # Average fsync duration in microseconds
+    group_commits: u64,              # Group commits (counter)
+    last_checkpoint_lsn: u64,       # LSN of most recent checkpoint
+    last_checkpoint_age_sec: u64,   # Seconds since last checkpoint
+    oldest_active_lsn: u64,         # Oldest LSN referenced by active txn
+    timestamp: i64,
+}
+
+X WalMetrics {
+    F new(ts: i64) -> WalMetrics {
+        WalMetrics {
+            total_size_bytes: 0,
+            segment_count: 0,
+            write_rate_bytes_sec: 0.0,
+            records_written: 0,
+            bytes_written: 0,
+            fsync_count: 0,
+            fsync_duration_avg_us: 0.0,
+            group_commits: 0,
+            last_checkpoint_lsn: 0,
+            last_checkpoint_age_sec: 0,
+            oldest_active_lsn: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# TxnMetrics — Transaction subsystem metrics
+# ============================================================================
+
+S TxnMetrics {
+    active_count: u32,               # Currently active transactions
+    total_committed: u64,            # Total committed (counter)
+    total_aborted: u64,              # Total aborted (counter)
+    total_deadlocks: u64,            # Total deadlocks detected (counter)
+    longest_running_ms: u64,         # Duration of longest active txn (gauge)
+    longest_running_txn_id: u64,     # Transaction ID of longest active txn
+    commit_rate_per_sec: f64,        # Commits per second (gauge)
+    rollback_rate_per_sec: f64,      # Rollbacks per second (gauge)
+    avg_duration_ms: f64,            # Average transaction duration (gauge)
+    timestamp: i64,
+}
+
+X TxnMetrics {
+    F new(ts: i64) -> TxnMetrics {
+        TxnMetrics {
+            active_count: 0,
+            total_committed: 0,
+            total_aborted: 0,
+            total_deadlocks: 0,
+            longest_running_ms: 0,
+            longest_running_txn_id: 0,
+            commit_rate_per_sec: 0.0,
+            rollback_rate_per_sec: 0.0,
+            avg_duration_ms: 0.0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# VectorEngineMetrics — Vector/HNSW index metrics
+# ============================================================================
+
+S VectorEngineMetrics {
+    total_vectors: u64,              # Total indexed vectors
+    hnsw_layers: u32,                # Number of HNSW layers
+    hnsw_entry_point: u64,           # Current entry point node ID
+    dimension: u32,                  # Vector dimension
+    search_count: u64,               # Total searches (counter)
+    insert_count: u64,               # Total inserts (counter)
+    delete_count: u64,               # Total deletes (counter)
+    avg_search_latency_us: f64,      # Average search latency (gauge)
+    p99_search_latency_us: f64,      # P99 search latency (gauge)
+    memory_bytes: u64,               # Memory used by HNSW structure
+    disk_pages: u64,                 # Disk pages used
+    timestamp: i64,
+}
+
+X VectorEngineMetrics {
+    F new(ts: i64) -> VectorEngineMetrics {
+        VectorEngineMetrics {
+            total_vectors: 0,
+            hnsw_layers: 0,
+            hnsw_entry_point: 0,
+            dimension: 0,
+            search_count: 0,
+            insert_count: 0,
+            delete_count: 0,
+            avg_search_latency_us: 0.0,
+            p99_search_latency_us: 0.0,
+            memory_bytes: 0,
+            disk_pages: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# GraphEngineMetrics — Graph engine metrics
+# ============================================================================
+
+S GraphEngineMetrics {
+    total_nodes: u64,                # Total graph nodes
+    total_edges: u64,                # Total graph edges
+    total_edge_types: u32,           # Distinct edge types
+    total_labels: u32,               # Distinct node labels
+    avg_degree: f64,                 # Average node degree (gauge)
+    max_degree: u64,                 # Maximum node degree
+    traversal_count: u64,            # Total traversals (counter)
+    avg_traversal_depth: f64,        # Average traversal depth (gauge)
+    avg_traversal_latency_us: f64,   # Average traversal latency (gauge)
+    disk_pages: u64,                 # Disk pages used
+    timestamp: i64,
+}
+
+X GraphEngineMetrics {
+    F new(ts: i64) -> GraphEngineMetrics {
+        GraphEngineMetrics {
+            total_nodes: 0,
+            total_edges: 0,
+            total_edge_types: 0,
+            total_labels: 0,
+            avg_degree: 0.0,
+            max_degree: 0,
+            traversal_count: 0,
+            avg_traversal_depth: 0.0,
+            avg_traversal_latency_us: 0.0,
+            disk_pages: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# FullTextEngineMetrics — Full-text search metrics
+# ============================================================================
+
+S FullTextEngineMetrics {
+    total_documents: u64,            # Total indexed documents
+    total_terms: u64,                # Unique terms in dictionary
+    total_tokens: u64,               # Total token occurrences
+    avg_doc_length: f64,             # Average document length in tokens
+    search_count: u64,               # Total searches (counter)
+    index_count: u64,                # Total documents indexed (counter)
+    avg_search_latency_us: f64,      # Average search latency (gauge)
+    dictionary_pages: u64,           # Pages used by dictionary B+Tree
+    posting_pages: u64,              # Pages used by posting lists
+    timestamp: i64,
+}
+
+X FullTextEngineMetrics {
+    F new(ts: i64) -> FullTextEngineMetrics {
+        FullTextEngineMetrics {
+            total_documents: 0,
+            total_terms: 0,
+            total_tokens: 0,
+            avg_doc_length: 0.0,
+            search_count: 0,
+            index_count: 0,
+            avg_search_latency_us: 0.0,
+            dictionary_pages: 0,
+            posting_pages: 0,
+            timestamp: ts,
+        }
+    }
+}
+
+# ============================================================================
+# HealthStatus — Database health check result
+# ============================================================================
+
+S HealthStatus {
+    status: u8,                      # HEALTH_HEALTHY | HEALTH_DEGRADED | HEALTH_UNHEALTHY
+    sql_engine_ok: bool,             # SQL engine responsive
+    vector_engine_ok: bool,          # Vector engine responsive
+    graph_engine_ok: bool,           # Graph engine responsive
+    fulltext_engine_ok: bool,        # Full-text engine responsive
+    rag_engine_ok: bool,             # RAG engine responsive
+    buffer_pool_ok: bool,            # Buffer pool within limits
+    wal_ok: bool,                    # WAL not corrupted, not too old
+    disk_space_ok: bool,             # Disk space above threshold
+    message: Str,                    # Human-readable status summary
+    checked_at: i64,                 # Epoch seconds
+}
+
+X HealthStatus {
+    F healthy(ts: i64) -> HealthStatus {
+        HealthStatus {
+            status: HEALTH_HEALTHY,
+            sql_engine_ok: true,
+            vector_engine_ok: true,
+            graph_engine_ok: true,
+            fulltext_engine_ok: true,
+            rag_engine_ok: true,
+            buffer_pool_ok: true,
+            wal_ok: true,
+            disk_space_ok: true,
+            message: "All systems healthy",
+            checked_at: ts,
+        }
+    }
+
+    ## Overall status derived from individual checks
+    F compute_status(mut self) {
+        all_ok := mut self.sql_engine_ok && self.vector_engine_ok
+            && self.graph_engine_ok && self.fulltext_engine_ok
+            && self.rag_engine_ok && self.buffer_pool_ok
+            && self.wal_ok && self.disk_space_ok;
+
+        I all_ok {
+            self.status = HEALTH_HEALTHY;
+            self.message = "All systems healthy";
+        } E I self.wal_ok && self.buffer_pool_ok && self.sql_engine_ok {
+            # Core systems ok but some engines degraded
+            self.status = HEALTH_DEGRADED;
+            self.message = "Some engines degraded";
+        } E {
+            self.status = HEALTH_UNHEALTHY;
+            self.message = "Critical system failure detected";
+        }
+    }
+
+    ## Status string for health endpoint
+    F status_string(self) -> Str {
+        M self.status {
+            0 => "healthy",
+            1 => "degraded",
+            _ => "unhealthy",
+        }
+    }
+
+    ## Suitable for Kubernetes liveness probe (passes unless critical failure)
+    F is_alive(self) -> bool {
+        self.status != HEALTH_UNHEALTHY
+    }
+
+    ## Suitable for Kubernetes readiness probe (passes only when fully ready)
+    F is_ready(self) -> bool {
+        self.status == HEALTH_HEALTHY
+    }
+}
+
+# ============================================================================
+# SlowQueryEntry — Captured slow query log entry
+# ============================================================================
+
+S SlowQueryEntry {
+    query_id: u64,                   # Unique query identifier
+    query_text: Str,                 # SQL text (truncated to 4KB)
+    duration_ms: u64,                # Total execution time
+    started_at: i64,                 # Epoch seconds when query started
+    plan_time_ms: u64,              # Time spent in query planning
+    exec_time_ms: u64,              # Time spent in execution
+    rows_scanned: u64,              # Total rows scanned across all engines
+    rows_returned: u64,             # Rows returned to client
+    buffer_hits: u64,               # Buffer pool hits
+    buffer_misses: u64,             # Buffer pool misses (disk reads)
+    memory_used_bytes: u64,         # Peak memory used by query
+    lock_wait_ms: u64,              # Time spent waiting for locks
+    engines_used: Vec<Str>,         # Engine names involved (e.g., ["sql", "vector"])
+    # Per-engine breakdown (percentages, sum to 100)
+    sql_percent: f64,               # % time in SQL engine
+    vector_percent: f64,            # % time in vector engine
+    graph_percent: f64,             # % time in graph engine
+    fulltext_percent: f64,          # % time in full-text engine
+    user_name: Str,                 # User who ran the query
+    client_address: Str,            # Client IP:port
+}
+
+X SlowQueryEntry {
+    F new(query_id: u64, query_text: Str, started_at: i64) -> SlowQueryEntry {
+        SlowQueryEntry {
+            query_id,
+            query_text,
+            duration_ms: 0,
+            started_at,
+            plan_time_ms: 0,
+            exec_time_ms: 0,
+            rows_scanned: 0,
+            rows_returned: 0,
+            buffer_hits: 0,
+            buffer_misses: 0,
+            memory_used_bytes: 0,
+            lock_wait_ms: 0,
+            engines_used: Vec.new(),
+            sql_percent: 0.0,
+            vector_percent: 0.0,
+            graph_percent: 0.0,
+            fulltext_percent: 0.0,
+            user_name: "",
+            client_address: "",
+        }
+    }
+
+    ## Set engine breakdown percentages
+    F set_engine_breakdown(mut self, sql: f64, vector: f64, graph: f64, fulltext: f64) {
+        self.sql_percent = sql;
+        self.vector_percent = vector;
+        self.graph_percent = graph;
+        self.fulltext_percent = fulltext;
+    }
+
+    ## Format as one-line log entry
+    F to_log_line(self) -> Str {
+        engines := mut "";
+        i: u64 := mut 0;
+        L i < self.engines_used.len() {
+            I i > 0 {
+                engines = "{engines},";
+            }
+            engines = "{engines}{self.engines_used[i]}";
+            i = i + 1;
+        }
+        "duration={self.duration_ms}ms rows_scanned={self.rows_scanned} rows_returned={self.rows_returned} buffer_hit_rate={self.buffer_hit_rate():.3} engines=[{engines}] query=\"{self.query_text}\""
+    }
+
+    ## Buffer hit rate
+    F buffer_hit_rate(self) -> f64 {
+        total := mut self.buffer_hits + self.buffer_misses;
+        I total > 0 {
+            (self.buffer_hits as f64) / (total as f64)
+        } E {
+            0.0
+        }
+    }
+}
+
+# ============================================================================
+# LogRotationConfig — Configuration for log file rotation
+# ============================================================================
+
+S LogRotationConfig {
+    mode: u8,                        # LOG_ROTATE_*
+    max_size_bytes: u64,             # Max log file size before rotation (default 100MB)
+    rotation_interval_sec: u32,      # Rotation interval in seconds (default 86400 = 24h)
+    max_files: u32,                  # Max rotated files to keep (default 7)
+    compress_rotated: bool,          # Compress old log files (default true)
+}
+
+X LogRotationConfig {
+    F default() -> LogRotationConfig {
+        LogRotationConfig {
+            mode: LOG_ROTATE_SIZE,
+            max_size_bytes: 104857600,   # 100MB
+            rotation_interval_sec: 86400, # 24 hours
+            max_files: 7,
+            compress_rotated: true,
+        }
+    }
+
+    ## Builder: set mode
+    F with_mode(mut self, mode: u8) -> LogRotationConfig {
+        self.mode = mode;
+        self
+    }
+
+    ## Builder: set max size
+    F with_max_size(mut self, bytes: u64) -> LogRotationConfig {
+        self.max_size_bytes = bytes;
+        self
+    }
+
+    ## Builder: set interval
+    F with_interval(mut self, secs: u32) -> LogRotationConfig {
+        self.rotation_interval_sec = secs;
+        self
+    }
+
+    ## Builder: set max files
+    F with_max_files(mut self, count: u32) -> LogRotationConfig {
+        self.max_files = count;
+        self
+    }
+
+    ## Builder: set compress
+    F with_compress(mut self, compress: bool) -> LogRotationConfig {
+        self.compress_rotated = compress;
+        self
+    }
+}
+
+# ============================================================================
+# LogRotationResult — Result of a log rotation operation
+# ============================================================================
+
+S LogRotationResult {
+    rotated: bool,                   # Whether rotation actually happened
+    new_log_file: Str,               # Path to new active log file
+    archived_file: Str,              # Path to archived/rotated file
+    files_deleted: u32,              # Old files deleted due to max_files limit
+}
+
+X LogRotationResult {
+    F new() -> LogRotationResult {
+        LogRotationResult {
+            rotated: false,
+            new_log_file: "",
+            archived_file: "",
+            files_deleted: 0,
+        }
+    }
+}
+
+# ============================================================================
+# QueryProfile — Detailed execution profile for EXPLAIN ANALYZE
+# ============================================================================
+
+S QueryProfile {
+    query_text: Str,                 # Original SQL
+    total_duration_ms: u64,          # Total wall-clock time
+    plan_time_ms: u64,               # Planning phase
+    exec_time_ms: u64,               # Execution phase
+    rows_produced: u64,              # Final result row count
+    peak_memory_bytes: u64,          # Peak memory during execution
+    # Engine breakdown (microseconds)
+    sql_time_us: u64,
+    vector_time_us: u64,
+    graph_time_us: u64,
+    fulltext_time_us: u64,
+    fusion_time_us: u64,             # Score fusion time
+    # I/O statistics
+    pages_read: u64,                 # Pages read from disk
+    pages_written: u64,              # Pages written to disk
+    buffer_hits: u64,
+    buffer_misses: u64,
+    # Lock statistics
+    lock_acquisitions: u64,
+    lock_wait_time_us: u64,
+}
+
+X QueryProfile {
+    F new(query_text: Str) -> QueryProfile {
+        QueryProfile {
+            query_text,
+            total_duration_ms: 0,
+            plan_time_ms: 0,
+            exec_time_ms: 0,
+            rows_produced: 0,
+            peak_memory_bytes: 0,
+            sql_time_us: 0,
+            vector_time_us: 0,
+            graph_time_us: 0,
+            fulltext_time_us: 0,
+            fusion_time_us: 0,
+            pages_read: 0,
+            pages_written: 0,
+            buffer_hits: 0,
+            buffer_misses: 0,
+            lock_acquisitions: 0,
+            lock_wait_time_us: 0,
+        }
+    }
+
+    ## Compute per-engine percentage breakdown
+    F engine_breakdown(self) -> (f64, f64, f64, f64) {
+        total := mut (self.sql_time_us + self.vector_time_us
+            + self.graph_time_us + self.fulltext_time_us) as f64;
+        I total == 0.0 {
+            R (0.0, 0.0, 0.0, 0.0);
+        }
+        (
+            (self.sql_time_us as f64) / total * 100.0,
+            (self.vector_time_us as f64) / total * 100.0,
+            (self.graph_time_us as f64) / total * 100.0,
+            (self.fulltext_time_us as f64) / total * 100.0,
+        )
+    }
+}
+
+# ============================================================================
+# DumpOptions — Logical backup (SQL dump) options
+# ============================================================================
+
+S DumpOptions {
+    include_ddl: bool,               # Include CREATE TABLE/INDEX statements
+    include_data: bool,              # Include INSERT statements
+    include_vectors: bool,           # Serialize vectors in INSERT
+    include_graph: bool,             # Include graph data (nodes, edges)
+    include_fulltext: bool,          # Include fulltext index data
+    table_filter: Option<Vec<Str>>,  # Only dump these tables (None = all)
+    format: u8,                      # 0 = SQL text, 1 = binary
+}
+
+X DumpOptions {
+    ## Full dump (DDL + data for all tables/engines)
+    F full() -> DumpOptions {
+        DumpOptions {
+            include_ddl: true,
+            include_data: true,
+            include_vectors: true,
+            include_graph: true,
+            include_fulltext: true,
+            table_filter: None,
+            format: 0,
+        }
+    }
+
+    ## Schema-only dump
+    F schema_only() -> DumpOptions {
+        DumpOptions {
+            include_ddl: true,
+            include_data: false,
+            include_vectors: false,
+            include_graph: false,
+            include_fulltext: false,
+            table_filter: None,
+            format: 0,
+        }
+    }
+
+    ## Data-only dump
+    F data_only() -> DumpOptions {
+        DumpOptions {
+            include_ddl: false,
+            include_data: true,
+            include_vectors: true,
+            include_graph: true,
+            include_fulltext: true,
+            table_filter: None,
+            format: 0,
+        }
+    }
+
+    ## Builder: set table filter
+    F with_tables(mut self, tables: Vec<Str>) -> DumpOptions {
+        self.table_filter = Some(tables);
+        self
+    }
+}
+
+# ============================================================================
+# DumpResult — Result of logical backup
+# ============================================================================
+
+S DumpResult {
+    tables_dumped: u32,              # Tables included in dump
+    rows_dumped: u64,                # Total rows dumped
+    vectors_dumped: u64,             # Vectors serialized
+    graph_nodes_dumped: u64,         # Graph nodes dumped
+    graph_edges_dumped: u64,         # Graph edges dumped
+    bytes_written: u64,              # Total bytes written to dump file
+    duration_ms: u64,                # Operation duration
+}
+
+X DumpResult {
+    F new() -> DumpResult {
+        DumpResult {
+            tables_dumped: 0,
+            rows_dumped: 0,
+            vectors_dumped: 0,
+            graph_nodes_dumped: 0,
+            graph_edges_dumped: 0,
+            bytes_written: 0,
+            duration_ms: 0,
+        }
+    }
+}
+
+# ============================================================================
+# RestoreOptions — Logical restore options
+# ============================================================================
+
+S RestoreOptions {
+    drop_existing: bool,             # DROP existing objects before restore
+    single_transaction: bool,        # Wrap entire restore in one transaction
+    ignore_errors: bool,             # Continue on error (default false)
+    parallel_workers: u32,           # Parallel restore workers (default 1)
+}
+
+X RestoreOptions {
+    F default() -> RestoreOptions {
+        RestoreOptions {
+            drop_existing: false,
+            single_transaction: true,
+            ignore_errors: false,
+            parallel_workers: 1,
+        }
+    }
+}
+
+# ============================================================================
+# MaintenanceCommand — Represents a parsed maintenance SQL command
+# ============================================================================
+
+## Enum-like discriminated union for maintenance commands
+## Used by the parser to communicate with the ops executor
+L MaintenanceCommandType =
+    CmdVacuum |
+    CmdVacuumFull |
+    CmdVacuumAnalyze |
+    CmdReindex |
+    CmdBackup |
+    CmdRestore |
+    CmdRestorePitr;
+
+S MaintenanceCommand {
+    cmd_type: MaintenanceCommandType,
+    target_name: Option<Str>,        # Table/index name (None = entire database)
+    path: Option<Str>,               # Backup/restore path
+    label: Option<Str>,              # Backup label
+    pitr_target: Option<PitrTarget>, # PITR target (for RESTORE ... TO)
+    concurrently: bool,              # REINDEX CONCURRENTLY
+    skip_locked: bool,               # VACUUM (SKIP_LOCKED)
+    io_limit: u32,                   # I/O throttle (0 = unlimited)
+}
+
+X MaintenanceCommand {
+    ## Create VACUUM command
+    F vacuum(target: Option<Str>) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdVacuum,
+            target_name: target,
+            path: None,
+            label: None,
+            pitr_target: None,
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create VACUUM FULL command
+    F vacuum_full(target: Option<Str>) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdVacuumFull,
+            target_name: target,
+            path: None,
+            label: None,
+            pitr_target: None,
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create VACUUM ANALYZE command
+    F vacuum_analyze(target: Option<Str>) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdVacuumAnalyze,
+            target_name: target,
+            path: None,
+            label: None,
+            pitr_target: None,
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create REINDEX command
+    F reindex(target: Option<Str>, concurrently: bool) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdReindex,
+            target_name: target,
+            path: None,
+            label: None,
+            pitr_target: None,
+            concurrently,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create BACKUP command
+    F backup(path: Str, label: Option<Str>) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdBackup,
+            target_name: None,
+            path: Some(path),
+            label,
+            pitr_target: None,
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create RESTORE command
+    F restore(path: Str) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdRestore,
+            target_name: None,
+            path: Some(path),
+            label: None,
+            pitr_target: None,
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Create RESTORE ... TO (PITR) command
+    F restore_pitr(path: Str, target: PitrTarget) -> MaintenanceCommand {
+        MaintenanceCommand {
+            cmd_type: MaintenanceCommandType.CmdRestorePitr,
+            target_name: None,
+            path: Some(path),
+            label: None,
+            pitr_target: Some(target),
+            concurrently: false,
+            skip_locked: false,
+            io_limit: 0,
+        }
+    }
+
+    ## Builder: set skip_locked
+    F with_skip_locked(mut self, skip: bool) -> MaintenanceCommand {
+        self.skip_locked = skip;
+        self
+    }
+
+    ## Builder: set io_limit
+    F with_io_limit(mut self, limit: u32) -> MaintenanceCommand {
+        self.io_limit = limit;
+        self
+    }
+}

@@ -1,0 +1,332 @@
+# Graph Shortest Path (Unweighted)
+# BFS-based shortest path finding for unweighted graphs
+# All edges have equal weight = 1, BFS guarantees shortest path
+# MVCC-consistent traversal using snapshot-isolated edge visibility
+# Returns path as sequence of node IDs and edge IDs with total distance
+
+U std/vec.Vec;
+U std/option.{Option, Some, None};
+U storage/error.{VaisError};
+U storage/txn/snapshot.{Snapshot};
+U storage/txn/clog.{Clog};
+U storage/buffer/pool.{BufferPool};
+U graph/types.{
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+    INVALID_NODE_ID, INVALID_EDGE_ID, NULL_PAGE
+};
+U graph/node/storage.{NodeStore};
+U graph/edge/adj.{AdjacencyManager, AdjEntry};
+U graph/visibility.{is_adj_entry_visible};
+U graph/traversal/bfs.{TraversalConfig};
+
+# ============================================================================
+# Error Codes: EE=03 (graph), CC=05 (shortest path / cycle)
+# ============================================================================
+
+F err_path_invalid_node(node_id: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0305001",
+        "Path finding: invalid node ID {node_id}"
+    )
+}
+
+F err_path_no_path(start: u64, end: u64) -> VaisError {
+    VaisError.new(
+        "VAIS-0305002",
+        "No path exists from node {start} to node {end}"
+    )
+}
+
+F err_path_invalid_direction(direction: u8) -> VaisError {
+    VaisError.new(
+        "VAIS-0305003",
+        "Invalid path finding direction: {direction}"
+    )
+}
+
+# ============================================================================
+# PathResult — Result of shortest path query
+# ============================================================================
+
+S PathResult {
+    path: Vec<u64>,      # Sequence of node IDs from start to end (inclusive)
+    edges: Vec<u64>,     # Sequence of edge IDs connecting the nodes
+    distance: u32,       # Total distance (number of edges)
+}
+
+X PathResult {
+    F new(path: Vec<u64>, edges: Vec<u64>) -> PathResult {
+        distance := mut I path.len() > 0 { (path.len() - 1) as u32 } E { 0 };
+        PathResult {
+            path,
+            edges,
+            distance,
+        }
+    }
+
+    F empty() -> PathResult {
+        PathResult {
+            path: Vec.new(),
+            edges: Vec.new(),
+            distance: 0,
+        }
+    }
+}
+
+# ============================================================================
+# ShortestPathFinder — BFS-based unweighted shortest path algorithm
+# ============================================================================
+
+S ShortestPathFinder {
+    pool: &BufferPool,
+    node_store: &NodeStore,
+    snapshot: Snapshot,
+    clog: &Clog,
+}
+
+X ShortestPathFinder {
+    F new(
+        pool: &BufferPool,
+        node_store: &NodeStore,
+        snapshot: Snapshot,
+        clog: &Clog
+    ) -> ShortestPathFinder {
+        ShortestPathFinder {
+            pool,
+            node_store,
+            snapshot,
+            clog,
+        }
+    }
+
+    # Find shortest path from start to end node
+    # Returns None if no path exists, Some(PathResult) otherwise
+    # Uses BFS which guarantees shortest path for unweighted graphs
+    F find_shortest_path(
+        self,
+        start: u64,
+        end: u64,
+        adj_mgr: &AdjacencyManager,
+        config: &TraversalConfig
+    ) -> Result<Option<PathResult>, VaisError> {
+        # Validate input
+        I start == INVALID_NODE_ID {
+            R Err(err_path_invalid_node(start));
+        }
+        I end == INVALID_NODE_ID {
+            R Err(err_path_invalid_node(end));
+        }
+
+        # Validate direction
+        I config.direction != DIRECTION_OUTGOING &&
+           config.direction != DIRECTION_INCOMING &&
+           config.direction != DIRECTION_BOTH {
+            R Err(err_path_invalid_direction(config.direction));
+        }
+
+        # Special case: start == end
+        I start == end {
+            path := mut Vec.new();
+            path.push(start);
+            R Ok(Some(PathResult.new(path, Vec.new())));
+        }
+
+        # BFS queue: (current_node, parent_index, edge_id_to_reach)
+        # parent_index points to entry in visited vector for path reconstruction
+        queue := mut Vec.new();
+        queue.push((start, 0u64, INVALID_EDGE_ID));
+
+        # Visited: (node_id, parent_index, edge_id)
+        # parent_index 0 means no parent (start node)
+        visited := mut Vec.new();
+        visited.push((start, 0u64, INVALID_EDGE_ID));
+
+        # Track index of end node when found
+        end_index: Option<u64> := mut None;
+        path_found := mut false;
+
+        # BFS loop
+        L queue.len() > 0 && !path_found {
+            # Dequeue from front (shift)
+            current := mut queue.remove(0);
+            current_node := mut current.0;
+            current_index := mut ShortestPathFinder.find_visited_index(&visited, current_node);
+
+            # Check depth limit (if enabled)
+            within_depth := mut true;
+            I config.max_depth > 0 {
+                depth := mut ShortestPathFinder.compute_depth(&visited, current_index);
+                I depth >= config.max_depth {
+                    within_depth = false;
+                }
+            }
+
+            I within_depth {
+                # Check if we reached the end
+                I current_node == end {
+                    end_index = Some(current_index);
+                    path_found = true;
+                } E {
+                    # Look up node to get adjacency page IDs
+                    node := mut self.node_store.read_node(current_node)?;
+
+                    # Process outgoing edges
+                    I config.direction == DIRECTION_OUTGOING || config.direction == DIRECTION_BOTH {
+                        I node.out_adj_page != NULL_PAGE {
+                            out_entries := mut adj_mgr.read_all_entries(node.out_adj_page)?;
+                            self.process_adj_entries(
+                                &out_entries, current_node, current_index, config,
+                                &queue, &visited
+                            );
+                            # Check if end was found in this batch
+                            I ShortestPathFinder.is_visited(visited, end) {
+                                end_index = Some(ShortestPathFinder.find_visited_index(visited, end));
+                                path_found = true;
+                            }
+                        }
+                    }
+
+                    # Process incoming edges (only if path not yet found)
+                    I !path_found && (config.direction == DIRECTION_INCOMING || config.direction == DIRECTION_BOTH) {
+                        I node.in_adj_page != NULL_PAGE {
+                            in_entries := mut adj_mgr.read_all_entries(node.in_adj_page)?;
+                            self.process_adj_entries(
+                                &in_entries, current_node, current_index, config,
+                                &queue, &visited
+                            );
+                            # Check if end was found in this batch
+                            I ShortestPathFinder.is_visited(visited, end) {
+                                end_index = Some(ShortestPathFinder.find_visited_index(visited, end));
+                                path_found = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # Reconstruct path if end was reached
+        M end_index {
+            Some(idx) => {
+                path_result := mut ShortestPathFinder.reconstruct_path(&visited, idx);
+                Ok(Some(path_result))
+            },
+            None => Ok(None),
+        }
+    }
+
+    # Helper: find index of node in visited list
+    F find_visited_index(visited: &Vec<(u64, u64, u64)>, node_id: u64) -> u64 {
+        i: u64 := mut 0;
+        L i < visited.len() {
+            I visited[i].0 == node_id {
+                R i;
+            }
+            i += 1;
+        }
+        0
+    }
+
+    # Helper: compute depth of a node by walking back to root
+    F compute_depth(visited: &Vec<(u64, u64, u64)>, index: u64) -> u32 {
+        depth: u32 := mut 0;
+        current := mut index;
+        L current != 0 && visited[current].1 != 0 {
+            current = visited[current].1;
+            depth += 1;
+        }
+        depth
+    }
+
+    # Helper: check if node is already visited
+    F is_visited(visited: &Vec<(u64, u64, u64)>, node_id: u64) -> bool {
+        i: u64 := mut 0;
+        L i < visited.len() {
+            I visited[i].0 == node_id {
+                R true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    # Helper: reconstruct path from visited list
+    F reconstruct_path(visited: &Vec<(u64, u64, u64)>, end_index: u64) -> PathResult {
+        path := mut Vec.new();
+        edges := mut Vec.new();
+
+        # Walk backwards from end to start
+        current := mut end_index;
+        at_start := mut false;
+        L !at_start {
+            path.push(visited[current].0);
+            I visited[current].2 != INVALID_EDGE_ID {
+                edges.push(visited[current].2);
+            }
+
+            I visited[current].1 == 0 || current == 0 {
+                at_start = true;
+            } E {
+                current = visited[current].1;
+            }
+        }
+
+        # Reverse path and edges (we built them backwards)
+        ShortestPathFinder.reverse_vec(&path);
+        ShortestPathFinder.reverse_vec(&edges);
+
+        PathResult.new(path, edges)
+    }
+
+    # Helper: reverse a vector in place
+    F reverse_vec<T>(vec: &mut Vec<T>) {
+        i: u64 := mut 0;
+        j := mut vec.len();
+        I j == 0 {
+            R;
+        }
+        j -= 1;
+
+        L i < j {
+            vec.swap(i, j);
+            i += 1;
+            I j > 0 {
+                j -= 1;
+            } E {
+                i = j;  # Force loop exit
+            }
+        }
+    }
+
+    # Helper: process adjacency entries and expand BFS frontier
+    F process_adj_entries(
+        self,
+        entries: &Vec<AdjEntry>,
+        current_node: u64,
+        current_index: u64,
+        config: &TraversalConfig,
+        mut queue: &mut Vec<(u64, u64, u64)>,
+        mut visited: &mut Vec<(u64, u64, u64)>
+    ) {
+        i: u64 := mut 0;
+        L i < entries.len() {
+            entry := mut &entries[i];
+
+            # Check MVCC visibility, edge type filter, and already-visited
+            I is_adj_entry_visible(entry, &self.snapshot, self.clog)
+                && config.is_edge_type_allowed(entry.edge_type) {
+                target := mut entry.target_node;
+                I !ShortestPathFinder.is_visited(visited, target) {
+                    # Add to visited
+                    new_index := mut visited.len();
+                    visited.push((target, current_index, entry.edge_id));
+
+                    # Add to queue
+                    queue.push((target, new_index, entry.edge_id));
+                }
+            }
+
+            i += 1;
+        }
+    }
+}

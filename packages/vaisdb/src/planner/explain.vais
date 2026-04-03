@@ -1,0 +1,722 @@
+# VaisDB - Hybrid Query Planner EXPLAIN Implementation
+#
+# Provides EXPLAIN and EXPLAIN ANALYZE commands for hybrid query plans.
+# Supports both text (indented tree) and JSON output formats.
+
+U storage/error.{VaisError};
+U sql/parser/ast.{Expr, JoinType, OrderByItem};
+U sql/planner/mod.{PlanNode, ProjectColumn, AggregateSpec};
+U planner/types.{
+    HybridPlanNode, HybridCost, EngineType, FusionMethod,
+    VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+    FullTextSearchMode, HybridExecStats, err_hybrid_plan_failed
+};
+
+# ============================================================================
+# ExplainFormat - Output format for EXPLAIN
+# ============================================================================
+
+L ExplainFormat = Text | Json;
+
+# ============================================================================
+# ExplainOptions - Configuration for EXPLAIN command
+# ============================================================================
+
+S ExplainOptions {
+    analyze: bool,      # Execute plan and collect runtime stats
+    verbose: bool,      # Show additional detail (predicates, cost breakdown)
+    format: ExplainFormat,
+}
+
+X ExplainOptions {
+    F default() -> ExplainOptions {
+        ExplainOptions {
+            analyze: false,
+            verbose: false,
+            format: ExplainFormat.Text,
+        }
+    }
+}
+
+# ============================================================================
+# explain_plan - Main entry point for EXPLAIN
+# ============================================================================
+
+F explain_plan(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
+    M options.format {
+        ExplainFormat.Text => explain_plan_text(plan, options, 0),
+        ExplainFormat.Json => explain_plan_json(plan, options),
+    }
+}
+
+# ============================================================================
+# Text Format Implementation
+# ============================================================================
+
+F explain_plan_text(
+    plan: &HybridPlanNode,
+    options: &ExplainOptions,
+    indent_level: u32,
+) -> Result<Str, VaisError> {
+    output := mut Str.new();
+    indent := mut create_indent(indent_level);
+
+    # Format node header
+    cost := mut plan.get_cost();
+    row_est := mut plan.row_estimate();
+    engine := mut plan.engine_type();
+
+    node_desc := mut format_node_description(plan);
+    cost_range := mut format_cost_range(cost, row_est);
+
+    output.push_str(&indent);
+    output.push_str(&node_desc);
+    output.push_str("  ");
+    output.push_str(&cost_range);
+
+    # Add actual stats in analyze mode
+    # FUTURE(integration): Populate HybridExecStats from actual execution
+    I options.analyze {
+        output.push_str(" (actual stats: not yet executed)");
+    }
+
+    output.push('\n');
+
+    # Verbose mode: show per-engine cost breakdown
+    I options.verbose {
+        output.push_str(&format_verbose_info(plan, indent_level + 1));
+    }
+
+    # Recursively format children
+    M plan {
+        HybridPlanNode.ScoreFusion { left, right, method: _, top_k: _, cost: _ } => {
+            left_output := mut explain_plan_text(left, options, indent_level + 1)?;
+            right_output := mut explain_plan_text(right, options, indent_level + 1)?;
+            output.push_str(&left_output);
+            output.push_str(&right_output);
+        },
+        HybridPlanNode.CrossEngineJoin { left, right, join_type: _, condition: _, cost: _ } => {
+            left_output := mut explain_plan_text(left, options, indent_level + 1)?;
+            right_output := mut explain_plan_text(right, options, indent_level + 1)?;
+            output.push_str(&left_output);
+            output.push_str(&right_output);
+        },
+        HybridPlanNode.HybridFilter { input, predicate: _, cost: _ } => {
+            child_output := mut explain_plan_text(input, options, indent_level + 1)?;
+            output.push_str(&child_output);
+        },
+        HybridPlanNode.HybridProject { input, columns: _, cost: _ } => {
+            child_output := mut explain_plan_text(input, options, indent_level + 1)?;
+            output.push_str(&child_output);
+        },
+        HybridPlanNode.HybridSort { input, order_by: _, cost: _ } => {
+            child_output := mut explain_plan_text(input, options, indent_level + 1)?;
+            output.push_str(&child_output);
+        },
+        HybridPlanNode.HybridLimit { input, limit: _, offset: _, cost: _ } => {
+            child_output := mut explain_plan_text(input, options, indent_level + 1)?;
+            output.push_str(&child_output);
+        },
+        HybridPlanNode.HybridAggregate { input, group_by: _, aggregates: _, cost: _ } => {
+            child_output := mut explain_plan_text(input, options, indent_level + 1)?;
+            output.push_str(&child_output);
+        },
+        _ => {
+            # Leaf nodes: SqlPlan, VectorScan, GraphTraverse, FullTextScan
+        }
+    }
+
+    Ok(output)
+}
+
+F create_indent(level: u32) -> Str {
+    indent := mut Str.new();
+    L _: 0..level {
+        indent.push_str("  ");
+    }
+    I level > 0 {
+        indent.push_str("-> ");
+    }
+    indent
+}
+
+F format_node_description(plan: &HybridPlanNode) -> Str {
+    M plan {
+        HybridPlanNode.SqlPlan { plan, cost: _ } => {
+            format_sql_plan_node(plan)
+        },
+        HybridPlanNode.VectorScan { params, alias, cost: _ } => {
+            desc := mut Str.from("VectorScan");
+            I alias.is_some() {
+                desc.push_str(" on ");
+                desc.push_str(alias.as_ref()!);
+            }
+            desc
+        },
+        HybridPlanNode.GraphTraverse { params, alias, cost: _ } => {
+            desc := mut Str.from("GraphTraverse");
+            I alias.is_some() {
+                desc.push_str(" on ");
+                desc.push_str(alias.as_ref()!);
+            }
+            desc
+        },
+        HybridPlanNode.FullTextScan { params, alias, cost: _ } => {
+            desc := mut Str.from("FullTextScan");
+            I alias.is_some() {
+                desc.push_str(" on ");
+                desc.push_str(alias.as_ref()!);
+            }
+            desc
+        },
+        HybridPlanNode.ScoreFusion { left: _, right: _, method, top_k, cost: _ } => {
+            desc := mut Str.from("ScoreFusion (");
+            desc.push_str(&format_fusion_method(method));
+            desc.push_str(" top_k=");
+            desc.push_str(&format_u32(*top_k));
+            desc.push(')');
+            desc
+        },
+        HybridPlanNode.CrossEngineJoin { left: _, right: _, join_type, condition: _, cost: _ } => {
+            desc := mut Str.from("CrossEngineJoin (");
+            desc.push_str(&format_join_type(join_type));
+            desc.push(')');
+            desc
+        },
+        HybridPlanNode.HybridFilter { input: _, predicate, cost: _ } => {
+            Str.from("HybridFilter")
+        },
+        HybridPlanNode.HybridProject { input: _, columns, cost: _ } => {
+            desc := mut Str.from("HybridProject (");
+            desc.push_str(&format_u64(columns.len() as u64));
+            desc.push_str(" columns)");
+            desc
+        },
+        HybridPlanNode.HybridSort { input: _, order_by, cost: _ } => {
+            desc := mut Str.from("HybridSort (");
+            desc.push_str(&format_u64(order_by.len() as u64));
+            desc.push_str(" keys)");
+            desc
+        },
+        HybridPlanNode.HybridLimit { input: _, limit, offset, cost: _ } => {
+            desc := mut Str.from("HybridLimit (");
+            M limit {
+                Some(l) => desc.push_str(&format_u64(*l)),
+                None => desc.push_str("ALL"),
+            }
+            M offset {
+                Some(o) => {
+                    I *o > 0 {
+                        desc.push_str(" offset ");
+                        desc.push_str(&format_u64(*o));
+                    }
+                },
+                None => {},
+            }
+            desc.push(')');
+            desc
+        },
+        HybridPlanNode.HybridAggregate { input: _, group_by, aggregates, having: _, cost: _ } => {
+            desc := mut Str.from("HybridAggregate (");
+            desc.push_str(&format_u64(aggregates.len() as u64));
+            desc.push_str(" aggs, ");
+            desc.push_str(&format_u64(group_by.len() as u64));
+            desc.push_str(" groups)");
+            desc
+        },
+    }
+}
+
+F format_sql_plan_node(node: &PlanNode) -> Str {
+    # Simplified SQL plan node formatting
+    # In practice, would recursively format the SQL PlanNode tree
+    Str.from("SqlPlan")
+}
+
+F format_fusion_method(method: &FusionMethod) -> Str {
+    M method {
+        FusionMethod.WeightedSum { weight_a, weight_b } => {
+            s := mut Str.from("WeightedSum(a=");
+            s.push_str(&format_f64(*weight_a, 2));
+            s.push_str(", b=");
+            s.push_str(&format_f64(*weight_b, 2));
+            s.push(')');
+            s
+        },
+        FusionMethod.ReciprocalRankFusion { k } => {
+            s := mut Str.from("RRF(k=");
+            s.push_str(&format_u32(*k));
+            s.push(')');
+            s
+        },
+    }
+}
+
+F format_join_type(join_type: &JoinType) -> Str {
+    M join_type {
+        JoinType.Inner => Str.from("INNER"),
+        JoinType.Left => Str.from("LEFT"),
+        JoinType.Right => Str.from("RIGHT"),
+        JoinType.Full => Str.from("FULL"),
+        JoinType.Cross => Str.from("CROSS"),
+    }
+}
+
+F format_cost_range(cost: &HybridCost, row_est: u64) -> Str {
+    s := mut Str.from("(cost=");
+    s.push_str(&format_f64(cost.total_io_cost + cost.total_cpu_cost, 2));
+    s.push_str("..");
+    s.push_str(&format_f64((cost.total_io_cost + cost.total_cpu_cost) * 2.0, 2));
+    s.push_str(" rows=");
+    s.push_str(&format_u64(row_est));
+    s.push(')');
+    s
+}
+
+F format_verbose_info(plan: &HybridPlanNode, indent_level: u32) -> Str {
+    output := mut Str.new();
+    cost := mut plan.get_cost();
+    indent := mut create_verbose_indent(indent_level);
+
+    # Per-engine cost breakdown
+    output.push_str(&indent);
+    output.push_str("Engine: ");
+    output.push_str(&format_engine_type(&plan.engine_type()));
+    output.push_str(" | IO: ");
+    output.push_str(&format_f64(cost.total_io_cost, 2));
+    output.push_str(" | CPU: ");
+    output.push_str(&format_f64(cost.total_cpu_cost, 2));
+    output.push_str(" | Memory: ");
+    output.push_str(&format_u64(cost.total_memory_bytes));
+    output.push('\n');
+
+    # Engine-specific breakdown I verbose
+    engine_breakdown := mut format_engine_breakdown(cost);
+    I engine_breakdown.len() > 0 {
+        output.push_str(&indent);
+        output.push_str(&engine_breakdown);
+        output.push('\n');
+    }
+
+    # Node-specific details
+    M plan {
+        HybridPlanNode.VectorScan { params, alias: _, cost: _ } => {
+            output.push_str(&indent);
+            output.push_str("top_k: ");
+            output.push_str(&format_u32(params.top_k));
+            I params.filter.is_some() {
+                output.push_str(" | Filter: yes");
+            }
+            output.push('\n');
+        },
+        HybridPlanNode.GraphTraverse { params, alias: _, cost: _ } => {
+            output.push_str(&indent);
+            output.push_str("max_depth: ");
+            output.push_str(&format_u32(params.max_depth));
+            output.push('\n');
+        },
+        HybridPlanNode.FullTextScan { params, alias: _, cost: _ } => {
+            output.push_str(&indent);
+            output.push_str("Mode: ");
+            output.push_str(&format_fulltext_mode(&params.search_mode));
+            output.push_str(" | top_k: ");
+            output.push_str(&format_u32(params.top_k));
+            output.push('\n');
+        },
+        HybridPlanNode.HybridFilter { input: _, predicate, cost: _ } => {
+            output.push_str(&indent);
+            output.push_str("Predicate: ");
+            output.push_str(&format_expr(predicate));
+            output.push('\n');
+        },
+        _ => {},
+    }
+
+    output
+}
+
+F create_verbose_indent(level: u32) -> Str {
+    indent := mut Str.new();
+    L _: 0..level {
+        indent.push_str("  ");
+    }
+    indent.push_str("     ");
+    indent
+}
+
+F format_engine_type(engine: &EngineType) -> Str {
+    M engine {
+        EngineType.Sql => Str.from("SQL"),
+        EngineType.Vector => Str.from("Vector"),
+        EngineType.Graph => Str.from("Graph"),
+        EngineType.FullText => Str.from("FullText"),
+        EngineType.Hybrid => Str.from("Hybrid"),
+    }
+}
+
+F format_engine_breakdown(cost: &HybridCost) -> Str {
+    s := mut Str.new();
+    parts := mut Vec.new();
+
+    I cost.vector_io_cost > 0.0 || cost.vector_cpu_cost > 0.0 {
+        part := mut Str.from("Vector(IO:");
+        part.push_str(&format_f64(cost.vector_io_cost, 2));
+        part.push_str(" CPU:");
+        part.push_str(&format_f64(cost.vector_cpu_cost, 2));
+        part.push(')');
+        parts.push(part);
+    }
+
+    I cost.graph_io_cost > 0.0 || cost.graph_cpu_cost > 0.0 {
+        part := mut Str.from("Graph(IO:");
+        part.push_str(&format_f64(cost.graph_io_cost, 2));
+        part.push_str(" CPU:");
+        part.push_str(&format_f64(cost.graph_cpu_cost, 2));
+        part.push(')');
+        parts.push(part);
+    }
+
+    I cost.fulltext_io_cost > 0.0 || cost.fulltext_cpu_cost > 0.0 {
+        part := mut Str.from("FullText(IO:");
+        part.push_str(&format_f64(cost.fulltext_io_cost, 2));
+        part.push_str(" CPU:");
+        part.push_str(&format_f64(cost.fulltext_cpu_cost, 2));
+        part.push(')');
+        parts.push(part);
+    }
+
+    I cost.sql_io_cost > 0.0 || cost.sql_cpu_cost > 0.0 {
+        part := mut Str.from("SQL(IO:");
+        part.push_str(&format_f64(cost.sql_io_cost, 2));
+        part.push_str(" CPU:");
+        part.push_str(&format_f64(cost.sql_cpu_cost, 2));
+        part.push(')');
+        parts.push(part);
+    }
+
+    I parts.len() > 0 {
+        s.push_str("Breakdown: ");
+        L (i, part): parts.iter().enumerate() {
+            I i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(part);
+        }
+    }
+
+    s
+}
+
+F format_fulltext_mode(mode: &FullTextSearchMode) -> Str {
+    M mode {
+        FullTextSearchMode.Simple => Str.from("Simple"),
+        FullTextSearchMode.Phrase { slop } => {
+            s := mut Str.from("Phrase(slop=");
+            s.push_str(&format_u32(*slop));
+            s.push(')');
+            s
+        },
+        FullTextSearchMode.Boolean => Str.from("Boolean"),
+    }
+}
+
+F format_expr(expr: &Expr) -> Str {
+    # Simplified expression formatting
+    # In practice, would recursively format the full expression tree
+    Str.from("<expr>")
+}
+
+F format_actual_stats(stats: &HybridExecStats) -> Str {
+    s := mut Str.from(" (actual rows=");
+    s.push_str(&format_u64(stats.rows_produced));
+    s.push_str(" time=");
+    s.push_str(&format_f64((stats.elapsed_us as f64) / 1000.0, 1));
+    s.push_str("ms)");
+    s
+}
+
+# ============================================================================
+# JSON Format Implementation
+# ============================================================================
+
+F explain_plan_json(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
+    json := mut Str.from("{\n");
+    json.push_str(&format_plan_node_json(plan, options, 1));
+    json.push_str("\n}");
+    Ok(json)
+}
+
+F format_plan_node_json(
+    plan: &HybridPlanNode,
+    options: &ExplainOptions,
+    indent_level: u32,
+) -> Str {
+    json := mut Str.new();
+    indent := mut create_json_indent(indent_level);
+    cost := mut plan.get_cost();
+
+    json.push_str(&indent);
+    json.push_str("\"node_type\": \"");
+    json.push_str(&format_node_type(plan));
+    json.push_str("\",\n");
+
+    json.push_str(&indent);
+    json.push_str("\"engine\": \"");
+    json.push_str(&format_engine_type(&plan.engine_type()));
+    json.push_str("\",\n");
+
+    json.push_str(&indent);
+    json.push_str("\"cost\": {\n");
+    json.push_str(&format_cost_json(cost, indent_level + 1));
+    json.push_str(&indent);
+    json.push_str("},\n");
+
+    json.push_str(&indent);
+    json.push_str("\"row_estimate\": ");
+    json.push_str(&format_u64(plan.row_estimate()));
+
+    # Add children I present
+    children := mut get_plan_children(plan);
+    I children.len() > 0 {
+        json.push_str(",\n");
+        json.push_str(&indent);
+        json.push_str("\"children\": [\n");
+
+        L (i, child): children.iter().enumerate() {
+            I i > 0 {
+                json.push_str(",\n");
+            }
+            json.push_str(&create_json_indent(indent_level + 1));
+            json.push_str("{\n");
+            json.push_str(&format_plan_node_json(child, options, indent_level + 2));
+            json.push_str(&create_json_indent(indent_level + 1));
+            json.push_str("}");
+        }
+
+        json.push('\n');
+        json.push_str(&indent);
+        json.push(']');
+    }
+
+    json
+}
+
+F create_json_indent(level: u32) -> Str {
+    indent := mut Str.new();
+    L _: 0..level {
+        indent.push_str("  ");
+    }
+    indent
+}
+
+F format_node_type(plan: &HybridPlanNode) -> Str {
+    M plan {
+        HybridPlanNode.SqlPlan { .. } => Str.from("SqlPlan"),
+        HybridPlanNode.VectorScan { .. } => Str.from("VectorScan"),
+        HybridPlanNode.GraphTraverse { .. } => Str.from("GraphTraverse"),
+        HybridPlanNode.FullTextScan { .. } => Str.from("FullTextScan"),
+        HybridPlanNode.ScoreFusion { .. } => Str.from("ScoreFusion"),
+        HybridPlanNode.CrossEngineJoin { .. } => Str.from("CrossEngineJoin"),
+        HybridPlanNode.HybridFilter { .. } => Str.from("HybridFilter"),
+        HybridPlanNode.HybridProject { .. } => Str.from("HybridProject"),
+        HybridPlanNode.HybridSort { .. } => Str.from("HybridSort"),
+        HybridPlanNode.HybridLimit { .. } => Str.from("HybridLimit"),
+        HybridPlanNode.HybridAggregate { .. } => Str.from("HybridAggregate"),
+    }
+}
+
+F format_cost_json(cost: &HybridCost, indent_level: u32) -> Str {
+    json := mut Str.new();
+    indent := mut create_json_indent(indent_level);
+
+    json.push_str(&indent);
+    json.push_str("\"total_io\": ");
+    json.push_str(&format_f64(cost.total_io_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&indent);
+    json.push_str("\"total_cpu\": ");
+    json.push_str(&format_f64(cost.total_cpu_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&indent);
+    json.push_str("\"total_memory_bytes\": ");
+    json.push_str(&format_u64(cost.total_memory_bytes));
+    json.push_str(",\n");
+
+    json.push_str(&indent);
+    json.push_str("\"breakdown\": {\n");
+
+    breakdown_indent := mut create_json_indent(indent_level + 1);
+    json.push_str(&breakdown_indent);
+    json.push_str("\"vector_io\": ");
+    json.push_str(&format_f64(cost.vector_io_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"vector_cpu\": ");
+    json.push_str(&format_f64(cost.vector_cpu_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"graph_io\": ");
+    json.push_str(&format_f64(cost.graph_io_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"graph_cpu\": ");
+    json.push_str(&format_f64(cost.graph_cpu_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"fulltext_io\": ");
+    json.push_str(&format_f64(cost.fulltext_io_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"fulltext_cpu\": ");
+    json.push_str(&format_f64(cost.fulltext_cpu_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"sql_io\": ");
+    json.push_str(&format_f64(cost.sql_io_cost, 2));
+    json.push_str(",\n");
+
+    json.push_str(&breakdown_indent);
+    json.push_str("\"sql_cpu\": ");
+    json.push_str(&format_f64(cost.sql_cpu_cost, 2));
+    json.push('\n');
+
+    json.push_str(&indent);
+    json.push_str("}\n");
+
+    json
+}
+
+F get_plan_children(plan: &HybridPlanNode) -> Vec<&HybridPlanNode> {
+    children := mut Vec.new();
+
+    M plan {
+        HybridPlanNode.ScoreFusion { left, right, .. } => {
+            children.push(left.as_ref());
+            children.push(right.as_ref());
+        },
+        HybridPlanNode.CrossEngineJoin { left, right, .. } => {
+            children.push(left.as_ref());
+            children.push(right.as_ref());
+        },
+        HybridPlanNode.HybridFilter { input, .. } => {
+            children.push(input.as_ref());
+        },
+        HybridPlanNode.HybridProject { input, .. } => {
+            children.push(input.as_ref());
+        },
+        HybridPlanNode.HybridSort { input, .. } => {
+            children.push(input.as_ref());
+        },
+        HybridPlanNode.HybridLimit { input, .. } => {
+            children.push(input.as_ref());
+        },
+        HybridPlanNode.HybridAggregate { input, .. } => {
+            children.push(input.as_ref());
+        },
+        _ => {},
+    }
+
+    children
+}
+
+# ============================================================================
+# Formatting Helpers
+# ============================================================================
+
+F format_u32(n: u32) -> Str {
+    s := mut Str.new();
+    I n == 0 {
+        s.push('0');
+        R s;
+    }
+
+    digits := mut Vec.new();
+    num := mut n;
+    L {  # W: num > 0
+        digits.push((num % 10) as u8 + b'0');
+        num /= 10;
+    }
+
+    L i: (0..digits.len()).rev() {
+        s.push(digits[i] as char);
+    }
+    s
+}
+
+F format_u64(n: u64) -> Str {
+    s := mut Str.new();
+    I n == 0 {
+        s.push('0');
+        R s;
+    }
+
+    digits := mut Vec.new();
+    num := mut n;
+    L {  # W: num > 0
+        digits.push((num % 10) as u8 + b'0');
+        num /= 10;
+    }
+
+    L i: (0..digits.len()).rev() {
+        s.push(digits[i] as char);
+    }
+    s
+}
+
+F format_f64(f: f64, precision: u32) -> Str {
+    # Simplified float formatting
+    # In practice, would use a proper float-to-string algorithm
+
+    I f < 0.0 {
+        s := mut Str.from("-");
+        s.push_str(&format_f64(-f, precision));
+        R s;
+    }
+
+    integer_part := mut f.floor() as u64;
+    fractional_part := mut f - (integer_part as f64);
+
+    s := mut format_u64(integer_part);
+
+    I precision > 0 {
+        s.push('.');
+        frac := mut fractional_part;
+        L _: 0..precision {
+            frac *= 10.0;
+            digit := mut (frac.floor() as u32) % 10;
+            s.push((digit as u8 + b'0') as char);
+        }
+    }
+
+    s
+}
+
+# ============================================================================
+# Public API - Format Helpers
+# ============================================================================
+
+# Format hybrid cost for display
+F format_hybrid_cost(cost: &HybridCost) -> Str {
+    s := mut Str.from("Total: IO=");
+    s.push_str(&format_f64(cost.total_io_cost, 2));
+    s.push_str(" CPU=");
+    s.push_str(&format_f64(cost.total_cpu_cost, 2));
+    s.push_str(" Mem=");
+    s.push_str(&format_u64(cost.total_memory_bytes));
+    s.push_str(" Rows=");
+    s.push_str(&format_u64(cost.row_estimate));
+    s
+}
+
+# Format per-engine cost breakdown for display
+F format_hybrid_cost_breakdown(cost: &HybridCost) -> Str {
+    format_engine_breakdown(cost)
+}

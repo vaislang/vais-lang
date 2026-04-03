@@ -1,0 +1,119 @@
+# LSN (Log Sequence Number) Allocator
+# Based on Stage 2: WAL Design
+# LSN = (segment_number: u32) << 32 | offset_in_segment: u32
+# Thread-safe atomic LSN allocation
+
+U storage/bytes.{encode_lsn, decode_lsn};
+U storage/error.{VaisError, err_internal};
+U std/sync.{Mutex};
+
+# Null LSN constant
+C NULL_LSN: u64 = 0;
+
+# LSN Allocator - manages monotonically increasing LSNs
+S LsnAllocator {
+    current_segment: u32,     # Current segment number
+    current_offset: u32,      # Current offset within segment
+    segment_size: u32,        # Max segment size in bytes
+    lock: Mutex,
+}
+
+X LsnAllocator {
+    # Create a new LSN allocator
+    F new(segment_size: u32) -> LsnAllocator {
+        LsnAllocator {
+            current_segment: 1,
+            current_offset: 0,
+            segment_size,
+            lock: Mutex.new(),
+        }
+    }
+
+    # Resume from a known LSN (used during recovery)
+    F resume(last_lsn: u64, segment_size: u32) -> LsnAllocator {
+        (segment, offset) := mut decode_lsn(last_lsn);
+        LsnAllocator {
+            current_segment: segment,
+            current_offset: offset,
+            segment_size,
+            lock: Mutex.new(),
+        }
+    }
+
+    # Allocate a new LSN for a record of given size
+    # Returns (lsn, needs_new_segment)
+    F allocate(mut self, record_size: u32) -> (u64, bool) {
+        guard := mut self.lock.lock();
+
+        needs_new_segment := mut false;
+
+        # Check if record fits in current segment
+        I self.current_offset + record_size > self.segment_size {
+            self.current_segment += 1;
+            self.current_offset = 0;
+            needs_new_segment = true;
+        }
+
+        lsn := mut encode_lsn(self.current_segment, self.current_offset);
+        self.current_offset += record_size;
+
+        drop(guard);
+        (lsn, needs_new_segment)
+    }
+
+    # Get the current LSN (without allocating)
+    F current_lsn(self) -> u64 {
+        guard := mut self.lock.lock();
+        lsn := mut encode_lsn(self.current_segment, self.current_offset);
+        drop(guard);
+        lsn
+    }
+
+    # Get current segment number
+    F current_segment_number(self) -> u32 {
+        guard := mut self.lock.lock();
+        seg := mut self.current_segment;
+        drop(guard);
+        seg
+    }
+
+    # Force advance to a new segment
+    F advance_segment(mut self) -> u32 {
+        guard := mut self.lock.lock();
+        self.current_segment += 1;
+        self.current_offset = 0;
+        seg := mut self.current_segment;
+        drop(guard);
+        seg
+    }
+}
+
+# Compare two LSNs
+F lsn_compare(lsn1: u64, lsn2: u64) -> i32 {
+    I lsn1 < lsn2 { -1 }
+    E I lsn1 > lsn2 { 1 }
+    E { 0 }
+}
+
+# Get the segment number from an LSN
+F lsn_segment(lsn: u64) -> u32 {
+    (segment, _) := mut decode_lsn(lsn);
+    segment
+}
+
+# Get the offset within segment from an LSN
+F lsn_offset(lsn: u64) -> u32 {
+    (_, offset) := mut decode_lsn(lsn);
+    offset
+}
+
+# Check if LSN is null/invalid
+F lsn_is_null(lsn: u64) -> bool {
+    lsn == 0
+}
+
+# Calculate the next LSN after a record
+F lsn_advance(lsn: u64, record_size: u32) -> u64 {
+    (segment, offset) := mut decode_lsn(lsn);
+    encode_lsn(segment, offset + record_size)
+}
