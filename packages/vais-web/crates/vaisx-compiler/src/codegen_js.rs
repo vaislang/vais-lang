@@ -62,6 +62,10 @@ struct JsCodegen<'a> {
     child_components: Vec<String>,
     /// Track event listener cleanup references
     listener_cleanups: Vec<String>,
+    /// CSS scope hash from `<style scoped>` block (if any).
+    /// When `Some`, every DOM element created via `$$element()` will receive
+    /// a `$$attr(el, "data-v-{hash}", "")` call for CSS scoping.
+    scope_hash: Option<String>,
 }
 
 impl<'a> JsCodegen<'a> {
@@ -81,6 +85,7 @@ impl<'a> JsCodegen<'a> {
             each_blocks_generated: 0,
             child_components: Vec::new(),
             listener_cleanups: Vec::new(),
+            scope_hash: None,
         }
     }
 
@@ -88,6 +93,24 @@ impl<'a> JsCodegen<'a> {
         // We generate code in two passes:
         // 1. Generate the component body into a buffer to discover runtime imports
         // 2. Prepend the import statement
+
+        // Detect scoped style blocks and compute a hash for DOM attribute injection.
+        // We use the first `<style scoped>` block found (there should be at most one).
+        // The hash is derived from the component name (ir.name) via the same algorithm
+        // used in the CSS scoping pass, so the attribute value will match the CSS selector.
+        for style in &file.styles {
+            if style.node.is_scoped {
+                // Prefer a pre-computed hash (set by the caller / build pipeline);
+                // fall back to computing it from the component name.
+                let hash = style
+                    .node
+                    .scope_hash
+                    .clone()
+                    .unwrap_or_else(|| vaisx_parser::style::compute_scope_hash(&self.ir.name));
+                self.scope_hash = Some(hash);
+                break;
+            }
+        }
 
         let mut body = String::with_capacity(1024);
         std::mem::swap(&mut self.output, &mut body);
@@ -307,6 +330,15 @@ impl<'a> JsCodegen<'a> {
             "let {} = $$element(\"{}\");",
             el_var, element.tag
         ));
+
+        // CSS scoping — add data-v-{hash} attribute to every DOM element
+        if let Some(hash) = self.scope_hash.clone() {
+            self.runtime_imports.insert("$$attr");
+            self.writeln(&format!(
+                "$$attr({}, \"data-v-{}\", \"\");",
+                el_var, hash
+            ));
+        }
 
         // Static attributes
         for attr in &element.attributes {

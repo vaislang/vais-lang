@@ -27,7 +27,7 @@ pub struct RawBlock {
 pub enum BlockKind {
     Script { context: ScriptContext },
     Template,
-    Style { is_global: bool },
+    Style { is_global: bool, is_scoped: bool },
 }
 
 /// Result of block separation.
@@ -232,9 +232,10 @@ fn try_parse_style_block(source: &str, pos: usize, rest: &str) -> Option<(RawBlo
 
     let open_tag_end = rest.find('>')? + 1;
 
-    // Parse attributes for "global"
+    // Parse attributes for "global" and "scoped"
     let attrs_str = &rest[6..open_tag_end - 1].trim();
     let is_global = attrs_str.contains("global");
+    let is_scoped = attrs_str.contains("scoped");
 
     let content_start = pos + open_tag_end;
 
@@ -246,7 +247,7 @@ fn try_parse_style_block(source: &str, pos: usize, rest: &str) -> Option<(RawBlo
 
     Some((
         RawBlock {
-            kind: BlockKind::Style { is_global },
+            kind: BlockKind::Style { is_global, is_scoped },
             outer_span: pos..outer_end,
             inner_span: content_start..close_pos,
             content,
@@ -375,11 +376,11 @@ mod tests {
         assert_eq!(result.styles.len(), 2);
         assert!(matches!(
             result.styles[0].kind,
-            BlockKind::Style { is_global: false }
+            BlockKind::Style { is_global: false, .. }
         ));
         assert!(matches!(
             result.styles[1].kind,
-            BlockKind::Style { is_global: true }
+            BlockKind::Style { is_global: true, .. }
         ));
     }
 

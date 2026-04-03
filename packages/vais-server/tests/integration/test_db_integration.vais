@@ -1,0 +1,345 @@
+# test_db_integration.vais — Integration test: vais-server db/ module ↔ vaisdb
+#
+# REQUIRES: vaisdb server running on port 5433
+#
+# Scenarios:
+#   1. DbConnection.connect() to vaisdb over TCP
+#   2. QueryBuilder CREATE TABLE via DbConnection.execute()
+#   3. QueryBuilder INSERT via DbConnection.execute()
+#   4. QueryBuilder SELECT via DbConnection.execute() + result validation
+#   5. Transaction: begin → insert → rollback → select (rollback verification)
+#   6. ConnectionPool acquire / release lifecycle
+
+U db/connection
+U db/query
+U db/pool
+
+# ============================================================================
+# Shared test config — points at the local vaisdb instance
+# ============================================================================
+
+C VAISDB_HOST: str = "127.0.0.1"
+C VAISDB_PORT: u16 = 5433
+
+# ============================================================================
+# Test 1: DbConnection connects to vaisdb over TCP
+# ============================================================================
+
+F test_db_connection() -> i64 {
+    config := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            I !conn.is_connected() {
+                println("FAIL test_db_connection: is_connected() returned false after connect()")
+                R 1
+            }
+            I conn.conn_id == 0 {
+                println("FAIL test_db_connection: conn_id should be non-zero")
+                R 1
+            }
+        },
+        Err(e) => {
+            println("FAIL test_db_connection: connect() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_db_connection")
+    0
+}
+
+# ============================================================================
+# Test 2: QueryBuilder builds and executes a CREATE TABLE statement
+# ============================================================================
+
+F test_create_table() -> i64 {
+    config := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            # Build a raw DDL string — CREATE TABLE falls outside the fluent builder's
+            # DML helpers, so we send it directly as a raw SQL string.
+            create_sql := "CREATE TABLE IF NOT EXISTS integration_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)"
+            M conn.execute(create_sql) {
+                Ok(result) => {
+                    # DDL returns no rows — affected_rows may be 0 or 1 depending on engine
+                    I result.row_count() != 0 {
+                        println("FAIL test_create_table: CREATE TABLE should return 0 rows, got {result.row_count()}")
+                        R 1
+                    }
+                },
+                Err(e) => {
+                    println("FAIL test_create_table: execute() returned error — {e.message}")
+                    R 1
+                },
+            }
+        },
+        Err(e) => {
+            println("FAIL test_create_table: connect() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_create_table")
+    0
+}
+
+# ============================================================================
+# Test 3: QueryBuilder INSERT via DbConnection.execute()
+# ============================================================================
+
+F test_insert_row() -> i64 {
+    config := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            fields := mut Vec.new()
+            fields.push("id")
+            fields.push("name")
+            fields.push("email")
+
+            qb  := QueryBuilder.new()
+            sql := qb.insert("integration_users", fields).build()
+
+            # Substitute parameter placeholders with literal values for the test
+            insert_sql := "INSERT INTO integration_users (id, name, email) VALUES (1, 'alice', 'alice@example.com')"
+
+            M conn.execute(insert_sql) {
+                Ok(result) => {
+                    I result.affected_rows != 1 {
+                        println("FAIL test_insert_row: expected affected_rows=1, got {result.affected_rows}")
+                        R 1
+                    }
+                },
+                Err(e) => {
+                    println("FAIL test_insert_row: execute() returned error — {e.message}")
+                    R 1
+                },
+            }
+
+            # Verify that the INSERT SQL shape produced by QueryBuilder is correct
+            I sql != "INSERT INTO integration_users (id, name, email) VALUES (?, ?, ?)" {
+                println("FAIL test_insert_row: unexpected QueryBuilder INSERT output: {sql}")
+                R 1
+            }
+        },
+        Err(e) => {
+            println("FAIL test_insert_row: connect() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_insert_row")
+    0
+}
+
+# ============================================================================
+# Test 4: QueryBuilder SELECT and result verification
+# ============================================================================
+
+F test_select_rows() -> i64 {
+    config := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            qb  := mut QueryBuilder.new()
+            qb  = qb.select("integration_users")
+            qb  = qb.column("id")
+            qb  = qb.column("name")
+            qb  = qb.column("email")
+            qb  = qb.where_clause("id = 1")
+            sql := qb.build()
+
+            # Verify built SQL shape
+            I sql != "SELECT id, name, email FROM integration_users WHERE id = 1" {
+                println("FAIL test_select_rows: unexpected SELECT SQL: {sql}")
+                R 1
+            }
+
+            M conn.execute(sql) {
+                Ok(result) => {
+                    I result.row_count() != 1 {
+                        println("FAIL test_select_rows: expected 1 row, got {result.row_count()}")
+                        R 1
+                    }
+                    row := result.rows.get(0)
+                    I row.get() == "" {
+                        println("FAIL test_select_rows: row data should not be empty")
+                        R 1
+                    }
+                },
+                Err(e) => {
+                    println("FAIL test_select_rows: execute() returned error — {e.message}")
+                    R 1
+                },
+            }
+        },
+        Err(e) => {
+            println("FAIL test_select_rows: connect() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_select_rows")
+    0
+}
+
+# ============================================================================
+# Test 5: Transaction — begin → insert → rollback → select verifies rollback
+# ============================================================================
+
+F test_transaction_rollback() -> i64 {
+    config := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    M DbConnection.connect(config) {
+        Ok(conn) => {
+            # BEGIN
+            begin_sql := QueryBuilder.new().begin_transaction().build()
+            I begin_sql != "BEGIN" {
+                println("FAIL test_transaction_rollback: expected 'BEGIN', got {begin_sql}")
+                R 1
+            }
+            M conn.execute(begin_sql) {
+                Ok(_) => {},
+                Err(e) => {
+                    println("FAIL test_transaction_rollback: BEGIN failed — {e.message}")
+                    R 1
+                },
+            }
+
+            # INSERT inside the transaction (id=99 — should not survive rollback)
+            M conn.execute("INSERT INTO integration_users (id, name, email) VALUES (99, 'temp', 'temp@example.com')") {
+                Ok(_) => {},
+                Err(e) => {
+                    println("FAIL test_transaction_rollback: INSERT inside tx failed — {e.message}")
+                    R 1
+                },
+            }
+
+            # ROLLBACK
+            rollback_sql := QueryBuilder.new().rollback().build()
+            I rollback_sql != "ROLLBACK" {
+                println("FAIL test_transaction_rollback: expected 'ROLLBACK', got {rollback_sql}")
+                R 1
+            }
+            M conn.execute(rollback_sql) {
+                Ok(_) => {},
+                Err(e) => {
+                    println("FAIL test_transaction_rollback: ROLLBACK failed — {e.message}")
+                    R 1
+                },
+            }
+
+            # SELECT should return 0 rows for id=99 (rolled back)
+            select_sql := QueryBuilder.new().select("integration_users").where_clause("id = 99").build()
+            M conn.execute(select_sql) {
+                Ok(result) => {
+                    I result.row_count() != 0 {
+                        println("FAIL test_transaction_rollback: rolled-back row should not exist, got {result.row_count()} rows")
+                        R 1
+                    }
+                },
+                Err(e) => {
+                    println("FAIL test_transaction_rollback: SELECT after rollback failed — {e.message}")
+                    R 1
+                },
+            }
+        },
+        Err(e) => {
+            println("FAIL test_transaction_rollback: connect() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_transaction_rollback")
+    0
+}
+
+# ============================================================================
+# Test 6: ConnectionPool acquire / release lifecycle
+# ============================================================================
+
+F test_connection_pool() -> i64 {
+    db_config   := DbConfig.tcp(VAISDB_HOST, VAISDB_PORT)
+    pool_config := PoolConfig.new(2, 5, 30000)
+
+    M ConnectionPool.new(db_config, pool_config) {
+        Ok(pool) => {
+            # Initial stats: 2 idle connections, 0 active
+            stats := pool.stats()
+            I stats.idle != 2 {
+                println("FAIL test_connection_pool: expected 2 idle connections after init, got {stats.idle}")
+                R 1
+            }
+            I stats.active != 0 {
+                println("FAIL test_connection_pool: expected 0 active connections after init, got {stats.active}")
+                R 1
+            }
+            I stats.total != 2 {
+                println("FAIL test_connection_pool: expected total=2 after init, got {stats.total}")
+                R 1
+            }
+
+            # Acquire one connection
+            pool := mut pool
+            M pool.acquire() {
+                Ok(conn) => {
+                    after_acquire := pool.stats()
+                    I after_acquire.active != 1 {
+                        println("FAIL test_connection_pool: expected 1 active after acquire, got {after_acquire.active}")
+                        R 1
+                    }
+                    I after_acquire.idle != 1 {
+                        println("FAIL test_connection_pool: expected 1 idle after acquire, got {after_acquire.idle}")
+                        R 1
+                    }
+
+                    # Release the connection back to the pool
+                    pool.release(conn)
+                    after_release := pool.stats()
+                    I after_release.active != 0 {
+                        println("FAIL test_connection_pool: expected 0 active after release, got {after_release.active}")
+                        R 1
+                    }
+                    I after_release.idle != 2 {
+                        println("FAIL test_connection_pool: expected 2 idle after release, got {after_release.idle}")
+                        R 1
+                    }
+                },
+                Err(e) => {
+                    println("FAIL test_connection_pool: acquire() returned error — {e.message}")
+                    R 1
+                },
+            }
+
+            # Teardown: close all connections
+            pool.close_all()
+            final_stats := pool.stats()
+            I final_stats.total != 0 {
+                println("FAIL test_connection_pool: expected total=0 after close_all, got {final_stats.total}")
+                R 1
+            }
+        },
+        Err(e) => {
+            println("FAIL test_connection_pool: ConnectionPool.new() returned error — {e.message}")
+            R 1
+        },
+    }
+    println("PASS test_connection_pool")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    println("=== Integration Tests: vais-server db/ ↔ vaisdb ===")
+    println("REQUIRES: vaisdb server running on {VAISDB_HOST}:{VAISDB_PORT}")
+
+    failures := mut 0
+    failures += test_db_connection()
+    failures += test_create_table()
+    failures += test_insert_row()
+    failures += test_select_rows()
+    failures += test_transaction_rollback()
+    failures += test_connection_pool()
+
+    I failures > 0 {
+        println("FAILED: {failures} integration test(s) failed")
+        R 1
+    }
+    println("ALL DB INTEGRATION TESTS PASSED")
+    0
+}

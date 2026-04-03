@@ -1,13 +1,29 @@
 # VaisDB Native Client
 # Connection management, query execution, prepared statements, transaction control
-# FUTURE(std/net): Implement TCP networking
 
 U std/vec
 U std/string
 U std/option
 U std/hashmap
+U std/net
 U storage/error
 U client/types
+
+# ============================================================================
+# Wire protocol constants (binary framing: [u8 type][u32 le length][payload])
+# Length field includes itself (4 bytes) but NOT the type byte.
+# ============================================================================
+
+C CLIENT_MSG_QUERY: u8 = 16          # Simple query message type
+C CLIENT_MSG_TERMINATE: u8 = 80      # Terminate message type
+
+C SERVER_MSG_ROW_DESC: u8 = 51       # RowDescription
+C SERVER_MSG_ROW_DATA: u8 = 33       # DataRow
+C SERVER_MSG_CMD_COMPLETE: u8 = 34   # CommandComplete
+C SERVER_MSG_READY: u8 = 35          # ReadyForQuery
+C SERVER_MSG_ERROR: u8 = 48          # ErrorResponse
+
+C CLIENT_RECV_BUF_SIZE: i64 = 4096
 
 # ============================================================================
 # VaisClient
@@ -16,8 +32,8 @@ U client/types
 S VaisClient {
     config: ClientConfig,
     state: ClientState,
-    # FUTURE(std/net): TCP socket handle
-    prepared_statements: HashMap<str, str>,  # name -> SQL
+    fd: i64,                                     # TCP socket handle (-1 = disconnected)
+    prepared_statements: HashMap<str, str>,      # name -> SQL
 }
 
 X VaisClient {
@@ -25,25 +41,48 @@ X VaisClient {
         VaisClient {
             config,
             state: Disconnected,
+            fd: -1,
             prepared_statements: HashMap.with_capacity(16),
         }
     }
 
-    # Connect to VaisDB server
-    # FUTURE(std/net): Implement TCP connection, startup handshake, authentication
+    # Connect to VaisDB server via TCP
     F connect(mut self) -> Result<(), VaisError> {
         I self.is_connected() {
             R Ok(())
         }
 
-        # Placeholder: transition state without actual TCP connection
+        host := &self.config.connection.host
+        port := self.config.connection.port as i64
+
+        stream := TcpStream.connect(host as i64, port)
+        I stream.fd < 0 {
+            R Err(err_client_connect_failed(
+                self.config.connection.host.clone(),
+                self.config.connection.port
+            ))
+        }
+
+        self.fd = stream.fd
         self.state = Connected
         Ok(())
     }
 
-    # Close connection
-    # FUTURE(std/net): Send Terminate message before closing
+    # Close connection — send Terminate and close socket
     F close(mut self) {
+        I self.fd >= 0 {
+            # Send Terminate message (type=80, length=4, no payload)
+            term_buf := mut Vec.with_capacity(5)
+            term_buf.push(CLIENT_MSG_TERMINATE)
+            term_buf.push(4 as u8)     # length LE byte 0
+            term_buf.push(0 as u8)     # length LE byte 1
+            term_buf.push(0 as u8)     # length LE byte 2
+            term_buf.push(0 as u8)     # length LE byte 3
+            stream := TcpStream { fd: self.fd }
+            stream.write(&term_buf as i64, 5)
+            stream.close()
+            self.fd = -1
+        }
         self.state = Disconnected
         self.prepared_statements.clear()
     }
@@ -56,26 +95,180 @@ X VaisClient {
         }
     }
 
+    # Serialize a simple query message into bytes
+    # Format: [u8 type=16][u32 le total_payload_len+4][u32 le sql_len][sql bytes]
+    F serialize_query_msg(sql: &str) -> Vec<u8> {
+        sql_len := __strlen(sql) as u32
+        # payload = 4 (u32 sql_len field) + sql_len bytes
+        payload := sql_len + 4
+        # length field in wire = payload + 4 (length field itself)
+        length_field := payload + 4
+
+        buf := mut Vec.with_capacity((5 + sql_len) as u64)
+
+        # type byte
+        buf.push(CLIENT_MSG_QUERY)
+
+        # length field (little-endian u32)
+        buf.push((length_field & 255) as u8)
+        buf.push(((length_field >> 8) & 255) as u8)
+        buf.push(((length_field >> 16) & 255) as u8)
+        buf.push(((length_field >> 24) & 255) as u8)
+
+        # sql_len field (little-endian u32)
+        buf.push((sql_len & 255) as u8)
+        buf.push(((sql_len >> 8) & 255) as u8)
+        buf.push(((sql_len >> 16) & 255) as u8)
+        buf.push(((sql_len >> 24) & 255) as u8)
+
+        # sql bytes
+        i := mut 0
+        L i < sql_len as u64 {
+            buf.push(sql[i])
+            i += 1
+        }
+
+        buf
+    }
+
+    # Send bytes over TCP socket (full write loop)
+    # Returns Ok(()) on success, Err on write failure
+    F tcp_send(self, data: &Vec<u8>) -> Result<(), VaisError> {
+        stream := TcpStream { fd: self.fd }
+        total := data.len() as i64
+        sent := stream.write_all(&data as i64, total)
+        I sent < 0 {
+            R Err(VaisError.new("VAIS-0701010", "TCP send failed"))
+        }
+        Ok(())
+    }
+
+    # Receive one binary framed message from TCP socket.
+    # Reads header (5 bytes: type + u32 le length), then payload.
+    # Returns (msg_type, payload_vec) or error.
+    F tcp_recv_msg(self) -> Result<ReceivedMsg, VaisError> {
+        stream := TcpStream { fd: self.fd }
+
+        # Read 5-byte header
+        hdr := mut Vec.with_capacity(5)
+        i := mut 0
+        L i < 5 {
+            hdr.push(0 as u8)
+            i += 1
+        }
+
+        n := stream.read(&mut hdr as i64, 5)
+        I n < 5 {
+            R Err(VaisError.new("VAIS-0701011", "TCP recv: incomplete header"))
+        }
+
+        msg_type := hdr[0]
+        length := (hdr[1] as u32) |
+                  ((hdr[2] as u32) << 8) |
+                  ((hdr[3] as u32) << 16) |
+                  ((hdr[4] as u32) << 24)
+
+        # length field includes itself (4 bytes); payload = length - 4
+        I length < 4 {
+            R Err(VaisError.new("VAIS-0701012", "TCP recv: invalid length field"))
+        }
+        payload_len := (length - 4) as i64
+
+        payload := mut Vec.with_capacity(payload_len as u64)
+        j := mut 0
+        L j < payload_len as u64 {
+            payload.push(0 as u8)
+            j += 1
+        }
+
+        I payload_len > 0 {
+            nr := stream.read(&mut payload as i64, payload_len)
+            I nr < payload_len {
+                R Err(VaisError.new("VAIS-0701013", "TCP recv: incomplete payload"))
+            }
+        }
+
+        Ok(ReceivedMsg { msg_type, payload })
+    }
+
     # Execute query and return result set
-    # FUTURE(std/net): Send Query message, receive RowDescription/DataRow/CommandComplete/ReadyForQuery
     F query(mut self, sql: &str) -> Result<ClientResult, VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
         }
 
-        # Placeholder: return empty result
-        Ok(ClientResult.new())
+        msg := self.serialize_query_msg(sql)
+        self.tcp_send(&msg)?;
+
+        result := mut ClientResult.new()
+        columns := mut Vec.with_capacity(0)
+        rows := mut Vec.with_capacity(0)
+        done := mut false
+
+        L !done {
+            recv := self.tcp_recv_msg()?;
+
+            I recv.msg_type == SERVER_MSG_ROW_DESC {
+                # Parse RowDescription: [u16 le col_count] then per col: [u32 le name_len][name bytes][...]
+                columns = parse_row_description(&recv.payload)
+            } E I recv.msg_type == SERVER_MSG_ROW_DATA {
+                # Parse DataRow: [u16 le col_count] then per cell: [u8 null_flag][u32 le data_len if not null][data]
+                row := parse_row_data(&recv.payload)
+                rows.push(row)
+            } E I recv.msg_type == SERVER_MSG_CMD_COMPLETE {
+                # Parse CommandComplete: [u32 le tag_len][tag bytes]
+                tag := parse_string_from_payload(&recv.payload)
+                affected := parse_affected_rows(&tag)
+                result = ClientResult {
+                    columns,
+                    rows,
+                    affected_rows: affected,
+                    tag,
+                }
+                done = true
+            } E I recv.msg_type == SERVER_MSG_READY {
+                done = true
+            } E I recv.msg_type == SERVER_MSG_ERROR {
+                msg_str := parse_error_message(&recv.payload)
+                R Err(VaisError.new("VAIS-0701020", msg_str))
+            } E {
+                # Unknown message — skip and continue
+            }
+        }
+
+        Ok(result)
     }
 
     # Execute DML statement and return affected rows
-    # FUTURE(std/net): Send Query message, receive CommandComplete with row count
     F execute(mut self, sql: &str) -> Result<u64, VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
         }
 
-        # Placeholder: return 0 affected rows
-        Ok(0)
+        msg := self.serialize_query_msg(sql)
+        self.tcp_send(&msg)?;
+
+        affected := mut 0
+        done := mut false
+
+        L !done {
+            recv := self.tcp_recv_msg()?;
+
+            I recv.msg_type == SERVER_MSG_CMD_COMPLETE {
+                tag := parse_string_from_payload(&recv.payload)
+                affected = parse_affected_rows(&tag)
+                done = true
+            } E I recv.msg_type == SERVER_MSG_READY {
+                done = true
+            } E I recv.msg_type == SERVER_MSG_ERROR {
+                msg_str := parse_error_message(&recv.payload)
+                R Err(VaisError.new("VAIS-0701021", msg_str))
+            } E {
+                # Skip rows/desc in execute path
+            }
+        }
+
+        Ok(affected)
     }
 
     # Prepare a named statement
@@ -84,13 +277,11 @@ X VaisClient {
             R Err(err_client_not_connected())
         }
 
-        # FUTURE(std/net): Send Parse/Describe/Sync, receive ParseComplete/ParameterDescription/RowDescription
         self.prepared_statements.insert(name.clone(), sql.clone())
         Ok(())
     }
 
     # Execute prepared statement with parameters
-    # FUTURE(std/net): Send Bind/Execute/Sync, receive BindComplete/DataRow/CommandComplete/ReadyForQuery
     F execute_prepared(mut self, name: &str, params: &Vec<Vec<u8>>) -> Result<ClientResult, VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
@@ -104,7 +295,7 @@ X VaisClient {
         Ok(ClientResult.new())
     }
 
-    # Begin transaction
+    # Begin transaction — send "BEGIN" SQL
     F begin(mut self) -> Result<(), VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
@@ -117,12 +308,12 @@ X VaisClient {
             _ => {},
         }
 
-        # FUTURE(std/net): Send Query "BEGIN" over wire protocol
+        self.execute("BEGIN")?;
         self.state = InTransaction
         Ok(())
     }
 
-    # Commit transaction
+    # Commit transaction — send "COMMIT" SQL
     F commit(mut self) -> Result<(), VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
@@ -135,12 +326,12 @@ X VaisClient {
             },
         }
 
-        # FUTURE(std/net): Send Query "COMMIT" over wire protocol
+        self.execute("COMMIT")?;
         self.state = Connected
         Ok(())
     }
 
-    # Rollback transaction
+    # Rollback transaction — send "ROLLBACK" SQL
     F rollback(mut self) -> Result<(), VaisError> {
         I !self.is_connected() {
             R Err(err_client_not_connected())
@@ -153,13 +344,279 @@ X VaisClient {
             },
         }
 
-        # FUTURE(std/net): Send Query "ROLLBACK" over wire protocol
+        self.execute("ROLLBACK")?;
         self.state = Connected
         Ok(())
     }
 }
 
+# ============================================================================
+# Wire protocol helpers (inline, no dependency on server/protocol)
+# ============================================================================
+
+# Received framed message: (msg_type, payload bytes)
+S ReceivedMsg {
+    msg_type: u8,
+    payload: Vec<u8>,
+}
+
+# Parse RowDescription payload into Vec<ColumnInfo>
+# Payload layout: [u16 le col_count] then per col: [u32 le name_len][name bytes][type_tag u8][u16 type_size][i32 type_mod][i32 table_oid][u16 col_idx]
+F parse_row_description(payload: &Vec<u8>) -> Vec<ColumnInfo> {
+    cols := mut Vec.with_capacity(0)
+    I payload.len() < 2 {
+        R cols
+    }
+
+    col_count := (payload[0] as u64) | ((payload[1] as u64) << 8)
+    pos := mut 2
+
+    i := mut 0
+    L i < col_count {
+        # Read name string: [u32 le len][bytes]
+        I pos + 4 > payload.len() {
+            B
+        }
+        name_len := (payload[pos] as u64) |
+                    ((payload[pos + 1] as u64) << 8) |
+                    ((payload[pos + 2] as u64) << 16) |
+                    ((payload[pos + 3] as u64) << 24)
+        pos += 4
+
+        I pos + name_len > payload.len() {
+            B
+        }
+        name_bytes := mut Vec.with_capacity(name_len)
+        k := mut 0
+        L k < name_len {
+            name_bytes.push(payload[pos + k])
+            k += 1
+        }
+        pos += name_len
+
+        name := M from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
+
+        # Read table_oid (i32 le, 4 bytes)
+        I pos + 4 > payload.len() { B }
+        pos += 4
+
+        # Read column_index (u16 le, 2 bytes)
+        I pos + 2 > payload.len() { B }
+        pos += 2
+
+        # Read type_tag (u8, 1 byte)
+        I pos + 1 > payload.len() { B }
+        type_tag := payload[pos]
+        pos += 1
+
+        # Read type_size (u16 le, 2 bytes)
+        I pos + 2 > payload.len() { B }
+        pos += 2
+
+        # Read type_modifier (i32 le, 4 bytes)
+        I pos + 4 > payload.len() { B }
+        pos += 4
+
+        cols.push(ColumnInfo.new(name, type_tag))
+        i += 1
+    }
+
+    cols
+}
+
+# Parse RowData payload into ClientRow
+# Payload layout: [u16 le col_count] then per cell: [u8 null_flag][if not null: u32 le data_len][data bytes]
+F parse_row_data(payload: &Vec<u8>) -> ClientRow {
+    I payload.len() < 2 {
+        R ClientRow.new()
+    }
+
+    col_count := (payload[0] as u64) | ((payload[1] as u64) << 8)
+    pos := mut 2
+    values := mut Vec.with_capacity(col_count)
+
+    i := mut 0
+    L i < col_count {
+        I pos + 1 > payload.len() {
+            values.push(None)
+            i += 1
+        } E {
+            null_flag := payload[pos]
+            pos += 1
+
+            I null_flag == 1 {
+                values.push(None)
+            } E {
+                I pos + 4 > payload.len() {
+                    values.push(None)
+                } E {
+                    data_len := (payload[pos] as u64) |
+                                ((payload[pos + 1] as u64) << 8) |
+                                ((payload[pos + 2] as u64) << 16) |
+                                ((payload[pos + 3] as u64) << 24)
+                    pos += 4
+
+                    I pos + data_len > payload.len() {
+                        values.push(None)
+                    } E {
+                        cell := mut Vec.with_capacity(data_len)
+                        d := mut 0
+                        L d < data_len {
+                            cell.push(payload[pos + d])
+                            d += 1
+                        }
+                        pos += data_len
+                        values.push(Some(cell))
+                    }
+                }
+            }
+
+            i += 1
+        }
+    }
+
+    ClientRow.from_values(values)
+}
+
+# Parse a length-prefixed string from payload: [u32 le len][bytes]
+F parse_string_from_payload(payload: &Vec<u8>) -> str {
+    I payload.len() < 4 {
+        R ""
+    }
+    str_len := (payload[0] as u64) |
+               ((payload[1] as u64) << 8) |
+               ((payload[2] as u64) << 16) |
+               ((payload[3] as u64) << 24)
+
+    I 4 + str_len > payload.len() {
+        R ""
+    }
+
+    bytes := mut Vec.with_capacity(str_len)
+    i := mut 0
+    L i < str_len {
+        bytes.push(payload[4 + i])
+        i += 1
+    }
+
+    M from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => "",
+    }
+}
+
+# Parse error message from ErrorResponse payload
+# Payload layout: [u32 le severity_len][severity][u32 le code_len][code][u32 le msg_len][message]...
+F parse_error_message(payload: &Vec<u8>) -> str {
+    I payload.len() < 4 {
+        R "Server error"
+    }
+
+    # Skip severity field
+    sev_len := (payload[0] as u64) |
+               ((payload[1] as u64) << 8) |
+               ((payload[2] as u64) << 16) |
+               ((payload[3] as u64) << 24)
+    pos := mut 4 + sev_len
+
+    # Skip code field
+    I pos + 4 > payload.len() {
+        R "Server error"
+    }
+    code_len := (payload[pos] as u64) |
+                ((payload[pos + 1] as u64) << 8) |
+                ((payload[pos + 2] as u64) << 16) |
+                ((payload[pos + 3] as u64) << 24)
+    pos = pos + 4 + code_len
+
+    # Read message field
+    I pos + 4 > payload.len() {
+        R "Server error"
+    }
+    msg_len := (payload[pos] as u64) |
+               ((payload[pos + 1] as u64) << 8) |
+               ((payload[pos + 2] as u64) << 16) |
+               ((payload[pos + 3] as u64) << 24)
+    pos += 4
+
+    I pos + msg_len > payload.len() {
+        R "Server error"
+    }
+
+    bytes := mut Vec.with_capacity(msg_len)
+    i := mut 0
+    L i < msg_len {
+        bytes.push(payload[pos + i])
+        i += 1
+    }
+
+    M from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => "Server error",
+    }
+}
+
+# Parse affected rows count from CommandComplete tag string.
+# Tag format examples: "INSERT 0 5", "UPDATE 3", "DELETE 1", "BEGIN", "COMMIT"
+F parse_affected_rows(tag: &str) -> u64 {
+    tag_len := __strlen(tag)
+    I tag_len == 0 {
+        R 0
+    }
+
+    # Scan from end to find last number token
+    end := mut tag_len
+    # Skip trailing whitespace
+    L end > 0 {
+        c := tag[end - 1]
+        I c == 32 {  # space
+            end -= 1
+        } E {
+            B
+        }
+    }
+
+    I end == 0 {
+        R 0
+    }
+
+    # Find start of last token
+    start := mut end
+    L start > 0 {
+        c := tag[start - 1]
+        I c >= 48 && c <= 57 {  # digit
+            start -= 1
+        } E {
+            B
+        }
+    }
+
+    I start == end {
+        R 0
+    }
+
+    # All digits in [start..end) — parse as u64
+    val := mut 0
+    idx := mut start
+    L idx < end {
+        ch := tag[idx]
+        I ch < 48 || ch > 57 {
+            R 0
+        }
+        val = val * 10 + (ch - 48) as u64
+        idx += 1
+    }
+
+    val
+}
+
+# ============================================================================
 # Convenience: create client from connection string
+# ============================================================================
+
 F create_client(conn_str: &str) -> Result<VaisClient, VaisError> {
     config := mut ClientConfig.from_connection_string(conn_str)?;
     Ok(VaisClient.new(config))

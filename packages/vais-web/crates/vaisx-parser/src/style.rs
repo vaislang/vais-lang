@@ -6,6 +6,15 @@
 //! - At-rules: `@media (query) { ... }`, `@keyframes name { ... }`
 //! - Comments: `/* ... */`
 //! - Nested rules (within at-rules)
+//!
+//! ## CSS Scoping
+//!
+//! When `<style scoped>` is used, [`scope_css_rules`] can be called to add
+//! `[data-v-{hash}]` attribute selectors to every non-global selector.
+//! `:global(selector)` wraps bypass scoping entirely.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::ast::*;
 
@@ -14,6 +23,198 @@ pub fn parse_css(source: &str, base_offset: usize) -> (Vec<Spanned<CssRule>>, Ve
     let mut parser = CssParser::new(source, base_offset);
     let rules = parser.parse_rules();
     (rules, parser.errors)
+}
+
+// ---------------------------------------------------------------------------
+// CSS Scoping
+// ---------------------------------------------------------------------------
+
+/// Compute an 8-character hex hash from a component filename (or any string).
+///
+/// Uses the standard library's [`DefaultHasher`] — no external crates required.
+///
+/// # Example
+/// ```ignore
+/// let hash = compute_scope_hash("MyButton.vaisx");
+/// assert_eq!(hash.len(), 8);
+/// ```
+pub fn compute_scope_hash(component_name: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    component_name.hash(&mut hasher);
+    let hash = hasher.finish();
+    // Take the lower 32 bits and format as 8 hex digits.
+    format!("{:08x}", hash as u32)
+}
+
+/// Scope a list of CSS rules by injecting `[data-v-{hash}]` into every selector.
+///
+/// Rules wrapped in `:global(...)` are emitted as-is (the wrapper is stripped).
+/// `@media` / other at-rules have their nested rules scoped recursively.
+///
+/// # Example
+/// ```ignore
+/// // Input:  ".btn { color: red; }"
+/// // Output: ".btn[data-v-a1b2c3d4] { color: red; }"
+/// ```
+pub fn scope_css_rules(rules: &[Spanned<CssRule>], hash: &str) -> Vec<Spanned<CssRule>> {
+    rules
+        .iter()
+        .map(|spanned| {
+            let scoped_node = scope_rule(&spanned.node, hash);
+            Spanned::new(scoped_node, spanned.span.clone())
+        })
+        .collect()
+}
+
+/// Scope a single [`CssRule`].
+fn scope_rule(rule: &CssRule, hash: &str) -> CssRule {
+    match rule {
+        CssRule::Style(style_rule) => {
+            let scoped_selectors = style_rule
+                .selectors
+                .iter()
+                .map(|sel| scope_selector(sel, hash))
+                .collect();
+            CssRule::Style(StyleRule {
+                selectors: scoped_selectors,
+                declarations: style_rule.declarations.clone(),
+            })
+        }
+        CssRule::AtRule(at_rule) => {
+            // Recurse into nested rules (e.g., @media blocks).
+            // @keyframes rules should NOT be scoped — their inner rules are
+            // percentage/from/to tokens, not element selectors.
+            let nested = if at_rule.name == "keyframes"
+                || at_rule.name.starts_with("-webkit-keyframes")
+                || at_rule.name.starts_with("-moz-keyframes")
+            {
+                at_rule.rules.clone()
+            } else {
+                scope_css_rules(&at_rule.rules, hash)
+            };
+            CssRule::AtRule(AtRule {
+                name: at_rule.name.clone(),
+                prelude: at_rule.prelude.clone(),
+                rules: nested,
+            })
+        }
+        CssRule::Comment(c) => CssRule::Comment(c.clone()),
+    }
+}
+
+/// Scope a single CSS selector string.
+///
+/// Handles:
+/// - `:global(inner)` — strip the `:global()` wrapper and emit `inner` unchanged.
+/// - Everything else — append `[data-v-{hash}]` after the last simple selector part.
+fn scope_selector(selector: &str, hash: &str) -> String {
+    let trimmed = selector.trim();
+
+    // Full `:global(...)` — emit the inner selector unchanged.
+    if let Some(inner) = extract_global(trimmed) {
+        return inner.trim().to_string();
+    }
+
+    // Selector that contains `:global(...)` sub-expressions inline.
+    if trimmed.contains(":global(") {
+        return scope_selector_with_inline_global(trimmed, hash);
+    }
+
+    // Normal selector — append the scope attribute after the last token.
+    append_scope_attr(trimmed, hash)
+}
+
+/// If `selector` is exactly `:global(inner)`, return `Some(inner)`.
+fn extract_global(selector: &str) -> Option<&str> {
+    let s = selector.trim();
+    if s.starts_with(":global(") && s.ends_with(')') {
+        let inner = &s[":global(".len()..s.len() - 1];
+        return Some(inner);
+    }
+    None
+}
+
+/// Handle selectors that contain `:global(...)` sub-expressions mixed with
+/// scoped parts, e.g. `.parent :global(.child)`.
+fn scope_selector_with_inline_global(selector: &str, hash: &str) -> String {
+    let attr = format!("[data-v-{}]", hash);
+    let mut result = String::with_capacity(selector.len() + attr.len() + 4);
+    let mut rest = selector;
+
+    while !rest.is_empty() {
+        if let Some(global_start) = rest.find(":global(") {
+            // Scope the part before `:global(`
+            let before = &rest[..global_start];
+            if !before.trim().is_empty() {
+                result.push_str(&append_scope_attr(before.trim(), hash));
+                result.push(' ');
+            }
+
+            // Find matching closing paren
+            let after_open = &rest[global_start + ":global(".len()..];
+            let mut depth = 1usize;
+            let mut end = 0;
+            for (i, ch) in after_open.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let inner = &after_open[..end];
+            result.push_str(inner.trim());
+            rest = &after_open[end + 1..];
+        } else {
+            // No more :global() — scope the remainder
+            if !rest.trim().is_empty() {
+                result.push_str(&append_scope_attr(rest.trim(), hash));
+            }
+            break;
+        }
+    }
+
+    result
+}
+
+/// Append `[data-v-{hash}]` to a simple (non-`:global`) selector.
+///
+/// The attribute is inserted **before** any pseudo-element (`::before`,
+/// `::after`, `::placeholder`, etc.) so the resulting rule stays valid.
+fn append_scope_attr(selector: &str, hash: &str) -> String {
+    let attr = format!("[data-v-{}]", hash);
+
+    // Check for pseudo-elements (:: prefix) — insert scope attr before them.
+    if let Some(pos) = find_pseudo_element_pos(selector) {
+        let mut result = String::with_capacity(selector.len() + attr.len());
+        result.push_str(&selector[..pos]);
+        result.push_str(&attr);
+        result.push_str(&selector[pos..]);
+        return result;
+    }
+
+    // Default: append at the end.
+    format!("{}{}", selector, attr)
+}
+
+/// Find the byte position of the first `::` pseudo-element in `selector`.
+/// Returns `None` if no pseudo-element is present.
+fn find_pseudo_element_pos(selector: &str) -> Option<usize> {
+    let bytes = selector.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if bytes[i] == b':' && bytes[i + 1] == b':' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 struct CssParser<'a> {
@@ -303,6 +504,174 @@ mod tests {
 
     fn parse(source: &str) -> (Vec<Spanned<CssRule>>, Vec<ParseError>) {
         parse_css(source, 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoping helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scope_hash_is_8_chars() {
+        let hash = compute_scope_hash("MyButton.vaisx");
+        assert_eq!(hash.len(), 8, "hash should be exactly 8 hex chars");
+    }
+
+    #[test]
+    fn scope_hash_deterministic() {
+        let h1 = compute_scope_hash("Counter.vaisx");
+        let h2 = compute_scope_hash("Counter.vaisx");
+        assert_eq!(h1, h2, "same filename should produce same hash");
+    }
+
+    #[test]
+    fn scope_hash_different_names() {
+        let h1 = compute_scope_hash("Counter.vaisx");
+        let h2 = compute_scope_hash("Button.vaisx");
+        assert_ne!(h1, h2, "different names should produce different hashes");
+    }
+
+    #[test]
+    fn scope_simple_selector() {
+        let (rules, _) = parse("h1 { color: blue; }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                assert_eq!(rule.selectors, vec!["h1[data-v-a1b2c3d4]"]);
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_class_selector() {
+        let (rules, _) = parse(".warning { color: red; }");
+        let hash = "deadbeef";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                assert_eq!(rule.selectors, vec![".warning[data-v-deadbeef]"]);
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_multiple_selectors() {
+        let (rules, _) = parse("h1, h2, .title { color: blue; }");
+        let hash = "12345678";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                assert_eq!(
+                    rule.selectors,
+                    vec![
+                        "h1[data-v-12345678]",
+                        "h2[data-v-12345678]",
+                        ".title[data-v-12345678]"
+                    ]
+                );
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_global_modifier_bypass() {
+        let (rules, _) = parse(":global(body) { margin: 0; }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                // :global() wrapper stripped, selector unchanged
+                assert_eq!(rule.selectors, vec!["body"]);
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_global_modifier_with_class() {
+        let (rules, _) = parse(":global(.reset) { padding: 0; }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                assert_eq!(rule.selectors, vec![".reset"]);
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_pseudo_element_before_append() {
+        let (rules, _) = parse("p::before { content: ''; }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Style(rule) => {
+                // Scope attr inserted before ::before pseudo-element
+                assert_eq!(rule.selectors, vec!["p[data-v-a1b2c3d4]::before"]);
+            }
+            _ => panic!("expected Style rule"),
+        }
+    }
+
+    #[test]
+    fn scope_media_query_recurses() {
+        let (rules, _) = parse("@media (max-width: 768px) { .container { width: 100%; } }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::AtRule(at) => {
+                assert_eq!(at.name, "media");
+                match &at.rules[0].node {
+                    CssRule::Style(rule) => {
+                        assert_eq!(rule.selectors, vec![".container[data-v-a1b2c3d4]"]);
+                    }
+                    _ => panic!("expected Style rule inside @media"),
+                }
+            }
+            _ => panic!("expected AtRule"),
+        }
+    }
+
+    #[test]
+    fn scope_keyframes_not_scoped() {
+        let src = "@keyframes fade { 0% { opacity: 0; } 100% { opacity: 1; } }";
+        let (rules, _) = parse(src);
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::AtRule(at) => {
+                assert_eq!(at.name, "keyframes");
+                // Keyframe selectors (0%, 100%) must NOT get the data-v attr
+                match &at.rules[0].node {
+                    CssRule::Style(rule) => {
+                        assert_eq!(rule.selectors, vec!["0%"]);
+                    }
+                    _ => panic!("expected Style rule inside @keyframes"),
+                }
+            }
+            _ => panic!("expected AtRule"),
+        }
+    }
+
+    #[test]
+    fn scope_comment_preserved() {
+        let (rules, _) = parse("/* comment */\nh1 { color: blue; }");
+        let hash = "a1b2c3d4";
+        let scoped = scope_css_rules(&rules, hash);
+        match &scoped[0].node {
+            CssRule::Comment(c) => assert_eq!(c, " comment "),
+            _ => panic!("expected Comment"),
+        }
+        match &scoped[1].node {
+            CssRule::Style(rule) => {
+                assert_eq!(rule.selectors, vec!["h1[data-v-a1b2c3d4]"]);
+            }
+            _ => panic!("expected Style"),
+        }
     }
 
     #[test]

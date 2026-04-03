@@ -262,10 +262,14 @@ pub struct AwaitBlock {
 pub struct StyleBlock {
     /// Whether this is `<style global>`.
     pub is_global: bool,
+    /// Whether this is `<style scoped>`.
+    pub is_scoped: bool,
     /// Raw CSS source text.
     pub raw_css: String,
     /// Parsed CSS rules (populated by the CSS parser pass).
     pub rules: Vec<Spanned<CssRule>>,
+    /// Scoped CSS hash (8-char, component filename-based). Populated when `is_scoped` is true.
+    pub scope_hash: Option<String>,
 }
 
 /// A CSS rule.

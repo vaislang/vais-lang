@@ -97,7 +97,8 @@ pub fn parse_with_recovery(source: &str) -> (VaisxFile, Vec<ParseError>) {
         .styles
         .into_iter()
         .map(|raw| {
-            let is_global = matches!(raw.kind, lexer::BlockKind::Style { is_global: true });
+            let is_global = matches!(raw.kind, lexer::BlockKind::Style { is_global: true, .. });
+            let is_scoped = matches!(raw.kind, lexer::BlockKind::Style { is_scoped: true, .. });
 
             let (rules, css_errors) = style::parse_css(&raw.content, raw.inner_span.start);
             errors.extend(css_errors);
@@ -105,8 +106,10 @@ pub fn parse_with_recovery(source: &str) -> (VaisxFile, Vec<ParseError>) {
             Spanned::new(
                 StyleBlock {
                     is_global,
+                    is_scoped,
                     raw_css: raw.content,
                     rules,
+                    scope_hash: None, // populated later by the scoping pass
                 },
                 raw.outer_span,
             )

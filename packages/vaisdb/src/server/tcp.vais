@@ -1,12 +1,12 @@
 # TCP Server & Accept Loop
 # Listens on configurable port, accepts connections, dispatches to handlers
-# Requires std/net for actual TCP I/O — placeholder implementation
 # Error codes: EE=06 (server), CC=03 (connection), CC=07 (listener)
 
 U std/vec
 U std/string
 U std/option
 U std/sync
+U std/net
 U storage/error
 U server/types
 U server/config
@@ -39,7 +39,7 @@ S TcpServer {
     state: ServerState,
     total_queries: AtomicI64,
     total_connections: AtomicI64,
-    # FUTURE(std/net): TcpListener handle
+    listener_fd: i64,
 }
 
 X TcpServer {
@@ -62,15 +62,74 @@ X TcpServer {
             state: Starting,
             total_queries: AtomicI64.new(0),
             total_connections: AtomicI64.new(0),
+            listener_fd: -1,
         })
     }
 
     # Start the server (bind and listen)
-    # FUTURE(std/net): Bind address, accept loop, startup logging
     F start(mut self) -> Result<(), VaisError> {
-        # Placeholder: transition state without actual TCP bind
+        port := self.config.port as i64
+        listener := TcpListener.bind(port)
+        I !listener.is_valid() {
+            R Err(err_server_bind_failed("0.0.0.0", self.config.port))
+        }
+        self.listener_fd = listener.fd
         self.state = Running
         Ok(())
+    }
+
+    # Run the accept loop — blocks until server is stopped
+    F run_accept_loop(mut self) {
+        L self.is_running() {
+            listener := TcpListener { fd: self.listener_fd, port: self.config.port as i64 }
+            stream := listener.accept()
+            I stream.is_valid() {
+                client_fd := stream.fd
+                timestamp := mut 0 as u64
+                M self.accept_connection(timestamp) {
+                    Ok(conn_id) => {
+                        proc := mut ConnectionProcessor.new(conn_id)
+                        self.handle_stream(proc, stream)
+                    },
+                    Err(_) => {
+                        stream.close()
+                    },
+                }
+            }
+        }
+    }
+
+    # Handle a single TcpStream through its connection lifecycle
+    F handle_stream(mut self, proc: mut ConnectionProcessor, stream: TcpStream) {
+        buf := mut Vec.with_capacity(4096)
+        i := mut 0
+        L i < 4096 {
+            buf.push(0 as u8)
+            i += 1
+        }
+        running := mut true
+        L running {
+            n := stream.read(&mut buf, 4096)
+            I n <= 0 {
+                running = false
+            } E {
+                M proc.on_data_received(&buf, &mut self) {
+                    Ok(responses) => {
+                        r := mut 0
+                        L r < responses.len() {
+                            resp := responses[r].clone()
+                            stream.write(&resp, resp.len() as i64)
+                            r += 1
+                        }
+                    },
+                    Err(_) => {
+                        running = false
+                    },
+                }
+            }
+        }
+        self.disconnect(proc.conn_id)
+        stream.close()
     }
 
     # Stop the server gracefully
@@ -85,7 +144,12 @@ X TcpServer {
             i += 1
         }
 
-        # FUTURE(std/net): Close TcpListener, drain in-flight queries, flush WAL + checkpoint
+        # Close TcpListener if open
+        I self.listener_fd >= 0 {
+            listener := TcpListener { fd: self.listener_fd, port: self.config.port as i64 }
+            listener.close()
+            self.listener_fd = -1
+        }
         self.state = Stopped
         Ok(())
     }

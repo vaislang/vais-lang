@@ -3,6 +3,7 @@
 
 U std/string
 U std/vec
+U std/net
 U core/config
 U core/error
 U core/context
@@ -145,7 +146,6 @@ X App {
     # -------------------------------------------------------------------------
 
     # Validate config, print startup banner, and begin accepting connections.
-    # FUTURE(std/http_server): delegates to the HTTP server runtime.
     F listen(self, addr: str) -> Result<(), VaisServerError> {
         M self.config.validate() {
             Ok(_) => {},
@@ -162,7 +162,237 @@ X App {
         println("")
         println("Listening on {addr} ...")
 
-        # FUTURE(std/http_server): block on accept loop
+        port := parse_port(addr)
+        I port == -1 {
+            R Err(VaisServerError.new("invalid address: " + addr))
+        }
+
+        listener := TcpListener.bind(port)
+        I !listener.is_valid() {
+            R Err(VaisServerError.new("failed to bind on port " + addr))
+        }
+
+        accept_loop(listener, self.routes)
         Ok(())
     }
 }
+
+# ============================================================================
+# TCP accept loop — runs forever, blocking on each new connection
+# ============================================================================
+
+F accept_loop(listener: TcpListener, routes: Vec<Route>) {
+    stream := listener.accept()
+    I stream.is_valid() {
+        buf := mut [0u8; 4096]
+        n := stream.read(&mut buf, 4096)
+        I n > 0 {
+            raw := bytes_to_str(&buf, n)
+            ctx := parse_http_request(raw)
+            matched_id := match_route(&routes, ctx.method, ctx.path)
+            resp := I matched_id != "" {
+                println("[dispatch] {ctx.method} {ctx.path} -> {matched_id}")
+                dispatch_handler(matched_id, ctx)
+            } E {
+                println("[no-route] {ctx.method} {ctx.path}")
+                Response {
+                    status: 404,
+                    body: "Not Found",
+                    content_type: "text/plain",
+                    headers: "",
+                    redirect_url: "",
+                }
+            }
+            http_resp := format_http_response(resp)
+            stream.write(http_resp as i64, str_len(http_resp))
+        }
+        stream.close()
+    }
+    accept_loop(listener, routes)
+}
+
+# ============================================================================
+# Route matching — linear scan over registered routes
+# ============================================================================
+
+F match_route(routes: &Vec<Route>, method: str, path: str) -> str {
+    match_route_at(routes, method, path, 0)
+}
+
+F match_route_at(routes: &Vec<Route>, method: str, path: str, idx: i64) -> str {
+    I idx >= routes.len() {
+        R ""
+    }
+    r := routes.get(idx)
+    I r.method == method && r.path == path {
+        R r.handler_id
+    }
+    match_route_at(routes, method, path, idx + 1)
+}
+
+# ============================================================================
+# Minimal HTTP/1.1 request parser
+# Returns a Context populated with method, path, query_params, and body
+# ============================================================================
+
+F parse_http_request(raw: str) -> Context {
+    # --- request line: "METHOD /path?query HTTP/1.1" ---
+    req_line_end := index_of(raw, "\r\n")
+    req_line := I req_line_end >= 0 { str_slice(raw, 0, req_line_end) } E { raw }
+
+    method    := extract_method(req_line)
+    full_path := extract_path(req_line)
+    path      := split_path(full_path)
+    query     := split_query(full_path)
+
+    # --- headers/body split on "\r\n\r\n" ---
+    header_end := index_of(raw, "\r\n\r\n")
+    body := I header_end >= 0 {
+        str_slice(raw, header_end + 4, str_len(raw))
+    } E { "" }
+
+    ctx := Context.new(method, path)
+    ctx2 := ctx.set_state("")
+    Context {
+        method: ctx2.method,
+        path: ctx2.path,
+        path_params: "",
+        query_params: query,
+        body,
+        response_headers: "",
+        state: "",
+    }
+}
+
+# Extract the HTTP method from the request line (first token)
+F extract_method(req_line: str) -> str {
+    sp := index_of(req_line, " ")
+    I sp > 0 { str_slice(req_line, 0, sp) } E { "GET" }
+}
+
+# Extract the full path+query token from the request line (second token)
+F extract_path(req_line: str) -> str {
+    sp1 := index_of(req_line, " ")
+    I sp1 < 0 { R "/" }
+    rest := str_slice(req_line, sp1 + 1, str_len(req_line))
+    sp2 := index_of(rest, " ")
+    I sp2 > 0 { str_slice(rest, 0, sp2) } E { rest }
+}
+
+# Return the path portion (before '?')
+F split_path(full_path: str) -> str {
+    q := index_of(full_path, "?")
+    I q >= 0 { str_slice(full_path, 0, q) } E { full_path }
+}
+
+# Return the query string portion (after '?')
+F split_query(full_path: str) -> str {
+    q := index_of(full_path, "?")
+    I q >= 0 { str_slice(full_path, q + 1, str_len(full_path)) } E { "" }
+}
+
+# ============================================================================
+# addr parsing — extract port from "host:port"
+# Returns -1 if no colon found or port string is empty
+# ============================================================================
+
+F parse_port(addr: str) -> i64 {
+    colon := last_index_of(addr, ":")
+    I colon < 0 { R -1 }
+    port_str := str_slice(addr, colon + 1, str_len(addr))
+    I str_len(port_str) == 0 { R -1 }
+    str_to_i64(port_str)
+}
+
+# ============================================================================
+# String utilities
+# ============================================================================
+
+# Find the first occurrence of `needle` in `haystack`; return -1 if not found
+F index_of(haystack: str, needle: str) -> i64 {
+    hlen := str_len(haystack)
+    nlen := str_len(needle)
+    I nlen == 0 { R 0 }
+    I nlen > hlen { R -1 }
+    index_of_scan(haystack, needle, hlen, nlen, 0)
+}
+
+F index_of_scan(haystack: str, needle: str, hlen: i64, nlen: i64, i: i64) -> i64 {
+    I i > hlen - nlen { R -1 }
+    I str_slice(haystack, i, i + nlen) == needle { R i }
+    index_of_scan(haystack, needle, hlen, nlen, i + 1)
+}
+
+# Find the last occurrence of `needle` in `haystack`; return -1 if not found
+F last_index_of(haystack: str, needle: str) -> i64 {
+    hlen := str_len(haystack)
+    nlen := str_len(needle)
+    I nlen == 0 { R hlen }
+    I nlen > hlen { R -1 }
+    last_index_of_scan(haystack, needle, hlen, nlen, hlen - nlen)
+}
+
+F last_index_of_scan(haystack: str, needle: str, hlen: i64, nlen: i64, i: i64) -> i64 {
+    I i < 0 { R -1 }
+    I str_slice(haystack, i, i + nlen) == needle { R i }
+    last_index_of_scan(haystack, needle, hlen, nlen, i - 1)
+}
+
+# ============================================================================
+# HTTP response formatter — converts a Response to an HTTP/1.1 response string
+# ============================================================================
+
+F format_http_response(resp: Response) -> str {
+    status_text := status_reason(resp.status)
+    result := "HTTP/1.1 " + resp.status as str + " " + status_text + "\r\n"
+    result = result + "Content-Type: " + resp.content_type + "\r\n"
+    result = result + "Content-Length: " + str_len(resp.body) as str + "\r\n"
+    result = result + "Connection: close\r\n"
+    I resp.headers != "" {
+        result = result + resp.headers + "\r\n"
+    }
+    result = result + "\r\n"
+    result = result + resp.body
+    result
+}
+
+F status_reason(code: u16) -> str {
+    I code == 200 { R "OK" }
+    I code == 201 { R "Created" }
+    I code == 204 { R "No Content" }
+    I code == 301 { R "Moved Permanently" }
+    I code == 302 { R "Found" }
+    I code == 400 { R "Bad Request" }
+    I code == 401 { R "Unauthorized" }
+    I code == 403 { R "Forbidden" }
+    I code == 404 { R "Not Found" }
+    I code == 405 { R "Method Not Allowed" }
+    I code == 500 { R "Internal Server Error" }
+    "Unknown"
+}
+
+# ============================================================================
+# External runtime functions
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F str_to_i64(s: str) -> i64
+X F bytes_to_str(buf: &[u8], len: i64) -> str
+
+# ============================================================================
+# Handler dispatch — user-provided function that resolves handler_id to a Response
+#
+# Users implement this function in their application code:
+#
+#   F dispatch_handler(handler_id: str, ctx: Context) -> Response {
+#       I handler_id == "get_users"  { R handle_get_users(ctx) }
+#       I handler_id == "create_user" { R handle_create_user(ctx) }
+#       # fallback
+#       Response { status: 500, body: "Unknown handler", content_type: "text/plain", headers: "", redirect_url: "" }
+#   }
+#
+# The linker resolves this symbol at build time.
+# ============================================================================
+
+X F dispatch_handler(handler_id: str, ctx: Context) -> Response

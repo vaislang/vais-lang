@@ -97,7 +97,7 @@ vaislang/vais-lang  ← 에코시스템 모노레포 (이 repo)
 
 - [x] vais compiler Phase 158 strict type coercion → vaisdb TC 에러 대응 중
 - [ ] vais-server의 vaisdb 네이티브 연동 — vaisdb wire protocol 안정화 후 실제 통합 테스트 필요
-- [ ] vais-web SSR → vais-server 연동 인터페이스 미정의
+- [x] vais-web SSR → vais-server 연동 인터페이스: HTTP API bridge (POST /ssr/render, port 3001)
 
 ## Cross-Project Verification Checklist
 
