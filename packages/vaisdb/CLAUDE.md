@@ -92,3 +92,34 @@ Current phase: Test Compilation — Phase 158 strict type coercion 대응 중. 2
 - ✅ Move semantics: &T/&mut T parameters exempted from move checking
 - ✅ Enum struct variant TC: expansion.rs enum_name preservation
 - ✅ bool→i64, int↔float, str↔i64 implicit coercion
+
+## VAIS Ecosystem
+
+> 전체 생태계 맵: [../../VAIS-ECOSYSTEM.md](../../VAIS-ECOSYSTEM.md)
+> 이 프로젝트는 `vaislang/vais-lang` 모노레포의 `packages/vaisdb/`에 위치합니다.
+
+### Position in Ecosystem
+```
+vais (compiler + std) ← upstream (별도 repo: vaislang/vais)
+    ↓
+vaisdb ← this package
+    ↓
+vais-server (native query API 사용) ← 같은 모노레포: ../vais-server/
+```
+
+### Upstream Dependencies
+| Source | Path | Interface |
+|--------|------|-----------|
+| vais compiler | (별도 repo) vaislang/vais | `vaisc build`, type system, codegen |
+| vais std | (별도 repo) vaislang/vais/std/ | file.vais, net.vais, sync.vais, hashmap.vais |
+
+### Downstream Dependencies
+| Project | Path | 사용하는 인터페이스 |
+|---------|------|-------------------|
+| vais-server | `../vais-server/` | wire protocol, query API |
+
+### 작업 전 체크리스트
+- **새 기능 구현 전**: `../../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std에 이미 있는 기능 재구현 금지
+- **컴파일러 이슈 발생 시**: vaislang/vais ROADMAP.md 확인하여 이미 수정 중인지 체크
+- **wire protocol 변경 시**: `../vais-server/src/db/` 모듈에 영향 → `../vais-server/ROADMAP.md` 확인
+- **query API 변경 시**: `../vais-server/src/db/query.vais`의 QueryBuilder와 호환성 확인

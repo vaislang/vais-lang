@@ -318,22 +318,23 @@ When adding or completing tasks, update both the task status and the `progress` 
 
 ## VAIS Ecosystem
 
-> 전체 생태계 맵: [../VAIS-ECOSYSTEM.md](../VAIS-ECOSYSTEM.md)
+> 전체 생태계 맵: [../../VAIS-ECOSYSTEM.md](../../VAIS-ECOSYSTEM.md)
+> 이 프로젝트는 `vaislang/vais-lang` 모노레포의 `packages/vais-server/`에 위치합니다.
 
 ### Position in Ecosystem
 ```
-vais (compiler + std) ← upstream
+vais (compiler + std) ← upstream (별도 repo: vaislang/vais)
     ↓
-vais-server ← this project
+vais-server ← this package
     ↓  ↑
-vaisdb (native query API)
+vaisdb (native query API) ← 같은 모노레포: ../vaisdb/
 ```
 
 ### Upstream Dependencies
 | Source | Path | Interface |
 |--------|------|-----------|
-| vais compiler | `../vais/` | `vaisc build`, type system |
-| vais std | `../vais/std/` | async_http.vais, http_server.vais, websocket.vais |
+| vais compiler | (별도 repo) vaislang/vais | `vaisc build`, type system |
+| vais std | (별도 repo) vaislang/vais/std/ | async_http.vais, http_server.vais, websocket.vais |
 | vaisdb | `../vaisdb/` | wire protocol, query API |
 
 ### Downstream Dependencies
@@ -342,8 +343,8 @@ vaisdb (native query API)
 | vais-web | `../vais-web/` | SSR 연동 (미정의) |
 
 ### 작업 전 체크리스트
-- **새 유틸리티 구현 전**: `../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std에 이미 있는 기능 재구현 금지
-- **HTTP 관련 작업 전**: `../vais/std/async_http.vais`, `std/http_server.vais`에 이미 구현된 기능 확인
+- **새 유틸리티 구현 전**: `../../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std에 이미 있는 기능 재구현 금지
+- **HTTP 관련 작업 전**: vaislang/vais의 `std/async_http.vais`, `std/http_server.vais`에 이미 구현된 기능 확인
 - **DB 관련 작업 전**: `../vaisdb/ROADMAP.md` 확인 — API 변경사항이나 새 기능 체크
-- **컴파일러 이슈 발생 시**: `../vais/ROADMAP.md` 확인하여 이미 수정 중인지 체크
+- **컴파일러 이슈 발생 시**: vaislang/vais ROADMAP.md 확인하여 이미 수정 중인지 체크
 - **JSON/Validation 등 범용 유틸**: std에 추가 제안을 먼저 검토, 프로젝트 로컬 구현은 최후 수단

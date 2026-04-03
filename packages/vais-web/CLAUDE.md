@@ -77,28 +77,29 @@ See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
 
 ## VAIS Ecosystem
 
-> 전체 생태계 맵: [../VAIS-ECOSYSTEM.md](../VAIS-ECOSYSTEM.md)
+> 전체 생태계 맵: [../../VAIS-ECOSYSTEM.md](../../VAIS-ECOSYSTEM.md)
+> 이 프로젝트는 `vaislang/vais-lang` 모노레포의 `packages/vais-web/`에 위치합니다.
 
 ### Position in Ecosystem
 ```
-vais (compiler) ← upstream
+vais (compiler) ← upstream (별도 repo: vaislang/vais)
 ├── vais-codegen-js  → JS codegen
 ├── vais-parser      → AST parsing
 ├── vais-ast         → AST definitions
 └── WASM codegen     → wasm32 target
     ↓
-vais-web ← this project
+vais-web ← this package
     ↓ (SSR)
-vais-server (backend API)
+vais-server (backend API) ← 같은 모노레포: ../vais-server/
 ```
 
 ### Upstream Dependencies
 | Source | Path | Interface |
 |--------|------|-----------|
-| vais-codegen-js | `../vais/crates/vais-codegen-js/` | JS ESM code generation |
-| vais-parser | `../vais/crates/vais-parser/` | Vais source parsing |
-| vais-ast | `../vais/crates/vais-ast/` | AST type definitions |
-| WASM codegen | `../vais/crates/vais-codegen/` | wasm32 compilation target |
+| vais-codegen-js | (별도 repo) vaislang/vais/crates/vais-codegen-js/ | JS ESM code generation |
+| vais-parser | (별도 repo) vaislang/vais/crates/vais-parser/ | Vais source parsing |
+| vais-ast | (별도 repo) vaislang/vais/crates/vais-ast/ | AST type definitions |
+| WASM codegen | (별도 repo) vaislang/vais/crates/vais-codegen/ | wasm32 compilation target |
 
 ### Downstream Dependencies
 | Project | Path | 사용하는 인터페이스 |
@@ -106,7 +107,7 @@ vais-server (backend API)
 | vais-server | `../vais-server/` | SSR 연동 (미정의) |
 
 ### 작업 전 체크리스트
-- **컴파일러 연동 변경 전**: `../vais/ROADMAP.md` 확인 — AST/Parser/Codegen 변경사항 체크
-- **새 유틸리티 구현 전**: `../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std나 다른 프로젝트에 이미 있는지 확인
-- **계약 테스트 실패 시**: `../vais/ROADMAP.md` 확인하여 코어 변경이 원인인지 체크
+- **컴파일러 연동 변경 전**: vaislang/vais ROADMAP.md 확인 — AST/Parser/Codegen 변경사항 체크
+- **새 유틸리티 구현 전**: `../../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std나 다른 프로젝트에 이미 있는지 확인
+- **계약 테스트 실패 시**: vaislang/vais ROADMAP.md 확인하여 코어 변경이 원인인지 체크
 - **SSR 관련 작업 시**: `../vais-server/ROADMAP.md` 확인 — 서버사이드 연동 인터페이스 중복 방지
