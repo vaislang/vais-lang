@@ -1,0 +1,210 @@
+# SQL Parser — command statements
+# Handles: SET, PREPARE, EXECUTE, VACUUM, REINDEX, BACKUP, RESTORE
+
+U storage/error
+U sql/parser/token
+U sql/parser/ast
+U sql/parser/parser
+
+X Parser {
+    # Parse SET SESSION|GLOBAL key = value
+    F parse_set_statement(mut self) -> Result<Statement, VaisError> {
+        is_global := mut false
+        I self.check_identifier("SESSION") {
+            self.advance()
+        } E I self.check_identifier("GLOBAL") {
+            self.advance()
+            is_global = true
+        }
+
+        key := self.expect_identifier()?;
+        self.expect(Eq)?;
+        value := self.parse_expr()?;
+
+        target := I is_global {
+            Global { key, value }
+        } E {
+            Session { key, value }
+        }
+
+        Ok(SetExpr { target })
+    }
+
+    # Parse PREPARE name AS statement
+    F parse_prepare(mut self) -> Result<Statement, VaisError> {
+        name := self.expect_identifier()?;
+        self.expect(As)?;
+        stmt := self.parse_statement()?;
+        Ok(Prepare { name, stmt: Box.new(stmt) })
+    }
+
+    # Parse EXECUTE name [(params...)]
+    F parse_execute(mut self) -> Result<Statement, VaisError> {
+        name := self.expect_identifier()?;
+        params := mut Vec.with_capacity(0)
+
+        I self.match_token(LParen) {
+            I !self.check(RParen) {
+                more_params := mut true
+                L more_params {
+                    expr := self.parse_expr()?;
+                    params.push(expr)
+                    I !self.match_token(Comma) {
+                        more_params = false
+                    }
+                }
+            }
+            self.expect(RParen)?;
+        }
+
+        Ok(Execute { name, params })
+    }
+
+    # Parse VACUUM [FULL] [ANALYZE] [table_name] [(SKIP_LOCKED)]
+    # Examples:
+    #   VACUUM
+    #   VACUUM my_table
+    #   VACUUM FULL
+    #   VACUUM FULL my_table
+    #   VACUUM ANALYZE my_table
+    #   VACUUM (SKIP_LOCKED)
+    #   VACUUM (SKIP_LOCKED) my_table
+    F parse_vacuum(mut self) -> Result<Statement, VaisError> {
+        full := mut false
+        analyze := mut false
+        skip_locked := mut false
+        table_name := mut Option.None
+
+        # Parse optional FULL keyword
+        I self.check_identifier("FULL") {
+            self.advance()
+            full = true
+        }
+
+        # Parse optional ANALYZE keyword (after VACUUM or VACUUM FULL)
+        I self.match_token(Analyze) || self.check_identifier("ANALYZE") {
+            I self.check_identifier("ANALYZE") {
+                self.advance()
+            }
+            analyze = true
+        }
+
+        # Parse optional (SKIP_LOCKED) option
+        I self.match_token(LParen) {
+            I self.check_identifier("SKIP_LOCKED") {
+                self.advance()
+                skip_locked = true
+            } E {
+                R Err(self.parse_error("expected SKIP_LOCKED in VACUUM options"))
+            }
+            self.expect(RParen)?;
+        }
+
+        # Parse optional table name
+        I self.is_identifier() {
+            name := self.expect_identifier()?;
+            table_name = Option.Some(name)
+        }
+
+        Ok(Vacuum { table_name, full, analyze, skip_locked })
+    }
+
+    # Parse REINDEX [CONCURRENTLY] { TABLE | INDEX | DATABASE } [name]
+    # Examples:
+    #   REINDEX TABLE my_table
+    #   REINDEX INDEX my_index
+    #   REINDEX DATABASE
+    #   REINDEX CONCURRENTLY TABLE my_table
+    F parse_reindex(mut self) -> Result<Statement, VaisError> {
+        concurrently := mut false
+        target := mut Option.None
+
+        # Parse optional CONCURRENTLY keyword
+        I self.check_identifier("CONCURRENTLY") {
+            self.advance()
+            concurrently = true
+        }
+
+        # Parse optional target type (TABLE, INDEX, DATABASE)
+        I self.check_identifier("TABLE") {
+            self.advance()
+            name := self.expect_identifier()?;
+            target = Option.Some(name)
+        } E I self.check_identifier("INDEX") {
+            self.advance()
+            name := self.expect_identifier()?;
+            target = Option.Some(name)
+        } E I self.check_identifier("DATABASE") {
+            self.advance()
+            # DATABASE reindex has no name argument (applies to current DB)
+        } E I self.is_identifier() {
+            # Bare name (treat as table)
+            name := self.expect_identifier()?;
+            target = Option.Some(name)
+        }
+
+        Ok(Reindex { target, concurrently })
+    }
+
+    # Parse BACKUP TO 'path' [LABEL 'label']
+    # Examples:
+    #   BACKUP TO '/backups/2026-02-27'
+    #   BACKUP TO '/backups/daily' LABEL 'pre-migration'
+    F parse_backup(mut self) -> Result<Statement, VaisError> {
+        # Expect TO keyword
+        I !self.check_identifier("TO") {
+            R Err(self.parse_error("expected TO after BACKUP"))
+        }
+        self.advance()
+
+        # Expect path as string literal
+        path := self.expect_string_literal()?;
+
+        # Parse optional LABEL 'label'
+        label := mut Option.None
+        I self.check_identifier("LABEL") {
+            self.advance()
+            label_str := self.expect_string_literal()?;
+            label = Option.Some(label_str)
+        }
+
+        Ok(Backup { path, label })
+    }
+
+    # Parse RESTORE FROM 'path' [TO TIMESTAMP 'ts' | TO LSN 'lsn']
+    # Examples:
+    #   RESTORE FROM '/backups/2026-02-27'
+    #   RESTORE FROM '/backups/daily' TO TIMESTAMP '2026-02-27T12:00:00Z'
+    #   RESTORE FROM '/backups/daily' TO LSN '4294967362'
+    F parse_restore(mut self) -> Result<Statement, VaisError> {
+        # Expect FROM keyword
+        I !self.check_identifier("FROM") {
+            R Err(self.parse_error("expected FROM after RESTORE"))
+        }
+        self.advance()
+
+        # Expect path as string literal
+        path := self.expect_string_literal()?;
+
+        # Parse optional PITR target: TO TIMESTAMP 'ts' | TO LSN 'lsn'
+        pitr_timestamp := mut Option.None
+        pitr_lsn := mut Option.None
+
+        I self.check_identifier("TO") {
+            self.advance()
+            I self.check_identifier("TIMESTAMP") {
+                self.advance()
+                ts := self.expect_string_literal()?;
+                pitr_timestamp = Option.Some(ts)
+            } E I self.check_identifier("LSN") {
+                self.advance()
+                lsn := self.expect_string_literal()?;
+                pitr_lsn = Option.Some(lsn)
+            } E {
+                R Err(self.parse_error("expected TIMESTAMP or LSN after TO in RESTORE"))
+            }
+        }
+
+        Ok(Restore { path, pitr_timestamp, pitr_lsn })
+    }
+}

@@ -1,0 +1,513 @@
+# SQL Parser — SELECT statements
+# Handles: WITH (CTEs), SELECT, FROM, JOIN, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET,
+#          set operations (UNION / INTERSECT / EXCEPT)
+
+U storage/error
+U sql/types
+U sql/parser/token
+U sql/parser/ast
+U sql/parser/parser
+
+X Parser {
+    # Parse a full SELECT query including CTEs and set operations
+    F parse_select(mut self) -> Result<SelectQuery, VaisError> {
+        # Parse optional WITH clause (CTEs)
+        ctes := mut Vec.with_capacity(0)
+        I self.match_token(With) {
+            ctes = self.parse_cte()?;
+        }
+
+        self.expect(Select)?;
+
+        # Parse optional DISTINCT
+        distinct := mut false
+        I self.match_token(Distinct) {
+            distinct = true
+        }
+
+        # Parse select list
+        select_list := self.parse_select_list()?;
+
+        # Parse optional FROM clause
+        from := mut Option.None
+        I self.match_token(From) {
+            refs := self.parse_from_clause()?;
+            from = Option.Some(refs)
+        }
+
+        # Parse optional WHERE clause
+        where_clause := self.parse_where_clause()?;
+
+        # Parse optional GROUP BY clause
+        group_by := self.parse_group_by()?;
+
+        # Parse optional HAVING clause
+        having := self.parse_having()?;
+
+        # Parse optional ORDER BY clause
+        order_by := self.parse_order_by()?;
+
+        # Parse optional LIMIT/OFFSET
+        (limit, offset) := self.parse_limit_offset()?;
+
+        # Build the query
+        query := mut SelectQuery {
+            ctes,
+            select_list,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            distinct,
+            set_op: Option.None,
+        }
+
+        # Parse optional set operations (UNION, INTERSECT, EXCEPT)
+        query.set_op = self.parse_set_operation()?;
+
+        Ok(query)
+    }
+
+    # Parse WITH clause containing one or more CTEs
+    F parse_cte(mut self) -> Result<Vec<Cte>, VaisError> {
+        ctes := mut Vec.with_capacity(0)
+
+        more_ctes := mut true
+        L more_ctes {
+            recursive := mut false
+            I self.match_token(Recursive) {
+                recursive = true
+            }
+
+            name := self.expect_identifier()?;
+
+            # Optional column alias list
+            columns := mut Vec.with_capacity(0)
+            I self.match_token(LParen) {
+                more_cols := mut true
+                L more_cols {
+                    col := self.expect_identifier()?;
+                    columns.push(col)
+                    I !self.match_token(Comma) {
+                        more_cols = false
+                    }
+                }
+                self.expect(RParen)?;
+            }
+
+            self.expect(As)?;
+            self.expect(LParen)?;
+            query := self.parse_select()?;
+            self.expect(RParen)?;
+
+            ctes.push(Cte { name, columns, query, recursive })
+
+            I !self.match_token(Comma) {
+                more_ctes = false
+            }
+        }
+
+        Ok(ctes)
+    }
+
+    # Parse the select list (between SELECT and FROM)
+    F parse_select_list(mut self) -> Result<Vec<SelectItem>, VaisError> {
+        items := mut Vec.with_capacity(0)
+
+        more_items := mut true
+        L more_items {
+            item := self.parse_select_item()?;
+            items.push(item)
+            I !self.match_token(Comma) {
+                more_items = false
+            }
+        }
+
+        Ok(items)
+    }
+
+    # Parse a single select item
+    F parse_select_item(mut self) -> Result<SelectItem, VaisError> {
+        # Check for * (all columns)
+        I self.match_token(Star) {
+            R Ok(AllColumns)
+        }
+
+        # Check for table.* (all columns from table)
+        # Peek: identifier DOT STAR
+        I self.is_identifier() {
+            saved_pos := self.pos
+            table_name := self.expect_identifier()?;
+            I self.match_token(Dot) {
+                I self.match_token(Star) {
+                    R Ok(AllColumnsFrom { table: table_name })
+                }
+                # Not table.*, backtrack
+                self.pos = saved_pos
+            } E {
+                # No dot, backtrack and parse as expression
+                self.pos = saved_pos
+            }
+        }
+
+        # Parse expression with optional alias
+        expr := self.parse_expr()?;
+        alias := mut Option.None
+        I self.match_token(As) {
+            a := self.expect_identifier()?;
+            alias = Option.Some(a)
+        } E I self.is_identifier() {
+            # Alias without AS keyword
+            a := self.expect_identifier()?;
+            alias = Option.Some(a)
+        }
+
+        Ok(Expr { expr, alias })
+    }
+
+    # Parse FROM clause (comma-separated table references with joins)
+    F parse_from_clause(mut self) -> Result<Vec<TableRef>, VaisError> {
+        refs := mut Vec.with_capacity(0)
+
+        more_refs := mut true
+        L more_refs {
+            table_ref := self.parse_table_ref()?;
+            # Check for joins attached to this table reference
+            joined := self.parse_joins(table_ref)?;
+            refs.push(joined)
+            I !self.match_token(Comma) {
+                more_refs = false
+            }
+        }
+
+        Ok(refs)
+    }
+
+    # Parse a single table reference (table name, subquery, or parenthesized ref)
+    F parse_table_ref(mut self) -> Result<TableRef, VaisError> {
+        # Subquery: (SELECT ...)
+        I self.match_token(LParen) {
+            query := self.parse_select()?;
+            self.expect(RParen)?;
+            # Subquery in FROM requires an alias
+            self.match_token(As)
+            alias := self.expect_identifier()?;
+            R Ok(Subquery { query: Box.new(query), alias })
+        }
+
+        # Check for table-valued function: VECTOR_SEARCH(...), GRAPH_TRAVERSE(...), FULLTEXT_MATCH(...)
+        I self.is_identifier() {
+            saved_pos := self.pos
+            name := self.expect_identifier()?;
+            name_upper := name.to_uppercase()
+
+            # Check if this is a known table-valued function followed by LParen
+            I (name_upper == "VECTOR_SEARCH" || name_upper == "GRAPH_TRAVERSE" || name_upper == "FULLTEXT_MATCH")
+                && self.check(LParen) {
+                # Parse table function: name(args...) AS alias
+                self.expect(LParen)?;
+
+                # Parse comma-separated argument expressions
+                args := mut Vec.with_capacity(0)
+                I !self.check(RParen) {
+                    more_args := mut true
+                    L more_args {
+                        arg := self.parse_expr()?;
+                        args.push(arg)
+                        I !self.match_token(Comma) {
+                            more_args = false
+                        }
+                    }
+                }
+                self.expect(RParen)?;
+
+                # Parse optional alias
+                alias := mut Option.None
+                I self.match_token(As) {
+                    a := self.expect_identifier()?;
+                    alias = Option.Some(a)
+                } E I self.is_identifier() && !self.is_join_keyword() {
+                    # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
+                    a := self.expect_identifier()?;
+                    alias = Option.Some(a)
+                }
+
+                R Ok(TableFunction { name, args, alias })
+            }
+
+            # Not a table function, backtrack and parse as regular table name
+            self.pos = saved_pos
+        }
+
+        # Table name with optional alias
+        name := self.expect_identifier()?;
+        alias := mut Option.None
+        I self.match_token(As) {
+            a := self.expect_identifier()?;
+            alias = Option.Some(a)
+        } E I self.is_identifier() && !self.is_join_keyword() {
+            # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
+            a := self.expect_identifier()?;
+            alias = Option.Some(a)
+        }
+
+        Ok(Table { name, alias })
+    }
+
+    # Parse zero or more joins following a table reference
+    F parse_joins(mut self, left: TableRef) -> Result<TableRef, VaisError> {
+        current := mut left
+
+        L self.is_join_keyword() {
+            current = self.parse_join(current)?;
+        }
+
+        Ok(current)
+    }
+
+    # Parse a single JOIN clause
+    F parse_join(mut self, left: TableRef) -> Result<TableRef, VaisError> {
+        # Determine join type
+        join_type := mut Inner
+        is_natural := mut false
+
+        # NATURAL keyword
+        I self.check_identifier("NATURAL") {
+            is_natural = true
+            self.advance()
+        }
+
+        M self.peek() {
+            Inner => {
+                self.advance()
+                join_type = Inner
+            },
+            Left => {
+                self.advance()
+                join_type = Left
+                # Optional OUTER keyword
+                I self.check_identifier("OUTER") {
+                    self.advance()
+                }
+            },
+            Right => {
+                self.advance()
+                join_type = Right
+                # Optional OUTER keyword
+                I self.check_identifier("OUTER") {
+                    self.advance()
+                }
+            },
+            Cross => {
+                self.advance()
+                join_type = Cross
+            },
+            Join => {
+                # Plain JOIN = INNER JOIN
+                join_type = Inner
+            },
+            _ => {
+                R Err(self.parse_error("expected JOIN keyword"))
+            },
+        }
+
+        self.expect(Join)?;
+
+        # Parse the right side table reference
+        right := self.parse_table_ref()?;
+
+        # Parse join condition
+        condition := mut Natural
+
+        I is_natural {
+            condition = Natural
+        } E {
+            M join_type {
+                Cross => {
+                    # CROSS JOIN has no condition; use Natural as placeholder
+                    R Ok(CrossJoin {
+                        left: Box.new(left),
+                        right: Box.new(right),
+                    })
+                },
+                _ => {
+                    I self.match_token(On) {
+                        expr := self.parse_expr()?;
+                        condition = On { expr }
+                    } E I self.match_token(Using) {
+                        self.expect(LParen)?;
+                        columns := mut Vec.with_capacity(0)
+                        more_cols := mut true
+                        L more_cols {
+                            col := self.expect_identifier()?;
+                            columns.push(col)
+                            I !self.match_token(Comma) {
+                                more_cols = false
+                            }
+                        }
+                        self.expect(RParen)?;
+                        condition = Using { columns }
+                    } E {
+                        R Err(self.parse_error("expected ON or USING after JOIN"))
+                    }
+                },
+            }
+        }
+
+        Ok(Join {
+            join: JoinClause {
+                join_type,
+                left: Box.new(left),
+                right: Box.new(right),
+                condition,
+            },
+        })
+    }
+
+    # Parse optional WHERE clause
+    F parse_where_clause(mut self) -> Result<Option<Expr>, VaisError> {
+        I self.match_token(Where) {
+            expr := self.parse_expr()?;
+            Ok(Option.Some(expr))
+        } E {
+            Ok(Option.None)
+        }
+    }
+
+    # Parse optional GROUP BY clause
+    F parse_group_by(mut self) -> Result<Vec<Expr>, VaisError> {
+        I self.match_token(Group) {
+            self.expect(By)?;
+            exprs := mut Vec.with_capacity(0)
+            more_exprs := mut true
+            L more_exprs {
+                expr := self.parse_expr()?;
+                exprs.push(expr)
+                I !self.match_token(Comma) {
+                    more_exprs = false
+                }
+            }
+            Ok(exprs)
+        } E {
+            Ok(Vec.with_capacity(0))
+        }
+    }
+
+    # Parse optional HAVING clause
+    F parse_having(mut self) -> Result<Option<Expr>, VaisError> {
+        I self.match_token(Having) {
+            expr := self.parse_expr()?;
+            Ok(Option.Some(expr))
+        } E {
+            Ok(Option.None)
+        }
+    }
+
+    # Parse optional ORDER BY clause
+    F parse_order_by(mut self) -> Result<Vec<OrderByItem>, VaisError> {
+        I self.match_token(Order) {
+            self.expect(By)?;
+            items := mut Vec.with_capacity(0)
+            more_items := mut true
+            L more_items {
+                expr := self.parse_expr()?;
+                asc := mut true
+                I self.match_token(Asc) {
+                    asc = true
+                } E I self.match_token(Desc) {
+                    asc = false
+                }
+
+                # Optional NULLS FIRST / NULLS LAST
+                nulls_first := mut Option.None
+                I self.match_token(Nulls) {
+                    I self.match_token(First) {
+                        nulls_first = Option.Some(true)
+                    } E I self.match_token(Last) {
+                        nulls_first = Option.Some(false)
+                    } E {
+                        R Err(self.parse_error("expected FIRST or LAST after NULLS"))
+                    }
+                }
+
+                items.push(OrderByItem { expr, asc, nulls_first })
+                I !self.match_token(Comma) {
+                    more_items = false
+                }
+            }
+            Ok(items)
+        } E {
+            Ok(Vec.with_capacity(0))
+        }
+    }
+
+    # Parse optional LIMIT and OFFSET clauses
+    F parse_limit_offset(mut self) -> Result<(Option<Expr>, Option<Expr>), VaisError> {
+        limit := mut Option.None
+        offset := mut Option.None
+
+        I self.match_token(Limit) {
+            expr := self.parse_expr()?;
+            limit = Option.Some(expr)
+        }
+
+        I self.match_token(Offset) {
+            expr := self.parse_expr()?;
+            offset = Option.Some(expr)
+        }
+
+        # Also allow LIMIT after OFFSET if LIMIT was not yet parsed
+        I limit.is_none() && self.match_token(Limit) {
+            expr := self.parse_expr()?;
+            limit = Option.Some(expr)
+        }
+
+        Ok((limit, offset))
+    }
+
+    # Parse optional set operation (UNION/INTERSECT/EXCEPT)
+    F parse_set_operation(mut self) -> Result<Option<SetOperation>, VaisError> {
+        op_kind := mut Option.None
+
+        M self.peek() {
+            Union => {
+                self.advance()
+                op_kind = Option.Some(Union)
+            },
+            Intersect => {
+                self.advance()
+                op_kind = Option.Some(Intersect)
+            },
+            Except => {
+                self.advance()
+                op_kind = Option.Some(Except)
+            },
+            _ => {
+                R Ok(Option.None)
+            },
+        }
+
+        # Check for ALL
+        all := mut false
+        I self.match_token(All) {
+            all = true
+        }
+
+        # Parse the right side query
+        right := self.parse_select()?;
+
+        M op_kind {
+            Option.Some(op) => {
+                Ok(Option.Some(SetOperation {
+                    op,
+                    all,
+                    right: Box.new(right),
+                }))
+            },
+            Option.None => Ok(Option.None),
+        }
+    }
+}

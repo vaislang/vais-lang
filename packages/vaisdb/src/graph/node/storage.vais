@@ -1,33 +1,26 @@
 # Graph Node Storage
 # Manages graph node pages: slotted page layout for GraphNode structs
-# Page type: PAGE_TYPE_GRAPH_NODE (0x30), engine: ENGINE_TAG_GRAPH (0x03)
+# Page type: PAGE_TYPE_GRAPH_NODE (48), engine: ENGINE_TAG_GRAPH (3)
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/option.{Option, Some, None};
-U std/hashmap.{HashMap};
-U storage/constants.{
-    PAGE_HEADER_SIZE, DEFAULT_PAGE_SIZE, NULL_PAGE,
-    FILE_ID_GRAPH, MVCC_TUPLE_META_SIZE, INVALID_TXN_ID
-};
-U storage/error.{VaisError, err_internal};
-U storage/page/header.{PageHeader};
-U storage/page/types.{PAGE_TYPE_GRAPH_NODE, ENGINE_TAG_GRAPH};
-U storage/buffer/pool.{BufferPool};
-U storage/page/allocator.{PageAllocator};
-U storage/page/freelist.{FreelistBitmap};
-U graph/types.{
-    GraphNode, GraphMeta, GraphConfig,
-    GRAPH_NODE_HEADER_SIZE, INVALID_NODE_ID,
-    err_graph_node_not_found, err_graph_node_corrupt, err_graph_page_full
-};
+U storage/bytes
+U std/vec
+U std/option
+U std/hashmap
+U storage/constants
+U storage/error
+U storage/page/header
+U storage/page/types
+U storage/buffer/pool
+U storage/page/allocator
+U storage/page/freelist
+U graph/types
 
 # Node page body header (after 48B page header)
 # node_count(2) + next_free_offset(2) + flags(2) + reserved(2) = 8 bytes
-C NODE_PAGE_BODY_HEADER_SIZE: u32 = 8;
+C NODE_PAGE_BODY_HEADER_SIZE: u32 = 8
 
 # Slot directory entry: offset(2) + length(2) = 4 bytes
-C NODE_SLOT_SIZE: u32 = 4;
+C NODE_SLOT_SIZE: u32 = 4
 
 # ============================================================================
 # NodeSlot — Slot directory entry for a node in a page
@@ -40,14 +33,14 @@ S NodeSlot {
 
 X NodeSlot {
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u16_le(self.offset);
-        buf.put_u16_le(self.length);
+        buf.write_u16_le(self.offset)
+        buf.write_u16_le(self.length)
     }
 
     F deserialize(buf: &ByteBuffer) -> Result<NodeSlot, VaisError> {
         Ok(NodeSlot {
-            offset: buf.get_u16_le()?,
-            length: buf.get_u16_le()?,
+            offset: read_u16_le_checked(buf)?,
+            length: read_u16_le_checked(buf)?,
         })
     }
 
@@ -75,13 +68,13 @@ S NodePage {
 X NodePage {
     # Create new empty node page
     F new(page_id: u32, page_size: u32) -> NodePage {
-        start_offset := mut (PAGE_HEADER_SIZE + NODE_PAGE_BODY_HEADER_SIZE) as u16;
+        start_offset := mut (PAGE_HEADER_SIZE + NODE_PAGE_BODY_HEADER_SIZE) as u16
         NodePage {
             page_id,
             node_count: 0,
             next_free_offset: start_offset,
             flags: 0,
-            slots: Vec.new(),
+            slots: Vec.with_capacity(0),
             page_data: vec![0u8; page_size as u64],
             page_size,
         }
@@ -91,21 +84,21 @@ X NodePage {
     F load(page_id: u32, page_data: &[u8], page_size: u32) -> Result<NodePage, VaisError> {
         header := mut PageHeader.read_from_page(page_data)?;
         I header.page_type != PAGE_TYPE_GRAPH_NODE {
-            R Err(err_graph_node_corrupt(0));
+            R Err(err_graph_node_corrupt(0))
         }
 
-        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
-        node_count := mut buf.get_u16_le()?;
-        next_free_offset := mut buf.get_u16_le()?;
-        flags := mut buf.get_u16_le()?;
-        buf.get_u16_le()?;  # reserved
+        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..])
+        node_count := mut read_u16_le_checked(buf)?;
+        next_free_offset := mut read_u16_le_checked(buf)?;
+        flags := mut read_u16_le_checked(buf)?;
+        read_u16_le_checked(buf)?;  # reserved
 
         # Read slot directory
-        slots := mut Vec.with_capacity(node_count as u64);
-        i: u64 := mut 0;
+        slots := mut Vec.with_capacity(node_count as u64)
+        i := mut 0
         L i < node_count as u64 {
-            slots.push(NodeSlot.deserialize(&buf)?);
-            i += 1;
+            slots.push(NodeSlot.deserialize(&buf)?)
+            i += 1
         }
 
         Ok(NodePage {
@@ -123,8 +116,8 @@ X NodePage {
     F available_space(self) -> u32 {
         # Slot directory grows top-down, node data grows bottom-up
         slot_dir_end := mut PAGE_HEADER_SIZE + NODE_PAGE_BODY_HEADER_SIZE +
-                        (self.node_count as u32 * NODE_SLOT_SIZE);
-        data_start := mut self.find_lowest_data_offset();
+                        (self.node_count as u32 * NODE_SLOT_SIZE)
+        data_start := mut self.find_lowest_data_offset()
         I data_start > slot_dir_end + NODE_SLOT_SIZE {
             data_start - slot_dir_end - NODE_SLOT_SIZE
         } E {
@@ -134,13 +127,13 @@ X NodePage {
 
     # Find lowest offset of existing node data (bottom-up growth)
     F find_lowest_data_offset(self) -> u32 {
-        lowest := mut self.page_size;
-        i: u64 := mut 0;
+        lowest := mut self.page_size
+        i := mut 0
         L i < self.slots.len() {
             I !self.slots[i].is_deleted() && (self.slots[i].offset as u32) < lowest {
-                lowest = self.slots[i].offset as u32;
+                lowest = self.slots[i].offset as u32
             }
-            i += 1;
+            i += 1
         }
         lowest
     }
@@ -148,31 +141,31 @@ X NodePage {
     # Add node to page (returns slot index)
     F add_node(mut self, node: &GraphNode) -> Result<u16, VaisError> {
         # Serialize node to temp buffer
-        temp_buf := mut ByteBuffer.new(node.serialized_size() as u64);
-        node.serialize(&temp_buf);
-        node_bytes := mut temp_buf.to_vec();
-        node_size := mut node_bytes.len() as u32;
+        temp_buf := mut ByteBuffer.new(node.serialized_size() as u64)
+        node.serialize(&temp_buf)
+        node_bytes := mut temp_buf.to_vec()
+        node_size := mut node_bytes.len() as u32
 
         # Check space
         I self.available_space() < node_size {
-            R Err(err_graph_page_full(self.page_id));
+            R Err(err_graph_page_full(self.page_id))
         }
 
         # Write node data bottom-up
-        data_offset := mut self.find_lowest_data_offset() - node_size;
-        i: u64 := mut 0;
+        data_offset := mut self.find_lowest_data_offset() - node_size
+        i := mut 0
         L i < node_bytes.len() {
-            self.page_data[(data_offset as u64) + i] = node_bytes[i];
-            i += 1;
+            self.page_data[(data_offset as u64) + i] = node_bytes[i]
+            i += 1
         }
 
         # Add slot entry
-        slot_index := mut self.node_count;
+        slot_index := mut self.node_count
         self.slots.push(NodeSlot {
             offset: data_offset as u16,
             length: node_size as u16,
-        });
-        self.node_count += 1;
+        })
+        self.node_count += 1
 
         Ok(slot_index)
     }
@@ -180,40 +173,40 @@ X NodePage {
     # Read node at slot index
     F read_node(self, slot_index: u16) -> Result<GraphNode, VaisError> {
         I slot_index >= self.node_count {
-            R Err(err_graph_node_not_found(0));
+            R Err(err_graph_node_not_found(0))
         }
 
-        slot := mut &self.slots[slot_index as u64];
+        slot := mut &self.slots[slot_index as u64]
         I slot.is_deleted() {
-            R Err(err_graph_node_not_found(0));
+            R Err(err_graph_node_not_found(0))
         }
 
         buf := mut ByteBuffer.wrap_readonly(
             &self.page_data[slot.offset as u64..(slot.offset + slot.length) as u64]
-        );
+        )
         GraphNode.deserialize(&buf)
     }
 
     # Update node at slot index (must fit in same or smaller space)
     F update_node(mut self, slot_index: u16, node: &GraphNode) -> Result<(), VaisError> {
         I slot_index >= self.node_count {
-            R Err(err_graph_node_not_found(0));
+            R Err(err_graph_node_not_found(0))
         }
 
-        slot := mut &self.slots[slot_index as u64];
-        temp_buf := mut ByteBuffer.new(node.serialized_size() as u64);
-        node.serialize(&temp_buf);
-        node_bytes := mut temp_buf.to_vec();
+        slot := mut &self.slots[slot_index as u64]
+        temp_buf := mut ByteBuffer.new(node.serialized_size() as u64)
+        node.serialize(&temp_buf)
+        node_bytes := mut temp_buf.to_vec()
 
         I node_bytes.len() > slot.length as u64 {
-            R Err(err_graph_page_full(self.page_id));
+            R Err(err_graph_page_full(self.page_id))
         }
 
         # Overwrite existing data
-        i: u64 := mut 0;
+        i := mut 0
         L i < node_bytes.len() {
-            self.page_data[(slot.offset as u64) + i] = node_bytes[i];
-            i += 1;
+            self.page_data[(slot.offset as u64) + i] = node_bytes[i]
+            i += 1
         }
 
         Ok(())
@@ -221,40 +214,40 @@ X NodePage {
 
     # Write page to buffer (for flushing to buffer pool)
     F write_to_buffer(self, page_lsn: u64, txn_id: u64) -> Vec<u8> {
-        out := mut vec![0u8; self.page_size as u64];
+        out := mut vec![0u8; self.page_size as u64]
 
         # Write page header
-        header := mut PageHeader.new(self.page_id, PAGE_TYPE_GRAPH_NODE, ENGINE_TAG_GRAPH);
-        header.page_lsn = page_lsn;
-        header.txn_id = txn_id;
-        header.item_count = self.node_count;
-        header.write_to_page(&out);
+        header := mut PageHeader.new(self.page_id, PAGE_TYPE_GRAPH_NODE, ENGINE_TAG_GRAPH)
+        header.page_lsn = page_lsn
+        header.txn_id = txn_id
+        header.item_count = self.node_count
+        header.write_to_page(&out)
 
         # Write node page body header
-        buf := mut ByteBuffer.wrap(&out);
-        buf.set_position(PAGE_HEADER_SIZE as u64);
-        buf.put_u16_le(self.node_count);
-        buf.put_u16_le(self.next_free_offset);
-        buf.put_u16_le(self.flags);
-        buf.put_u16_le(0);  # reserved
+        buf := mut ByteBuffer.wrap(&out)
+        buf.seek(PAGE_HEADER_SIZE as u64)
+        buf.write_u16_le(self.node_count)
+        buf.write_u16_le(self.next_free_offset)
+        buf.write_u16_le(self.flags)
+        buf.write_u16_le(0);  # reserved
 
         # Write slot directory
-        i: u64 := mut 0;
+        i := mut 0
         L i < self.slots.len() {
-            self.slots[i].serialize(&buf);
-            i += 1;
+            self.slots[i].serialize(&buf)
+            i += 1
         }
 
         # Copy node data area (bottom-up region)
-        lowest := mut self.find_lowest_data_offset() as u64;
-        j: u64 := mut lowest;
+        lowest := mut self.find_lowest_data_offset() as u64
+        j := mut lowest
         L j < self.page_size as u64 {
-            out[j] = self.page_data[j];
-            j += 1;
+            out[j] = self.page_data[j]
+            j += 1
         }
 
         # Update checksum
-        PageHeader.update_checksum(&out);
+        PageHeader.update_checksum(&out)
 
         out
     }
@@ -269,7 +262,7 @@ S NodeStore {
     allocator: &PageAllocator,
     bitmap: &FreelistBitmap,
     page_size: u32,
-    node_index: HashMap<u64, (u32, u16)>,  # node_id -> (page_id, slot_index)
+    node_index: HashMap<u64, NodeLocation>,  # node_id -> (page_id, slot_index)
 }
 
 X NodeStore {
@@ -281,41 +274,41 @@ X NodeStore {
     ) -> NodeStore {
         NodeStore {
             pool, allocator, bitmap, page_size,
-            node_index: HashMap.new(),
+            node_index: HashMap.with_capacity(16),
         }
     }
 
     # Write a new node, allocating a page if needed
-    # Returns (page_id, slot_index)
-    # Also registers the node in the node_id -> (page_id, slot_index) index
-    F write_node(mut self, node: &GraphNode, txn_id: u64) -> Result<(u32, u16), VaisError> {
+    # Returns NodeLocation
+    # Also registers the node in the node_id -> NodeLocation index
+    F write_node(mut self, node: &GraphNode, txn_id: u64) -> Result<NodeLocation, VaisError> {
         # Allocate new page (simple strategy: one node per page for now)
         page_id := mut self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
-        npage := mut NodePage.new(page_id, self.page_size);
+        npage := mut NodePage.new(page_id, self.page_size)
         slot_index := mut npage.add_node(node)?;
 
         # Write to buffer pool
-        page_buffer := mut npage.write_to_buffer(0, txn_id);
+        page_buffer := mut npage.write_to_buffer(0, txn_id)
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        frame_data := mut self.pool.get_page_mut(frame_id);
-        i: u64 := mut 0;
+        frame_data := mut self.pool.get_page_mut(frame_id)
+        i := mut 0
         L i < page_buffer.len() {
-            frame_data[i] = page_buffer[i];
-            i += 1;
+            frame_data[i] = page_buffer[i]
+            i += 1
         }
-        self.pool.unpin_page(frame_id, true);
+        self.pool.unpin_page(frame_id, true)
 
         # Register in node index
-        self.node_index.insert(node.node_id, (page_id, slot_index));
+        self.node_index.insert(node.node_id, NodeLocation { page_id: page_id, slot_index: slot_index })
 
-        Ok((page_id, slot_index))
+        Ok(NodeLocation { page_id: page_id, slot_index: slot_index })
     }
 
     # Read a node by node_id (uses node_index for lookup)
     F read_node(self, node_id: u64) -> Result<GraphNode, VaisError> {
         M self.node_index.get(&node_id) {
             Some(loc) => {
-                self.read_node_at(loc.0, loc.1)
+                self.read_node_at(loc.page_id, loc.slot_index)
             },
             None => Err(err_graph_node_not_found(node_id)),
         }
@@ -324,10 +317,10 @@ X NodeStore {
     # Read a node from storage at a specific (page_id, slot_index)
     F read_node_at(self, page_id: u32, slot_index: u16) -> Result<GraphNode, VaisError> {
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        page_data := mut self.pool.get_page(frame_id);
+        page_data := mut self.pool.get_page(frame_id)
         npage := mut NodePage.load(page_id, page_data, self.page_size)?;
         node := mut npage.read_node(slot_index)?;
-        self.pool.unpin_page(frame_id, false);
+        self.pool.unpin_page(frame_id, false)
         Ok(node)
     }
 
@@ -335,26 +328,26 @@ X NodeStore {
     F delete_node(mut self, node_id: u64, txn_id: u64, cmd_id: u32) -> Result<(), VaisError> {
         M self.node_index.get(&node_id) {
             Some(loc) => {
-                page_id := mut loc.0;
-                slot_index := mut loc.1;
+                page_id := mut loc.page_id
+                slot_index := mut loc.slot_index
                 frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-                page_data := mut self.pool.get_page_mut(frame_id);
+                page_data := mut self.pool.get_page_mut(frame_id)
                 npage := mut NodePage.load(page_id, page_data, self.page_size)?;
                 node := mut npage.read_node(slot_index)?;
 
                 # Set MVCC expiration fields
-                node.txn_id_expire = txn_id;
-                node.expire_cmd_id = cmd_id;
+                node.txn_id_expire = txn_id
+                node.expire_cmd_id = cmd_id
 
                 # Write back
                 npage.update_node(slot_index, &node)?;
-                page_buffer := mut npage.write_to_buffer(0, txn_id);
-                i: u64 := mut 0;
+                page_buffer := mut npage.write_to_buffer(0, txn_id)
+                i := mut 0
                 L i < page_buffer.len() {
-                    page_data[i] = page_buffer[i];
-                    i += 1;
+                    page_data[i] = page_buffer[i]
+                    i += 1
                 }
-                self.pool.unpin_page(frame_id, true);
+                self.pool.unpin_page(frame_id, true)
                 Ok(())
             },
             None => Err(err_graph_node_not_found(node_id)),
@@ -364,23 +357,23 @@ X NodeStore {
     # Update a node in storage at a specific location
     F update_node(mut self, page_id: u32, slot_index: u16, node: &GraphNode, txn_id: u64) -> Result<(), VaisError> {
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        page_data := mut self.pool.get_page_mut(frame_id);
+        page_data := mut self.pool.get_page_mut(frame_id)
         npage := mut NodePage.load(page_id, page_data, self.page_size)?;
         npage.update_node(slot_index, node)?;
 
         # Write back
-        page_buffer := mut npage.write_to_buffer(0, txn_id);
-        i: u64 := mut 0;
+        page_buffer := mut npage.write_to_buffer(0, txn_id)
+        i := mut 0
         L i < page_buffer.len() {
-            page_data[i] = page_buffer[i];
-            i += 1;
+            page_data[i] = page_buffer[i]
+            i += 1
         }
-        self.pool.unpin_page(frame_id, true);
+        self.pool.unpin_page(frame_id, true)
         Ok(())
     }
 
     # Register a node_id -> location mapping in the index (used during recovery)
     F register_node(mut self, node_id: u64, page_id: u32, slot_index: u16) {
-        self.node_index.insert(node_id, (page_id, slot_index));
+        self.node_index.insert(node_id, NodeLocation { page_id: page_id, slot_index: slot_index })
     }
 }

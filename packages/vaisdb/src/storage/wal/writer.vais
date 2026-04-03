@@ -3,25 +3,24 @@
 # Based on Stage 2: WAL Design
 # Manages segment creation, record serialization, prev_lsn chain per txn
 
-U std/file.{File, OpenMode, fsync};
-U std/sync.{Mutex};
-U std/hashmap.{HashMap};
-U std/bytes.{ByteBuffer};
+U storage/file
+U std/vec
+U std/sync
+U std/hashmap
+U storage/bytes
 
-U storage/error.{VaisError, err_internal, err_wal_corruption};
-U storage/constants.{
-    WAL_RECORD_HEADER_SIZE, DEFAULT_WAL_SEGMENT_SIZE,
-    WAL_SEGMENT_HEADER_SIZE,
-};
-U storage/wal/header.{WalRecordHeader};
-U storage/wal/segment.{WalSegmentHeader, segment_filename};
-U storage/wal/lsn.{LsnAllocator, NULL_LSN};
-U storage/wal/buffer.{WalBuffer};
-U storage/checksum.{calculate_wal_checksum};
+U storage/error
+U storage/constants
+U storage/wal/header
+U storage/wal/segment
+U storage/wal/naming
+U storage/wal/lsn
+U storage/wal/buffer
+U storage/checksum
 
 # WAL Writer - manages appending records to WAL segment files
 S WalWriter {
-    wal_dir: Str,                     # Directory for WAL segment files
+    wal_dir: str,                     # Directory for WAL segment files
     segment_size: u32,                # Max segment size (default 256MB)
     lsn_allocator: LsnAllocator,      # Thread-safe LSN allocation
     prev_lsn_map: HashMap<u64, u64>,  # txn_id -> last LSN for that txn (undo chain)
@@ -29,64 +28,65 @@ S WalWriter {
     current_file: Option<File>,       # Current open segment file
     current_segment_header: Option<WalSegmentHeader>,
     buffer: WalBuffer,                # Write buffer for batching
-    lock: Mutex,
+    lock: Mutex<i64>,
     is_open: bool,
 }
 
 X WalWriter {
     # Create a new WAL writer
-    F new(wal_dir: Str, segment_size: u32) -> Result<WalWriter, VaisError> {
-        lsn_allocator := mut LsnAllocator.new(segment_size);
+    F new(wal_dir: str, segment_size: u32) -> Result<WalWriter, VaisError> {
+        lsn_allocator := mut LsnAllocator.new(segment_size)
 
         Ok(WalWriter {
             wal_dir,
             segment_size,
             lsn_allocator,
-            prev_lsn_map: HashMap.new(),
+            prev_lsn_map: HashMap.with_capacity(16),
             current_segment: 0,
             current_file: None,
             current_segment_header: None,
             buffer: WalBuffer.new(),
-            lock: Mutex.new(),
+            lock: Mutex.new(0),
             is_open: false,
         })
     }
 
     # Open or resume WAL writer from last known LSN
     F open(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
         # Create WAL directory if it doesn't exist
-        std/file.create_dir_all(&self.wal_dir)?;
+        create_dir_all(&self.wal_dir)?;
 
         # Find the latest segment
         latest_segment := mut self.find_latest_segment()?;
         I latest_segment > 0 {
             # Resume from existing segment
-            self.current_segment = latest_segment;
-            seg_path := mut self.segment_path(latest_segment);
-            file := mut File.open(&seg_path, OpenMode.ReadWrite)?;
+            self.current_segment = latest_segment
+            seg_path := mut self.segment_path(latest_segment)
+            file := mut File.open(&seg_path, "rw")?;
 
             # Read segment header to find last LSN
-            header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
-            header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8);
-            file.read_at(0, &header_buf)?;
-            seg_header := mut WalSegmentHeader.deserialize(&header_buf)?;
+            header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64)
+            header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8)
+            file.read_into_at(0, &header_buf)?;
+            seg_header := mut WalSegmentHeader.from_bytes(&header_buf)?;
+            # header_buf.drop() # disabled for dev compiler
 
             # Resume LSN allocator from last LSN
             I seg_header.last_lsn != NULL_LSN {
-                self.lsn_allocator = LsnAllocator.resume(seg_header.last_lsn, self.segment_size);
+                self.lsn_allocator = LsnAllocator.resume(seg_header.last_lsn, self.segment_size)
             }
 
-            self.current_file = Some(file);
-            self.current_segment_header = Some(seg_header);
+            self.current_file = Some(file)
+            self.current_segment_header = Some(seg_header)
         } E {
             # Create first segment
             self.create_new_segment()?;
         }
 
-        self.is_open = true;
-        drop(guard);
+        self.is_open = true
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
@@ -99,12 +99,14 @@ X WalWriter {
         engine_type: u8,
         payload: &[u8],
     ) -> Result<u64, VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
-        record_length := mut WAL_RECORD_HEADER_SIZE + payload.len() as u32;
+        record_length := mut WAL_RECORD_HEADER_SIZE + payload.len() as u32
 
         # Allocate LSN
-        (lsn, needs_new_segment) := mut self.lsn_allocator.allocate(record_length);
+        alloc_result := mut self.lsn_allocator.allocate(record_length)
+        lsn := mut alloc_result.lsn
+        needs_new_segment := mut alloc_result.needs_new_segment
 
         I needs_new_segment {
             self.finalize_current_segment()?;
@@ -112,10 +114,10 @@ X WalWriter {
         }
 
         # Get prev_lsn for this transaction (undo chain)
-        prev_lsn := mut M self.prev_lsn_map.get(&txn_id) {
-            Some(&prev) => prev,
+        prev_lsn := mut M self.prev_lsn_map.get_opt(&txn_id) {
+            Some(prev) => prev,
             None => NULL_LSN,
-        };
+        }
 
         # Build WAL record header
         header := mut WalRecordHeader.new(
@@ -125,26 +127,26 @@ X WalWriter {
             record_type,
             engine_type,
             record_length,
-        );
+        )
 
         # Serialize header + payload
-        record_buf := mut Vec.with_capacity(record_length as u64);
-        record_buf.resize(record_length as u64, 0u8);
-        buf := mut ByteBuffer.wrap(&record_buf);
-        header.serialize(&buf);
+        record_buf := mut Vec.with_capacity(record_length as u64)
+        record_buf.resize(record_length as u64, 0u8)
+        buf := mut ByteBuffer.wrap(&record_buf)
+        header.serialize(&buf)
 
         # Write payload after header
         L i: 0..payload.len() {
-            record_buf[WAL_RECORD_HEADER_SIZE as u64 + i] = payload[i];
+            record_buf[WAL_RECORD_HEADER_SIZE as u64 + i] = payload[i]
         }
 
         # Compute CRC32C checksum over entire record (with checksum field zeroed)
-        checksum := mut calculate_wal_checksum(&record_buf);
+        checksum := mut calculate_wal_checksum(&record_buf)
         # Write checksum at offset 36 (little-endian)
-        record_buf[36] = (checksum & 0xFF) as u8;
-        record_buf[37] = ((checksum >> 8) & 0xFF) as u8;
-        record_buf[38] = ((checksum >> 16) & 0xFF) as u8;
-        record_buf[39] = ((checksum >> 24) & 0xFF) as u8;
+        record_buf[36] = (checksum & 255) as u8
+        record_buf[37] = ((checksum >> 8) & 255) as u8
+        record_buf[38] = ((checksum >> 16) & 255) as u8
+        record_buf[39] = ((checksum >> 24) & 255) as u8
 
         # Append to buffer or write directly
         I self.buffer.can_fit(record_length) {
@@ -156,49 +158,49 @@ X WalWriter {
         }
 
         # Update prev_lsn for this transaction
-        self.prev_lsn_map.insert(txn_id, lsn);
+        self.prev_lsn_map.insert(txn_id, lsn)
 
         # Update segment header's last_lsn
-        I seg_header := mut &self.current_segment_header {
-            I M seg_header {
-                Some(ref mut h) => {
-                    h.last_lsn = lsn;
-                },
-                None => {},
-            }
+        M &mut self.current_segment_header {
+            Some(h) => {
+                h.last_lsn = lsn
+            },
+            None => {},
         }
 
-        drop(guard);
+        # buf.drop() # disabled for dev compiler
+        # record_buf.drop() # disabled for dev compiler
+        # guard.drop() # disabled for dev compiler
         Ok(lsn)
     }
 
     # Flush buffered records to disk
     F flush(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
         self.flush_buffer()?;
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
     # Flush and fsync to disk (durable write)
     F sync(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
         self.flush_buffer()?;
         M &self.current_file {
-            Some(ref file) => {
-                fsync(file)?;
+            Some(file) => {
+                file_fsync(file)?;
             },
             None => {},
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
     # Remove transaction from prev_lsn map (after commit/abort)
     F clear_txn(mut self, txn_id: u64) {
-        guard := mut self.lock.lock();
-        self.prev_lsn_map.remove(&txn_id);
-        drop(guard);
+        guard := mut self.lock.lock()
+        self.prev_lsn_map.remove(&txn_id)
+        # guard.drop() # disabled for dev compiler
     }
 
     # Get the current LSN
@@ -208,14 +210,20 @@ X WalWriter {
 
     # Close the WAL writer
     F close(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
         I self.is_open {
             self.flush_buffer()?;
             self.finalize_current_segment()?;
-            self.current_file = None;
-            self.is_open = false;
+            M &self.current_file {
+                Some(file) => {
+                    file.close()
+                },
+                None => {},
+            }
+            self.current_file = None
+            self.is_open = false
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
@@ -223,42 +231,43 @@ X WalWriter {
 
     # Flush the in-memory buffer to disk
     F flush_buffer(mut self) -> Result<(), VaisError> {
-        I self.buffer.is_empty() {
-            R Ok(());
+        I self.buffer.len() == 0 {
+            R Ok(())
         }
 
         M &self.current_file {
-            Some(ref file) => {
+            Some(file) => {
                 file.write_all(self.buffer.contents())?;
             },
             None => {
-                R Err(err_internal("WAL writer: no open segment file"));
+                R Err(err_internal("WAL writer: no open segment file"))
             },
         }
 
-        self.buffer.clear();
+        self.buffer.clear()
         Ok(())
     }
 
     # Create a new WAL segment file
     F create_new_segment(mut self) -> Result<(), VaisError> {
-        seg_num := mut self.lsn_allocator.current_segment_number();
-        self.current_segment = seg_num;
-        seg_path := mut self.segment_path(seg_num);
+        seg_num := mut self.lsn_allocator.current_segment_number()
+        self.current_segment = seg_num
+        seg_path := mut self.segment_path(seg_num)
 
         file := mut File.create(&seg_path)?;
 
         # Write segment header
-        first_lsn := mut self.lsn_allocator.current_lsn();
-        seg_header := mut WalSegmentHeader.new(seg_num, first_lsn);
+        first_lsn := mut self.lsn_allocator.current_lsn()
+        seg_header := mut WalSegmentHeader.new(seg_num, first_lsn)
 
-        header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
-        header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8);
-        seg_header.serialize_to(&header_buf);
-        file.write_all(&header_buf)?;
+        header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64)
+        header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8)
+        header_buf = seg_header.to_bytes()
+        file.write_all(&header_buf[0..header_buf.len()])?;
+        # header_buf.drop() # disabled for dev compiler
 
-        self.current_file = Some(file);
-        self.current_segment_header = Some(seg_header);
+        self.current_file = Some(file)
+        self.current_segment_header = Some(seg_header)
 
         Ok(())
     }
@@ -266,12 +275,13 @@ X WalWriter {
     # Finalize the current segment (update header with last_lsn)
     F finalize_current_segment(mut self) -> Result<(), VaisError> {
         M (&self.current_file, &self.current_segment_header) {
-            (Some(ref file), Some(ref seg_header)) => {
-                header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64);
-                header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8);
-                seg_header.serialize_to(&header_buf);
-                file.write_at(0, &header_buf)?;
-                fsync(file)?;
+            (Some(file), Some(seg_header)) => {
+                header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64)
+                header_buf.resize(WAL_SEGMENT_HEADER_SIZE as u64, 0u8)
+                header_buf = seg_header.to_bytes()
+                file.write_at(0, &header_buf[0..header_buf.len()])?;
+                file_fsync(file)?;
+                # header_buf.drop() # disabled for dev compiler
             },
             _ => {},
         }
@@ -280,14 +290,14 @@ X WalWriter {
 
     # Find the latest segment number in the WAL directory
     F find_latest_segment(self) -> Result<u32, VaisError> {
-        entries := mut std/file.read_dir(&self.wal_dir)?;
-        max_segment: u32 := mut 0;
+        entries := mut read_dir(&self.wal_dir)?;
+        max_segment := mut 0
 
         L entry: &entries {
-            name := mut entry.file_name();
+            name := mut entry.file_name()
             # Segment files are named NNNNNN.wal (e.g., 000001.wal)
-            I name.ends_with(".wal") && name.len() == 10 {
-                M name[0..6].parse_u32() {
+            I is_wal_segment_filename(&name) {
+                M parse_wal_segment_number(&name) {
                     Ok(num) => {
                         I num > max_segment { max_segment = num; }
                     },
@@ -300,8 +310,15 @@ X WalWriter {
     }
 
     # Build the full path for a segment file
-    F segment_path(self, segment_number: u32) -> Str {
-        filename := mut segment_filename(segment_number);
+    F segment_path(self, segment_number: u32) -> str {
+        filename := mut WalSegmentHeader.segment_filename(segment_number)
         self.wal_dir + "/" + &filename
+    }
+
+    F drop(mut self) {
+        # self.buffer.drop() # disabled for dev compiler
+        # self.prev_lsn_map.drop() # disabled for dev compiler
+        # self.lock.drop() # disabled for dev compiler
+        self.is_open = false
     }
 }

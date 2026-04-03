@@ -2,20 +2,14 @@
 # HNSW WAL Integration - Write helpers, redo/undo handlers for crash recovery
 # Error codes: EE=02 (vector), CC=09 (WAL)
 
-U storage/wal/group_commit.{GroupCommitManager};
-U storage/wal/record_types.{
-    HNSW_INSERT_NODE, HNSW_DELETE_NODE, HNSW_UPDATE_EDGES,
-    HNSW_LAYER_PROMOTE, VECTOR_DATA_WRITE, QUANTIZATION_UPDATE
-};
-U storage/wal/record_vector.{
-    HnswInsertNodePayload, HnswDeleteNodePayload, HnswUpdateEdgesPayload,
-    HnswLayerPromotePayload, VectorDataWritePayload, QuantizationUpdatePayload
-};
-U storage/buffer/pool.{BufferPool};
-U vector/hnsw/types.{HnswNode, HnswNeighbor, HnswMeta};
-U vector/hnsw/insert.{NodeStore};
-U std/result.{Result, Ok, Err};
-U storage/error.{VaisError};
+U storage/wal/group_commit
+U storage/wal/record_types
+U storage/wal/record_vector
+U storage/buffer/pool
+U vector/hnsw/types
+U vector/hnsw/insert
+U std/result
+U storage/error
 
 # WAL manager for HNSW operations
 # Coordinates WAL writes with GroupCommitManager for crash recovery
@@ -40,18 +34,18 @@ X HnswWalManager {
         affected_pages: &[(u8, u32)]
     ) -> Result<u64, VaisError> {
         # Build neighbor list from node
-        L neighbors: Vec<(u64, f32)> := mut Vec.new();
-        L i: u64 = 0;
-        layer_count := mut node.neighbors.len();
+        L neighbors: Vec<(u64, f32)> := mut Vec.with_capacity(0)
+        L i: u64 = 0
+        layer_count := mut node.neighbors.len()
         L i < layer_count {
-            layer_neighbors := mut &node.neighbors[i];
-            L j: u64 = 0;
+            layer_neighbors := mut &node.neighbors[i]
+            L j: u64 = 0
             L j < layer_neighbors.len() {
-                nb := mut &layer_neighbors[j];
-                neighbors.push((nb.node_id, nb.distance));
-                j = j + 1;
+                nb := mut &layer_neighbors[j]
+                neighbors.push((nb.node_id, nb.distance))
+                j = j + 1
             }
-            i = i + 1;
+            i = i + 1
         }
 
         # Create payload
@@ -62,10 +56,10 @@ X HnswWalManager {
             file_id,
             page_id,
             affected_pages: affected_pages.to_vec()
-        };
+        }
 
         # Serialize and write
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, HNSW_INSERT_NODE, 0, &payload_bytes)
     }
 
@@ -84,9 +78,9 @@ X HnswWalManager {
             layers_affected: layers.to_vec(),
             file_id,
             page_id
-        };
+        }
 
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, HNSW_DELETE_NODE, 0, &payload_bytes)
     }
 
@@ -109,9 +103,9 @@ X HnswWalManager {
             new_neighbors: new_neighbors.to_vec(),
             file_id,
             page_id
-        };
+        }
 
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, HNSW_UPDATE_EDGES, 0, &payload_bytes)
     }
 
@@ -130,9 +124,9 @@ X HnswWalManager {
             new_max_layer,
             file_id,
             page_id
-        };
+        }
 
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, HNSW_LAYER_PROMOTE, 0, &payload_bytes)
     }
 
@@ -151,9 +145,9 @@ X HnswWalManager {
             page_id,
             offset,
             vector_data: data.to_vec()
-        };
+        }
 
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, VECTOR_DATA_WRITE, 0, &payload_bytes)
     }
 
@@ -168,9 +162,9 @@ X HnswWalManager {
         payload := mut QuantizationUpdatePayload {
             index_id,
             codebook: codebook.to_vec()
-        };
+        }
 
-        payload_bytes := mut payload.serialize();
+        payload_bytes := mut payload.serialize()
         self.gcm.write_record(txn_id, QUANTIZATION_UPDATE, 0, &payload_bytes)
     }
 }
@@ -186,24 +180,24 @@ F redo_hnsw_insert(
         node_id: payload.node_id,
         vector_page_id: payload.page_id,
         max_layer: payload.layer,
-        neighbors: Vec.new()
-    };
+        neighbors: Vec.with_capacity(0)
+    }
 
     # Build neighbor layers
-    L i: u64 = 0;
+    L i: u64 = 0
     L i <= payload.layer as u64 {
-        L layer_neighbors: Vec<HnswNeighbor> := mut Vec.new();
+        L layer_neighbors: Vec<HnswNeighbor> := mut Vec.with_capacity(0)
 
         # Filter neighbors for this layer
-        L j: u64 = 0;
+        L j: u64 = 0
         L j < payload.neighbors.len() {
-            L (nid, dist) = payload.neighbors[j];
-            layer_neighbors.push(HnswNeighbor { node_id: nid, distance: dist });
-            j = j + 1;
+            L (nid, dist) = payload.neighbors[j]
+            layer_neighbors.push(HnswNeighbor { node_id: nid, distance: dist })
+            j = j + 1
         }
 
-        node.neighbors.push(layer_neighbors);
-        i = i + 1;
+        node.neighbors.push(layer_neighbors)
+        i = i + 1
     }
 
     # Insert node into store (idempotent)
@@ -230,22 +224,22 @@ F redo_hnsw_update_edges(
     node := mut store.get_node(payload.node_id)?;
 
     # Update neighbors at layer
-    I payload.layer as u64 >= node.neighbors.len() {
+    I (payload.layer as u64) >= node.neighbors.len() {
         # Error: invalid layer
-        R Err(VaisError.new(0x020900, "REDO: invalid layer for edge update"));
+        R Err(VaisError.new(133376, "REDO: invalid layer for edge update"))
     }
 
     # Build new neighbor list
-    L new_neighbors: Vec<HnswNeighbor> := mut Vec.new();
-    L i: u64 = 0;
+    L new_neighbors: Vec<HnswNeighbor> := mut Vec.with_capacity(0)
+    L i: u64 = 0
     L i < payload.new_neighbors.len() {
-        nid := mut payload.new_neighbors[i];
+        nid := mut payload.new_neighbors[i]
         # Distance not stored in payload, use placeholder (will be recalculated)
-        new_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 });
-        i = i + 1;
+        new_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 })
+        i = i + 1
     }
 
-    node.neighbors[payload.layer as u64] = new_neighbors;
+    node.neighbors[payload.layer as u64] = new_neighbors
 
     # Write back
     store.update_node(&node)
@@ -261,11 +255,12 @@ F redo_hnsw_layer_promote(
     node := mut store.get_node(payload.node_id)?;
 
     # Update max_layer
-    node.max_layer = payload.new_max_layer;
+    node.max_layer = payload.new_max_layer
 
     # Ensure neighbors vector has enough layers
     L node.neighbors.len() <= payload.new_max_layer as u64 {
-        node.neighbors.push(Vec.new());
+        tmp_neighbors := Vec.with_capacity(0)
+        node.neighbors.push(tmp_neighbors)
     }
 
     # Write back
@@ -282,20 +277,20 @@ F redo_vector_data_write(
     frame := mut pool.pin_page(payload.file_id, payload.page_id)?;
 
     # Write data at offset
-    page_data := mut frame.get_page_data_mut();
+    page_data := mut frame.get_page_data_mut()
     I payload.offset as u64 + payload.vector_data.len() > page_data.len() {
-        pool.unpin_page(payload.file_id, payload.page_id, false);
-        R Err(VaisError.new(0x020901, "REDO: vector data write out of bounds"));
+        pool.unpin_page(payload.file_id, payload.page_id, false)
+        R Err(VaisError.new(133377, "REDO: vector data write out of bounds"))
     }
 
-    L i: u64 = 0;
+    L i: u64 = 0
     L i < payload.vector_data.len() {
-        page_data[payload.offset as u64 + i] = payload.vector_data[i];
-        i = i + 1;
+        page_data[payload.offset as u64 + i] = payload.vector_data[i]
+        i = i + 1
     }
 
     # Mark dirty and unpin
-    pool.unpin_page(payload.file_id, payload.page_id, true);
+    pool.unpin_page(payload.file_id, payload.page_id, true)
     Ok(())
 }
 
@@ -321,7 +316,7 @@ F undo_hnsw_delete(
 
     # Physical undo not supported (would need node snapshot)
     # Return error to indicate missing undo data
-    Err(VaisError.new(0x020902, "UNDO: delete requires node snapshot (MVCC mode only)"))
+    Err(VaisError.new(133378, "UNDO: delete requires node snapshot (MVCC mode only)"))
 }
 
 # Dispatcher for vector REDO operations
@@ -359,7 +354,7 @@ F dispatch_vector_redo(
             Ok(())
         },
         _ => {
-            Err(VaisError.new(0x020903, "Unknown vector WAL record type"))
+            Err(VaisError.new(133379, "Unknown vector WAL record type"))
         }
     }
 }
@@ -387,38 +382,38 @@ F dispatch_vector_undo(
             # Load node
             node := mut store.get_node(payload.node_id)?;
 
-            I payload.layer as u64 >= node.neighbors.len() {
-                R Err(VaisError.new(0x020904, "UNDO: invalid layer for edge update"));
+            I (payload.layer as u64) >= node.neighbors.len() {
+                R Err(VaisError.new(133380, "UNDO: invalid layer for edge update"))
             }
 
             # Restore old neighbors
-            L old_neighbors: Vec<HnswNeighbor> := mut Vec.new();
-            L i: u64 = 0;
+            L old_neighbors: Vec<HnswNeighbor> := mut Vec.with_capacity(0)
+            L i: u64 = 0
             L i < payload.old_neighbors.len() {
-                nid := mut payload.old_neighbors[i];
-                old_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 });
-                i = i + 1;
+                nid := mut payload.old_neighbors[i]
+                old_neighbors.push(HnswNeighbor { node_id: nid, distance: 0.0 })
+                i = i + 1
             }
 
-            node.neighbors[payload.layer as u64] = old_neighbors;
+            node.neighbors[payload.layer as u64] = old_neighbors
             store.update_node(&node)
         },
         HNSW_LAYER_PROMOTE => {
             # Undo layer promote: would need old_max_layer in payload
             # Current design: layer promote is monotonic (no undo)
-            Err(VaisError.new(0x020905, "UNDO: layer promote requires old_max_layer"))
+            Err(VaisError.new(133381, "UNDO: layer promote requires old_max_layer"))
         },
         VECTOR_DATA_WRITE => {
             # Undo vector write: would need old data in payload
             # Current design: use undo log for physical undo
-            Err(VaisError.new(0x020906, "UNDO: vector write requires old data snapshot"))
+            Err(VaisError.new(133382, "UNDO: vector write requires old data snapshot"))
         },
         QUANTIZATION_UPDATE => {
             # Undo quantization: would need old codebook
-            Err(VaisError.new(0x020907, "UNDO: quantization update requires old codebook"))
+            Err(VaisError.new(133383, "UNDO: quantization update requires old codebook"))
         },
         _ => {
-            Err(VaisError.new(0x020908, "Unknown vector WAL record type for undo"))
+            Err(VaisError.new(133384, "Unknown vector WAL record type for undo"))
         }
     }
 }

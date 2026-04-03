@@ -2,10 +2,12 @@
 # Based on Stage 2: WAL Design
 # All fields naturally aligned for ARM/strict-alignment architectures
 
-U storage/error.{VaisError, err_wal_corruption};
-U storage/constants.{WAL_RECORD_HEADER_SIZE};
-U storage/checksum.{calculate_wal_checksum, verify_wal_checksum};
-U std/bytes.{ByteBuffer};
+U storage/error
+U std/vec
+U std/time
+U storage/constants
+U storage/checksum
+U storage/bytes
 
 # WAL Record Header Structure (48 bytes)
 S WalRecordHeader {
@@ -17,7 +19,13 @@ S WalRecordHeader {
     checksum: u32,          # 36-39: CRC32C of entire record
     record_type: u8,        # 40:    Type of WAL record
     engine_type: u8,        # 41:    Engine that generated this record
-    reserved: [u8; 6],      # 42-47: Reserved (must be 0)
+    reserved: Vec<u8>,      # 42-47: Reserved (must be 0, 6 bytes)
+}
+
+# WAL record with header and payload
+S WalRecord {
+    header: WalRecordHeader,
+    payload: Vec<u8>,
 }
 
 X WalRecordHeader {
@@ -30,7 +38,9 @@ X WalRecordHeader {
         engine_type: u8,
         record_length: u32
     ) -> WalRecordHeader {
-        timestamp := mut std/time.unix_timestamp_us();
+        timestamp := mut time_micros()
+        reserved := mut Vec.with_capacity(6)
+        reserved.resize(6, 0u8)
         WalRecordHeader {
             lsn,
             txn_id,
@@ -40,41 +50,41 @@ X WalRecordHeader {
             checksum: 0,  # Set to 0, computed later
             record_type,
             engine_type,
-            reserved: [0, 0, 0, 0, 0, 0],
+            reserved,
         }
     }
 
     # Serialize header to ByteBuffer (little-endian)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u64_le(self.lsn);
-        buf.put_u64_le(self.txn_id);
-        buf.put_u64_le(self.prev_lsn);
-        buf.put_u64_le(self.timestamp);
-        buf.put_u32_le(self.record_length);
-        buf.put_u32_le(self.checksum);
-        buf.put_u8(self.record_type);
-        buf.put_u8(self.engine_type);
+        buf.write_i64_le(self.lsn)
+        buf.write_i64_le(self.txn_id)
+        buf.write_i64_le(self.prev_lsn)
+        buf.write_i64_le(self.timestamp)
+        buf.write_i32_le(self.record_length)
+        buf.write_i32_le(self.checksum)
+        buf.write_u8(self.record_type)
+        buf.write_u8(self.engine_type)
         # Write reserved bytes
-        L i: 0..6 {
-            buf.put_u8(self.reserved[i]);
+        L i: 0..self.reserved.len() {
+            buf.write_u8(self.reserved[i])
         }
     }
 
     # Deserialize header from ByteBuffer
     F deserialize(buf: &ByteBuffer) -> Result<WalRecordHeader, VaisError> {
-        lsn := mut buf.get_u64_le()?;
-        txn_id := mut buf.get_u64_le()?;
-        prev_lsn := mut buf.get_u64_le()?;
-        timestamp := mut buf.get_u64_le()?;
-        record_length := mut buf.get_u32_le()?;
-        checksum := mut buf.get_u32_le()?;
-        record_type := mut buf.get_u8()?;
-        engine_type := mut buf.get_u8()?;
+        lsn := mut read_i64_le_checked(buf)?;
+        txn_id := mut read_i64_le_checked(buf)?;
+        prev_lsn := mut read_i64_le_checked(buf)?;
+        timestamp := mut read_i64_le_checked(buf)?;
+        record_length := mut read_i32_le_checked(buf)?;
+        checksum := mut read_i32_le_checked(buf)?;
+        record_type := mut read_u8_checked(buf)?;
+        engine_type := mut read_u8_checked(buf)?;
 
         # Read reserved bytes
-        reserved := mut [0u8; 6];
-        L i: 0..6 {
-            reserved[i] = buf.get_u8()?;
+        reserved := mut Vec.with_capacity(6)
+        L _: 0..6 {
+            reserved.push(read_u8_checked(buf)?)
         }
 
         Ok(WalRecordHeader {
@@ -91,17 +101,19 @@ X WalRecordHeader {
     }
 
     # Serialize header to byte array (48 bytes)
-    F to_bytes(self) -> [u8; 48] {
-        buf := mut ByteBuffer.with_capacity(WAL_RECORD_HEADER_SIZE as u64);
-        self.serialize(&mut buf);
-        bytes := mut [0u8; 48];
-        buf.as_slice().copy_to(&mut bytes, 0);
-        bytes
+    F to_bytes(self) -> Vec<u8> {
+        buf := mut ByteBuffer.with_capacity(WAL_RECORD_HEADER_SIZE as u64)
+        self.serialize(&mut buf)
+        buf.to_vec()
     }
 
     # Deserialize header from byte array
-    F from_bytes(data: &[u8; 48]) -> Result<WalRecordHeader, VaisError> {
-        buf := mut ByteBuffer.from_slice(data);
+    F from_bytes(data: &[u8]) -> Result<WalRecordHeader, VaisError> {
+        # Use write_bytes with raw pointer to avoid Vec<u8> stride-8 indexing issue
+        buf := mut ByteBuffer.with_capacity(data.len() as i64)
+        ptr := (&data[0]) as i64
+        buf.write_bytes(ptr, data.len() as i64)
+        buf.rewind()
         WalRecordHeader.deserialize(&buf)
     }
 
@@ -112,8 +124,8 @@ X WalRecordHeader {
 
     # Compute and set checksum for full record data
     # Must be called after full record (header + payload) is assembled
-    F set_checksum(&mut self, full_record: &[u8]) {
-        self.checksum = calculate_wal_checksum(full_record);
+    F set_checksum(mut self, full_record: &[u8]) {
+        self.checksum = calculate_wal_checksum(full_record)
     }
 
     # Get size in bytes
@@ -123,10 +135,10 @@ X WalRecordHeader {
 }
 
 # Engine Type Constants
-C ENGINE_META: u8 = 0x00;
-C ENGINE_RELATIONAL: u8 = 0x01;
-C ENGINE_VECTOR: u8 = 0x02;
-C ENGINE_GRAPH: u8 = 0x03;
-C ENGINE_FULLTEXT: u8 = 0x04;
-C ENGINE_RAG: u8 = 0x05;
-C ENGINE_SECURITY: u8 = 0x06;
+C ENGINE_META: u8 = 0
+C ENGINE_RELATIONAL: u8 = 1
+C ENGINE_VECTOR: u8 = 2
+C ENGINE_GRAPH: u8 = 3
+C ENGINE_FULLTEXT: u8 = 4
+C ENGINE_RAG: u8 = 5
+C ENGINE_SECURITY: u8 = 6

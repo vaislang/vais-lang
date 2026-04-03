@@ -1,0 +1,230 @@
+# Hybrid Query Planner - Pure Statistics Types and Helpers
+# Split from planner/statistics so tests and planner logic can use
+# lightweight stats utilities without importing storage/catalog collectors.
+
+U storage/error
+U std/vec
+U sql/types
+
+C ERR_CODE_STATS_COLLECTION_FAILED: str = "VAIS-0008030"
+C ERR_CODE_STATS_INVALID_SAMPLE_SIZE: str = "VAIS-0008031"
+C ERR_CODE_STATS_HISTOGRAM_FAILED: str = "VAIS-0008032"
+
+F sc_err_stats_collection_failed(reason: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_COLLECTION_FAILED,
+        "Statistics collection failed: {reason}"
+    )
+}
+
+F sc_err_stats_invalid_sample_size(size: u64) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_INVALID_SAMPLE_SIZE,
+        "Invalid sample size: {size} (must be > 0)"
+    )
+}
+
+F sc_err_stats_histogram_failed(reason: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_STATS_HISTOGRAM_FAILED,
+        "Histogram construction failed: {reason}"
+    )
+}
+
+C DEFAULT_SAMPLE_SIZE: u64 = 1000
+C DEFAULT_HISTOGRAM_BUCKETS: u64 = 100
+C MIN_ROWS_FOR_SAMPLING: u64 = 5000
+
+S TableColumnStats {
+    table_name: str,
+    column_name: str,
+    n_distinct: u64,
+    null_fraction: f64,
+    histogram: Vec<SqlValue>,
+    min_value: Option<SqlValue>,
+    max_value: Option<SqlValue>,
+    avg_width: u32,
+}
+
+X TableColumnStats {
+    F new(table_name: str, column_name: str) -> TableColumnStats {
+        table_name_value := mut table_name.clone()
+        column_name_value := mut column_name.clone()
+        TableColumnStats {
+            table_name: table_name_value,
+            column_name: column_name_value,
+            n_distinct: 0,
+            null_fraction: 0.0,
+            histogram: Vec.with_capacity(0),
+            min_value: None,
+            max_value: None,
+            avg_width: 0,
+        }
+    }
+
+    F estimate_equality_selectivity(self) -> f64 {
+        I self.n_distinct == 0 {
+            R 0.1
+        }
+        1.0 / (self.n_distinct as f64)
+    }
+
+    F estimate_range_selectivity(self, value: &SqlValue) -> f64 {
+        I self.histogram.len() == 0 {
+            R 0.3
+        }
+
+        bucket_idx := mut 0u64
+        found_bucket := mut false
+        i := mut 0
+        L i < self.histogram.len() {
+            I !found_bucket {
+                M sc_compare_values(value, &self.histogram[i]) {
+                    Ok(cmp) => {
+                        I cmp < 0 {
+                            bucket_idx = i
+                            found_bucket = true
+                        }
+                    },
+                    Err(_) => {
+                        R 0.3
+                    },
+                }
+            }
+            i += 1
+        }
+
+        total_buckets := mut self.histogram.len()
+        I total_buckets == 0 {
+            R 0.3
+        }
+        (bucket_idx as f64) / (total_buckets as f64)
+    }
+}
+
+S StatisticsConfig {
+    sample_size: u64,
+    histogram_buckets: u64,
+    force_full_scan: bool,
+}
+
+X StatisticsConfig {
+    F default() -> StatisticsConfig {
+        StatisticsConfig {
+            sample_size: DEFAULT_SAMPLE_SIZE,
+            histogram_buckets: DEFAULT_HISTOGRAM_BUCKETS,
+            force_full_scan: false,
+        }
+    }
+
+    F with_sample_size(mut self, size: u64) -> StatisticsConfig {
+        self.sample_size = size
+        self
+    }
+
+    F with_histogram_buckets(mut self, buckets: u64) -> StatisticsConfig {
+        self.histogram_buckets = buckets
+        self
+    }
+
+    F with_force_full_scan(mut self) -> StatisticsConfig {
+        self.force_full_scan = true
+        self
+    }
+}
+
+F sc_build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlValue> {
+    I sorted_sample.len() == 0 || bucket_count == 0 {
+        R Vec.with_capacity(0)
+    }
+
+    boundaries := mut Vec.with_capacity(0)
+    sample_size := mut sorted_sample.len()
+    bucket_size := mut sample_size / bucket_count
+
+    I bucket_size == 0 {
+        R sorted_sample.clone()
+    }
+
+    i := mut 1u64
+    L i < bucket_count {
+        idx := mut i * bucket_size
+        I idx < sample_size {
+            boundaries.push(sorted_sample[idx].clone())
+        }
+        i += 1
+    }
+
+    boundaries
+}
+
+F sc_reservoir_sample(rows: &Vec<SqlValue>, sample_size: u64, seed: u64) -> Vec<SqlValue> {
+    I sample_size == 0 || rows.len() == 0 {
+        R Vec.with_capacity(0)
+    }
+
+    reservoir := mut Vec.with_capacity(0)
+    i := mut 0u64
+
+    L i < rows.len() {
+        val := mut &rows[i]
+        I i < sample_size {
+            reservoir.push(val.clone())
+        } E {
+            rand := mut sc_pseudo_random(seed, i)
+            j := mut rand % (i + 1)
+            I j < sample_size {
+                reservoir[j] = val.clone()
+            }
+        }
+        i += 1
+    }
+
+    reservoir
+}
+
+F sc_pseudo_random(seed: u64, index: u64) -> u64 {
+    h := mut seed ^ index
+    I h == 0 {
+        h = 1
+    }
+    h ^= h << 13
+    h ^= h >> 33
+    h ^= h >> 7
+    h ^= h << 17
+    h
+}
+
+F sc_compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
+    M (a, b) {
+        (IntVal { v: va }, IntVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (FloatVal { v: va }, FloatVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (StringVal { v: va }, StringVal { v: vb }) => {
+            I va < vb { Ok(-1) }
+            E I va > vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (DateVal { v: va }, DateVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (TimestampVal { v: va }, TimestampVal { v: vb }) => {
+            I *va < *vb { Ok(-1) }
+            E I *va > *vb { Ok(1) }
+            E { Ok(0) }
+        },
+        (Null, Null) => Ok(0),
+        (Null, _) => Ok(-1),
+        (_, Null) => Ok(1),
+        _ => Err(sc_err_stats_collection_failed("Cannot compare values of different types")),
+    }
+}

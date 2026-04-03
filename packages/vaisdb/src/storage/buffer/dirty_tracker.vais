@@ -2,8 +2,8 @@
 # Tracks which frames are dirty and need flushing during checkpoint
 # Maintains a dirty page table for crash recovery
 
-U std/sync.{Mutex};
-U storage/buffer/frame.{PageLocation};
+U std/sync
+U storage/buffer/frame
 
 # Entry in the dirty page table
 S DirtyPageEntry {
@@ -15,103 +15,129 @@ S DirtyPageEntry {
 # Dirty page tracker
 S DirtyTracker {
     entries: Vec<DirtyPageEntry>,
-    lock: Mutex,
+    lock: Mutex<()>,
 }
 
 X DirtyTracker {
     F new() -> DirtyTracker {
         DirtyTracker {
-            entries: Vec.new(),
-            lock: Mutex.new(),
+            entries: Vec.with_capacity(0),
+            lock: Mutex.new(()),
         }
     }
 
     # Mark a page as dirty
     F mark_dirty(mut self, frame_id: u32, location: PageLocation, lsn: u64) {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
         # Check if already tracked
-        L entry: &self.entries {
-            I entry.frame_id == frame_id {
+        i := mut 0
+        L i < self.entries.len() {
+            I self.entries[i].frame_id == frame_id {
                 # Already dirty, keep the earlier first_dirty_lsn
-                drop(guard);
-                R;
+                # guard.drop() # disabled for dev compiler
+                R
             }
+            i += 1
         }
 
         self.entries.push(DirtyPageEntry {
             location,
             first_dirty_lsn: lsn,
             frame_id,
-        });
+        })
 
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
     }
 
     # Mark a page as clean (flushed to disk)
     F mark_clean(mut self, frame_id: u32) {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
-        i: u64 := mut 0;
-        removed := mut false;
+        i := mut 0
+        removed := mut false
         L i < self.entries.len() && !removed {
             I self.entries[i].frame_id == frame_id {
-                self.entries.swap_remove(i);
-                removed = true;
+                last_idx := mut self.entries.len() - 1
+                I i != last_idx {
+                    # Swap with last element before pop (manual swap-remove)
+                    last_entry_loc := mut self.entries[last_idx].location
+                    last_entry_lsn := mut self.entries[last_idx].first_dirty_lsn
+                    last_entry_fid := mut self.entries[last_idx].frame_id
+                    self.entries[i].location = last_entry_loc
+                    self.entries[i].first_dirty_lsn = last_entry_lsn
+                    self.entries[i].frame_id = last_entry_fid
+                }
+                self.entries.pop()
+                removed = true
             } E {
-                i += 1;
+                i += 1
             }
         }
 
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
     }
 
     # Get all dirty page entries (for checkpoint)
     F get_dirty_pages(self) -> Vec<DirtyPageEntry> {
-        guard := mut self.lock.lock();
-        result := mut self.entries.clone();
-        drop(guard);
+        guard := mut self.lock.lock()
+        result := mut self.entries.clone()
+        # guard.drop() # disabled for dev compiler
         result
     }
 
     # Get count of dirty pages
     F dirty_count(self) -> u32 {
-        guard := mut self.lock.lock();
-        count := mut self.entries.len() as u32;
-        drop(guard);
+        guard := mut self.lock.lock()
+        count := mut self.entries.len() as u32
+        # guard.drop() # disabled for dev compiler
         count
     }
 
     # Get the minimum first_dirty_lsn (for recovery start point)
     F min_dirty_lsn(self) -> u64 {
-        guard := mut self.lock.lock();
-        min_lsn: u64 := mut u64.MAX;
-        L entry: &self.entries {
-            I entry.first_dirty_lsn < min_lsn {
-                min_lsn = entry.first_dirty_lsn;
+        guard := mut self.lock.lock()
+        min_lsn := mut 0u64
+        has_min := mut false
+        i := mut 0
+        L i < self.entries.len() {
+            I !has_min {
+                min_lsn = self.entries[i].first_dirty_lsn
+                has_min = true
+            } E I self.entries[i].first_dirty_lsn < min_lsn {
+                min_lsn = self.entries[i].first_dirty_lsn
             }
+            i += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         min_lsn
     }
 
     # Clear all entries (after full flush)
     F clear(mut self) {
-        guard := mut self.lock.lock();
-        self.entries.clear();
-        drop(guard);
+        guard := mut self.lock.lock()
+        self.entries.clear()
+        # guard.drop() # disabled for dev compiler
+    }
+
+    F drop(mut self) {
+        # self.entries.drop() # disabled for dev compiler
+        # self.lock.drop() # disabled for dev compiler
     }
 
     # Check if a specific page is dirty
     F is_dirty(self, file_id: u8, page_id: u32) -> bool {
-        guard := mut self.lock.lock();
-        L entry: &self.entries {
-            I entry.location.file_id == file_id && entry.location.page_id == page_id {
-                drop(guard);
-                R true;
+        guard := mut self.lock.lock()
+        i := mut 0
+        L i < self.entries.len() {
+            I self.entries[i].location.file_id == file_id &&
+              self.entries[i].location.page_id == page_id {
+                # guard.drop() # disabled for dev compiler
+                R true
             }
+            i += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         false
     }
 }

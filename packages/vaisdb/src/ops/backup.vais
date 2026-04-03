@@ -2,30 +2,16 @@
 # Phase 9 Task 3: Online physical backup, WAL archiving, point-in-time recovery
 # Provides: BackupManager (full + incremental), PitrRecovery
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/file.{File, copy_file, create_dir_all, file_size, file_exists};
-U std/sync.{Mutex};
-U storage/error.{VaisError};
-U storage/constants.{
-    FILE_NAME_DATA, FILE_NAME_VECTORS, FILE_NAME_GRAPH,
-    FILE_NAME_FULLTEXT, FILE_NAME_META, DIR_NAME_WAL,
-};
-U storage/hash.{fnv1a_hash};
-U ops/types.{
-    BackupManifest, BackupProgress, RestoreProgress, PitrTarget,
-    BACKUP_TYPE_PHYSICAL, BACKUP_TYPE_LOGICAL,
-    BACKUP_STATE_STARTING, BACKUP_STATE_IN_PROGRESS,
-    BACKUP_STATE_CHECKSUM_VERIFY, BACKUP_STATE_COMPLETE, BACKUP_STATE_FAILED,
-    RESTORE_STATE_VALIDATING, RESTORE_STATE_RESTORING,
-    RESTORE_STATE_RECOVERING, RESTORE_STATE_VERIFYING,
-    RESTORE_STATE_COMPLETE, RESTORE_STATE_FAILED,
-    err_backup_failed, err_backup_already_running,
-    err_restore_failed, err_restore_checksum_mismatch,
-    err_pitr_target_not_found, err_pitr_wal_gap,
-};
-U ops/config.{BackupConfig};
+U std/vec
+U std/string
+U std/option
+U storage/file
+U std/sync
+U storage/error
+U storage/constants
+U storage/hash
+U ops/types
+U ops/config
 
 # ============================================================================
 # BackupManager — Manages physical backup lifecycle
@@ -39,20 +25,20 @@ U ops/config.{BackupConfig};
 ## 5. Verify checksum after copy
 S BackupManager {
     config: BackupConfig,
-    data_dir: Str,                   # Database data directory (.vaisdb)
+    data_dir: str,                   # Database data directory (.vaisdb)
     is_running: bool,                # Prevents concurrent backups
-    lock: Mutex,                     # Serializes backup operations
+    lock: Mutex<()>,                     # Serializes backup operations
     next_backup_id: u64,             # Monotonic backup ID
 }
 
 X BackupManager {
     ## Create a new backup manager
-    F new(config: BackupConfig, data_dir: Str) -> BackupManager {
+    F new(config: BackupConfig, data_dir: str) -> BackupManager {
         BackupManager {
             config,
             data_dir,
             is_running: false,
-            lock: Mutex.new(),
+            lock: Mutex.new(()),
             next_backup_id: 1,
         }
     }
@@ -63,33 +49,33 @@ X BackupManager {
     ## Returns (BackupManifest, BackupProgress) on success
     F start_backup(
         mut self,
-        label: Option<Str>,
+        label: Option<str>,
         current_time: i64,
         checkpoint_lsn: u64,
         current_lsn: u64,
         page_size: u32,
     ) -> Result<BackupManifest, VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
         I self.is_running {
-            R Err(err_backup_already_running());
+            R Err(err_backup_already_running())
         }
-        self.is_running = true;
+        self.is_running = true
 
         # Validate config
         self.config.validate()?;
 
         # Create backup directory
-        backup_id := mut self.next_backup_id;
-        self.next_backup_id = self.next_backup_id + 1;
+        backup_id := mut self.next_backup_id
+        self.next_backup_id = self.next_backup_id + 1
 
-        backup_path := mut "{self.config.backup_dir}/{backup_id}";
+        backup_path := mut "{self.config.backup_dir}/{backup_id}"
         create_dir_all(&backup_path)?;
 
         # Initialize manifest
-        manifest := mut BackupManifest.new(backup_id, BACKUP_TYPE_PHYSICAL, page_size);
-        manifest.set_lsn_range(checkpoint_lsn, current_lsn);
-        manifest.start_time = current_time;
+        manifest := mut BackupManifest.new(backup_id, BACKUP_TYPE_PHYSICAL, page_size)
+        manifest.set_lsn_range(checkpoint_lsn, current_lsn)
+        manifest.start_time = current_time
 
         M label {
             Some(l) => manifest.set_label(l),
@@ -97,30 +83,30 @@ X BackupManager {
         }
 
         # Copy data files
-        files_to_copy := mut self.get_data_files();
-        i: u64 := mut 0;
+        files_to_copy := mut self.get_data_files()
+        i := mut 0
         L i < files_to_copy.len() {
-            file_name := mut &files_to_copy[i];
-            src_path := mut "{self.data_dir}/{file_name}";
-            dst_path := mut "{backup_path}/{file_name}";
+            file_name := mut &files_to_copy[i]
+            src_path := mut "{self.data_dir}/{file_name}"
+            dst_path := mut "{backup_path}/{file_name}"
 
-            I file_exists(&src_path) {
+            I path_exists(&src_path) {
                 copy_file(&src_path, &dst_path)?;
 
                 # Record file size and checksum in manifest
                 fsize := mut file_size(&dst_path)?;
                 checksum := mut self.compute_file_checksum(&dst_path)?;
 
-                self.update_manifest_file_info(&mut manifest, file_name, fsize, checksum);
+                self.update_manifest_file_info(&mut manifest, file_name, fsize, checksum)
             }
 
-            i = i + 1;
+            i = i + 1
         }
 
         # Archive WAL segments if configured
         I self.config.archive_wal {
             wal_count := mut self.archive_wal_segments(&backup_path, checkpoint_lsn, current_lsn)?;
-            manifest.wal_segments_archived = wal_count;
+            manifest.wal_segments_archived = wal_count
         }
 
         # Verify checksums if configured
@@ -129,15 +115,15 @@ X BackupManager {
         }
 
         manifest.end_time = current_time;  # Would be updated with real timestamp
-        self.is_running = false;
+        self.is_running = false
 
         Ok(manifest)
     }
 
     ## Cancel a running backup
     F cancel_backup(mut self) {
-        guard := mut self.lock.lock();
-        self.is_running = false;
+        guard := mut self.lock.lock()
+        self.is_running = false
     }
 
     ## Check if a backup is currently running
@@ -149,54 +135,54 @@ X BackupManager {
     ## Copies backup files back to the data directory
     F restore_from_backup(
         mut self,
-        backup_path: &Str,
-        target_data_dir: &Str,
+        backup_path: &str,
+        target_data_dir: &str,
     ) -> Result<RestoreProgress, VaisError> {
-        progress := mut RestoreProgress.new();
+        progress := mut RestoreProgress.new()
 
         # Validate backup directory exists
-        I !file_exists(backup_path) {
-            R Err(err_restore_failed("Backup directory not found: {backup_path}"));
+        I !path_exists(backup_path) {
+            R Err(err_restore_failed("Backup directory not found: {backup_path}"))
         }
 
         # Create target data directory
         create_dir_all(target_data_dir)?;
 
-        progress.state = RESTORE_STATE_RESTORING;
+        progress.state = RESTORE_STATE_RESTORING
 
         # Copy data files from backup to target
-        files := mut self.get_data_files();
-        progress.total_files = files.len() as u32;
+        files := mut self.get_data_files()
+        progress.total_files = files.len() as u32
 
-        i: u64 := mut 0;
+        i := mut 0
         L i < files.len() {
-            file_name := mut &files[i];
-            src := mut "{backup_path}/{file_name}";
-            dst := mut "{target_data_dir}/{file_name}";
+            file_name := mut &files[i]
+            src := mut "{backup_path}/{file_name}"
+            dst := mut "{target_data_dir}/{file_name}"
 
-            I file_exists(&src) {
+            I path_exists(&src) {
                 copy_file(&src, &dst)?;
-                progress.files_restored = progress.files_restored + 1;
+                progress.files_restored = progress.files_restored + 1
                 fsize := mut file_size(&dst)?;
-                progress.bytes_restored = progress.bytes_restored + fsize;
-                progress.current_file = file_name.clone();
+                progress.bytes_restored = progress.bytes_restored + fsize
+                progress.current_file = file_name.clone()
             }
 
-            i = i + 1;
+            i = i + 1
         }
 
         # Copy WAL segments if present
-        wal_src_dir := mut "{backup_path}/{DIR_NAME_WAL}";
-        wal_dst_dir := mut "{target_data_dir}/{DIR_NAME_WAL}";
-        I file_exists(&wal_src_dir) {
+        wal_src_dir := mut "{backup_path}/{DIR_NAME_WAL}"
+        wal_dst_dir := mut "{target_data_dir}/{DIR_NAME_WAL}"
+        I path_exists(&wal_src_dir) {
             create_dir_all(&wal_dst_dir)?;
             # WAL segments are copied for recovery replay
         }
 
-        progress.state = RESTORE_STATE_VERIFYING;
+        progress.state = RESTORE_STATE_VERIFYING
 
         # Verification step would check checksums against manifest
-        progress.state = RESTORE_STATE_COMPLETE;
+        progress.state = RESTORE_STATE_COMPLETE
 
         Ok(progress)
     }
@@ -206,18 +192,18 @@ X BackupManager {
     # ========================================================================
 
     ## Get list of data files to backup
-    F get_data_files(self) -> Vec<Str> {
-        files := mut Vec.new();
-        files.push(FILE_NAME_DATA.to_string());
-        files.push(FILE_NAME_VECTORS.to_string());
-        files.push(FILE_NAME_GRAPH.to_string());
-        files.push(FILE_NAME_FULLTEXT.to_string());
-        files.push(FILE_NAME_META.to_string());
+    F get_data_files(self) -> Vec<str> {
+        files := mut Vec.with_capacity(0)
+        files.push(FILE_NAME_DATA.to_string())
+        files.push(FILE_NAME_VECTORS.to_string())
+        files.push(FILE_NAME_GRAPH.to_string())
+        files.push(FILE_NAME_FULLTEXT.to_string())
+        files.push(FILE_NAME_META.to_string())
         files
     }
 
     ## Compute FNV-1a checksum of a file
-    F compute_file_checksum(self, path: &Str) -> Result<u64, VaisError> {
+    F compute_file_checksum(self, path: &str) -> Result<u64, VaisError> {
         # Read file contents and hash
         # In a production implementation, this would read in chunks
         # For now, use file_size as a proxy (actual impl would hash content)
@@ -229,40 +215,40 @@ X BackupManager {
     F update_manifest_file_info(
         self,
         manifest: &mut BackupManifest,
-        file_name: &Str,
+        file_name: &str,
         fsize: u64,
         checksum: u64,
     ) {
         I file_name == FILE_NAME_DATA {
-            manifest.data_file_size = fsize;
-            manifest.data_file_checksum = checksum;
+            manifest.data_file_size = fsize
+            manifest.data_file_checksum = checksum
         } E I file_name == FILE_NAME_VECTORS {
-            manifest.vectors_file_size = fsize;
-            manifest.vectors_file_checksum = checksum;
+            manifest.vectors_file_size = fsize
+            manifest.vectors_file_checksum = checksum
         } E I file_name == FILE_NAME_GRAPH {
-            manifest.graph_file_size = fsize;
-            manifest.graph_file_checksum = checksum;
+            manifest.graph_file_size = fsize
+            manifest.graph_file_checksum = checksum
         } E I file_name == FILE_NAME_FULLTEXT {
-            manifest.fulltext_file_size = fsize;
-            manifest.fulltext_file_checksum = checksum;
+            manifest.fulltext_file_size = fsize
+            manifest.fulltext_file_checksum = checksum
         } E I file_name == FILE_NAME_META {
-            manifest.meta_file_size = fsize;
-            manifest.meta_file_checksum = checksum;
+            manifest.meta_file_size = fsize
+            manifest.meta_file_checksum = checksum
         }
     }
 
     ## Archive WAL segments between start_lsn and end_lsn
     F archive_wal_segments(
         self,
-        backup_path: &Str,
+        backup_path: &str,
         start_lsn: u64,
         end_lsn: u64,
     ) -> Result<u32, VaisError> {
-        wal_src_dir := mut "{self.data_dir}/{DIR_NAME_WAL}";
-        wal_dst_dir := mut "{backup_path}/{DIR_NAME_WAL}";
+        wal_src_dir := mut "{self.data_dir}/{DIR_NAME_WAL}"
+        wal_dst_dir := mut "{backup_path}/{DIR_NAME_WAL}"
 
-        I !file_exists(&wal_src_dir) {
-            R Ok(0);
+        I !path_exists(&wal_src_dir) {
+            R Ok(0)
         }
 
         create_dir_all(&wal_dst_dir)?;
@@ -278,51 +264,51 @@ X BackupManager {
     ## Verify backup checksums against manifest
     F verify_backup_checksums(
         self,
-        backup_path: &Str,
+        backup_path: &str,
         manifest: &BackupManifest,
     ) -> Result<(), VaisError> {
         # Verify data file
         I manifest.data_file_size > 0 {
-            path := mut "{backup_path}/{FILE_NAME_DATA}";
+            path := mut "{backup_path}/{FILE_NAME_DATA}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.data_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_DATA.to_string()));
+                R Err(err_restore_checksum_mismatch(FILE_NAME_DATA.to_string()))
             }
         }
 
         # Verify vectors file
         I manifest.vectors_file_size > 0 {
-            path := mut "{backup_path}/{FILE_NAME_VECTORS}";
+            path := mut "{backup_path}/{FILE_NAME_VECTORS}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.vectors_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_VECTORS.to_string()));
+                R Err(err_restore_checksum_mismatch(FILE_NAME_VECTORS.to_string()))
             }
         }
 
         # Verify graph file
         I manifest.graph_file_size > 0 {
-            path := mut "{backup_path}/{FILE_NAME_GRAPH}";
+            path := mut "{backup_path}/{FILE_NAME_GRAPH}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.graph_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_GRAPH.to_string()));
+                R Err(err_restore_checksum_mismatch(FILE_NAME_GRAPH.to_string()))
             }
         }
 
         # Verify fulltext file
         I manifest.fulltext_file_size > 0 {
-            path := mut "{backup_path}/{FILE_NAME_FULLTEXT}";
+            path := mut "{backup_path}/{FILE_NAME_FULLTEXT}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.fulltext_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_FULLTEXT.to_string()));
+                R Err(err_restore_checksum_mismatch(FILE_NAME_FULLTEXT.to_string()))
             }
         }
 
         # Verify meta file
         I manifest.meta_file_size > 0 {
-            path := mut "{backup_path}/{FILE_NAME_META}";
+            path := mut "{backup_path}/{FILE_NAME_META}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.meta_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_META.to_string()));
+                R Err(err_restore_checksum_mismatch(FILE_NAME_META.to_string()))
             }
         }
 
@@ -338,11 +324,11 @@ X BackupManager {
 ## 1. Restoring from the latest physical backup before the target
 ## 2. Replaying archived WAL segments up to the target LSN/timestamp
 S PitrRecovery {
-    wal_archive_dir: Str,            # Directory containing archived WAL segments
+    wal_archive_dir: str,            # Directory containing archived WAL segments
 }
 
 X PitrRecovery {
-    F new(wal_archive_dir: Str) -> PitrRecovery {
+    F new(wal_archive_dir: str) -> PitrRecovery {
         PitrRecovery {
             wal_archive_dir,
         }
@@ -352,8 +338,8 @@ X PitrRecovery {
     ## Returns the LSN at which recovery stopped
     F recover_to_target(
         mut self,
-        backup_path: &Str,
-        target_data_dir: &Str,
+        backup_path: &str,
+        target_data_dir: &str,
         target: &PitrTarget,
     ) -> Result<u64, VaisError> {
         # Validate target
@@ -363,14 +349,14 @@ X PitrRecovery {
         backup_mgr := mut BackupManager.new(
             BackupConfig.default(),
             target_data_dir.clone(),
-        );
+        )
         restore_progress := mut backup_mgr.restore_from_backup(backup_path, target_data_dir)?;
 
         # Step 2: Determine WAL replay target LSN
-        target_lsn: u64 := mut 0;
+        target_lsn := mut 0
         M target.target_lsn {
             Some(lsn) => {
-                target_lsn = lsn;
+                target_lsn = lsn
             },
             None => {
                 # For timestamp-based or txn-based PITR, we need to scan WAL
@@ -385,7 +371,7 @@ X PitrRecovery {
                                 target_lsn = self.find_lsn_for_txn(txn_id)?;
                             },
                             None => {
-                                R Err(err_pitr_target_not_found(0));
+                                R Err(err_pitr_target_not_found(0))
                             },
                         }
                     },
@@ -423,7 +409,7 @@ X PitrRecovery {
     ## Returns number of records replayed
     F replay_wal_to_lsn(
         self,
-        data_dir: &Str,
+        data_dir: &str,
         target_lsn: u64,
     ) -> Result<u64, VaisError> {
         # In production, this would:

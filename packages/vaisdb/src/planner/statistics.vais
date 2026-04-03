@@ -118,7 +118,7 @@ X TableColumnStats {
                             found_bucket = true;
                         }
                     },
-                    Err(_) => R 0.3,  # Cannot compare, use default
+                    Err(_) => { R 0.3 },  # Cannot compare, use default
                 }
             }
         }
@@ -227,7 +227,7 @@ X StatisticsCollector {
         # Lookup table in catalog
         table_info := mut M catalog.get_table(table_name) {
             Some(info) => info,
-            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         # Use catalog metadata as base estimate
@@ -251,7 +251,7 @@ X StatisticsCollector {
         # Get table metadata
         table_info := mut M catalog.get_table(table_name) {
             Some(info) => info,
-            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         # Get column metadata
@@ -263,7 +263,7 @@ X StatisticsCollector {
             }
         }
         M column_info {
-            None => R Err(err_stats_collection_failed("Column '{column_name}' not found in '{table_name}'")),
+            None => { R Err(err_stats_collection_failed("Column '{column_name}' not found in '{table_name}'")) },
             Some(_) => {},
         }
 
@@ -408,7 +408,7 @@ X StatisticsCollector {
         column_stats := mut Vec.new();
         table_info := mut M catalog.get_table(table_name) {
             Some(info) => info,
-            None => R Err(err_stats_collection_failed("Table '{table_name}' not found")),
+            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         columns := mut catalog.get_columns(table_info.table_id);
@@ -503,9 +503,10 @@ F build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlVa
 # Uses FNV-1a hash followed by mixing for better distribution
 F pseudo_random(seed: u64, index: u64) -> u64 {
     h := mut seed ^ index;
-    h = h.wrapping_mul(0x100000001b3);
+    h = h.wrapping_mul(1099511628211);
     h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    fnv_mix: u64 := (4283786199 as u64) << 32 | (3981806797 as u64);
+    h = h.wrapping_mul(fnv_mix);
     h ^= h >> 33;
     h
 }
@@ -518,36 +519,79 @@ F pseudo_random(seed: u64, index: u64) -> u64 {
 # Returns: Ok(-1) I a < b, Ok(0) I a == b, Ok(1) I a > b
 # Returns: Err I values are not comparable
 F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
-    M (a, b) {
-        (SqlValue.IntVal { v: va }, SqlValue.IntVal { v: vb }) => {
-            I *va < *vb { Ok(-1) }
-            E I *va > *vb { Ok(1) }
-            E { Ok(0) }
+    M a {
+        SqlValue.Null => {
+            M b {
+                SqlValue.Null => Ok(0),
+                _ => Ok(-1),
+            }
         },
-        (SqlValue.FloatVal { v: va }, SqlValue.FloatVal { v: vb }) => {
-            I *va < *vb { Ok(-1) }
-            E I *va > *vb { Ok(1) }
-            E { Ok(0) }
+        SqlValue.IntVal { v } => {
+            va := *v;
+            M b {
+                SqlValue.IntVal { v } => {
+                    I va < *v { Ok(-1) }
+                    E I va > *v { Ok(1) }
+                    E { Ok(0) }
+                },
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
         },
-        (SqlValue.StringVal { v: va }, SqlValue.StringVal { v: vb }) => {
-            I va < vb { Ok(-1) }
-            E I va > vb { Ok(1) }
-            E { Ok(0) }
+        SqlValue.FloatVal { v } => {
+            va := *v;
+            M b {
+                SqlValue.FloatVal { v } => {
+                    I va < *v { Ok(-1) }
+                    E I va > *v { Ok(1) }
+                    E { Ok(0) }
+                },
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
         },
-        (SqlValue.DateVal { v: va }, SqlValue.DateVal { v: vb }) => {
-            I *va < *vb { Ok(-1) }
-            E I *va > *vb { Ok(1) }
-            E { Ok(0) }
+        SqlValue.StringVal { v } => {
+            va := v.clone();
+            M b {
+                SqlValue.StringVal { v } => {
+                    I va < *v { Ok(-1) }
+                    E I va > *v { Ok(1) }
+                    E { Ok(0) }
+                },
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
         },
-        (SqlValue.TimestampVal { v: va }, SqlValue.TimestampVal { v: vb }) => {
-            I *va < *vb { Ok(-1) }
-            E I *va > *vb { Ok(1) }
-            E { Ok(0) }
+        SqlValue.DateVal { v } => {
+            va := *v;
+            M b {
+                SqlValue.DateVal { v } => {
+                    I va < *v { Ok(-1) }
+                    E I va > *v { Ok(1) }
+                    E { Ok(0) }
+                },
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
         },
-        (SqlValue.Null, SqlValue.Null) => Ok(0),
-        (SqlValue.Null, _) => Ok(-1),  # NULL sorts first
-        (_, SqlValue.Null) => Ok(1),
-        _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+        SqlValue.TimestampVal { v } => {
+            va := *v;
+            M b {
+                SqlValue.TimestampVal { v } => {
+                    I va < *v { Ok(-1) }
+                    E I va > *v { Ok(1) }
+                    E { Ok(0) }
+                },
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
+        },
+        _ => {
+            M b {
+                SqlValue.Null => Ok(1),
+                _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
+            }
+        },
     }
 }
 

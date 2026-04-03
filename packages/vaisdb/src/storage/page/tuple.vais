@@ -2,19 +2,20 @@
 # Each tuple: [MvccTupleMeta (32B)] + [User Data (variable)]
 # Handles overflow detection and inline prefix for large tuples
 
-U storage/constants.{MVCC_TUPLE_META_SIZE, PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE};
-U storage/error.{VaisError, err_internal};
-U storage/page/mvcc.{MvccTupleMeta};
+U storage/constants
+U storage/bytes
+U storage/error
+U storage/page/mvcc
 
 # Overflow threshold: inline prefix size for overflowed tuples
-C OVERFLOW_INLINE_PREFIX: u32 = 64;
+C OVERFLOW_INLINE_PREFIX: u32 = 64
 
 # Overflow pointer size: page_id (u32) + total_len (u32) = 8 bytes
-C OVERFLOW_POINTER_SIZE: u32 = 8;
+C OVERFLOW_POINTER_SIZE: u32 = 8
 
 # Tuple overflow flag (stored in first byte of user data area as a marker)
-C TUPLE_FLAG_OVERFLOW: u8 = 0x01;
-C TUPLE_FLAG_NORMAL: u8 = 0x00;
+C TUPLE_FLAG_OVERFLOW: u8 = 1
+C TUPLE_FLAG_NORMAL: u8 = 0
 
 # Represents a tuple stored in a heap page
 S Tuple {
@@ -62,8 +63,8 @@ X Tuple {
 
     # Check if user data needs overflow for given page size
     F needs_overflow(user_data_len: u32, page_size: u32) -> bool {
-        max_tuple := mut page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE;
-        normal_size := mut MVCC_TUPLE_META_SIZE + 1 + user_data_len;
+        max_tuple := mut page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE
+        normal_size := mut MVCC_TUPLE_META_SIZE + 1 + user_data_len
         normal_size > max_tuple
     }
 
@@ -75,35 +76,53 @@ X Tuple {
 
     # Write tuple to a byte slice at the given offset
     F write_to(self, page_data: &mut [u8], offset: u64) {
-        buf := mut ByteBuffer.wrap(&page_data[offset..]);
-        self.mvcc.serialize(&buf);
+        end := mut offset + self.on_page_size() as u64
+        buf := mut ByteBuffer.wrap(&page_data[offset..end])
+        self.mvcc.serialize(&buf)
 
         I self.is_overflow {
-            buf.put_u8(TUPLE_FLAG_OVERFLOW);
-            buf.put_bytes(&self.user_data);
-            buf.put_u32_le(self.overflow_page_id);
-            buf.put_u32_le(self.overflow_total_len);
+            buf.write_u8(TUPLE_FLAG_OVERFLOW)
+            write_raw_bytes(&buf, &self.user_data[0..self.user_data.len()])
+            buf.write_i32_le(self.overflow_page_id)
+            buf.write_i32_le(self.overflow_total_len)
         } E {
-            buf.put_u8(TUPLE_FLAG_NORMAL);
-            buf.put_bytes(&self.user_data);
+            buf.write_u8(TUPLE_FLAG_NORMAL)
+            write_raw_bytes(&buf, &self.user_data[0..self.user_data.len()])
+        }
+    }
+
+    # Write tuple to a Vec-backed page buffer without relying on slice coercions
+    F write_to_vec(self, page_data: &Vec<u8>, offset: u64) {
+        end := mut offset + self.on_page_size() as u64
+        buf := mut ByteBuffer.wrap(&page_data[offset..end])
+        self.mvcc.serialize(&buf)
+
+        I self.is_overflow {
+            buf.write_u8(TUPLE_FLAG_OVERFLOW)
+            write_raw_bytes(&buf, &self.user_data[0..self.user_data.len()])
+            buf.write_i32_le(self.overflow_page_id)
+            buf.write_i32_le(self.overflow_total_len)
+        } E {
+            buf.write_u8(TUPLE_FLAG_NORMAL)
+            write_raw_bytes(&buf, &self.user_data[0..self.user_data.len()])
         }
     }
 
     # Read tuple from a byte slice at the given offset with known length
     F read_from(page_data: &[u8], offset: u64, len: u64) -> Result<Tuple, VaisError> {
-        buf := mut ByteBuffer.wrap_readonly(&page_data[offset..offset + len]);
+        buf := mut ByteBuffer.wrap_readonly(&page_data[offset..offset + len])
         mvcc := mut MvccTupleMeta.deserialize(&buf)?;
-        flag := mut buf.get_u8()?;
+        flag := mut read_u8_checked(buf)?;
 
         I flag == TUPLE_FLAG_OVERFLOW {
-            remaining := mut len - MVCC_TUPLE_META_SIZE as u64 - 1 - OVERFLOW_POINTER_SIZE as u64;
-            inline_data := mut buf.get_bytes(remaining)?;
-            overflow_page_id := mut buf.get_u32_le()?;
-            overflow_total_len := mut buf.get_u32_le()?;
+            remaining := mut len - MVCC_TUPLE_META_SIZE as u64 - 1 - OVERFLOW_POINTER_SIZE as u64
+            inline_data := mut read_exact_bytes(&buf, remaining)?;
+            overflow_page_id := mut read_i32_le_checked(buf)?;
+            overflow_total_len := mut read_i32_le_checked(buf)?;
             Ok(Tuple.new_overflow(mvcc, inline_data, overflow_page_id, overflow_total_len))
         } E {
-            remaining := mut len - MVCC_TUPLE_META_SIZE as u64 - 1;
-            user_data := mut buf.get_bytes(remaining)?;
+            remaining := mut len - MVCC_TUPLE_META_SIZE as u64 - 1
+            user_data := mut read_exact_bytes(&buf, remaining)?;
             Ok(Tuple.new(mvcc, user_data))
         }
     }

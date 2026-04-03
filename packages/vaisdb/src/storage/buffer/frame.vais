@@ -1,9 +1,10 @@
 # Buffer Frame - Individual slot in the buffer pool
 # Each frame holds one page of data plus metadata for eviction and concurrency
 
-U std/sync.{RwLock};
-U storage/constants.{PAGE_HEADER_SIZE};
-U storage/error.{VaisError};
+U std/sync
+U std/vec
+U storage/constants
+U storage/error
 
 # Describes the location of a page in the database files
 S PageLocation {
@@ -17,16 +18,23 @@ X PageLocation {
     }
 
     F is_valid(self) -> bool {
-        self.page_id != 0xFFFFFFFF
+        I self.page_id != 4294967295 {
+            R true
+        }
+        false
     }
 
     F invalid() -> PageLocation {
-        PageLocation { file_id: 0xFF, page_id: 0xFFFFFFFF }
+        PageLocation { file_id: 255, page_id: 4294967295 }
     }
 }
 
 # Buffer frame state
-L FrameState = Empty | Clean | Dirty;
+E FrameState {
+    Empty,
+    Clean,
+    Dirty,
+}
 
 # A single buffer pool frame
 S BufferFrame {
@@ -36,7 +44,7 @@ S BufferFrame {
     pin_count: u32,          # Number of active pins (0 = evictable)
     clock_ref: bool,         # Clock replacement reference bit
     data: Vec<u8>,           # Page data buffer
-    latch: RwLock,           # Read-write latch for concurrent access
+    latch: RwLock<()>,           # Read-write latch for concurrent access
     page_lsn: u64,           # Cached LSN from page header
     needs_fpi: bool,         # Full Page Image needed after checkpoint
 }
@@ -44,8 +52,8 @@ S BufferFrame {
 X BufferFrame {
     # Create a new empty frame
     F new(frame_id: u32, page_size: u32) -> BufferFrame {
-        data := mut Vec.with_capacity(page_size as u64);
-        data.resize(page_size as u64, 0u8);
+        data := mut Vec.with_capacity(page_size as u64)
+        data.resize(page_size as u64, 0u8)
 
         BufferFrame {
             frame_id,
@@ -54,7 +62,7 @@ X BufferFrame {
             pin_count: 0,
             clock_ref: false,
             data,
-            latch: RwLock.new(),
+            latch: RwLock.new(()),
             page_lsn: 0,
             needs_fpi: false,
         }
@@ -62,70 +70,73 @@ X BufferFrame {
 
     # Load a page into this frame
     F load(mut self, location: PageLocation, page_data: &[u8]) {
-        self.location = location;
+        self.location = location
         L i: 0..page_data.len() {
-            self.data[i] = page_data[i];
+            self.data[i] = page_data[i]
         }
-        self.state = FrameState.Clean;
-        self.clock_ref = true;
+        self.state = FrameState.Clean
+        self.clock_ref = true
         self.pin_count = 1;  # Caller gets initial pin
 
         # Extract page_lsn from header (offset 0, u64 LE)
-        self.page_lsn = read_u64_le(&self.data, 0);
+        self.page_lsn = read_u64_le(&self.data[0..self.data.len()], 0)
     }
 
     # Pin the frame (increment pin count)
     F pin(mut self) {
-        self.pin_count += 1;
-        self.clock_ref = true;
+        self.pin_count += 1
+        self.clock_ref = true
     }
 
     # Unpin the frame (decrement pin count)
     F unpin(mut self) {
         I self.pin_count > 0 {
-            self.pin_count -= 1;
+            self.pin_count -= 1
         }
     }
 
     # Check if frame is evictable (not pinned)
     F is_evictable(self) -> bool {
-        self.pin_count == 0
+        I self.pin_count == 0 {
+            R true
+        }
+        false
     }
 
     # Check if frame is empty
     F is_empty(self) -> bool {
-        M self.state {
-            FrameState.Empty => true,
-            _ => false,
+        I self.state == FrameState.Empty {
+            R true
         }
+        false
     }
 
     # Check if frame is dirty
     F is_dirty(self) -> bool {
-        M self.state {
-            FrameState.Dirty => true,
-            _ => false,
+        I self.state == FrameState.Dirty {
+            R true
         }
+        false
     }
 
     # Mark frame as dirty
     F mark_dirty(mut self) {
-        self.state = FrameState.Dirty;
+        self.state = FrameState.Dirty
     }
 
     # Mark frame as clean (after flush to disk)
     F mark_clean(mut self) {
-        self.state = FrameState.Clean;
+        self.state = FrameState.Clean
     }
 
     # Reset frame to empty state
     F reset(mut self) {
-        self.location = PageLocation.invalid();
-        self.state = FrameState.Empty;
-        self.pin_count = 0;
-        self.clock_ref = false;
-        self.page_lsn = 0;
-        self.needs_fpi = false;
+        self.location = PageLocation.invalid()
+        self.state = FrameState.Empty
+        self.pin_count = 0
+        self.clock_ref = false
+        self.page_lsn = 0
+        self.needs_fpi = false
     }
 
     # Get page data reference (requires read latch)
@@ -133,33 +144,45 @@ X BufferFrame {
         &self.data
     }
 
-    # Get mutable page data reference (requires write latch)
-    F get_data_mut(mut self) -> &mut [u8] {
-        self.mark_dirty();
-        self.clock_ref = true;
-        &self.data
+    # Mark this frame for in-place mutation.
+    F prepare_write(mut self) {
+        self.mark_dirty()
+        self.clock_ref = true
     }
 
     # Update page LSN after modification
     F set_page_lsn(mut self, lsn: u64) {
-        self.page_lsn = lsn;
+        self.page_lsn = lsn
         # Also write LSN to data buffer at offset 0
-        write_u64_le(&self.data, 0, lsn);
+        self.data[0] = (lsn & 255) as u8
+        self.data[1] = ((lsn >> 8) & 255) as u8
+        self.data[2] = ((lsn >> 16) & 255) as u8
+        self.data[3] = ((lsn >> 24) & 255) as u8
+        self.data[4] = ((lsn >> 32) & 255) as u8
+        self.data[5] = ((lsn >> 40) & 255) as u8
+        self.data[6] = ((lsn >> 48) & 255) as u8
+        self.data[7] = ((lsn >> 56) & 255) as u8
     }
 
     # Acquire read latch
-    F read_lock(self) -> RwLockReadGuard {
+    F read_lock(self) -> RwLockReadGuard<()> {
         self.latch.read()
     }
 
     # Acquire write latch
-    F write_lock(mut self) -> RwLockWriteGuard {
+    F write_lock(mut self) -> RwLockWriteGuard<()> {
         self.latch.write()
     }
 
     # Set FPI flag (after checkpoint)
     F set_needs_fpi(mut self, val: bool) {
-        self.needs_fpi = val;
+        self.needs_fpi = val
+    }
+
+    F drop(mut self) {
+        # self.data.drop() # disabled for dev compiler
+        # self.latch.drop() # disabled for dev compiler
+        self.reset()
     }
 }
 
@@ -173,16 +196,4 @@ F read_u64_le(data: &[u8], offset: u64) -> u64 {
     ((data[offset + 5] as u64) << 40) |
     ((data[offset + 6] as u64) << 48) |
     ((data[offset + 7] as u64) << 56)
-}
-
-# Helper: write u64 little-endian to byte slice
-F write_u64_le(data: &mut [u8], offset: u64, val: u64) {
-    data[offset] = (val & 0xFF) as u8;
-    data[offset + 1] = ((val >> 8) & 0xFF) as u8;
-    data[offset + 2] = ((val >> 16) & 0xFF) as u8;
-    data[offset + 3] = ((val >> 24) & 0xFF) as u8;
-    data[offset + 4] = ((val >> 32) & 0xFF) as u8;
-    data[offset + 5] = ((val >> 40) & 0xFF) as u8;
-    data[offset + 6] = ((val >> 48) & 0xFF) as u8;
-    data[offset + 7] = ((val >> 56) & 0xFF) as u8;
 }

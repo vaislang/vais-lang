@@ -4,16 +4,20 @@
 # Default batching window: 1ms (1000μs)
 # Reduces fsync calls from 1-per-txn to 1-per-batch
 
-U std/sync.{Mutex, CondVar};
-U std/file.{fsync};
+U std/sync
+U storage/file
 
-U storage/error.{VaisError, err_internal};
-U storage/constants.{DEFAULT_GROUP_COMMIT_TIMEOUT_US};
-U storage/wal/writer.{WalWriter};
-U storage/wal/lsn.{NULL_LSN};
+U storage/error
+U storage/constants
+U storage/wal/writer
+U storage/wal/lsn
 
 # Sync mode configuration
-L SyncMode = Fsync | Fdatasync | Async;
+E SyncMode {
+    Fsync,
+    Fdatasync,
+    Async,
+}
 
 # Group commit configuration
 S GroupCommitConfig {
@@ -25,21 +29,21 @@ S GroupCommitConfig {
 X GroupCommitConfig {
     F default() -> GroupCommitConfig {
         GroupCommitConfig {
-            sync_mode: SyncMode.Fsync,
+            sync_mode: Fsync,
             timeout_us: DEFAULT_GROUP_COMMIT_TIMEOUT_US,
             max_batch_size: 256,
         }
     }
 
     F with_sync_mode(sync_mode: SyncMode) -> GroupCommitConfig {
-        config := mut GroupCommitConfig.default();
-        config.sync_mode = sync_mode;
+        config := mut GroupCommitConfig.default()
+        config.sync_mode = sync_mode
         config
     }
 
     F async_mode() -> GroupCommitConfig {
         GroupCommitConfig {
-            sync_mode: SyncMode.Async,
+            sync_mode: Async,
             timeout_us: 0,
             max_batch_size: 1024,
         }
@@ -59,7 +63,7 @@ S GroupCommitManager {
     writer: WalWriter,
     pending: Vec<PendingCommit>,
     flushed_lsn: u64,       # Highest LSN that has been fsynced
-    lock: Mutex,
+    lock: Mutex<i64>,
     flush_cv: CondVar,       # Signal when flush completes
 }
 
@@ -69,9 +73,9 @@ X GroupCommitManager {
         GroupCommitManager {
             config,
             writer,
-            pending: Vec.new(),
+            pending: Vec.with_capacity(0),
             flushed_lsn: NULL_LSN,
-            lock: Mutex.new(),
+            lock: Mutex.new(0i64),
             flush_cv: CondVar.new(),
         }
     }
@@ -97,15 +101,15 @@ X GroupCommitManager {
     # 3. If batch is full or timeout, trigger flush
     # 4. Wait until this LSN has been fsynced
     F commit_and_wait(mut self, txn_id: u64, commit_lsn: u64) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
         # If async mode, don't wait for fsync
         M self.config.sync_mode {
-            SyncMode.Async => {
+            Async => {
                 # Just mark as done without waiting
-                self.writer.clear_txn(txn_id);
-                drop(guard);
-                R Ok(());
+                self.writer.clear_txn(txn_id)
+                # guard.drop() # disabled for dev compiler
+                R Ok(())
             },
             _ => {},
         }
@@ -115,49 +119,49 @@ X GroupCommitManager {
             txn_id,
             lsn: commit_lsn,
             completed: false,
-        });
+        })
 
         # Check if we should trigger a flush
-        should_flush := mut self.pending.len() as u32 >= self.config.max_batch_size;
+        should_flush := mut (self.pending.len() as u32) >= self.config.max_batch_size
 
         I should_flush {
             self.do_flush()?;
-            drop(guard);
-            R Ok(());
+            # guard.drop() # disabled for dev compiler
+            R Ok(())
         }
 
         # Wait for timeout or another txn to trigger flush
         # condvar wait with timeout: batches concurrent commits into one fsync
-        waited := mut self.flush_cv.wait_timeout(guard, self.config.timeout_us as u64);
+        waited := mut self.flush_cv.wait_timeout(guard, self.config.timeout_us as u64)
 
         # After wakeup: check if our LSN has been flushed by another thread
         I self.flushed_lsn >= commit_lsn {
-            drop(waited);
-            R Ok(());
+            # waited.drop() # disabled for dev compiler
+            R Ok(())
         }
 
         # Our LSN not yet flushed — we are the flush leader for this batch
         self.do_flush()?;
 
-        drop(waited);
+        # waited.drop() # disabled for dev compiler
         Ok(())
     }
 
     # Periodic flush (called by background timer or batch trigger)
     F periodic_flush(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
-        I !self.pending.is_empty() {
+        guard := mut self.lock.lock()
+        I !self.pending.len() == 0 {
             self.do_flush()?;
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
     # Force flush all pending records
     F flush(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
         self.do_flush()?;
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
@@ -173,12 +177,12 @@ X GroupCommitManager {
 
     # Close the group commit manager
     F close(mut self) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
-        I !self.pending.is_empty() {
+        guard := mut self.lock.lock()
+        I !self.pending.len() == 0 {
             self.do_flush()?;
         }
         self.writer.close()?;
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         Ok(())
     }
 
@@ -186,8 +190,8 @@ X GroupCommitManager {
 
     # Perform the actual flush + fsync
     F do_flush(mut self) -> Result<(), VaisError> {
-        I self.pending.is_empty() {
-            R Ok(());
+        I self.pending.len() == 0 {
+            R Ok(())
         }
 
         # Flush writer buffer to OS page cache
@@ -195,37 +199,37 @@ X GroupCommitManager {
 
         # fsync based on sync mode
         M self.config.sync_mode {
-            SyncMode.Fsync => {
+            Fsync => {
                 self.writer.sync()?;
             },
-            SyncMode.Fdatasync => {
+            Fdatasync => {
                 # Use fdatasync (metadata not synced) - falls back to sync
                 self.writer.sync()?;
             },
-            SyncMode.Async => {
+            Async => {
                 # No sync needed
             },
         }
 
         # Find max LSN in pending commits
-        max_lsn := mut self.flushed_lsn;
+        max_lsn := mut self.flushed_lsn
         L pending: &self.pending {
             I pending.lsn > max_lsn {
-                max_lsn = pending.lsn;
+                max_lsn = pending.lsn
             }
         }
-        self.flushed_lsn = max_lsn;
+        self.flushed_lsn = max_lsn
 
         # Clear prev_lsn entries for committed transactions
         L pending: &self.pending {
-            self.writer.clear_txn(pending.txn_id);
+            self.writer.clear_txn(pending.txn_id)
         }
 
         # Clear pending list
-        self.pending.clear();
+        self.pending.clear()
 
         # Notify all waiters
-        self.flush_cv.notify_all();
+        self.flush_cv.notify_all()
 
         Ok(())
     }

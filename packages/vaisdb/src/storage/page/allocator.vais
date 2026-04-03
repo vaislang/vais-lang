@@ -2,13 +2,10 @@
 # Based on Stage 1 Section 8: Free Page Management
 # Manages allocation hints and file extension
 
-U std/sync.{Mutex};
-U storage/constants.{
-    NULL_PAGE, FILE_EXTENSION_INCREMENT,
-    FILE_ID_DATA, FILE_ID_VECTORS, FILE_ID_GRAPH, FILE_ID_FULLTEXT, FILE_ID_UNDO
-};
-U storage/error.{VaisError, err_freelist_empty, err_internal};
-U storage/page/freelist.{FreelistBitmap, pages_per_bitmap_page};
+U std/sync
+U storage/constants
+U storage/error
+U storage/page/freelist
 
 # Per-file allocation state
 S FileAllocState {
@@ -33,7 +30,7 @@ X FileAllocState {
 
 # Page allocator - manages allocation across all files
 S PageAllocator {
-    file_states: [FileAllocState; 5],  # One per file (data, vectors, graph, fulltext, undo)
+    file_states: Vec<FileAllocState>,  # One per file (data, vectors, graph, fulltext, undo)
     page_size: u32,                     # Page size (8KB or 16KB)
     pages_per_bitmap: u32,              # Cached: how many pages per freelist page
     extension_increment: u32,           # How many pages to add when extending
@@ -42,16 +39,16 @@ S PageAllocator {
 X PageAllocator {
     # Create a new page allocator
     F new(page_size: u32) -> PageAllocator {
-        pages_per_bitmap := mut pages_per_bitmap_page(page_size);
+        pages_per_bitmap := mut pages_per_bitmap_page(page_size)
+        file_states := mut Vec.with_capacity(5)
+        file_states.push(FileAllocState.new(FILE_ID_DATA, 1))
+        file_states.push(FileAllocState.new(FILE_ID_VECTORS, 1))
+        file_states.push(FileAllocState.new(FILE_ID_GRAPH, 1))
+        file_states.push(FileAllocState.new(FILE_ID_FULLTEXT, 1))
+        file_states.push(FileAllocState.new(FILE_ID_UNDO, 1))
 
         PageAllocator {
-            file_states: [
-                FileAllocState.new(FILE_ID_DATA, 1),
-                FileAllocState.new(FILE_ID_VECTORS, 1),
-                FileAllocState.new(FILE_ID_GRAPH, 1),
-                FileAllocState.new(FILE_ID_FULLTEXT, 1),
-                FileAllocState.new(FILE_ID_UNDO, 1),
-            ],
+            file_states,
             page_size,
             pages_per_bitmap,
             extension_increment: FILE_EXTENSION_INCREMENT,
@@ -61,7 +58,7 @@ X PageAllocator {
     # Get file state for a given file_id
     F get_file_state(mut self, file_id: u8) -> Result<&mut FileAllocState, VaisError> {
         I file_id >= 5 {
-            R Err(err_internal("Invalid file_id: {file_id}"));
+            R Err(err_internal("Invalid file_id: {file_id}"))
         }
         Ok(&self.file_states[file_id as u64])
     }
@@ -71,19 +68,20 @@ X PageAllocator {
     # NOTE: This is a simplified version - in real implementation, this would
     # interact with buffer pool to read/write freelist pages
     F allocate_page(mut self, file_id: u8, bitmap: &mut FreelistBitmap) -> Result<u32, VaisError> {
+        pages_per_bitmap := mut self.pages_per_bitmap
         state := mut self.get_file_state(file_id)?;
 
         # Try to find a free page starting from last allocation position
-        M bitmap.find_first_free_fast(self.pages_per_bitmap, state.last_alloc_position) {
+        M bitmap.find_first_free_fast(pages_per_bitmap, state.last_alloc_position) {
             Some(page_id) => {
                 # Mark page as allocated
-                bitmap.set_bit(page_id, self.pages_per_bitmap, false);
+                bitmap.set_bit(page_id, pages_per_bitmap, false)
 
                 # Update allocation hint
-                state.last_alloc_position = page_id + 1;
+                state.last_alloc_position = page_id + 1
 
                 Ok(page_id)
-            }
+            },
             None => {
                 # No free pages available
                 Err(err_freelist_empty())
@@ -96,11 +94,11 @@ X PageAllocator {
     F deallocate_page(mut self, file_id: u8, page_id: u32, bitmap: &mut FreelistBitmap) -> Result<(), VaisError> {
         # Verify file_id is valid
         I file_id >= 5 {
-            R Err(err_internal("Invalid file_id: {file_id}"));
+            R Err(err_internal("Invalid file_id: {file_id}"))
         }
 
         # Mark page as free
-        bitmap.set_bit(page_id, self.pages_per_bitmap, true);
+        bitmap.set_bit(page_id, self.pages_per_bitmap, true)
 
         Ok(())
     }
@@ -109,15 +107,16 @@ X PageAllocator {
     # Attempts to allocate contiguous or near-contiguous pages for better locality
     # Returns Vec of allocated page_ids (may be fewer than requested)
     F allocate_bulk(mut self, file_id: u8, count: u32, bitmap: &mut FreelistBitmap) -> Result<Vec<u32>, VaisError> {
+        pages_per_bitmap := mut self.pages_per_bitmap
         state := mut self.get_file_state(file_id)?;
 
         # Use bitmap's bulk allocation
-        allocated := mut bitmap.allocate_bulk(self.pages_per_bitmap, count);
+        allocated := mut bitmap.allocate_bulk(pages_per_bitmap, count)
 
         # Update allocation hint to end of allocated range
         I allocated.len() > 0 {
-            last_allocated := mut allocated[allocated.len() - 1];
-            state.last_alloc_position = last_allocated + 1;
+            last_allocated := mut allocated[allocated.len() - 1]
+            state.last_alloc_position = last_allocated + 1
         }
 
         Ok(allocated)
@@ -130,8 +129,9 @@ X PageAllocator {
 
     # Calculate how many pages are needed after extension
     F pages_after_extension(self, file_id: u8) -> Result<u32, VaisError> {
+        extension_increment := mut self.extension_increment
         state := mut self.get_file_state_readonly(file_id)?;
-        Ok(state.total_pages + self.extension_increment)
+        Ok(state.total_pages + extension_increment)
     }
 
     # Mark pages as free after file extension
@@ -143,15 +143,16 @@ X PageAllocator {
         new_total: u32,
         bitmap: &mut FreelistBitmap
     ) -> Result<(), VaisError> {
+        pages_per_bitmap := mut self.pages_per_bitmap
         state := mut self.get_file_state(file_id)?;
 
         # Mark all new pages as free
         L page_id: old_total..new_total {
-            bitmap.set_bit(page_id, self.pages_per_bitmap, true);
+            bitmap.set_bit(page_id, pages_per_bitmap, true)
         }
 
         # Update total pages count
-        state.total_pages = new_total;
+        state.total_pages = new_total
 
         Ok(())
     }
@@ -159,16 +160,17 @@ X PageAllocator {
     # Get readonly file state (for queries)
     F get_file_state_readonly(self, file_id: u8) -> Result<&FileAllocState, VaisError> {
         I file_id >= 5 {
-            R Err(err_internal("Invalid file_id: {file_id}"));
+            R Err(err_internal("Invalid file_id: {file_id}"))
         }
         Ok(&self.file_states[file_id as u64])
     }
 
     # Get allocation statistics for a file
     F get_stats(self, file_id: u8, bitmap: &FreelistBitmap) -> Result<AllocStats, VaisError> {
+        pages_per_bitmap := mut self.pages_per_bitmap
         state := mut self.get_file_state_readonly(file_id)?;
-        free_pages := mut bitmap.count_free(self.pages_per_bitmap);
-        allocated_pages := mut state.total_pages - free_pages;
+        free_pages := mut bitmap.count_free(pages_per_bitmap)
+        allocated_pages := mut state.total_pages - free_pages
 
         Ok(AllocStats {
             file_id,
@@ -187,7 +189,7 @@ X PageAllocator {
     # Reset allocation hint to beginning (for testing or after major compaction)
     F reset_allocation_hint(mut self, file_id: u8) -> Result<(), VaisError> {
         state := mut self.get_file_state(file_id)?;
-        state.last_alloc_position = 0;
+        state.last_alloc_position = 0
         Ok(())
     }
 }
@@ -203,7 +205,7 @@ S AllocStats {
 }
 
 X AllocStats {
-    F to_string(self) -> Str {
+    F to_string(self) -> str {
         "File {self.file_id}: {self.allocated_pages}/{self.total_pages} pages allocated ({self.utilization_percent}%), {self.free_pages} free"
     }
 }
@@ -223,25 +225,25 @@ X ThreadSafeAllocator {
 
     # Thread-safe allocation
     F allocate_page(self, file_id: u8, bitmap: &mut FreelistBitmap) -> Result<u32, VaisError> {
-        guard := mut self.inner.lock();
+        guard := mut self.inner.lock()
         guard.allocate_page(file_id, bitmap)
     }
 
     # Thread-safe deallocation
     F deallocate_page(self, file_id: u8, page_id: u32, bitmap: &mut FreelistBitmap) -> Result<(), VaisError> {
-        guard := mut self.inner.lock();
+        guard := mut self.inner.lock()
         guard.deallocate_page(file_id, page_id, bitmap)
     }
 
     # Thread-safe bulk allocation
     F allocate_bulk(self, file_id: u8, count: u32, bitmap: &mut FreelistBitmap) -> Result<Vec<u32>, VaisError> {
-        guard := mut self.inner.lock();
+        guard := mut self.inner.lock()
         guard.allocate_bulk(file_id, count, bitmap)
     }
 
     # Thread-safe statistics query
     F get_stats(self, file_id: u8, bitmap: &FreelistBitmap) -> Result<AllocStats, VaisError> {
-        guard := mut self.inner.lock();
+        guard := mut self.inner.lock()
         guard.get_stats(file_id, bitmap)
     }
 }

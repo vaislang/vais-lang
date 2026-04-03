@@ -6,45 +6,45 @@
 # SetOperationExecutor: UNION, INTERSECT, EXCEPT
 # Error codes: EE=01 (SQL), CC=07 (Subquery), NNN=001-005
 
-U std/hashmap.{HashMap, HashSet};
-U std/result.Result;
-U std/option.Option;
-U std/vec.Vec;
-U std/str.Str;
-U std/box.Box;
+U std/hashmap
+U std/result
+U std/option
+U std/vec
+U std/str
+U std/box
 
-U storage/error.VaisError;
-U sql/types.{SqlValue, group_key_hash};
-U sql/row.Row;
-U sql/parser/ast.{SelectQuery, Expr, SetOpKind};
-U sql/executor/mod.{ExecutorRow, ExecStats, ExecContext};
-U sql/executor/expr_eval.{eval_expr, EvalContext};
+U storage/error
+U sql/types
+U sql/row
+U sql/parser/ast
+U sql/executor/mod
+U sql/executor/expr_eval
 
 # ============================================================================
 # CTE Context - Shared storage for materialized CTEs
 # ============================================================================
 
 S CteContext {
-    materialized: HashMap<Str, Vec<Row>>,
+    materialized: HashMap<str, Vec<Row>>,
 }
 
 X CteContext {
     F new() -> CteContext {
         CteContext {
-            materialized: HashMap.new(),
+            materialized: HashMap.with_capacity(16),
         }
     }
 
-    F insert(mut self, name: Str, rows: Vec<Row>) {
-        self.materialized.insert(name, rows);
+    F insert(mut self, name: str, rows: Vec<Row>) {
+        self.materialized.insert(name, rows)
     }
 
-    F get(self, name: &Str) -> Option<&Vec<Row>> {
+    F get(self, name: &str) -> Option<&Vec<Row>> {
         self.materialized.get(name)
     }
 
     F clear(mut self) {
-        self.materialized.clear();
+        self.materialized.clear()
     }
 }
 
@@ -55,8 +55,8 @@ X CteContext {
 # Forward declaration: we need a way to build an executor from SelectQuery
 # In practice, this would be provided by the planner/builder module
 # For now, we define the signature as a placeholder
-T ExecutorBuilder {
-    F build_select(query: &SelectQuery, ctx: &ExecContext, eval_ctx: &EvalContext, cte_ctx: &CteContext) -> Result<Box<dyn Executor>, VaisError>;
+W ExecutorBuilder {
+    F build_select(query: &SelectQuery, ctx: &ExecContext, eval_ctx: &EvalContext, cte_ctx: &CteContext) -> Result<Box<dyn Executor>, VaisError>
 }
 
 S SubqueryExecutor {
@@ -77,29 +77,30 @@ X SubqueryExecutor {
     F eval(mut self) -> Result<SqlValue, VaisError> {
         self.child.open()?;
 
-        result_val := mut SqlValue.Null;
-        row_count := mut 0u64;
+        result_val := mut Null
+        row_count := mut 0u64
 
-        has_more := mut true;
+        has_more := mut true
         L has_more {
-            M self.child.next()? {
+            _next := self.child.next()?;
+            M _next {
                 Option.None => { has_more = false; },
                 Option.Some(exec_row) => {
-                    row_count += 1;
-                    self.stats.add_scanned(1);
+                    row_count += 1
+                    self.stats.add_scanned(1)
 
                     I row_count > 1 {
                         self.child.close()?;
                         R Result.Err(VaisError.new(
                             "VAIS-E0107002",
                             "Scalar subquery returned more than one row"
-                        ));
+                        ))
                     }
 
                     # Get first column value
-                    row := mut exec_row.get_row();
+                    row := mut exec_row.get_row()
                     I row.column_count() > 0 {
-                        result_val = row.get(0).clone();
+                        result_val = row.get(0).clone()
                     }
                 },
             }
@@ -127,28 +128,29 @@ F eval_in_subquery(
 ) -> Result<SqlValue, VaisError> {
     child.open()?;
 
-    found := mut false;
-    found_null := mut false;
+    found := mut false
+    found_null := mut false
 
-    has_more := mut true;
+    has_more := mut true
     L has_more {
-        M child.next()? {
+        _next := child.next()?;
+        M _next {
             Option.None => { has_more = false; },
             Option.Some(exec_row) => {
-                stats.add_scanned(1);
-                row := mut exec_row.get_row();
+                stats.add_scanned(1)
+                row := mut exec_row.get_row()
 
                 I row.column_count() > 0 {
-                    val := mut row.get(0);
+                    val := mut row.get(0)
 
                     # Compare using SQL equals (NULL propagation)
                     M expr_val.equals(val) {
-                        SqlValue.BoolVal { v: true } => {
-                            found = true;
-                            has_more = false;
+                        BoolVal { v: true } => {
+                            found = true
+                            has_more = false
                         },
-                        SqlValue.Null => {
-                            found_null = true;
+                        Null => {
+                            found_null = true
                         },
                         _ => {},
                     }
@@ -163,12 +165,12 @@ F eval_in_subquery(
     # IN: found -> TRUE, not found but NULL seen -> NULL, not found -> FALSE
     # NOT IN: found -> FALSE, not found but NULL seen -> NULL, not found -> TRUE
     result := mut I found {
-        SqlValue.BoolVal { v: !negated }
+        BoolVal { v: !negated }
     } E I found_null {
-        SqlValue.Null
+        Null
     } E {
-        SqlValue.BoolVal { v: negated }
-    };
+        BoolVal { v: negated }
+    }
 
     Result.Ok(result)
 }
@@ -185,12 +187,13 @@ F eval_exists(
 ) -> Result<SqlValue, VaisError> {
     child.open()?;
 
-    exists := mut false;
+    exists := mut false
 
-    M child.next()? {
+    _next := child.next()?;
+    M _next {
         Option.Some(_) => {
-            exists = true;
-            stats.add_scanned(1);
+            exists = true
+            stats.add_scanned(1)
         },
         Option.None => {},
     }
@@ -198,10 +201,10 @@ F eval_exists(
     child.close()?;
 
     result := mut I negated {
-        SqlValue.BoolVal { v: !exists }
+        BoolVal { v: !exists }
     } E {
-        SqlValue.BoolVal { v: exists }
-    };
+        BoolVal { v: exists }
+    }
 
     Result.Ok(result)
 }
@@ -211,7 +214,7 @@ F eval_exists(
 # ============================================================================
 
 S CteRefExecutor {
-    cte_name: Str,
+    cte_name: str,
     cte_ctx: &CteContext,
     materialized: Option<Vec<Row>>,
     cursor: u64,
@@ -219,7 +222,7 @@ S CteRefExecutor {
 }
 
 X CteRefExecutor {
-    F new(cte_name: Str, cte_ctx: &CteContext) -> CteRefExecutor {
+    F new(cte_name: str, cte_ctx: &CteContext) -> CteRefExecutor {
         CteRefExecutor {
             cte_name,
             cte_ctx,
@@ -233,8 +236,8 @@ X CteRefExecutor {
         # Lookup CTE by name
         M self.cte_ctx.get(&self.cte_name) {
             Option.Some(rows) => {
-                self.materialized = Option.Some(rows.clone());
-                self.cursor = 0;
+                self.materialized = Option.Some(rows.clone())
+                self.cursor = 0
                 Result.Ok(())
             },
             Option.None => {
@@ -255,10 +258,10 @@ X CteRefExecutor {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
                 } E {
-                    row := mut &rows[self.cursor];
-                    self.cursor += 1;
-                    self.stats.add_produced();
-                    self.stats.add_scanned(1);
+                    row := mut &rows[self.cursor]
+                    self.cursor += 1
+                    self.stats.add_produced()
+                    self.stats.add_scanned(1)
                     Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
                 }
             },
@@ -266,8 +269,8 @@ X CteRefExecutor {
     }
 
     F close(mut self) -> Result<(), VaisError> {
-        self.materialized = Option.None;
-        self.cursor = 0;
+        self.materialized = Option.None
+        self.cursor = 0
         Result.Ok(())
     }
 
@@ -310,17 +313,17 @@ X SetOperationExecutor {
 
     F open(mut self) -> Result<(), VaisError> {
         M self.op_kind {
-            SetOpKind.Union => {
+            Union => {
                 I self.all {
                     self.open_union_all()?;
                 } E {
                     self.open_union()?;
                 }
             },
-            SetOpKind.Intersect => {
+            Intersect => {
                 self.open_intersect()?;
             },
-            SetOpKind.Except => {
+            Except => {
                 self.open_except()?;
             },
         }
@@ -337,9 +340,9 @@ X SetOperationExecutor {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
                 } E {
-                    row := mut &rows[self.cursor];
-                    self.cursor += 1;
-                    self.stats.add_produced();
+                    row := mut &rows[self.cursor]
+                    self.cursor += 1
+                    self.stats.add_produced()
                     Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
                 }
             },
@@ -347,8 +350,8 @@ X SetOperationExecutor {
     }
 
     F close(mut self) -> Result<(), VaisError> {
-        self.materialized = Option.None;
-        self.cursor = 0;
+        self.materialized = Option.None
+        self.cursor = 0
         self.left.close()?;
         self.right.close()?;
         Result.Ok(())
@@ -363,34 +366,36 @@ X SetOperationExecutor {
         self.left.open()?;
         self.right.open()?;
 
-        result := mut Vec.new();
+        result := mut Vec.with_capacity(0)
 
         # Materialize left side
-        has_left := mut true;
+        has_left := mut true
         L has_left {
-            M self.left.next()? {
+            _left := self.left.next()?;
+            M _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    result.push(exec_row.get_row().clone());
+                    self.stats.add_scanned(1)
+                    result.push(exec_row.get_row().clone())
                 },
             }
         }
 
         # Materialize right side
-        has_right := mut true;
+        has_right := mut true
         L has_right {
-            M self.right.next()? {
+            _right := self.right.next()?;
+            M _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    result.push(exec_row.get_row().clone());
+                    self.stats.add_scanned(1)
+                    result.push(exec_row.get_row().clone())
                 },
             }
         }
 
-        self.materialized = Option.Some(result);
-        self.cursor = 0;
+        self.materialized = Option.Some(result)
+        self.cursor = 0
 
         Result.Ok(())
     }
@@ -400,59 +405,61 @@ X SetOperationExecutor {
         self.left.open()?;
         self.right.open()?;
 
-        seen := mut HashSet.new();
-        result := mut Vec.new();
+        seen := mut HashSet.new()
+        result := mut Vec.with_capacity(0)
 
         # Materialize left side with dedup
-        has_left := mut true;
+        has_left := mut true
         L has_left {
-            M self.left.next()? {
+            _left := self.left.next()?;
+            M _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
                     # Hash all row values
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
+                    hash := mut group_key_hash(&values)
 
                     I !seen.contains(&hash) {
-                        seen.insert(hash);
-                        result.push(row.clone());
+                        seen.insert(hash)
+                        result.push(row.clone())
                     }
                 },
             }
         }
 
         # Materialize right side with dedup
-        has_right := mut true;
+        has_right := mut true
         L has_right {
-            M self.right.next()? {
+            _right := self.right.next()?;
+            M _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
                     # Hash all row values
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
+                    hash := mut group_key_hash(&values)
 
                     I !seen.contains(&hash) {
-                        seen.insert(hash);
-                        result.push(row.clone());
+                        seen.insert(hash)
+                        result.push(row.clone())
                     }
                 },
             }
         }
 
-        self.materialized = Option.Some(result);
-        self.cursor = 0;
+        self.materialized = Option.Some(result)
+        self.cursor = 0
 
         Result.Ok(())
     }
@@ -463,55 +470,57 @@ X SetOperationExecutor {
         self.right.open()?;
 
         # Materialize right side into hash set
-        right_hashes := mut HashSet.new();
+        right_hashes := mut HashSet.new()
 
-        has_right := mut true;
+        has_right := mut true
         L has_right {
-            M self.right.next()? {
+            _right := self.right.next()?;
+            M _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
-                    right_hashes.insert(hash);
+                    hash := mut group_key_hash(&values)
+                    right_hashes.insert(hash)
                 },
             }
         }
 
         # Probe from left side, emit rows in both
-        seen := mut HashSet.new();
-        result := mut Vec.new();
+        seen := mut HashSet.new()
+        result := mut Vec.with_capacity(0)
 
-        has_left := mut true;
+        has_left := mut true
         L has_left {
-            M self.left.next()? {
+            _left := self.left.next()?;
+            M _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
+                    hash := mut group_key_hash(&values)
 
                     # Only emit if in right side and not already seen (dedup)
                     I right_hashes.contains(&hash) && !seen.contains(&hash) {
-                        seen.insert(hash);
-                        result.push(row.clone());
+                        seen.insert(hash)
+                        result.push(row.clone())
                     }
                 },
             }
         }
 
-        self.materialized = Option.Some(result);
-        self.cursor = 0;
+        self.materialized = Option.Some(result)
+        self.cursor = 0
 
         Result.Ok(())
     }
@@ -522,55 +531,57 @@ X SetOperationExecutor {
         self.right.open()?;
 
         # Materialize right side into hash set
-        right_hashes := mut HashSet.new();
+        right_hashes := mut HashSet.new()
 
-        has_right := mut true;
+        has_right := mut true
         L has_right {
-            M self.right.next()? {
+            _right := self.right.next()?;
+            M _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
-                    right_hashes.insert(hash);
+                    hash := mut group_key_hash(&values)
+                    right_hashes.insert(hash)
                 },
             }
         }
 
         # Probe from left side, emit rows NOT in right
-        seen := mut HashSet.new();
-        result := mut Vec.new();
+        seen := mut HashSet.new()
+        result := mut Vec.with_capacity(0)
 
-        has_left := mut true;
+        has_left := mut true
         L has_left {
-            M self.left.next()? {
+            _left := self.left.next()?;
+            M _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
-                    self.stats.add_scanned(1);
-                    row := mut exec_row.get_row();
+                    self.stats.add_scanned(1)
+                    row := mut exec_row.get_row()
 
-                    values: Vec<SqlValue> := mut Vec.new();
+                    values := mut Vec.with_capacity(0)
                     L i: 0..row.column_count() {
-                        values.push(row.get(i).clone());
+                        values.push(row.get(i).clone())
                     }
-                    hash := mut group_key_hash(&values);
+                    hash := mut group_key_hash(&values)
 
                     # Only emit if NOT in right side and not already seen (dedup)
                     I !right_hashes.contains(&hash) && !seen.contains(&hash) {
-                        seen.insert(hash);
-                        result.push(row.clone());
+                        seen.insert(hash)
+                        result.push(row.clone())
                     }
                 },
             }
         }
 
-        self.materialized = Option.Some(result);
-        self.cursor = 0;
+        self.materialized = Option.Some(result)
+        self.cursor = 0
 
         Result.Ok(())
     }
