@@ -1,27 +1,20 @@
 # Graph Edge Property Storage
 # Manages edge property pages: stores PropertyMap for edges
-# Page type: PAGE_TYPE_GRAPH_PROPERTY (0x32), engine: ENGINE_TAG_GRAPH (0x03)
+# Page type: PAGE_TYPE_GRAPH_PROPERTY (50), engine: ENGINE_TAG_GRAPH (3)
 # Edge metadata (src, dst, type, MVCC) is stored in AdjEntry within adjacency pages.
 # This module stores only the variable-size property data for edges/nodes.
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/option.{Option, Some, None};
-U storage/constants.{
-    PAGE_HEADER_SIZE, DEFAULT_PAGE_SIZE, NULL_PAGE,
-    FILE_ID_GRAPH, INVALID_TXN_ID
-};
-U storage/error.{VaisError, err_internal};
-U storage/page/header.{PageHeader};
-U storage/page/types.{PAGE_TYPE_GRAPH_PROPERTY, ENGINE_TAG_GRAPH};
-U storage/buffer/pool.{BufferPool};
-U storage/page/allocator.{PageAllocator};
-U storage/page/freelist.{FreelistBitmap};
-U graph/types.{
-    PropertyMap, PROP_PAGE_HEADER_SIZE,
-    ENTITY_TYPE_NODE, ENTITY_TYPE_EDGE,
-    err_graph_page_full
-};
+U storage/bytes
+U std/vec
+U std/option
+U storage/constants
+U storage/error
+U storage/page/header
+U storage/page/types
+U storage/buffer/pool
+U storage/page/allocator
+U storage/page/freelist
+U graph/types
 
 # ============================================================================
 # PropertyPage — Stores properties for a single entity (node or edge)
@@ -49,21 +42,21 @@ X PropertyPageHeader {
 
     # Serialize (16 bytes)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u8(self.entity_type);
-        buf.put_u64_le(self.entity_id);
-        buf.put_u16_le(self.prop_count);
-        buf.put_u32_le(self.next_prop_page);
-        buf.put_u8(self.reserved);
+        buf.write_u8(self.entity_type)
+        buf.write_i64_le(self.entity_id)
+        buf.write_u16_le(self.prop_count)
+        buf.write_i32_le(self.next_prop_page)
+        buf.write_u8(self.reserved)
     }
 
     # Deserialize (16 bytes)
     F deserialize(buf: &ByteBuffer) -> Result<PropertyPageHeader, VaisError> {
         Ok(PropertyPageHeader {
-            entity_type: buf.get_u8()?,
-            entity_id: buf.get_u64_le()?,
-            prop_count: buf.get_u16_le()?,
-            next_prop_page: buf.get_u32_le()?,
-            reserved: buf.get_u8()?,
+            entity_type: read_u8_checked(buf)?,
+            entity_id: read_i64_le_checked(buf)?,
+            prop_count: read_u16_le_checked(buf)?,
+            next_prop_page: read_i32_le_checked(buf)?,
+            reserved: read_u8_checked(buf)?,
         })
     }
 }
@@ -97,57 +90,57 @@ X PropertyStore {
         props: &PropertyMap,
         txn_id: u64
     ) -> Result<u32, VaisError> {
-        I props.is_empty() {
-            R Ok(NULL_PAGE);
+        I props.len() == 0 {
+            R Ok(NULL_PAGE)
         }
 
         # Serialize properties
-        prop_buf := mut ByteBuffer.new(512);
-        props.serialize(&prop_buf);
-        prop_bytes := mut prop_buf.to_vec();
+        prop_buf := mut ByteBuffer.with_capacity(512)
+        props.serialize(&prop_buf)
+        prop_bytes := mut prop_buf.to_vec()
 
         # Allocate page
         page_id := mut self.allocator.allocate_page(FILE_ID_GRAPH, self.bitmap)?;
 
         # Build page
-        page_data := mut vec![0u8; self.page_size as u64];
+        page_data := mut vec![0u8; self.page_size as u64]
 
         # Write page header
-        header := mut PageHeader.new(page_id, PAGE_TYPE_GRAPH_PROPERTY, ENGINE_TAG_GRAPH);
-        header.txn_id = txn_id;
-        header.item_count = props.len() as u16;
-        header.write_to_page(&page_data);
+        header := mut PageHeader.new(page_id, PAGE_TYPE_GRAPH_PROPERTY, ENGINE_TAG_GRAPH)
+        header.txn_id = txn_id
+        header.item_count = props.len() as u16
+        header.write_to_page(&page_data)
 
         # Write property page header
-        buf := mut ByteBuffer.wrap(&page_data);
-        buf.set_position(PAGE_HEADER_SIZE as u64);
-        prop_header := mut PropertyPageHeader.new(entity_type, entity_id);
-        prop_header.prop_count = props.len() as u16;
-        prop_header.serialize(&buf);
+        buf := mut ByteBuffer.wrap(&page_data)
+        buf.seek(PAGE_HEADER_SIZE as u64)
+        prop_header := mut PropertyPageHeader.new(entity_type, entity_id)
+        prop_header.prop_count = props.len() as u16
+        prop_header.serialize(&buf)
 
         # Write property data
-        available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE;
-        I prop_bytes.len() as u32 > available {
-            R Err(err_graph_page_full(page_id));
+        available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE
+        I (prop_bytes.len() as u32) > available {
+            R Err(err_graph_page_full(page_id))
         }
-        i: u64 := mut 0;
+        i := mut 0
         L i < prop_bytes.len() {
-            buf.put_u8(prop_bytes[i]);
-            i += 1;
+            buf.write_u8(prop_bytes[i])
+            i += 1
         }
 
         # Update checksum
-        PageHeader.update_checksum(&page_data);
+        PageHeader.update_checksum(&page_data)
 
         # Write to buffer pool
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        frame_data := mut self.pool.get_page_mut(frame_id);
-        j: u64 := mut 0;
+        frame_data := mut self.pool.get_page_mut(frame_id)
+        j := mut 0
         L j < page_data.len() {
-            frame_data[j] = page_data[j];
-            j += 1;
+            frame_data[j] = page_data[j]
+            j += 1
         }
-        self.pool.unpin_page(frame_id, true);
+        self.pool.unpin_page(frame_id, true)
 
         Ok(page_id)
     }
@@ -155,27 +148,27 @@ X PropertyStore {
     # Read properties for an entity
     F read_properties(self, page_id: u32) -> Result<PropertyMap, VaisError> {
         I page_id == NULL_PAGE {
-            R Ok(PropertyMap.new());
+            R Ok(PropertyMap.new())
         }
 
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        page_data := mut self.pool.get_page(frame_id);
+        page_data := mut self.pool.get_page(frame_id)
 
         # Verify page type
         header := mut PageHeader.read_from_page(page_data)?;
         I header.page_type != PAGE_TYPE_GRAPH_PROPERTY {
-            self.pool.unpin_page(frame_id, false);
-            R Err(err_internal("Expected GRAPH_PROPERTY page type"));
+            self.pool.unpin_page(frame_id, false)
+            R Err(err_internal("Expected GRAPH_PROPERTY page type"))
         }
 
         # Read property page header
-        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
+        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..])
         prop_header := mut PropertyPageHeader.deserialize(&buf)?;
 
         # Read property data
         props := mut PropertyMap.deserialize(&buf)?;
 
-        self.pool.unpin_page(frame_id, false);
+        self.pool.unpin_page(frame_id, false)
         Ok(props)
     }
 
@@ -187,59 +180,59 @@ X PropertyStore {
         txn_id: u64
     ) -> Result<(), VaisError> {
         I page_id == NULL_PAGE {
-            R Err(err_internal("Cannot update properties on NULL page"));
+            R Err(err_internal("Cannot update properties on NULL page"))
         }
 
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
-        page_data := mut self.pool.get_page_mut(frame_id);
+        page_data := mut self.pool.get_page_mut(frame_id)
 
         # Read existing header
         header := mut PageHeader.read_from_page(page_data)?;
-        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..]);
+        buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..])
         prop_header := mut PropertyPageHeader.deserialize(&buf)?;
 
         # Serialize new properties
-        prop_buf := mut ByteBuffer.new(512);
-        props.serialize(&prop_buf);
-        prop_bytes := mut prop_buf.to_vec();
+        prop_buf := mut ByteBuffer.with_capacity(512)
+        props.serialize(&prop_buf)
+        prop_bytes := mut prop_buf.to_vec()
 
-        available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE;
-        I prop_bytes.len() as u32 > available {
-            self.pool.unpin_page(frame_id, false);
-            R Err(err_graph_page_full(page_id));
+        available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE
+        I (prop_bytes.len() as u32) > available {
+            self.pool.unpin_page(frame_id, false)
+            R Err(err_graph_page_full(page_id))
         }
 
         # Rewrite property data
-        write_buf := mut ByteBuffer.wrap(page_data);
-        write_buf.set_position((PAGE_HEADER_SIZE + PROP_PAGE_HEADER_SIZE) as u64);
-        i: u64 := mut 0;
+        write_buf := mut ByteBuffer.wrap(page_data)
+        write_buf.seek((PAGE_HEADER_SIZE + PROP_PAGE_HEADER_SIZE) as u64)
+        i := mut 0
         L i < prop_bytes.len() {
-            write_buf.put_u8(prop_bytes[i]);
-            i += 1;
+            write_buf.write_u8(prop_bytes[i])
+            i += 1
         }
 
         # Update header
-        new_header := mut header;
-        new_header.txn_id = txn_id;
-        new_header.item_count = props.len() as u16;
-        new_header.write_to_page(page_data);
+        new_header := mut header
+        new_header.txn_id = txn_id
+        new_header.item_count = props.len() as u16
+        new_header.write_to_page(page_data)
 
         # Update prop_header count
-        h_buf := mut ByteBuffer.wrap(page_data);
-        h_buf.set_position(PAGE_HEADER_SIZE as u64);
-        updated_prop_header := mut prop_header;
-        updated_prop_header.prop_count = props.len() as u16;
-        updated_prop_header.serialize(&h_buf);
+        h_buf := mut ByteBuffer.wrap(page_data)
+        h_buf.seek(PAGE_HEADER_SIZE as u64)
+        updated_prop_header := mut prop_header
+        updated_prop_header.prop_count = props.len() as u16
+        updated_prop_header.serialize(&h_buf)
 
-        PageHeader.update_checksum(page_data);
-        self.pool.unpin_page(frame_id, true);
+        PageHeader.update_checksum_slice(page_data)
+        self.pool.unpin_page(frame_id, true)
         Ok(())
     }
 
     # Delete properties (free the page)
     F delete_properties(mut self, page_id: u32) -> Result<(), VaisError> {
         I page_id == NULL_PAGE {
-            R Ok(());
+            R Ok(())
         }
         self.allocator.free_page(FILE_ID_GRAPH, page_id, self.bitmap)?;
         Ok(())

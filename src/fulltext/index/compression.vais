@@ -2,9 +2,15 @@
 # Variable-byte (VByte) encoding for doc_id deltas
 # Delta encoding for sorted doc_id lists to reduce storage
 
-U std/vec.Vec;
-U std/bytes.{ByteBuffer};
-U storage/error.{VaisError};
+U std/vec
+U storage/bytes
+U storage/error
+
+# Decoded VByte result — value and bytes consumed
+S VByteResult {
+    value: u64,
+    consumed: u64,
+}
 
 # ============================================================================
 # VByte Encoding — Variable-byte encoding for unsigned integers
@@ -13,21 +19,20 @@ U storage/error.{VaisError};
 
 # Encode a u64 value using variable-byte encoding
 F vbyte_encode(value: u64) -> Vec<u8> {
-    result := mut Vec.new();
-    v := mut value;
+    result := mut Vec.with_capacity(0)
+    v := mut value
 
     I v == 0 {
-        result.push(0);
-        R result;
-    }
-
-    L v > 0 {
-        byte := mut (v & 0x7F) as u8;
-        v = v >> 7;
-        I v > 0 {
-            byte = byte | 0x80;  # Set continuation bit
+        result.push(0)
+    } E {
+        L v > 0 {
+            byte := mut (v & 127) as u8
+            v = v >> 7
+            I v > 0 {
+                byte = byte | 128  # Set continuation bit
+            }
+            result.push(byte)
         }
-        result.push(byte);
     }
 
     result
@@ -35,39 +40,39 @@ F vbyte_encode(value: u64) -> Vec<u8> {
 
 # Decode a u64 value from variable-byte encoding
 # Returns (decoded_value, bytes_consumed)
-F vbyte_decode(data: &[u8], start: u64) -> Result<(u64, u64), VaisError> {
-    value: u64 := mut 0;
-    shift: u32 := mut 0;
-    pos := mut start;
+F vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
+    value := mut 0
+    shift := mut 0
+    pos := mut start
 
-    decoding := mut true;
+    decoding := mut true
     L decoding {
         I pos >= data.len() {
             R Err(VaisError.new(
                 "VAIS-0405003",
                 "VByte decode: unexpected end of data"
-            ));
+            ))
         }
 
-        byte := mut data[pos];
-        value = value | (((byte & 0x7F) as u64) << shift);
-        pos += 1;
+        byte := mut data[pos]
+        value = value | (((byte & 127) as u64) << shift)
+        pos += 1
 
-        I (byte & 0x80) == 0 {
+        I (byte & 128) == 0 {
             # Last byte
-            decoding = false;
+            decoding = false
         } E {
-            shift += 7;
+            shift += 7
             I shift > 63 {
                 R Err(VaisError.new(
                     "VAIS-0405004",
                     "VByte decode: value overflow (more than 10 bytes)"
-                ));
+                ))
             }
         }
     }
 
-    Ok((value, pos - start))
+    Ok(VByteResult { value, consumed: pos - start })
 }
 
 # ============================================================================
@@ -79,39 +84,39 @@ F vbyte_decode(data: &[u8], start: u64) -> Result<(u64, u64), VaisError> {
 # Deltas: [10, 5, 8, 7]
 # Output: VByte-encoded deltas
 F delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
-    result := mut Vec.new();
+    result := mut Vec.with_capacity(0)
 
-    I doc_ids.is_empty() {
-        R result;
-    }
-
-    # Encode count
-    count_bytes := mut vbyte_encode(doc_ids.len() as u64);
-    i: u64 := mut 0;
-    L i < count_bytes.len() {
-        result.push(count_bytes[i]);
-        i += 1;
-    }
-
-    # Encode first doc_id as absolute value
-    first_bytes := mut vbyte_encode(doc_ids[0]);
-    i = 0;
-    L i < first_bytes.len() {
-        result.push(first_bytes[i]);
-        i += 1;
-    }
-
-    # Encode subsequent doc_ids as deltas
-    idx: u64 := mut 1;
-    L idx < doc_ids.len() {
-        delta := mut doc_ids[idx] - doc_ids[idx - 1];
-        delta_bytes := mut vbyte_encode(delta);
-        i = 0;
-        L i < delta_bytes.len() {
-            result.push(delta_bytes[i]);
-            i += 1;
+    I doc_ids.len() == 0 {
+        # empty: skip
+    } E {
+        # Encode count
+        count_bytes := mut vbyte_encode(doc_ids.len() as u64)
+        i := mut 0
+        L i < count_bytes.len() {
+            result.push(count_bytes[i])
+            i += 1
         }
-        idx += 1;
+
+        # Encode first doc_id as absolute value
+        first_bytes := mut vbyte_encode(doc_ids[0])
+        i = 0
+        L i < first_bytes.len() {
+            result.push(first_bytes[i])
+            i += 1
+        }
+
+        # Encode subsequent doc_ids as deltas
+        idx := mut 1
+        L idx < doc_ids.len() {
+            delta := mut doc_ids[idx] - doc_ids[idx - 1]
+            delta_bytes := mut vbyte_encode(delta)
+            i = 0
+            L i < delta_bytes.len() {
+                result.push(delta_bytes[i])
+                i += 1
+            }
+            idx += 1
+        }
     }
 
     result
@@ -119,35 +124,62 @@ F delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
 
 # Delta-decode VByte-encoded doc_ids back to sorted list
 F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
-    result := mut Vec.new();
+    result := mut Vec.with_capacity(0)
 
-    I data.is_empty() {
-        R Ok(result);
-    }
+    I data.len() == 0 {
+        # empty: skip
+    } E {
+        pos := mut 0
 
-    pos: u64 := mut 0;
+        # Decode count
+        count := mut 0u64
+        consumed := mut 0u64
+        __mv1 := vbyte_decode(data, pos)
+        M __mv1 {
+            Ok(vb) => {
+                count = vb.value
+                consumed = vb.consumed
+            },
+            Err(e) => { R Err(e) },
+        }
+        pos += consumed
 
-    # Decode count
-    (count, consumed) := mut vbyte_decode(data, pos)?;
-    pos += consumed;
+        I count == 0 {
+            # zero count: skip
+        } E {
+            # Decode first doc_id (absolute)
+            first_id := mut 0u64
+            consumed2 := mut 0u64
+            __mv2 := vbyte_decode(data, pos)
+            M __mv2 {
+                Ok(vb) => {
+                    first_id = vb.value
+                    consumed2 = vb.consumed
+                },
+                Err(e) => { R Err(e) },
+            }
+            pos += consumed2
+            result.push(first_id)
 
-    I count == 0 {
-        R Ok(result);
-    }
-
-    # Decode first doc_id (absolute)
-    (first_id, consumed) := mut vbyte_decode(data, pos)?;
-    pos += consumed;
-    result.push(first_id);
-
-    # Decode deltas
-    i: u64 := mut 1;
-    L i < count {
-        (delta, consumed) := mut vbyte_decode(data, pos)?;
-        pos += consumed;
-        prev := mut result[result.len() - 1];
-        result.push(prev + delta);
-        i += 1;
+            # Decode deltas
+            i := mut 1
+            L i < count {
+                delta := mut 0u64
+                consumed3 := mut 0u64
+                __mv3 := vbyte_decode(data, pos)
+                M __mv3 {
+                    Ok(vb) => {
+                        delta = vb.value
+                        consumed3 = vb.consumed
+                    },
+                    Err(e) => { R Err(e) },
+                }
+                pos += consumed3
+                prev := mut result[result.len() - 1]
+                result.push(prev + delta)
+                i += 1
+            }
+        }
     }
 
     Ok(result)
@@ -162,74 +194,73 @@ F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
 # Entries must be sorted by doc_id
 # Format: [delta_encoded_doc_ids][vbyte_term_freqs][position_data]
 F encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
-    result := mut Vec.new();
+    result := mut Vec.with_capacity(0)
 
-    I entries.is_empty() {
+    I entries.len() == 0 {
         # Write count = 0
-        result.push(0);
-        R result;
-    }
-
-    # Extract doc_ids for delta encoding
-    doc_ids := mut Vec.with_capacity(entries.len());
-    i: u64 := mut 0;
-    L i < entries.len() {
-        doc_ids.push(entries[i].doc_id);
-        i += 1;
-    }
-
-    # Delta-encode doc_ids
-    encoded_ids := mut delta_encode_doc_ids(&doc_ids);
-    i = 0;
-    L i < encoded_ids.len() {
-        result.push(encoded_ids[i]);
-        i += 1;
-    }
-
-    # VByte-encode term frequencies
-    i = 0;
-    L i < entries.len() {
-        freq_bytes := mut vbyte_encode(entries[i].term_freq as u64);
-        j: u64 := mut 0;
-        L j < freq_bytes.len() {
-            result.push(freq_bytes[j]);
-            j += 1;
-        }
-        i += 1;
-    }
-
-    # Encode positions (VByte count + delta-encoded positions per entry)
-    i = 0;
-    L i < entries.len() {
-        pos_count := mut vbyte_encode(entries[i].positions.len() as u64);
-        j: u64 := mut 0;
-        L j < pos_count.len() {
-            result.push(pos_count[j]);
-            j += 1;
+        result.push(0)
+    } E {
+        # Extract doc_ids for delta encoding
+        doc_ids := mut Vec.with_capacity(entries.len())
+        i := mut 0
+        L i < entries.len() {
+            doc_ids.push(entries[i].doc_id)
+            i += 1
         }
 
-        # Delta-encode positions within each entry
-        I !entries[i].positions.is_empty() {
-            first := mut vbyte_encode(entries[i].positions[0] as u64);
-            j = 0;
-            L j < first.len() {
-                result.push(first[j]);
-                j += 1;
+        # Delta-encode doc_ids
+        encoded_ids := mut delta_encode_doc_ids(&doc_ids)
+        i = 0
+        L i < encoded_ids.len() {
+            result.push(encoded_ids[i])
+            i += 1
+        }
+
+        # VByte-encode term frequencies
+        i = 0
+        L i < entries.len() {
+            freq_bytes := mut vbyte_encode(entries[i].term_freq as u64)
+            j := mut 0
+            L j < freq_bytes.len() {
+                result.push(freq_bytes[j])
+                j += 1
+            }
+            i += 1
+        }
+
+        # Encode positions (VByte count + delta-encoded positions per entry)
+        i = 0
+        L i < entries.len() {
+            pos_count := mut vbyte_encode(entries[i].positions.len() as u64)
+            j := mut 0
+            L j < pos_count.len() {
+                result.push(pos_count[j])
+                j += 1
             }
 
-            k: u64 := mut 1;
-            L k < entries[i].positions.len() {
-                delta := mut entries[i].positions[k] - entries[i].positions[k - 1];
-                d_bytes := mut vbyte_encode(delta as u64);
-                j = 0;
-                L j < d_bytes.len() {
-                    result.push(d_bytes[j]);
-                    j += 1;
+            # Delta-encode positions within each entry
+            I !entries[i].positions.len() == 0 {
+                first := mut vbyte_encode(entries[i].positions[0] as u64)
+                j = 0
+                L j < first.len() {
+                    result.push(first[j])
+                    j += 1
                 }
-                k += 1;
+
+                k := mut 1
+                L k < entries[i].positions.len() {
+                    delta := mut entries[i].positions[k] - entries[i].positions[k - 1]
+                    d_bytes := mut vbyte_encode(delta as u64)
+                    j = 0
+                    L j < d_bytes.len() {
+                        result.push(d_bytes[j])
+                        j += 1
+                    }
+                    k += 1
+                }
             }
+            i += 1
         }
-        i += 1;
     }
 
     result
@@ -237,65 +268,119 @@ F encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
 
 # Decode compressed posting list back to entries
 F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError> {
-    result := mut Vec.new();
-    pos: u64 := mut 0;
+    result := mut Vec.with_capacity(0)
+    pos := mut 0
 
-    I data.is_empty() || data[0] == 0 {
-        R Ok(result);
-    }
-
-    # Decode doc_ids
-    doc_ids := mut delta_decode_doc_ids(data)?;
-    # Re-compute pos by re-parsing to find where doc_ids end
-    (count, consumed) := mut vbyte_decode(data, 0)?;
-    pos = consumed;
-    prev: u64 := mut 0;
-    i: u64 := mut 0;
-    L i < count {
-        (val, consumed) := mut vbyte_decode(data, pos)?;
-        pos += consumed;
-        I i == 0 { prev = val; } E { prev += val; }
-        i += 1;
-    }
-
-    # Decode term frequencies
-    freqs := mut Vec.with_capacity(doc_ids.len());
-    i = 0;
-    L i < count {
-        (freq, consumed) := mut vbyte_decode(data, pos)?;
-        pos += consumed;
-        freqs.push(freq as u32);
-        i += 1;
-    }
-
-    # Decode positions
-    i = 0;
-    L i < count {
-        (pos_count, consumed) := mut vbyte_decode(data, pos)?;
-        pos += consumed;
-
-        positions := mut Vec.with_capacity(pos_count as u64);
-        I pos_count > 0 {
-            (first_pos, consumed) := mut vbyte_decode(data, pos)?;
-            pos += consumed;
-            positions.push(first_pos as u32);
-
-            j: u64 := mut 1;
-            L j < pos_count {
-                (delta, consumed) := mut vbyte_decode(data, pos)?;
-                pos += consumed;
-                prev_pos := mut positions[positions.len() - 1];
-                positions.push(prev_pos + delta as u32);
-                j += 1;
+    I data.len() == 0 || data[0] == 0 {
+        # empty or zero-count: skip
+    } E {
+        # Decode doc_ids
+        doc_ids := mut delta_decode_doc_ids(data)?;
+        # Re-compute pos by re-parsing to find where doc_ids end
+        count := mut 0u64
+        consumed4 := mut 0u64
+        __mv4 := vbyte_decode(data, 0)
+        M __mv4 {
+            Ok(vb) => {
+                count = vb.value
+                consumed4 = vb.consumed
+            },
+            Err(e) => { R Err(e) },
+        }
+        pos = consumed4
+        prev := mut 0
+        i := mut 0
+        L i < count {
+            val := mut 0u64
+            consumed5 := mut 0u64
+            __mv5 := vbyte_decode(data, pos)
+            M __mv5 {
+                Ok(vb) => {
+                    val = vb.value
+                    consumed5 = vb.consumed
+                },
+                Err(e) => { R Err(e) },
             }
+            pos += consumed5
+            I i == 0 { prev = val } E { prev += val }
+            i += 1
         }
 
-        result.push(PostingEntryCompact {
-            doc_id: doc_ids[i as u64],
-            term_freq: freqs[i as u64],
-            positions,
-        });
-        i += 1;
+        # Decode term frequencies
+        freqs := mut Vec.with_capacity(doc_ids.len())
+        i = 0
+        L i < count {
+            freq := mut 0u64
+            consumed6 := mut 0u64
+            __mv6 := vbyte_decode(data, pos)
+            M __mv6 {
+                Ok(vb) => {
+                    freq = vb.value
+                    consumed6 = vb.consumed
+                },
+                Err(e) => { R Err(e) },
+            }
+            pos += consumed6
+            freqs.push(freq as u32)
+            i += 1
+        }
+
+        # Decode positions
+        i = 0
+        L i < count {
+            pos_count := mut 0u64
+            consumed7 := mut 0u64
+            __mv7 := vbyte_decode(data, pos)
+            M __mv7 {
+                Ok(vb) => {
+                    pos_count = vb.value
+                    consumed7 = vb.consumed
+                },
+                Err(e) => { R Err(e) },
+            }
+            pos += consumed7
+
+            positions := mut Vec.with_capacity(pos_count as u64)
+            I pos_count > 0 {
+                first_pos := mut 0u64
+                consumed8 := mut 0u64
+                __mv8 := vbyte_decode(data, pos)
+                M __mv8 {
+                    Ok(vb) => {
+                        first_pos = vb.value
+                        consumed8 = vb.consumed
+                    },
+                    Err(e) => { R Err(e) },
+                }
+                pos += consumed8
+                positions.push(first_pos as u32)
+
+                j := mut 1
+                L j < pos_count {
+                    delta := mut 0u64
+                    consumed9 := mut 0u64
+                    __mv9 := vbyte_decode(data, pos)
+                    M __mv9 {
+                        Ok(vb) => {
+                            delta = vb.value
+                            consumed9 = vb.consumed
+                        },
+                        Err(e) => { R Err(e) },
+                    }
+                    pos += consumed9
+                    prev_pos := mut positions[positions.len() - 1]
+                    positions.push(prev_pos + delta)
+                    j += 1
+                }
+            }
+
+            result.push(PostingEntryCompact {
+                doc_id: doc_ids[i as u64],
+                term_freq: freqs[i as u64],
+                positions,
+            })
+            i += 1
+        }
     }
 
     Ok(result)

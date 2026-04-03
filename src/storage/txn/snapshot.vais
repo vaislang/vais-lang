@@ -1,77 +1,91 @@
-# Transaction Snapshot
+# Transaction TxnSnapshot
 # Represents a point-in-time view for MVCC visibility checks
 # Based on Stage 3 Section 7: Isolation Levels
 
-U storage/constants.{INVALID_TXN_ID};
+U storage/constants
 
-# Snapshot for transaction isolation
-S Snapshot {
+# TxnSnapshot for transaction isolation
+S TxnSnapshot {
     txn_id: u64,               # This transaction's ID
     current_cmd_id: u32,       # Current command sequence within transaction
     active_txns: Vec<u64>,     # Active transaction IDs at snapshot creation time
     min_active_txn: u64,       # Smallest active txn_id (optimization)
 }
 
-X Snapshot {
+X TxnSnapshot {
     # Create a new snapshot
-    F new(txn_id: u64, active_txns: Vec<u64>) -> Snapshot {
-        min_active := mut txn_id;
-        L id: &active_txns {
-            I *id < min_active {
-                min_active = *id;
+    F new(txn_id: u64, active_txns: Vec<u64>) -> TxnSnapshot {
+        min_active := mut txn_id
+        active_copy := mut active_txns.clone()
+        n := active_copy.len()
+        si := mut 0u64
+        L si < n {
+            id := active_copy[si]
+            I id < min_active {
+                min_active = id
             }
+            si += 1
         }
 
-        Snapshot {
+        TxnSnapshot {
             txn_id,
             current_cmd_id: 0,
-            active_txns,
+            active_txns: active_txns.clone(),
             min_active_txn: min_active,
         }
     }
 
     # Advance command ID (called per statement)
     F advance_cmd(mut self) {
-        self.current_cmd_id += 1;
+        self.current_cmd_id += 1
     }
 
     # Check if a transaction ID was active at snapshot time
-    F is_active(self, txn_id: u64) -> bool {
-        L id: &self.active_txns {
-            I *id == txn_id {
-                R true;
+    F is_active(&self, txn_id: u64) -> bool {
+        si := mut 0u64
+        L si < self.active_txns.len() {
+            I self.active_txns[si] == txn_id {
+                R true
             }
+            si += 1
         }
         false
     }
 
     # Check if a transaction was committed before this snapshot
     # txn_id < snapshot.txn_id AND txn_id NOT IN active_txns
-    F is_visible_txn(self, txn_id: u64) -> bool {
+    F is_visible_txn(&self, txn_id: u64) -> bool {
         I txn_id >= self.txn_id {
-            R false;
+            R false
         }
-        !self.is_active(txn_id)
+        I self.is_active(txn_id) {
+            false
+        } E {
+            true
+        }
     }
 
     # Get current transaction ID
-    F get_txn_id(self) -> u64 {
+    F get_txn_id(&self) -> u64 {
         self.txn_id
     }
 
     # Get current command ID
-    F get_cmd_id(self) -> u32 {
+    F get_cmd_id(&self) -> u32 {
         self.current_cmd_id
     }
 
     # Get low water mark (oldest relevant transaction)
-    F low_water_mark(self) -> u64 {
+    F low_water_mark(&self) -> u64 {
         self.min_active_txn
     }
 }
 
 # Isolation levels supported by VaisDB
-L IsolationLevel = ReadCommitted | SnapshotIsolation;
+E IsolationLevel {
+    ReadCommitted,
+    SnapshotIsolation,
+}
 
 # Default isolation level
-C DEFAULT_ISOLATION: IsolationLevel = IsolationLevel.SnapshotIsolation;
+C DEFAULT_ISOLATION: IsolationLevel = SnapshotIsolation

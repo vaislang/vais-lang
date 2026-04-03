@@ -3,21 +3,18 @@
 # Queue-based traversal with visited set for cycle prevention
 # Supports edge type filtering and directional traversal
 
-U std/vec.Vec;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
-U storage/txn/snapshot.{Snapshot};
-U storage/txn/clog.{Clog};
-U storage/buffer/pool.{BufferPool};
-U storage/page/allocator.{PageAllocator};
-U storage/page/freelist.{FreelistBitmap};
-U graph/types.{
-    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
-    INVALID_NODE_ID, INVALID_EDGE_ID, NULL_PAGE
-};
-U graph/node/storage.{NodeStore};
-U graph/edge/adj.{AdjacencyManager, AdjEntry};
-U graph/visibility.{is_adj_entry_visible};
+U std/vec
+U std/option
+U storage/error
+U storage/txn/snapshot
+U storage/txn/clog
+U storage/buffer/pool
+U storage/page/allocator
+U storage/page/freelist
+U graph/types
+U graph/node/storage
+U graph/edge/adj
+U graph/visibility
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=04 (traversal)
@@ -96,14 +93,14 @@ S TraversalResult {
 X TraversalResult {
     F new() -> TraversalResult {
         TraversalResult {
-            steps: Vec.new(),
+            steps: Vec.with_capacity(0),
             nodes_visited: 0,
         }
     }
 
     F add_step(mut self, step: TraversalStep) {
-        self.steps.push(step);
-        self.nodes_visited += 1;
+        self.steps.push(step)
+        self.nodes_visited += 1
     }
 }
 
@@ -128,13 +125,13 @@ X TraversalConfig {
     F is_edge_type_allowed(self, edge_type: u16) -> bool {
         M self.edge_types {
             None => true,
-            Some(ref types) => {
-                i: u64 := mut 0;
+            Some(types) => {
+                i := mut 0
                 L i < types.len() {
                     I types[i] == edge_type {
-                        R true;
+                        R true
                     }
-                    i += 1;
+                    i += 1
                 }
                 false
             }
@@ -178,40 +175,40 @@ X BfsTraversal {
         config: &TraversalConfig
     ) -> Result<TraversalResult, VaisError> {
         I start_node == INVALID_NODE_ID {
-            R Err(err_traversal_invalid_node(start_node));
+            R Err(err_traversal_invalid_node(start_node))
         }
 
         # Validate direction
         I config.direction != DIRECTION_OUTGOING &&
            config.direction != DIRECTION_INCOMING &&
            config.direction != DIRECTION_BOTH {
-            R Err(err_traversal_invalid_direction(config.direction));
+            R Err(err_traversal_invalid_direction(config.direction))
         }
 
         # Initialize result
-        result := mut TraversalResult.new();
+        result := mut TraversalResult.new()
 
         # Queue: (node_id, depth, adj_out_page, adj_in_page)
         # For simplified implementation, assume caller provides adj page IDs via node lookup
         # In production: need NodeIndex.lookup(node_id) -> Option<(page_id, slot)>
 
         # Queue: (node_id, depth)
-        queue := mut Vec.new();
-        queue.push((start_node, 0u32));
+        queue := mut Vec.with_capacity(0)
+        queue.push(TraversalEntry { node_id: start_node, depth: 0u32 })
 
         # Visited set: Vec<u64> for cycle prevention
-        visited := mut Vec.new();
-        visited.push(start_node);
+        visited := mut Vec.with_capacity(0)
+        visited.push(start_node)
 
         # Add start node to result
-        result.add_step(TraversalStep.root(start_node));
+        result.add_step(TraversalStep.root(start_node))
 
         # BFS loop
         L queue.len() > 0 {
             # Dequeue from front (shift)
-            current := mut queue.remove(0);
-            current_node := mut current.0;
-            current_depth := mut current.1;
+            current := mut queue.remove(0)
+            current_node := mut current.node_id
+            current_depth := mut current.depth
 
             # Check depth limit -- skip expansion if at max depth
             I config.max_depth == 0 || current_depth < config.max_depth {
@@ -222,7 +219,7 @@ X BfsTraversal {
                 I config.direction == DIRECTION_OUTGOING || config.direction == DIRECTION_BOTH {
                     I node.out_adj_page != NULL_PAGE {
                         out_entries := mut adj_mgr.read_all_entries(node.out_adj_page)?;
-                        self.process_edges(&out_entries, current_node, current_depth, config, &queue, &visited, &result);
+                        self.process_edges(&out_entries, current_node, current_depth, config, &queue, &visited, &result)
                     }
                 }
 
@@ -230,7 +227,7 @@ X BfsTraversal {
                 I config.direction == DIRECTION_INCOMING || config.direction == DIRECTION_BOTH {
                     I node.in_adj_page != NULL_PAGE {
                         in_entries := mut adj_mgr.read_all_entries(node.in_adj_page)?;
-                        self.process_edges(&in_entries, current_node, current_depth, config, &queue, &visited, &result);
+                        self.process_edges(&in_entries, current_node, current_depth, config, &queue, &visited, &result)
                     }
                 }
             }
@@ -241,12 +238,12 @@ X BfsTraversal {
 
     # Helper: check if node is already visited
     F is_visited(visited: &Vec<u64>, node_id: u64) -> bool {
-        i: u64 := mut 0;
+        i := mut 0
         L i < visited.len() {
             I visited[i] == node_id {
-                R true;
+                R true
             }
-            i += 1;
+            i += 1
         }
         false
     }
@@ -258,26 +255,26 @@ X BfsTraversal {
         current_node: u64,
         current_depth: u32,
         config: &TraversalConfig,
-        mut queue: &mut Vec<(u64, u32)>,
+        mut queue: &mut Vec<TraversalEntry>,
         mut visited: &mut Vec<u64>,
         mut result: &mut TraversalResult
     ) {
-        next_depth := mut current_depth + 1;
+        next_depth := mut current_depth + 1
 
-        i: u64 := mut 0;
+        i := mut 0
         L i < entries.len() {
-            entry := mut &entries[i];
+            entry := mut &entries[i]
 
             # Check MVCC visibility, edge type filter, and already-visited
             I is_adj_entry_visible(entry, &self.snapshot, self.clog)
                 && config.is_edge_type_allowed(entry.edge_type) {
-                target := mut entry.target_node;
+                target := mut entry.target_node
                 I !BfsTraversal.is_visited(visited, target) {
                     # Mark as visited
-                    visited.push(target);
+                    visited.push(target)
 
                     # Add to queue
-                    queue.push((target, next_depth));
+                    queue.push(TraversalEntry { node_id: target, depth: next_depth })
 
                     # Add to result
                     step := mut TraversalStep.from_edge(
@@ -286,12 +283,12 @@ X BfsTraversal {
                         current_node,
                         entry.edge_id,
                         entry.edge_type
-                    );
-                    result.add_step(step);
+                    )
+                    result.add_step(step)
                 }
             }
 
-            i += 1;
+            i += 1
         }
     }
 }

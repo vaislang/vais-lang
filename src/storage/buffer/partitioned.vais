@@ -2,11 +2,11 @@
 # Splits total capacity across N partitions to reduce lock contention
 # Each partition is an independent BufferPool
 
-U std/sync.{Mutex};
-U std/hashmap.{HashMap};
-U storage/error.{VaisError, err_internal};
-U storage/page/manager.{PageManager};
-U storage/buffer/pool.{BufferPool};
+U std/sync
+U std/hashmap
+U storage/error
+U storage/page/manager
+U storage/buffer/pool
 
 # Partitioned buffer pool: N independent pools to reduce contention
 S PartitionedBufferPool {
@@ -18,20 +18,20 @@ S PartitionedBufferPool {
 X PartitionedBufferPool {
     # Create a new partitioned buffer pool
     # total_capacity is divided evenly across partitions
-    F new(page_manager: PageManager, total_capacity: u32, partition_count: u32) -> PartitionedBufferPool {
+    F new(page_manager: PageManager, page_size: u32, total_capacity: u32, partition_count: u32) -> PartitionedBufferPool {
         I partition_count == 0 {
             partition_count = 4;  # Default to 4 partitions
         }
 
-        per_partition := mut total_capacity / partition_count;
+        per_partition := mut total_capacity / partition_count
         I per_partition == 0 {
-            per_partition = 1;
+            per_partition = 1
         }
 
-        partitions := mut Vec.with_capacity(partition_count as u64);
+        partitions := mut Vec.with_capacity(partition_count as u64)
         L i: 0..partition_count {
-            pool := mut BufferPool.new(page_manager.clone(), per_partition);
-            partitions.push(pool);
+            pool := mut BufferPool.new(page_manager.clone(), page_size, per_partition)
+            partitions.push(pool)
         }
 
         PartitionedBufferPool {
@@ -44,7 +44,7 @@ X PartitionedBufferPool {
     # Fetch a page into the buffer pool
     # Returns (partition_id, frame_id)
     F fetch_page(mut self, file_id: u8, page_id: u32) -> Result<(u32, u32), VaisError> {
-        partition_id := mut self.partition_for_page(file_id, page_id);
+        partition_id := mut self.partition_for_page(file_id, page_id)
         frame_id := mut self.partitions[partition_id as u64].fetch_page(file_id, page_id)?;
         Ok((partition_id, frame_id))
     }
@@ -52,9 +52,9 @@ X PartitionedBufferPool {
     # Unpin a page in a specific partition
     F unpin_page(mut self, partition_id: u32, frame_id: u32, is_dirty: bool) {
         I partition_id >= self.partition_count {
-            return;  # Invalid partition
+            R  # Invalid partition
         }
-        self.partitions[partition_id as u64].unpin_page(frame_id, is_dirty);
+        self.partitions[partition_id as u64].unpin_page(frame_id, is_dirty)
     }
 
     # Get read-only reference to page data
@@ -63,7 +63,7 @@ X PartitionedBufferPool {
     }
 
     # Get mutable reference to page data
-    F get_page_mut(mut self, partition_id: u32, frame_id: u32) -> &mut [u8] {
+    F get_page_mut(mut self, partition_id: u32, frame_id: u32) -> &Vec<u8> {
         self.partitions[partition_id as u64].get_page_mut(frame_id)
     }
 
@@ -83,40 +83,40 @@ X PartitionedBufferPool {
     # Release a page from the buffer pool
     F release_page(mut self, partition_id: u32, frame_id: u32) {
         I partition_id >= self.partition_count {
-            return;  # Invalid partition
+            R  # Invalid partition
         }
-        self.partitions[partition_id as u64].release_page(frame_id);
+        self.partitions[partition_id as u64].release_page(frame_id)
     }
 
     # Determine which partition a page belongs to
     F partition_for_page(self, file_id: u8, page_id: u32) -> u32 {
-        hash := mut hash_page_location(file_id, page_id);
+        hash := mut hash_page_location(file_id, page_id)
         hash % self.partition_count
     }
 
     # Get total capacity across all partitions
     F get_capacity(self) -> u32 {
-        total: u32 := mut 0;
+        total := mut 0
         L partition: &self.partitions {
-            total += partition.get_capacity();
+            total += partition.get_capacity()
         }
         total
     }
 
     # Get total used frames across all partitions
     F used_count(self) -> u32 {
-        total: u32 := mut 0;
+        total := mut 0
         L partition: &self.partitions {
-            total += partition.used_count();
+            total += partition.used_count()
         }
         total
     }
 
     # Get total dirty page count across all partitions
     F dirty_count(self) -> u32 {
-        total: u32 := mut 0;
+        total := mut 0
         L partition: &self.partitions {
-            total += partition.dirty_count();
+            total += partition.dirty_count()
         }
         total
     }
@@ -129,7 +129,7 @@ X PartitionedBufferPool {
     # Set FPI flag on all loaded frames (called after checkpoint)
     F set_all_needs_fpi(mut self) {
         L partition: &self.partitions {
-            partition.set_all_needs_fpi();
+            partition.set_all_needs_fpi()
         }
     }
 
@@ -140,7 +140,7 @@ X PartitionedBufferPool {
 
     # Clear FPI flag for a frame
     F clear_fpi(mut self, partition_id: u32, frame_id: u32) {
-        self.partitions[partition_id as u64].clear_fpi(frame_id);
+        self.partitions[partition_id as u64].clear_fpi(frame_id)
     }
 
     # Get partition reference (for stats collection)
@@ -152,22 +152,22 @@ X PartitionedBufferPool {
 # Hash function for page location
 # Uses FNV-1a hash for good distribution
 F hash_page_location(file_id: u8, page_id: u32) -> u32 {
-    hash: u64 := mut 14695981039346656037u64;  # FNV offset basis
-    prime: u64 := mut 1099511628211u64;        # FNV prime
+    hash := mut (1u64 << 63) + 5472609002491880229;  # FNV offset basis
+    prime := mut 1099511628211u64;        # FNV prime
 
     # Hash file_id
-    hash = hash ^ (file_id as u64);
-    hash = hash * prime;
+    hash = hash ^ (file_id as u64)
+    hash = hash * prime
 
     # Hash page_id bytes
-    hash = hash ^ ((page_id & 0xFF) as u64);
-    hash = hash * prime;
-    hash = hash ^ (((page_id >> 8) & 0xFF) as u64);
-    hash = hash * prime;
-    hash = hash ^ (((page_id >> 16) & 0xFF) as u64);
-    hash = hash * prime;
-    hash = hash ^ (((page_id >> 24) & 0xFF) as u64);
-    hash = hash * prime;
+    hash = hash ^ ((page_id & 255) as u64)
+    hash = hash * prime
+    hash = hash ^ (((page_id >> 8) & 255) as u64)
+    hash = hash * prime
+    hash = hash ^ (((page_id >> 16) & 255) as u64)
+    hash = hash * prime
+    hash = hash ^ (((page_id >> 24) & 255) as u64)
+    hash = hash * prime
 
-    (hash & 0xFFFFFFFF) as u32
+    (hash & 4294967295) as u32
 }

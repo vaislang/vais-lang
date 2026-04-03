@@ -2,17 +2,13 @@
 # Phase 9 Task 7: Slow query logging with per-engine breakdown
 # Provides: SlowQueryLogger (ring buffer + file logger), QueryProfiler
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/sync.{Mutex};
-U storage/error.{VaisError};
-U ops/types.{
-    SlowQueryEntry, QueryProfile,
-    SLOW_QUERY_SORT_DURATION, SLOW_QUERY_SORT_TIMESTAMP, SLOW_QUERY_SORT_ROWS_SCANNED,
-    err_slow_query_log_full,
-};
-U ops/config.{SlowQueryConfig};
+U std/vec
+U std/string
+U std/option
+U std/sync
+U storage/error
+U ops/types
+U ops/config
 
 # ============================================================================
 # SlowQueryLogger — Ring buffer for recent slow queries + file logging
@@ -26,20 +22,20 @@ S SlowQueryLogger {
     buffer: Vec<SlowQueryEntry>,     # Ring buffer storage
     write_pos: u64,                  # Next write position (modular)
     count: u64,                      # Total entries written (may exceed buffer size)
-    lock: Mutex,                     # Protects buffer writes
+    lock: Mutex<()>,                     # Protects buffer writes
     next_query_id: u64,              # Monotonic query ID counter
 }
 
 X SlowQueryLogger {
     ## Create a new slow query logger
     F new(config: SlowQueryConfig) -> SlowQueryLogger {
-        capacity := mut config.ring_buffer_size as u64;
+        capacity := mut config.ring_buffer_size as u64
         SlowQueryLogger {
             config,
             buffer: Vec.with_capacity(capacity),
             write_pos: 0,
             count: 0,
-            lock: Mutex.new(),
+            lock: Mutex.new(()),
             next_query_id: 1,
         }
     }
@@ -53,36 +49,36 @@ X SlowQueryLogger {
     ## Returns the assigned query_id, or None if logging is disabled
     F record(mut self, entry: SlowQueryEntry) -> Option<u64> {
         I !self.config.enabled {
-            R None;
+            R None
         }
 
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
         # Assign query ID
-        query_id := mut self.next_query_id;
-        self.next_query_id = self.next_query_id + 1;
+        query_id := mut self.next_query_id
+        self.next_query_id = self.next_query_id + 1
 
         # Truncate query text if needed
-        truncated_entry := mut entry;
-        I truncated_entry.query_text.len() as u32 > self.config.max_query_length {
+        truncated_entry := mut entry
+        I (truncated_entry.query_text.len() as u32) > self.config.max_query_length {
             truncated_entry.query_text = truncated_entry.query_text
-                .substring(0, self.config.max_query_length as u64);
+                .substring(0, self.config.max_query_length as u64)
         }
-        truncated_entry.query_id = query_id;
+        truncated_entry.query_id = query_id
 
         # Write to ring buffer
-        capacity := mut self.config.ring_buffer_size as u64;
+        capacity := mut self.config.ring_buffer_size as u64
         I self.buffer.len() < capacity {
             # Buffer not yet full, just push
-            self.buffer.push(truncated_entry);
+            self.buffer.push(truncated_entry)
         } E {
             # Buffer full, overwrite oldest entry
-            idx := mut self.write_pos % capacity;
-            self.buffer[idx] = truncated_entry;
+            idx := mut self.write_pos % capacity
+            self.buffer[idx] = truncated_entry
         }
 
-        self.write_pos = self.write_pos + 1;
-        self.count = self.count + 1;
+        self.write_pos = self.write_pos + 1
+        self.count = self.count + 1
 
         Some(query_id)
     }
@@ -90,33 +86,33 @@ X SlowQueryLogger {
     ## Get recent slow queries from the ring buffer
     ## Returns entries sorted by the specified order
     F get_recent(self, limit: u32, sort_by: u8) -> Vec<SlowQueryEntry> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
-        capacity := mut self.config.ring_buffer_size as u64;
-        result := mut Vec.new();
+        capacity := mut self.config.ring_buffer_size as u64
+        result := mut Vec.with_capacity(0)
 
         # Determine how many entries are actually stored
         stored := mut I self.buffer.len() < capacity {
             self.buffer.len()
         } E {
             capacity
-        };
+        }
 
         # Copy entries out (most recent first)
-        copied: u64 := mut 0;
-        max_copy := mut I (limit as u64) < stored { limit as u64 } E { stored };
+        copied := mut 0
+        max_copy := mut I (limit as u64) < stored { limit as u64 } E { stored }
 
         I stored > 0 {
-            read_pos := mut I self.write_pos > 0 { self.write_pos - 1 } E { 0 };
+            read_pos := mut I self.write_pos > 0 { self.write_pos - 1 } E { 0 }
             L copied < max_copy {
-                idx := mut read_pos % capacity;
-                result.push(self.buffer[idx].clone());
-                copied = copied + 1;
+                idx := mut read_pos % capacity
+                result.push(self.buffer[idx].clone())
+                copied = copied + 1
                 I read_pos == 0 {
                     # Wrapped around or reached beginning
-                    read_pos = capacity - 1;
+                    read_pos = capacity - 1
                 } E {
-                    read_pos = read_pos - 1;
+                    read_pos = read_pos - 1
                 }
             }
         }
@@ -125,14 +121,14 @@ X SlowQueryLogger {
         M sort_by {
             0 => {
                 # SLOW_QUERY_SORT_DURATION: sort by duration descending
-                sort_by_duration_desc(&mut result);
+                sort_by_duration_desc(&mut result)
             },
             1 => {
                 # SLOW_QUERY_SORT_TIMESTAMP: already in reverse chronological order
             },
             2 => {
                 # SLOW_QUERY_SORT_ROWS_SCANNED: sort by rows_scanned descending
-                sort_by_rows_scanned_desc(&mut result);
+                sort_by_rows_scanned_desc(&mut result)
             },
             _ => {},
         }
@@ -148,31 +144,31 @@ X SlowQueryLogger {
     ## Get current buffer utilization
     F buffer_utilization(self) -> f64 {
         I self.config.ring_buffer_size == 0 {
-            R 0.0;
+            R 0.0
         }
         (self.buffer.len() as f64) / (self.config.ring_buffer_size as f64)
     }
 
     ## Clear the ring buffer
     F clear(mut self) {
-        guard := mut self.lock.lock();
-        self.buffer.clear();
-        self.write_pos = 0;
+        guard := mut self.lock.lock()
+        self.buffer.clear()
+        self.write_pos = 0
     }
 
     ## Format a slow query entry as a log line (for file output)
-    F format_log_line(self, entry: &SlowQueryEntry) -> Str {
-        engines := mut "";
-        i: u64 := mut 0;
+    F format_log_line(self, entry: &SlowQueryEntry) -> str {
+        engines := mut ""
+        i := mut 0
         L i < entry.engines_used.len() {
             I i > 0 {
-                engines = "{engines},";
+                engines = "{engines},"
             }
-            engines = "{engines}{entry.engines_used[i]}";
-            i = i + 1;
+            engines = "{engines}{entry.engines_used[i]}"
+            i = i + 1
         }
 
-        hit_rate := mut entry.buffer_hit_rate();
+        hit_rate := mut entry.buffer_hit_rate()
         "[SLOW] id={entry.query_id} duration={entry.duration_ms}ms plan={entry.plan_time_ms}ms exec={entry.exec_time_ms}ms rows_scanned={entry.rows_scanned} rows_returned={entry.rows_returned} buffer_hit_rate={hit_rate:.3} lock_wait={entry.lock_wait_ms}ms memory={entry.memory_used_bytes}B engines=[{engines}] user={entry.user_name} client={entry.client_address} sql=\"{entry.query_text}\""
     }
 }
@@ -197,7 +193,7 @@ S QueryProfiler {
 
 X QueryProfiler {
     ## Create a new profiler for a query
-    F new(query_text: Str) -> QueryProfiler {
+    F new(query_text: str) -> QueryProfiler {
         QueryProfiler {
             profile: QueryProfile.new(query_text),
             is_active: false,
@@ -212,117 +208,117 @@ X QueryProfiler {
 
     ## Start profiling (record start timestamp)
     F start(mut self, current_ns: u64) {
-        self.start_time_ns = current_ns;
-        self.is_active = true;
+        self.start_time_ns = current_ns
+        self.is_active = true
     }
 
     ## Mark start of planning phase
     F start_planning(mut self, current_ns: u64) {
         # Planning start is the query start
-        self.start_time_ns = current_ns;
+        self.start_time_ns = current_ns
     }
 
     ## Mark end of planning phase, start of execution phase
     F end_planning(mut self, current_ns: u64) {
         I self.start_time_ns > 0 {
-            self.profile.plan_time_ms = (current_ns - self.start_time_ns) / 1000000;
+            self.profile.plan_time_ms = (current_ns - self.start_time_ns) / 1000000
         }
     }
 
     ## Mark start of SQL engine work
     F start_sql(mut self, current_ns: u64) {
-        self.sql_start_ns = current_ns;
+        self.sql_start_ns = current_ns
     }
 
     ## Mark end of SQL engine work
     F end_sql(mut self, current_ns: u64) {
         I self.sql_start_ns > 0 {
             self.profile.sql_time_us = self.profile.sql_time_us
-                + (current_ns - self.sql_start_ns) / 1000;
-            self.sql_start_ns = 0;
+                + (current_ns - self.sql_start_ns) / 1000
+            self.sql_start_ns = 0
         }
     }
 
     ## Mark start of vector engine work
     F start_vector(mut self, current_ns: u64) {
-        self.vector_start_ns = current_ns;
+        self.vector_start_ns = current_ns
     }
 
     ## Mark end of vector engine work
     F end_vector(mut self, current_ns: u64) {
         I self.vector_start_ns > 0 {
             self.profile.vector_time_us = self.profile.vector_time_us
-                + (current_ns - self.vector_start_ns) / 1000;
-            self.vector_start_ns = 0;
+                + (current_ns - self.vector_start_ns) / 1000
+            self.vector_start_ns = 0
         }
     }
 
     ## Mark start of graph engine work
     F start_graph(mut self, current_ns: u64) {
-        self.graph_start_ns = current_ns;
+        self.graph_start_ns = current_ns
     }
 
     ## Mark end of graph engine work
     F end_graph(mut self, current_ns: u64) {
         I self.graph_start_ns > 0 {
             self.profile.graph_time_us = self.profile.graph_time_us
-                + (current_ns - self.graph_start_ns) / 1000;
-            self.graph_start_ns = 0;
+                + (current_ns - self.graph_start_ns) / 1000
+            self.graph_start_ns = 0
         }
     }
 
     ## Mark start of full-text engine work
     F start_fulltext(mut self, current_ns: u64) {
-        self.fulltext_start_ns = current_ns;
+        self.fulltext_start_ns = current_ns
     }
 
     ## Mark end of full-text engine work
     F end_fulltext(mut self, current_ns: u64) {
         I self.fulltext_start_ns > 0 {
             self.profile.fulltext_time_us = self.profile.fulltext_time_us
-                + (current_ns - self.fulltext_start_ns) / 1000;
-            self.fulltext_start_ns = 0;
+                + (current_ns - self.fulltext_start_ns) / 1000
+            self.fulltext_start_ns = 0
         }
     }
 
     ## Mark start of score fusion work
     F start_fusion(mut self, current_ns: u64) {
-        self.fusion_start_ns = current_ns;
+        self.fusion_start_ns = current_ns
     }
 
     ## Mark end of score fusion work
     F end_fusion(mut self, current_ns: u64) {
         I self.fusion_start_ns > 0 {
             self.profile.fusion_time_us = self.profile.fusion_time_us
-                + (current_ns - self.fusion_start_ns) / 1000;
-            self.fusion_start_ns = 0;
+                + (current_ns - self.fusion_start_ns) / 1000
+            self.fusion_start_ns = 0
         }
     }
 
     ## Record I/O statistics
     F record_io(mut self, pages_read: u64, pages_written: u64, hits: u64, misses: u64) {
-        self.profile.pages_read = self.profile.pages_read + pages_read;
-        self.profile.pages_written = self.profile.pages_written + pages_written;
-        self.profile.buffer_hits = self.profile.buffer_hits + hits;
-        self.profile.buffer_misses = self.profile.buffer_misses + misses;
+        self.profile.pages_read = self.profile.pages_read + pages_read
+        self.profile.pages_written = self.profile.pages_written + pages_written
+        self.profile.buffer_hits = self.profile.buffer_hits + hits
+        self.profile.buffer_misses = self.profile.buffer_misses + misses
     }
 
     ## Record lock statistics
     F record_lock(mut self, acquisitions: u64, wait_time_us: u64) {
-        self.profile.lock_acquisitions = self.profile.lock_acquisitions + acquisitions;
-        self.profile.lock_wait_time_us = self.profile.lock_wait_time_us + wait_time_us;
+        self.profile.lock_acquisitions = self.profile.lock_acquisitions + acquisitions
+        self.profile.lock_wait_time_us = self.profile.lock_wait_time_us + wait_time_us
     }
 
     ## Finalize profiling: compute total duration
     F finish(mut self, current_ns: u64, rows_produced: u64) {
         I self.start_time_ns > 0 {
-            total_ns := mut current_ns - self.start_time_ns;
-            self.profile.total_duration_ms = total_ns / 1000000;
-            self.profile.exec_time_ms = self.profile.total_duration_ms - self.profile.plan_time_ms;
+            total_ns := mut current_ns - self.start_time_ns
+            self.profile.total_duration_ms = total_ns / 1000000
+            self.profile.exec_time_ms = self.profile.total_duration_ms - self.profile.plan_time_ms
         }
-        self.profile.rows_produced = rows_produced;
+        self.profile.rows_produced = rows_produced
         self.profile.peak_memory_bytes = 0;  # FUTURE(memory): Integrate with memory tracking subsystem
-        self.is_active = false;
+        self.is_active = false
     }
 
     ## Get the completed profile
@@ -332,32 +328,32 @@ X QueryProfiler {
 
     ## Convert profile into a SlowQueryEntry for the slow query log
     F to_slow_query_entry(self, started_at: i64) -> SlowQueryEntry {
-        entry := mut SlowQueryEntry.new(0, self.profile.query_text.clone(), started_at);
-        entry.duration_ms = self.profile.total_duration_ms;
-        entry.plan_time_ms = self.profile.plan_time_ms;
-        entry.exec_time_ms = self.profile.exec_time_ms;
-        entry.rows_returned = self.profile.rows_produced;
-        entry.buffer_hits = self.profile.buffer_hits;
-        entry.buffer_misses = self.profile.buffer_misses;
-        entry.memory_used_bytes = self.profile.peak_memory_bytes;
-        entry.lock_wait_ms = self.profile.lock_wait_time_us / 1000;
+        entry := mut SlowQueryEntry.new(0, self.profile.query_text.clone(), started_at)
+        entry.duration_ms = self.profile.total_duration_ms
+        entry.plan_time_ms = self.profile.plan_time_ms
+        entry.exec_time_ms = self.profile.exec_time_ms
+        entry.rows_returned = self.profile.rows_produced
+        entry.buffer_hits = self.profile.buffer_hits
+        entry.buffer_misses = self.profile.buffer_misses
+        entry.memory_used_bytes = self.profile.peak_memory_bytes
+        entry.lock_wait_ms = self.profile.lock_wait_time_us / 1000
 
         # Compute engine breakdown percentages
-        (sql_pct, vec_pct, graph_pct, ft_pct) := mut self.profile.engine_breakdown();
-        entry.set_engine_breakdown(sql_pct, vec_pct, graph_pct, ft_pct);
+        (sql_pct, vec_pct, graph_pct, ft_pct) := mut self.profile.engine_breakdown()
+        entry.set_engine_breakdown(sql_pct, vec_pct, graph_pct, ft_pct)
 
         # Populate engines_used list
         I self.profile.sql_time_us > 0 {
-            entry.engines_used.push("sql");
+            entry.engines_used.push("sql")
         }
         I self.profile.vector_time_us > 0 {
-            entry.engines_used.push("vector");
+            entry.engines_used.push("vector")
         }
         I self.profile.graph_time_us > 0 {
-            entry.engines_used.push("graph");
+            entry.engines_used.push("graph")
         }
         I self.profile.fulltext_time_us > 0 {
-            entry.engines_used.push("fulltext");
+            entry.engines_used.push("fulltext")
         }
 
         entry
@@ -370,34 +366,34 @@ X QueryProfiler {
 
 ## Sort entries by duration descending (slowest first)
 F sort_by_duration_desc(entries: &mut Vec<SlowQueryEntry>) {
-    len := mut entries.len();
+    len := mut entries.len()
     I len <= 1 {
-        R;
+        R
     }
-    i: u64 := mut 1;
+    i := mut 1
     L i < len {
-        j := mut i;
+        j := mut i
         L j > 0 && entries[j].duration_ms > entries[j - 1].duration_ms {
-            entries.swap(j, j - 1);
-            j = j - 1;
+            entries.swap(j, j - 1)
+            j = j - 1
         }
-        i = i + 1;
+        i = i + 1
     }
 }
 
 ## Sort entries by rows_scanned descending
 F sort_by_rows_scanned_desc(entries: &mut Vec<SlowQueryEntry>) {
-    len := mut entries.len();
+    len := mut entries.len()
     I len <= 1 {
-        R;
+        R
     }
-    i: u64 := mut 1;
+    i := mut 1
     L i < len {
-        j := mut i;
+        j := mut i
         L j > 0 && entries[j].rows_scanned > entries[j - 1].rows_scanned {
-            entries.swap(j, j - 1);
-            j = j - 1;
+            entries.swap(j, j - 1)
+            j = j - 1
         }
-        i = i + 1;
+        i = i + 1
     }
 }

@@ -1,0 +1,91 @@
+# SQL Parser — DML statements
+# Handles: INSERT, UPDATE, DELETE
+
+U storage/error
+U sql/types
+U sql/parser/token
+U sql/parser/ast
+U sql/parser/parser
+
+X Parser {
+    # Parse INSERT INTO table [(columns)] VALUES (...) | SELECT ...
+    F parse_insert(mut self) -> Result<InsertStmt, VaisError> {
+        self.expect(Into)?;
+        table_name := self.expect_identifier()?;
+
+        # Optional column list
+        columns := mut Vec.with_capacity(0)
+        I self.match_token(LParen) {
+            more_cols := mut true
+            L more_cols {
+                col := self.expect_identifier()?;
+                columns.push(col)
+                I !self.match_token(Comma) {
+                    more_cols = false
+                }
+            }
+            self.expect(RParen)?;
+        }
+
+        # VALUES (...) or SELECT ...
+        source := I self.match_token(Values) {
+            rows := mut Vec.with_capacity(0)
+            more_rows := mut true
+            L more_rows {
+                self.expect(LParen)?;
+                row := mut Vec.with_capacity(0)
+                more_vals := mut true
+                L more_vals {
+                    expr := self.parse_expr()?;
+                    row.push(expr)
+                    I !self.match_token(Comma) {
+                        more_vals = false
+                    }
+                }
+                self.expect(RParen)?;
+                rows.push(row)
+                I !self.match_token(Comma) {
+                    more_rows = false
+                }
+            }
+            Values { rows }
+        } E {
+            # INSERT ... SELECT
+            query := self.parse_select()?;
+            Query { query }
+        }
+
+        Ok(InsertStmt { table_name, columns, source })
+    }
+
+    # Parse UPDATE table SET col=val, ... [WHERE ...]
+    F parse_update(mut self) -> Result<UpdateStmt, VaisError> {
+        table_name := self.expect_identifier()?;
+        self.expect(Set)?;
+
+        assignments := mut Vec.with_capacity(0)
+        more_assigns := mut true
+        L more_assigns {
+            column := self.expect_identifier()?;
+            self.expect(Eq)?;
+            value := self.parse_expr()?;
+            assignments.push(Assignment { column, value })
+            I !self.match_token(Comma) {
+                more_assigns = false
+            }
+        }
+
+        where_clause := self.parse_where_clause()?;
+
+        Ok(UpdateStmt { table_name, assignments, where_clause })
+    }
+
+    # Parse DELETE FROM table [WHERE ...]
+    F parse_delete(mut self) -> Result<DeleteStmt, VaisError> {
+        self.expect(From)?;
+        table_name := self.expect_identifier()?;
+        where_clause := self.parse_where_clause()?;
+
+        Ok(DeleteStmt { table_name, where_clause })
+    }
+}

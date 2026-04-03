@@ -3,9 +3,9 @@
 # Based on Stage 1 Section 5 and Stage 3 Section 3
 # CRITICAL: All three visibility functions (tuple, edge, posting) use this same logic
 
-U storage/txn/snapshot.{Snapshot};
-U storage/txn/clog.{Clog, TxnStatus};
-U storage/constants.{INVALID_TXN_ID};
+U storage/txn/snapshot
+U storage/txn/clog
+U storage/constants
 
 # Unified visibility check
 # Works for tuples (MvccTupleMeta), graph edges (AdjEntry), and posting entries
@@ -14,45 +14,45 @@ F is_visible(
     txn_id_expire: u64,
     cmd_id: u32,
     expire_cmd_id: u32,
-    snapshot: &Snapshot,
+    snapshot: &TxnSnapshot,
     clog: &Clog,
 ) -> bool {
     # Fast-path: if creating txn was aborted, tuple was never committed → invisible
     I is_aborted_fast(txn_id_create, clog) {
-        R false;
+        R false
     }
 
-    created_by := mut txn_id_create;
-    expired_by := mut txn_id_expire;
+    created_by := mut txn_id_create
+    expired_by := mut txn_id_expire
 
     # If the expiring txn was aborted, treat as not expired
     expired_by_effective := mut I expired_by != INVALID_TXN_ID && !is_aborted_fast(expired_by, clog) {
         expired_by
     } E {
         INVALID_TXN_ID
-    };
+    }
 
     # Case 1: Created by current transaction — use cmd_id for same-txn visibility
     I created_by == snapshot.get_txn_id() {
         # Created by later command in same txn → invisible
         I cmd_id >= snapshot.get_cmd_id() {
-            R false;
+            R false
         }
         # Not yet expired, or expired by later command
         I expired_by_effective == INVALID_TXN_ID {
-            R true;
+            R true
         }
         # Expired by same transaction - check expire_cmd_id
         I expired_by_effective == snapshot.get_txn_id() {
             # Visible only if expiration happened in a LATER command
             # (expire_cmd_id == cmd_id means this command is doing the expiration)
-            R expire_cmd_id > snapshot.get_cmd_id();
+            R expire_cmd_id > snapshot.get_cmd_id()
         }
-        R true;
+        R true
     }
 
     # Case 2: Created by committed transaction visible to this snapshot
-    I !is_committed_before(created_by, snapshot, clog) {
+    I !txn_is_committed_before(created_by, snapshot, clog) {
         R false;  # Creator not yet committed or aborted
     }
 
@@ -62,22 +62,22 @@ F is_visible(
     }
     # Expired by current transaction - check expire_cmd_id
     I expired_by_effective == snapshot.get_txn_id() {
-        R expire_cmd_id > snapshot.get_cmd_id();
+        R expire_cmd_id > snapshot.get_cmd_id()
     }
-    I !is_committed_before(expired_by_effective, snapshot, clog) {
+    I !txn_is_committed_before(expired_by_effective, snapshot, clog) {
         R true;  # Expirer not yet committed = still visible
     }
     R false;  # Expired by committed transaction
 }
 
 # Check if a transaction was committed before the snapshot
-F is_committed_before(txn_id: u64, snapshot: &Snapshot, clog: &Clog) -> bool {
+F txn_is_committed_before(txn_id: u64, snapshot: &TxnSnapshot, clog: &Clog) -> bool {
     # Must be: txn_id < snapshot.txn_id AND txn_id NOT IN snapshot.active_txns AND committed
     I txn_id >= snapshot.get_txn_id() {
-        R false;
+        R false
     }
     I snapshot.is_active(txn_id) {
-        R false;
+        R false
     }
     clog.is_committed(txn_id)
 }
@@ -85,7 +85,7 @@ F is_committed_before(txn_id: u64, snapshot: &Snapshot, clog: &Clog) -> bool {
 # Fast-path check for aborted transactions
 F is_aborted_fast(txn_id: u64, clog: &Clog) -> bool {
     I txn_id == INVALID_TXN_ID {
-        R false;
+        R false
     }
     clog.is_aborted(txn_id)
 }
@@ -96,7 +96,7 @@ F is_tuple_visible(
     txn_id_expire: u64,
     cmd_id: u32,
     expire_cmd_id: u32,
-    snapshot: &Snapshot,
+    snapshot: &TxnSnapshot,
     clog: &Clog,
 ) -> bool {
     is_visible(txn_id_create, txn_id_expire, cmd_id, expire_cmd_id, snapshot, clog)
@@ -108,19 +108,19 @@ F is_edge_visible(
     txn_id_expire: u64,
     cmd_id: u32,
     expire_cmd_id: u32,
-    snapshot: &Snapshot,
+    snapshot: &TxnSnapshot,
     clog: &Clog,
 ) -> bool {
     is_visible(txn_id_create, txn_id_expire, cmd_id, expire_cmd_id, snapshot, clog)
 }
 
 # Convenience: check visibility for a full-text posting entry
-F is_posting_visible(
+F is_posting_visible_txn(
     txn_id_create: u64,
     txn_id_expire: u64,
     cmd_id: u32,
     expire_cmd_id: u32,
-    snapshot: &Snapshot,
+    snapshot: &TxnSnapshot,
     clog: &Clog,
 ) -> bool {
     is_visible(txn_id_create, txn_id_expire, cmd_id, expire_cmd_id, snapshot, clog)

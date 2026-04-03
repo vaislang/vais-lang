@@ -8,46 +8,37 @@
 # - VE-02-03-005: MVCC filter failed (snapshot or CLOG error)
 # - VE-02-03-006: Insufficient visible results after max retries
 
-U std/result.{Result, Ok, Err};
-U std/vec.Vec;
-# U std/string.String;  # Removed: Str is builtin
-U src/common/error.{VaisError, ErrorCategory};
-U src/vector/hnsw/types.{
-    HnswMeta,
-    HnswNode,
-    INVALID_NODE_ID,
-};
-U src/vector/hnsw/search.{
-    SearchResult,
-    SearchResultEntry,
-    NodeStore,
-    knn_search,
-};
-U src/vector/hnsw/distance.DistanceComputer;
-U src/storage/txn/snapshot.Snapshot;
-U src/storage/txn/clog.{Clog, TxnStatus};
-U src/storage/txn/visibility.{is_visible, is_committed_before, is_aborted_fast};
-U src/storage/constants.INVALID_TXN_ID;
-U src/storage/wal/record_types.HNSW_DELETE_NODE;
-U src/storage/wal/record_vector.HnswDeleteNodePayload;
+U std/result
+U std/vec
+# U std/string.String;  # Removed: str is builtin
+U storage/error
+U vector/hnsw/types
+U vector/hnsw/search
+U vector/distance
+U src/storage/txn/snapshot
+U src/storage/txn/clog
+U src/storage/txn/visibility
+U src/storage/constants
+U src/storage/wal/record_types
+U src/storage/wal/record_vector
 
 # ============================================================================
 # Error Constructors
 # ============================================================================
 
-F err_delete_failed(node_id: u64, detail: Str) -> VaisError {
+F err_delete_failed(node_id: u64, detail: str) -> VaisError {
     VaisError.new(
         ErrorCategory.Vector,
         "VE-02-03-004",
-        Str.from("Failed to delete HNSW node {node_id}: {detail}"),
+        "Failed to delete HNSW node {node_id}: {detail}",
     )
 }
 
-F err_mvcc_filter_failed(detail: Str) -> VaisError {
+F err_mvcc_filter_failed(detail: str) -> VaisError {
     VaisError.new(
         ErrorCategory.Vector,
         "VE-02-03-005",
-        Str.from("MVCC post-filter failed: {detail}"),
+        "MVCC post-filter failed: {detail}",
     )
 }
 
@@ -55,7 +46,7 @@ F err_insufficient_results(k: u64, found: u64) -> VaisError {
     VaisError.new(
         ErrorCategory.Vector,
         "VE-02-03-006",
-        Str.from("Insufficient visible results after max retries: requested {k}, found {found}"),
+        "Insufficient visible results after max retries: requested {k}, found {found}",
     )
 }
 
@@ -125,50 +116,50 @@ F hnsw_delete(
     I node_id == INVALID_NODE_ID {
         R Err(err_delete_failed(
             node_id,
-            Str.from("Invalid node ID"),
-        ));
+            "Invalid node ID",
+        ))
     }
 
-    node_res := mut store.get_node_mut(node_id);
+    node_res := mut store.get_node_mut(node_id)
     node := mut M node_res {
         Ok(n) => n,
-        Err(e) => R Err(err_delete_failed(
+        Err(e) => { R Err(err_delete_failed(
             node_id,
-            Str.from("Node not found in store"),
-        )),
-    };
+            "Node not found in store",
+        )) },
+    }
 
     # Step 2: Validate not already deleted
     I node.is_deleted {
         R Err(err_delete_failed(
             node_id,
-            Str.from("Node already deleted"),
-        ));
+            "Node already deleted",
+        ))
     }
 
     # Step 3: Mark node as deleted (soft delete)
-    node.mark_deleted(txn_id, cmd_id);
+    node.mark_deleted(txn_id, cmd_id)
 
     # Step 4: Update metadata deleted count
-    meta.delete_node();
+    meta.delete_node()
 
     # Step 5: Collect affected layers for WAL record
-    layers_affected := mut Vec.with_capacity((node.max_layer + 1) as u64);
-    layer: u8 := mut 0;
+    layers_affected := mut Vec.with_capacity((node.max_layer + 1) as u64)
+    layer := mut 0
     L layer <= node.max_layer {
-        layers_affected.push(layer);
-        layer = layer + 1;
+        layers_affected.push(layer)
+        layer = layer + 1
     }
 
     # Step 6: WAL-log the deletion
     # Note: Actual WAL write would be done by GroupCommitManager
     # Here we just prepare the payload
     wal_payload := mut HnswDeleteNodePayload {
-        node_id: node_id,
+        node_id,
         layers_affected: layers_affected.clone(),
-        file_id: file_id,
-        page_id: page_id,
-    };
+        file_id,
+        page_id,
+    }
 
     # Serialize payload for WAL (would be passed to GroupCommitManager)
     # In real implementation: group_commit_mgr.write_record(HNSW_DELETE_NODE, wal_payload)
@@ -193,17 +184,17 @@ F hnsw_delete(
 # - 50% deleted → oversample = 3.0
 F calculate_oversample_factor(meta: &HnswMeta) -> f64 {
     I meta.total_nodes == 0 {
-        R 2.0;
+        R 2.0
     }
 
-    invisible_ratio := mut (meta.total_deleted as f64) / (meta.total_nodes as f64);
+    invisible_ratio := mut (meta.total_deleted as f64) / (meta.total_nodes as f64)
 
     # Clamp invisible_ratio to prevent division by zero or overflow
     I invisible_ratio >= 0.95 {
-        invisible_ratio = 0.95;
+        invisible_ratio = 0.95
     }
 
-    adaptive_factor := mut 1.0 / (1.0 - invisible_ratio) * 1.5;
+    adaptive_factor := mut 1.0 / (1.0 - invisible_ratio) * 1.5
 
     # Return max of base oversample (2.0) and adaptive factor
     I adaptive_factor > 2.0 {
@@ -248,20 +239,20 @@ F mvcc_filtered_search(
     clog: &Clog,
 ) -> Result<SearchResult, VaisError> {
     # Calculate initial oversample factor
-    oversample := mut calculate_oversample_factor(meta);
+    oversample := mut calculate_oversample_factor(meta)
 
     # Retry loop with adaptive oversampling
-    retry := mut 0;
-    max_retries := mut 3;
+    retry := mut 0
+    max_retries := mut 3
 
     L retry < max_retries {
         # Calculate actual k and ef for this attempt
-        actual_k := mut ((k as f64) * oversample).ceil() as u64;
+        actual_k := mut ((k as f64) * oversample).ceil() as u64
         actual_ef := mut I (actual_k as u32) > ef_search {
             actual_k as u32
         } E {
             ef_search
-        };
+        }
 
         # Perform HNSW search with oversampled k
         search_result := mut knn_search(
@@ -274,14 +265,14 @@ F mvcc_filtered_search(
         )?;
 
         # Filter results by MVCC visibility
-        visible_results := mut Vec.with_capacity(k);
-        idx: u64 := mut 0;
+        visible_results := mut Vec.with_capacity(k)
+        idx := mut 0
         L idx < search_result.results.len() {
-            entry := mut &search_result.results[idx];
-            node_id := mut entry.node_id;
+            entry := mut &search_result.results[idx]
+            node_id := mut entry.node_id
 
             # Get node and check visibility
-            node_res := mut store.get_node(node_id);
+            node_res := mut store.get_node(node_id)
             M node_res {
                 Ok(node) => {
                     # Check MVCC visibility
@@ -289,33 +280,33 @@ F mvcc_filtered_search(
                         visible_results.push(SearchResultEntry.new(
                             entry.node_id,
                             entry.distance,
-                        ));
+                        ))
                     }
                 },
                 Err(_) => {},  # Skip nodes that can't be retrieved
             }
 
-            idx = idx + 1;
+            idx = idx + 1
         }
 
         # Check if we have enough visible results
         I visible_results.len() >= k {
             # Success: truncate to k and return
             I visible_results.len() > k {
-                visible_results.truncate(k);
+                visible_results.truncate(k)
             }
 
-            final_result := mut SearchResult.with_capacity(k);
-            final_result.results = visible_results;
-            final_result.nodes_visited = search_result.nodes_visited;
-            final_result.distance_computations = search_result.distance_computations;
+            final_result := mut with_capacity(k)
+            final_result.results = visible_results
+            final_result.nodes_visited = search_result.nodes_visited
+            final_result.distance_computations = search_result.distance_computations
 
-            R Ok(final_result);
+            R Ok(final_result)
         }
 
         # Insufficient results - double oversample and retry
-        oversample = oversample * 2.0;
-        retry = retry + 1;
+        oversample = oversample * 2.0
+        retry = retry + 1
     }
 
     # Max retries exhausted - return what we have (may be < k)
@@ -323,12 +314,12 @@ F mvcc_filtered_search(
     # Caller should check result.results.len() < k
 
     # Perform final search with max oversample
-    actual_k_final := mut ((k as f64) * oversample).ceil() as u64;
+    actual_k_final := mut ((k as f64) * oversample).ceil() as u64
     actual_ef_final := mut I (actual_k_final as u32) > ef_search {
         actual_k_final as u32
     } E {
         ef_search
-    };
+    }
 
     final_search := mut knn_search(
         query,
@@ -340,37 +331,37 @@ F mvcc_filtered_search(
     )?;
 
     # Final visibility filter
-    final_visible := mut Vec.with_capacity(k);
-    final_idx: u64 := mut 0;
+    final_visible := mut Vec.with_capacity(k)
+    final_idx := mut 0
     L final_idx < final_search.results.len() {
-        final_entry := mut &final_search.results[final_idx];
-        final_node_id := mut final_entry.node_id;
+        final_entry := mut &final_search.results[final_idx]
+        final_node_id := mut final_entry.node_id
 
-        final_node_res := mut store.get_node(final_node_id);
+        final_node_res := mut store.get_node(final_node_id)
         M final_node_res {
             Ok(final_node) => {
                 I is_vector_visible(final_node, snapshot, clog) {
                     final_visible.push(SearchResultEntry.new(
                         final_entry.node_id,
                         final_entry.distance,
-                    ));
+                    ))
                 }
             },
             Err(_) => {},  # Skip nodes that can't be retrieved
         }
 
-        final_idx = final_idx + 1;
+        final_idx = final_idx + 1
     }
 
     # Truncate to k if we exceeded
     I final_visible.len() > k {
-        final_visible.truncate(k);
+        final_visible.truncate(k)
     }
 
-    result := mut SearchResult.with_capacity(k);
-    result.results = final_visible;
-    result.nodes_visited = final_search.nodes_visited;
-    result.distance_computations = final_search.distance_computations;
+    result := mut with_capacity(k)
+    result.results = final_visible
+    result.nodes_visited = final_search.nodes_visited
+    result.distance_computations = final_search.distance_computations
 
     Ok(result)
 }
@@ -403,28 +394,28 @@ F is_gc_ready(
 ) -> bool {
     # Must be soft-deleted
     I !node.is_deleted {
-        R false;
+        R false
     }
 
     # txn_id_expire must be valid
     I node.txn_id_expire == INVALID_TXN_ID {
-        R false;
+        R false
     }
 
     # Check if deleting transaction was aborted (not GC-ready if aborted)
     I is_aborted_fast(node.txn_id_expire, clog) {
-        R false;
+        R false
     }
 
     # Check if deleting transaction is committed
     I !clog.is_committed(node.txn_id_expire) {
-        R false;
+        R false
     }
 
     # Check if deletion is before low water mark
     # If txn_id_expire < low_water_mark, no active txn can see this node
     I node.txn_id_expire < low_water_mark {
-        R true;
+        R true
     }
 
     false
@@ -458,23 +449,23 @@ F scan_gc_candidates(
     low_water_mark: u64,
     clog: &Clog,
 ) -> Vec<u64> {
-    ready_nodes := mut Vec.new();
+    ready_nodes := mut Vec.with_capacity(0)
 
-    idx: u64 := mut 0;
+    idx := mut 0
     L idx < node_ids.len() {
-        node_id := mut node_ids[idx];
+        node_id := mut node_ids[idx]
 
-        node_res := mut store.get_node(node_id);
+        node_res := mut store.get_node(node_id)
         M node_res {
             Ok(node) => {
                 I is_gc_ready(node, low_water_mark, clog) {
-                    ready_nodes.push(node_id);
+                    ready_nodes.push(node_id)
                 }
             },
             Err(_) => {},  # Skip nodes that can't be retrieved
         }
 
-        idx = idx + 1;
+        idx = idx + 1
     }
 
     ready_nodes
@@ -489,9 +480,9 @@ F scan_gc_candidates(
 # In real implementation, NodeStore would be extended like:
 #
 # T NodeStore {
-#     F get_node(self, node_id: u64) -> Result<&HnswNode, VaisError>;
-#     F get_node_mut(&mut self, node_id: u64) -> Result<&mut HnswNode, VaisError>;
-#     F get_vector(self, node_id: u64) -> Result<&[f32], VaisError>;
+#     F get_node(self, node_id: u64) -> Result<&HnswNode, VaisError>
+#     F get_node_mut(mut self, node_id: u64) -> Result<&mut HnswNode, VaisError>
+#     F get_vector(self, node_id: u64) -> Result<&[f32], VaisError>
 # }
 #
 # For this file to compile standalone, we assume get_node_mut exists.

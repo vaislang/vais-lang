@@ -3,80 +3,99 @@
 # Page 1 of each file is the freelist bitmap
 # Bit 0=allocated, 1=free
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{PAGE_HEADER_SIZE, PAGE_BODY_SIZE_8K, NULL_PAGE};
-U storage/error.{VaisError, err_freelist_empty, err_internal};
-U storage/page/header.{PageHeader};
-U storage/page/types.{PAGE_TYPE_FREELIST, ENGINE_TAG_COMMON};
+U storage/bytes
+U std/vec
+U storage/constants
+U storage/error
+U storage/page/header
+U storage/page/types
 
 # Calculate how many pages can be tracked by one freelist bitmap page
 F pages_per_bitmap_page(page_size: u32) -> u32 {
     (page_size - PAGE_HEADER_SIZE) * 8
 }
 
+F min_u64(a: u64, b: u64) -> u64 {
+    I a < b { a } E { b }
+}
+
 # Freelist bitmap structure
 # Holds a single page worth of bitmap data
 S FreelistBitmap {
-    data: [u8; PAGE_BODY_SIZE_8K],  # Bitmap data (8144 bytes for 8KB pages)
+    data: Vec<u8>,  # Bitmap data (8144 bytes for 8KB pages)
 }
 
 X FreelistBitmap {
     # Create a new empty freelist bitmap (all pages allocated)
     F new() -> FreelistBitmap {
+        data := mut Vec.with_capacity(PAGE_BODY_SIZE_8K as u64)
+        data.resize(PAGE_BODY_SIZE_8K as u64, 0u8)
         FreelistBitmap {
-            data: [0u8; PAGE_BODY_SIZE_8K],
+            data,
         }
     }
 
     # Create a new freelist bitmap with all pages marked as free
     F new_all_free() -> FreelistBitmap {
+        data := mut Vec.with_capacity(PAGE_BODY_SIZE_8K as u64)
+        data.resize(PAGE_BODY_SIZE_8K as u64, 255u8)
         FreelistBitmap {
-            data: [0xFFu8; PAGE_BODY_SIZE_8K],
+            data,
         }
     }
 
     # Get the state of a bit (true = free, false = allocated)
     F get_bit(self, page_id: u32, pages_per_bitmap: u32) -> bool {
-        bit_index := mut page_id % pages_per_bitmap;
-        byte_index := mut (bit_index / 8) as u64;
-        bit_offset := mut (bit_index % 8) as u8;
+        bit_index := mut page_id % pages_per_bitmap
+        byte_index := mut (bit_index / 8) as u64
+        bit_offset := mut (bit_index % 8) as u8
 
         I byte_index >= self.data.len() {
-            R false;
+            R false
         }
 
-        (self.data[byte_index] & (1 << bit_offset)) != 0
+        byte_val: u8 := mut self.data[byte_index] as u8
+        mask: u8 := mut (1 << bit_offset) as u8
+        (byte_val & mask) != 0u8
     }
 
     # Set the state of a bit (true = free, false = allocated)
     F set_bit(mut self, page_id: u32, pages_per_bitmap: u32, free: bool) {
-        bit_index := mut page_id % pages_per_bitmap;
-        byte_index := mut (bit_index / 8) as u64;
-        bit_offset := mut (bit_index % 8) as u8;
+        bit_index := mut page_id % pages_per_bitmap
+        byte_index := mut (bit_index / 8) as u64
+        bit_offset := mut (bit_index % 8) as u8
 
         I byte_index >= self.data.len() {
-            R;
+            R
         }
 
+        byte_val: u8 := mut self.data[byte_index] as u8
         I free {
             # Set bit to 1 (free)
-            self.data[byte_index] |= (1 << bit_offset);
+            mask := mut (1 << bit_offset) as u8
+            byte_val = byte_val | mask
         } E {
             # Set bit to 0 (allocated)
-            self.data[byte_index] &= !(1 << bit_offset);
+            mask := mut (1 << bit_offset) as u8
+            byte_val = byte_val & (255u8 ^ mask)
         }
+        self.data[byte_index] = byte_val
     }
 
     # Find first free page starting from hint position
     # Returns None if no free pages found
     F find_first_free(self, pages_per_bitmap: u32, start_hint: u32) -> Option<u32> {
-        start_bit := mut start_hint % pages_per_bitmap;
-        max_bits := mut pages_per_bitmap.min((self.data.len() * 8) as u32);
+        start_bit := mut start_hint % pages_per_bitmap
+        max_bits := mut I pages_per_bitmap < (self.data.len() * 8) as u32 {
+            pages_per_bitmap
+        } E {
+            (self.data.len() * 8) as u32
+        }
 
         # Scan from hint to end
         L bit: start_bit..max_bits {
             I self.get_bit(bit, pages_per_bitmap) {
-                R Some(bit);
+                R Some(bit)
             }
         }
 
@@ -84,7 +103,7 @@ X FreelistBitmap {
         I start_bit > 0 {
             L bit: 0..start_bit {
                 I self.get_bit(bit, pages_per_bitmap) {
-                    R Some(bit);
+                    R Some(bit)
                 }
             }
         }
@@ -95,18 +114,20 @@ X FreelistBitmap {
     # Find first free page using byte-level scanning for better performance
     # This is an optimized version of find_first_free
     F find_first_free_fast(self, pages_per_bitmap: u32, start_hint: u32) -> Option<u32> {
-        start_byte := mut ((start_hint % pages_per_bitmap) / 8) as u64;
-        max_bytes := mut ((pages_per_bitmap + 7) / 8) as u64.min(self.data.len());
+        start_byte := mut ((start_hint % pages_per_bitmap) / 8) as u64
+        max_bytes := mut min_u64(((pages_per_bitmap + 7) / 8) as u64, self.data.len())
 
         # Scan from hint byte to end
         L byte_idx: start_byte..max_bytes {
-            I self.data[byte_idx] != 0 {
+            byte_val: u8 := mut self.data[byte_idx] as u8
+            I byte_val != 0u8 {
                 # Found a byte with free bits, find the first free bit
                 L bit_offset: 0..8 {
-                    page_id := mut (byte_idx * 8 + bit_offset) as u32;
+                    page_id := mut (byte_idx * 8 + bit_offset) as u32
                     I page_id < pages_per_bitmap {
-                        I (self.data[byte_idx] & (1 << bit_offset)) != 0 {
-                            R Some(page_id);
+                        mask: u8 := mut (1 << bit_offset) as u8
+                        I (byte_val & mask) != 0u8 {
+                            R Some(page_id)
                         }
                     }
                 }
@@ -116,12 +137,14 @@ X FreelistBitmap {
         # Wrap around: scan from 0 to hint byte
         I start_byte > 0 {
             L byte_idx: 0..start_byte {
-                I self.data[byte_idx] != 0 {
+                byte_val: u8 := mut self.data[byte_idx] as u8
+                I byte_val != 0u8 {
                     L bit_offset: 0..8 {
-                        page_id := mut (byte_idx * 8 + bit_offset) as u32;
+                        page_id := mut (byte_idx * 8 + bit_offset) as u32
                         I page_id < pages_per_bitmap {
-                            I (self.data[byte_idx] & (1 << bit_offset)) != 0 {
-                                R Some(page_id);
+                            mask: u8 := mut (1 << bit_offset) as u8
+                            I (byte_val & mask) != 0u8 {
+                                R Some(page_id)
                             }
                         }
                     }
@@ -132,31 +155,42 @@ X FreelistBitmap {
         None
     }
 
+    # Allocate a single page from the bitmap and mark it allocated
+    F allocate(mut self, pages_per_bitmap: u32, start_hint: u32) -> Option<u32> {
+        M self.find_first_free_fast(pages_per_bitmap, start_hint) {
+            Some(page_id) => {
+                self.set_bit(page_id, pages_per_bitmap, false)
+                Some(page_id)
+            },
+            None => None,
+        }
+    }
+
+    # Deallocate a page and mark it free again
+    F deallocate(mut self, page_id: u32, pages_per_bitmap: u32) {
+        self.set_bit(page_id, pages_per_bitmap, true)
+    }
+
+    # Check whether a page is currently allocated
+    F is_allocated(self, page_id: u32, pages_per_bitmap: u32) -> bool {
+        !self.get_bit(page_id, pages_per_bitmap)
+    }
+
     # Count total number of free pages in this bitmap
     F count_free(self, pages_per_bitmap: u32) -> u32 {
-        count := mut 0u32;
-        max_bytes := mut ((pages_per_bitmap + 7) / 8) as u64.min(self.data.len());
+        count := mut 0u32
+        max_bytes := mut min_u64(((pages_per_bitmap + 7) / 8) as u64, self.data.len())
 
         L byte_idx: 0..max_bytes {
-            byte_val := mut self.data[byte_idx];
-            # Count set bits in this byte using Brian Kernighan's algorithm
-            L byte_val != 0 {
-                byte_val &= byte_val - 1;  # Clear the lowest set bit
-                count += 1;
+            byte_val: u8 := mut self.data[byte_idx] as u8
+            bit_limit: u64 := mut 8
+            I byte_idx == ((pages_per_bitmap / 8) as u64) && (pages_per_bitmap % 8) != 0 {
+                bit_limit = (pages_per_bitmap % 8) as u64
             }
-        }
-
-        # Adjust for partial last byte if pages_per_bitmap is not a multiple of 8
-        last_byte_bits := mut pages_per_bitmap % 8;
-        I last_byte_bits != 0 {
-            last_byte_idx := mut (pages_per_bitmap / 8) as u64;
-            I last_byte_idx < self.data.len() {
-                last_byte := mut self.data[last_byte_idx];
-                # Count bits beyond pages_per_bitmap that shouldn't be counted
-                L bit: last_byte_bits..8 {
-                    I (last_byte & (1 << bit)) != 0 {
-                        count -= 1;
-                    }
+            L bit: 0..bit_limit {
+                mask: u8 := mut (1 << bit) as u8
+                I (byte_val & mask) != 0u8 {
+                    count += 1
                 }
             }
         }
@@ -164,24 +198,32 @@ X FreelistBitmap {
         count
     }
 
+    F free_count(self, pages_per_bitmap: u32) -> u32 {
+        self.count_free(pages_per_bitmap)
+    }
+
     # Allocate N contiguous or near-contiguous pages
     # Returns Vec of allocated page IDs (may be fewer than requested if not enough free)
     # Best effort: tries to find contiguous blocks, falls back to scattered allocation
     F allocate_bulk(mut self, pages_per_bitmap: u32, count: u32) -> Vec<u32> {
-        allocated := mut Vec.new();
-        search_start := mut 0u32;
+        allocated := mut Vec.with_capacity(0)
+        search_start := mut 0u32
 
-        has_free := mut true;
-        L allocated.len() < (count as u64) && has_free {
-            M self.find_first_free_fast(pages_per_bitmap, search_start) {
-                Some(page_id) => {
-                    self.set_bit(page_id, pages_per_bitmap, false);
-                    allocated.push(page_id);
-                    search_start = page_id + 1;
-                }
-                None => {
-                    # No more free pages
-                    has_free = false;
+        has_free := mut true
+        L has_free {
+            I allocated.len() >= (count as u64) {
+                has_free = false
+            } E {
+                M self.find_first_free_fast(pages_per_bitmap, search_start) {
+                    Some(page_id) => {
+                        self.set_bit(page_id, pages_per_bitmap, false)
+                        allocated.push(page_id)
+                        search_start = page_id + 1
+                    },
+                    None => {
+                        # No more free pages
+                        has_free = false
+                    },
                 }
             }
         }
@@ -191,17 +233,18 @@ X FreelistBitmap {
 
     # Serialize bitmap to byte buffer (writes bitmap data only, not page header)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_bytes(&self.data);
+        write_raw_bytes(buf, &self.data[0..self.data.len()])
     }
 
     # Deserialize bitmap from byte buffer
     F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<FreelistBitmap, VaisError> {
-        body_size := mut (page_size - PAGE_HEADER_SIZE) as u64;
-        data := mut buf.get_bytes(body_size)?;
+        body_size := mut (page_size - PAGE_HEADER_SIZE) as u64
+        data := mut read_exact_bytes(buf, body_size)?;
 
-        bitmap := mut FreelistBitmap.new();
-        L i: 0..body_size.min(bitmap.data.len()) {
-            bitmap.data[i] = data[i];
+        bitmap := mut FreelistBitmap.new()
+        copy_len := mut min_u64(body_size, bitmap.data.len())
+        L i: 0..copy_len {
+            bitmap.data[i] = data[i]
         }
 
         Ok(bitmap)
@@ -209,22 +252,29 @@ X FreelistBitmap {
 
     # Write bitmap to a full page buffer (including page header)
     F write_to_page(self, page_data: &mut [u8], page_id: u32, page_lsn: u64, txn_id: u64) {
+        page_len := mut page_data.len()
+
         # Write page header
-        header := mut PageHeader.new(page_id, PAGE_TYPE_FREELIST, ENGINE_TAG_COMMON);
-        header.page_lsn = page_lsn;
-        header.txn_id = txn_id;
-        header.free_space_offset = (PAGE_HEADER_SIZE + (self.data.len() as u32)) as u16;
-        header.item_count = 0;
+        header := mut PageHeader.new(page_id, PAGE_TYPE_FREELIST, ENGINE_TAG_COMMON)
+        header.page_lsn = page_lsn
+        header.txn_id = txn_id
+        header.free_space_offset = (PAGE_HEADER_SIZE + (self.data.len() as u32)) as u16
+        header.item_count = 0
 
-        header.write_to_page(page_data);
+        buf := mut ByteBuffer.with_capacity(page_len)
+        header.serialize(&buf)
+        self.serialize(&buf)
 
-        # Write bitmap data after header
-        L i: 0..self.data.len() {
-            page_data[PAGE_HEADER_SIZE as u64 + i] = self.data[i];
+        page_bytes := mut buf.to_vec()
+        I page_bytes.len() < page_len {
+            page_bytes.resize(page_len, 0u8)
         }
 
-        # Update checksum
-        PageHeader.update_checksum(page_data);
+        PageHeader.update_checksum(&page_bytes)
+
+        L i: 0..page_len {
+            page_data[i] = page_bytes[i]
+        }
     }
 
     # Read bitmap from a full page buffer
@@ -233,14 +283,15 @@ X FreelistBitmap {
 
         # Verify this is a freelist page
         I header.page_type != PAGE_TYPE_FREELIST {
-            R Err(err_internal("Expected FREELIST page type"));
+            R Err(err_internal("Expected FREELIST page type"))
         }
 
-        bitmap := mut FreelistBitmap.new();
-        body_size := mut (page_size - PAGE_HEADER_SIZE) as u64;
+        bitmap := mut FreelistBitmap.new()
+        body_size := mut (page_size - PAGE_HEADER_SIZE) as u64
 
-        L i: 0..body_size.min(bitmap.data.len()) {
-            bitmap.data[i] = page_data[PAGE_HEADER_SIZE as u64 + i];
+        copy_len := mut min_u64(body_size, bitmap.data.len())
+        L i: 0..copy_len {
+            bitmap.data[i] = page_data[PAGE_HEADER_SIZE as u64 + i]
         }
 
         Ok(bitmap)

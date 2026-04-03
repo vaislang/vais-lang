@@ -3,12 +3,12 @@
 # Avoids top-down insert overhead by building bottom-up
 # Used for CREATE INDEX, COPY, and initial data load
 
-U storage/constants.{NULL_PAGE, PAGE_HEADER_SIZE};
-U storage/error.{VaisError, err_internal};
-U storage/buffer/pool.{BufferPool};
-U storage/btree/tree.{BTree};
-U storage/btree/node.{BTreeInternalNode, BTreeLeafNode};
-U storage/btree/entry.{BTreeLeafEntry, BTreeInternalEntry};
+U storage/constants
+U storage/error
+U storage/buffer/pool
+U storage/btree/tree
+U storage/btree/node
+U storage/btree/entry
 
 # Bulk load entry: pre-sorted (key, tid) pair
 S BulkLoadEntry {
@@ -32,15 +32,15 @@ F bulk_load(
     fill_factor: f64,    # 0.0-1.0, typically 0.9 for bulk load
     pool: &mut BufferPool,
 ) -> Result<BTree, VaisError> {
-    I entries.is_empty() {
+    I entries.len() == 0 {
         # Create empty tree with single leaf root
         root_page := mut pool.allocate_page(file_id)?;
         root_frame := mut pool.fetch_page(file_id, root_page)?;
-        leaf := mut BTreeLeafNode.new(root_page, page_size, true);
-        flushed := mut leaf.flush();
+        leaf := mut BTreeLeafNode.new(root_page, page_size, true)
+        flushed := mut leaf.flush()
         pool.write_page(root_frame, flushed)?;
-        pool.unpin_page(root_frame, true);
-        R Ok(BTree.new(root_page, file_id, page_size));
+        pool.unpin_page(root_frame, true)
+        R Ok(BTree.new(root_page, file_id, page_size))
     }
 
     # Phase 1: Build leaf level (bottom-up)
@@ -48,25 +48,25 @@ F bulk_load(
 
     I leaf_pages.len() == 1 {
         # Only one leaf page needed — it's the root
-        tree := mut BTree.new(leaf_pages[0].page_id, file_id, page_size);
-        tree.entry_count = entries.len() as u64;
-        R Ok(tree);
+        tree := mut BTree.new(leaf_pages[0].page_id, file_id, page_size)
+        tree.entry_count = entries.len() as u64
+        R Ok(tree)
     }
 
     # Phase 2: Build internal levels from leaf separators
-    current_level := mut leaf_pages;
-    height: u32 := mut 1;
+    current_level := mut leaf_pages
+    height := mut 1
 
     L current_level.len() > 1 {
         current_level = build_internal_level(&current_level, file_id, page_size, fill_factor, pool)?;
-        height += 1;
+        height += 1
     }
 
     # The last remaining page is the root
-    root_page_id := mut current_level[0].page_id;
-    tree := mut BTree.new(root_page_id, file_id, page_size);
-    tree.height = height;
-    tree.entry_count = entries.len() as u64;
+    root_page_id := mut current_level[0].page_id
+    tree := mut BTree.new(root_page_id, file_id, page_size)
+    tree.height = height
+    tree.entry_count = entries.len() as u64
 
     Ok(tree)
 }
@@ -85,15 +85,15 @@ F build_leaf_level(
     fill_factor: f64,
     pool: &mut BufferPool,
 ) -> Result<Vec<PageInfo>, VaisError> {
-    pages := mut Vec.new();
+    pages := mut Vec.with_capacity(0)
     current_page := mut pool.allocate_page(file_id)?;
     current_frame := mut pool.fetch_page(file_id, current_page)?;
-    leaf := mut BTreeLeafNode.new(current_page, page_size, false);
-    first_key := mut entries[0].key.clone();
-    prev_page_id := mut NULL_PAGE;
+    leaf := mut BTreeLeafNode.new(current_page, page_size, false)
+    first_key := mut entries[0].key.clone()
+    prev_page_id := mut NULL_PAGE
 
-    body_size := mut page_size - PAGE_HEADER_SIZE;
-    target_fill := mut (body_size as f64 * fill_factor) as u32;
+    body_size := mut page_size - PAGE_HEADER_SIZE
+    target_fill := mut (body_size as f64 * fill_factor) as u32
 
     L entry: entries {
         entry_size := mut 8 + entry.key.len() as u32;  # 8B dir + key data
@@ -103,34 +103,34 @@ F build_leaf_level(
         I used + entry_size > target_fill && leaf.entry_count() > 0 {
             # Finalize current leaf
             I prev_page_id != NULL_PAGE {
-                leaf.set_prev_leaf(prev_page_id);
+                leaf.set_prev_leaf(prev_page_id)
             }
 
-            flushed := mut leaf.flush();
+            flushed := mut leaf.flush()
             pool.write_page(current_frame, flushed)?;
-            pool.unpin_page(current_frame, true);
+            pool.unpin_page(current_frame, true)
 
             pages.push(PageInfo {
                 page_id: current_page,
                 first_key: first_key.clone(),
-            });
+            })
 
             # Start new leaf
-            prev_page_id = current_page;
+            prev_page_id = current_page
             current_page = pool.allocate_page(file_id)?;
             current_frame = pool.fetch_page(file_id, current_page)?;
-            leaf = BTreeLeafNode.new(current_page, page_size, false);
-            leaf.set_prev_leaf(prev_page_id);
-            first_key = entry.key.clone();
+            leaf = BTreeLeafNode.new(current_page, page_size, false)
+            leaf.set_prev_leaf(prev_page_id)
+            first_key = entry.key.clone()
 
             # Update previous leaf's next pointer
             prev_frame := mut pool.fetch_page(file_id, prev_page_id)?;
-            prev_data := mut pool.get_page(prev_frame);
+            prev_data := mut pool.get_page(prev_frame)
             prev_leaf := mut BTreeLeafNode.from_page_data(prev_data, page_size)?;
-            prev_leaf.set_next_leaf(current_page);
-            prev_flushed := mut prev_leaf.flush();
+            prev_leaf.set_next_leaf(current_page)
+            prev_flushed := mut prev_leaf.flush()
             pool.write_page(prev_frame, prev_flushed)?;
-            pool.unpin_page(prev_frame, true);
+            pool.unpin_page(prev_frame, true)
         }
 
         leaf.insert(&entry.key, entry.tid)?;
@@ -138,16 +138,16 @@ F build_leaf_level(
 
     # Finalize last leaf
     I prev_page_id != NULL_PAGE {
-        leaf.set_prev_leaf(prev_page_id);
+        leaf.set_prev_leaf(prev_page_id)
     }
-    flushed := mut leaf.flush();
+    flushed := mut leaf.flush()
     pool.write_page(current_frame, flushed)?;
-    pool.unpin_page(current_frame, true);
+    pool.unpin_page(current_frame, true)
 
     pages.push(PageInfo {
         page_id: current_page,
         first_key,
-    });
+    })
 
     Ok(pages)
 }
@@ -160,53 +160,53 @@ F build_internal_level(
     fill_factor: f64,
     pool: &mut BufferPool,
 ) -> Result<Vec<PageInfo>, VaisError> {
-    pages := mut Vec.new();
+    pages := mut Vec.with_capacity(0)
     current_page := mut pool.allocate_page(file_id)?;
     current_frame := mut pool.fetch_page(file_id, current_page)?;
-    internal := mut BTreeInternalNode.new(current_page, page_size, false);
+    internal := mut BTreeInternalNode.new(current_page, page_size, false)
 
     # First child becomes leftmost_child
-    internal.set_leftmost_child(children[0].page_id);
-    first_key := mut children[0].first_key.clone();
+    internal.set_leftmost_child(children[0].page_id)
+    first_key := mut children[0].first_key.clone()
 
     body_size := mut page_size - PAGE_HEADER_SIZE - 4;  # -4 for leftmost_child
-    target_fill := mut (body_size as f64 * fill_factor) as u32;
+    target_fill := mut (body_size as f64 * fill_factor) as u32
 
     L i: 1..children.len() {
-        entry_size := mut 8 + children[i].first_key.len() as u32;
+        entry_size := mut 8 + children[i].first_key.len() as u32
 
-        used := mut internal.entry_count() as u32 * 8;
+        used := mut internal.entry_count() as u32 * 8
         I used + entry_size > target_fill && internal.entry_count() > 0 {
             # Finalize current internal node
-            flushed := mut internal.flush();
+            flushed := mut internal.flush()
             pool.write_page(current_frame, flushed)?;
-            pool.unpin_page(current_frame, true);
+            pool.unpin_page(current_frame, true)
 
             pages.push(PageInfo {
                 page_id: current_page,
                 first_key: first_key.clone(),
-            });
+            })
 
             # Start new internal node
             current_page = pool.allocate_page(file_id)?;
             current_frame = pool.fetch_page(file_id, current_page)?;
-            internal = BTreeInternalNode.new(current_page, page_size, false);
-            internal.set_leftmost_child(children[i].page_id);
-            first_key = children[i].first_key.clone();
+            internal = BTreeInternalNode.new(current_page, page_size, false)
+            internal.set_leftmost_child(children[i].page_id)
+            first_key = children[i].first_key.clone()
         } E {
             internal.insert_entry(&children[i].first_key, children[i].page_id)?;
         }
     }
 
     # Finalize last internal node
-    flushed := mut internal.flush();
+    flushed := mut internal.flush()
     pool.write_page(current_frame, flushed)?;
-    pool.unpin_page(current_frame, true);
+    pool.unpin_page(current_frame, true)
 
     pages.push(PageInfo {
         page_id: current_page,
         first_key,
-    });
+    })
 
     Ok(pages)
 }

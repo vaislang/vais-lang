@@ -1,0 +1,651 @@
+# SQL Parser — Security DDL statements (Phase 10)
+# Handles: CREATE/ALTER/DROP USER, CREATE/DROP ROLE,
+#          GRANT, REVOKE, CREATE/DROP POLICY
+
+U storage/error
+U sql/parser/token
+U sql/parser/ast
+U sql/parser/parser
+
+X Parser {
+    # Parse CREATE USER username [WITH] PASSWORD 'password' [options...]
+    # Options: SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN
+    #          CONNECTION LIMIT n | IN ROLE role1, role2, ...
+    F parse_create_user(mut self) -> Result<CreateUserStmt, VaisError> {
+        username := self.expect_identifier()?;
+
+        # Optional WITH keyword
+        I self.check(With) {
+            self.advance()
+        }
+
+        # PASSWORD 'password' is required
+        self.expect(Password_Kw)?;
+        password := self.expect_string_literal()?;
+
+        stmt := mut CreateUserStmt.new(username, password)
+
+        # Parse optional user options
+        more_opts := mut true
+        L more_opts {
+            I self.check_identifier("SUPERUSER") {
+                self.advance()
+                stmt.is_superuser = Option.Some(true)
+            } E I self.check_identifier("NOSUPERUSER") {
+                self.advance()
+                stmt.is_superuser = Option.Some(false)
+            } E I self.match_token(Login_Kw) {
+                stmt.can_login = Option.Some(true)
+            } E I self.check_identifier("NOLOGIN") {
+                self.advance()
+                stmt.can_login = Option.Some(false)
+            } E I self.match_token(Connection_Kw) {
+                self.expect(Limit)?;
+                limit_val := self.expect_int_literal()?;
+                stmt.connection_limit = Option.Some(limit_val)
+            } E I self.match_token(In) {
+                self.expect(Role_Kw)?;
+                # Parse comma-separated role names
+                more_roles := mut true
+                L more_roles {
+                    role := self.expect_identifier()?;
+                    stmt.in_roles.push(role)
+                    I !self.match_token(Comma) {
+                        more_roles = false
+                    }
+                }
+            } E {
+                more_opts = false
+            }
+        }
+
+        Ok(stmt)
+    }
+
+    # Parse ALTER USER username [SET PASSWORD 'pw'] [RENAME TO name] [options...]
+    F parse_alter_user(mut self) -> Result<AlterUserStmt, VaisError> {
+        username := self.expect_identifier()?;
+        stmt := mut AlterUserStmt.new(username)
+
+        # Parse one or more options
+        more_opts := mut true
+        L more_opts {
+            I self.match_token(Set) {
+                # SET PASSWORD 'new_password'
+                self.expect(Password_Kw)?;
+                pw := self.expect_string_literal()?;
+                stmt.password = Option.Some(pw)
+            } E I self.match_token(Rename) {
+                # RENAME TO new_name
+                I !self.check_identifier("TO") {
+                    R Err(self.parse_error("expected TO after RENAME"))
+                }
+                self.advance()
+                new_name := self.expect_identifier()?;
+                stmt.rename_to = Option.Some(new_name)
+            } E I self.check_identifier("SUPERUSER") {
+                self.advance()
+                stmt.is_superuser = Option.Some(true)
+            } E I self.check_identifier("NOSUPERUSER") {
+                self.advance()
+                stmt.is_superuser = Option.Some(false)
+            } E I self.match_token(Login_Kw) {
+                stmt.can_login = Option.Some(true)
+            } E I self.check_identifier("NOLOGIN") {
+                self.advance()
+                stmt.can_login = Option.Some(false)
+            } E I self.check_identifier("LOCK") {
+                self.advance()
+                stmt.is_locked = Option.Some(true)
+            } E I self.check_identifier("UNLOCK") {
+                self.advance()
+                stmt.is_locked = Option.Some(false)
+            } E I self.match_token(Connection_Kw) {
+                self.expect(Limit)?;
+                limit_val := self.expect_int_literal()?;
+                stmt.connection_limit = Option.Some(limit_val)
+            } E {
+                more_opts = false
+            }
+        }
+
+        Ok(stmt)
+    }
+
+    # Parse DROP USER [IF EXISTS] username [CASCADE]
+    F parse_drop_user(mut self) -> Result<Statement, VaisError> {
+        if_exists := mut false
+        I self.check_identifier("IF") {
+            self.advance()
+            I self.check_identifier("EXISTS") {
+                self.advance()
+            } E {
+                R Err(self.parse_error("expected EXISTS after IF"))
+            }
+            if_exists = true
+        }
+
+        name := self.expect_identifier()?;
+
+        cascade := mut false
+        I self.check_identifier("CASCADE") {
+            self.advance()
+            cascade = true
+        }
+
+        Ok(DropUser { name, if_exists, cascade })
+    }
+
+    # Parse CREATE ROLE role_name [IN ROLE parent1, parent2, ...]
+    F parse_create_role(mut self) -> Result<CreateRoleStmt, VaisError> {
+        role_name := self.expect_identifier()?;
+        stmt := mut CreateRoleStmt.new(role_name)
+
+        # Optional IN ROLE parent roles
+        I self.match_token(In) {
+            self.expect(Role_Kw)?;
+            more_roles := mut true
+            L more_roles {
+                parent := self.expect_identifier()?;
+                stmt.in_roles.push(parent)
+                I !self.match_token(Comma) {
+                    more_roles = false
+                }
+            }
+        }
+
+        Ok(stmt)
+    }
+
+    # Parse DROP ROLE [IF EXISTS] role_name [CASCADE]
+    F parse_drop_role(mut self) -> Result<Statement, VaisError> {
+        if_exists := mut false
+        I self.check_identifier("IF") {
+            self.advance()
+            I self.check_identifier("EXISTS") {
+                self.advance()
+            } E {
+                R Err(self.parse_error("expected EXISTS after IF"))
+            }
+            if_exists = true
+        }
+
+        name := self.expect_identifier()?;
+
+        cascade := mut false
+        I self.check_identifier("CASCADE") {
+            self.advance()
+            cascade = true
+        }
+
+        Ok(DropRole { name, if_exists, cascade })
+    }
+
+    # Parse GRANT statement:
+    #   GRANT ROLE role_name TO grantee
+    #   GRANT priv1, priv2, ... ON [TABLE|DATABASE|SCHEMA] object TO grantee [WITH GRANT OPTION]
+    F parse_grant(mut self) -> Result<Statement, VaisError> {
+        # Check for GRANT ROLE role_name TO user_or_role
+        I self.check(Role_Kw) {
+            self.advance()
+            role_name := self.expect_identifier()?;
+            # Expect TO (identifier, not a keyword)
+            I !self.check_identifier("TO") {
+                R Err(self.parse_error("expected TO after role name in GRANT ROLE"))
+            }
+            self.advance()
+            grantee := self.expect_identifier()?;
+            R Ok(Grant {
+                grant: GrantStmt {
+                    grant_type: RoleMembership { role_name, grantee },
+                },
+            })
+        }
+
+        # Parse privilege list
+        privileges := self.parse_privilege_list()?;
+
+        # Expect ON [TABLE|DATABASE|SCHEMA] object_name
+        self.expect(On)?;
+        (object_type, object_name) := self.parse_grant_object()?;
+
+        # Expect TO grantee
+        I !self.check_identifier("TO") {
+            R Err(self.parse_error("expected TO after object name in GRANT"))
+        }
+        self.advance()
+        grantee := self.expect_identifier()?;
+
+        # Optional WITH GRANT OPTION
+        with_grant_option := mut false
+        I self.check(With) {
+            self.advance()
+            I !self.check(Grant_Kw) {
+                R Err(self.parse_error("expected GRANT after WITH"))
+            }
+            self.advance()
+            I !self.check_identifier("OPTION") {
+                R Err(self.parse_error("expected OPTION after GRANT"))
+            }
+            self.advance()
+            with_grant_option = true
+        }
+
+        Ok(Grant {
+            grant: GrantStmt {
+                grant_type: Privileges {
+                    privileges,
+                    object_type,
+                    object_name,
+                    grantee,
+                    with_grant_option,
+                },
+            },
+        })
+    }
+
+    # Parse REVOKE statement:
+    #   REVOKE ROLE role_name FROM grantee
+    #   REVOKE priv1, priv2, ... ON [TABLE|DATABASE|SCHEMA] object FROM grantee [CASCADE]
+    F parse_revoke(mut self) -> Result<Statement, VaisError> {
+        # Check for REVOKE ROLE role_name FROM user_or_role
+        I self.check(Role_Kw) {
+            self.advance()
+            role_name := self.expect_identifier()?;
+            self.expect(From)?;
+            grantee := self.expect_identifier()?;
+            R Ok(Revoke {
+                revoke: RevokeStmt {
+                    revoke_type: RoleMembership { role_name, grantee },
+                },
+            })
+        }
+
+        # Parse privilege list
+        privileges := self.parse_privilege_list()?;
+
+        # Expect ON [TABLE|DATABASE|SCHEMA] object_name
+        self.expect(On)?;
+        (object_type, object_name) := self.parse_grant_object()?;
+
+        # Expect FROM grantee
+        self.expect(From)?;
+        grantee := self.expect_identifier()?;
+
+        # Optional CASCADE
+        cascade := mut false
+        I self.check_identifier("CASCADE") {
+            self.advance()
+            cascade = true
+        }
+
+        Ok(Revoke {
+            revoke: RevokeStmt {
+                revoke_type: Privileges {
+                    privileges,
+                    object_type,
+                    object_name,
+                    grantee,
+                    cascade,
+                },
+            },
+        })
+    }
+
+    # Parse a comma-separated list of privilege names:
+    # ALL [PRIVILEGES] | SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
+    F parse_privilege_list(mut self) -> Result<Vec<PrivilegeKind>, VaisError> {
+        privs := mut Vec.with_capacity(0)
+
+        # Check for ALL [PRIVILEGES]
+        I self.match_token(All) {
+            # Optional PRIVILEGES keyword (identifier)
+            I self.check_identifier("PRIVILEGES") {
+                self.advance()
+            }
+            privs.push(All)
+            R Ok(privs)
+        }
+
+        # Parse individual privilege keywords
+        more_privs := mut true
+        L more_privs {
+            priv := M self.peek() {
+                Select => {
+                    self.advance()
+                    Select
+                },
+                Insert => {
+                    self.advance()
+                    Insert
+                },
+                Update => {
+                    self.advance()
+                    Update
+                },
+                Delete => {
+                    self.advance()
+                    Delete
+                },
+                Create => {
+                    self.advance()
+                    Create
+                },
+                Drop => {
+                    self.advance()
+                    Drop
+                },
+                Alter => {
+                    self.advance()
+                    Alter
+                },
+                _ => {
+                    R Err(self.parse_error("expected privilege name (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or ALL)"))
+                },
+            }
+            privs.push(priv)
+            I !self.match_token(Comma) {
+                more_privs = false
+            }
+        }
+
+        Ok(privs)
+    }
+
+    # Parse the object reference in GRANT/REVOKE: [TABLE|DATABASE|SCHEMA] name
+    F parse_grant_object(mut self) -> Result<(ObjectKind, str), VaisError> {
+        obj_type := mut Table;  # Default is TABLE
+
+        M self.peek() {
+            Table => {
+                self.advance()
+                obj_type = Table
+            },
+            _ => {
+                I self.check_identifier("DATABASE") {
+                    self.advance()
+                    obj_type = Database
+                } E I self.check_identifier("SCHEMA") {
+                    self.advance()
+                    obj_type = Schema
+                }
+                # If none matched, default to Table and next token is the name
+            },
+        }
+
+        obj_name := self.expect_identifier()?;
+        Ok((obj_type, obj_name))
+    }
+
+    # Parse CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE]
+    #   [FOR {ALL|SELECT|INSERT|UPDATE|DELETE}] [TO role]
+    #   USING (expr) [WITH CHECK (expr)]
+    F parse_create_policy(mut self) -> Result<CreatePolicyStmt, VaisError> {
+        policy_name := self.expect_identifier()?;
+        self.expect(On)?;
+        table_name := self.expect_identifier()?;
+
+        stmt := mut CreatePolicyStmt.new(policy_name, table_name)
+
+        # Optional AS PERMISSIVE | RESTRICTIVE
+        I self.match_token(As) {
+            I self.check_identifier("PERMISSIVE") {
+                self.advance()
+                stmt.policy_type = Permissive
+            } E I self.check_identifier("RESTRICTIVE") {
+                self.advance()
+                stmt.policy_type = Restrictive
+            } E {
+                R Err(self.parse_error("expected PERMISSIVE or RESTRICTIVE after AS"))
+            }
+        }
+
+        # Optional FOR {ALL|SELECT|INSERT|UPDATE|DELETE}
+        I self.check_identifier("FOR") {
+            self.advance()
+            cmd := M self.peek() {
+                All => {
+                    self.advance()
+                    All
+                },
+                Select => {
+                    self.advance()
+                    Select
+                },
+                Insert => {
+                    self.advance()
+                    Insert
+                },
+                Update => {
+                    self.advance()
+                    Update
+                },
+                Delete => {
+                    self.advance()
+                    Delete
+                },
+                _ => {
+                    R Err(self.parse_error("expected ALL, SELECT, INSERT, UPDATE, or DELETE after FOR"))
+                },
+            }
+            stmt.cmd_scope = cmd
+        }
+
+        # Optional TO role
+        I self.check_identifier("TO") {
+            self.advance()
+            role := self.expect_identifier()?;
+            stmt.role_name = Option.Some(role)
+        }
+
+        # USING (expr) — read as raw SQL string between parentheses
+        I self.check_identifier("USING") {
+            self.advance()
+            using_str := self.read_paren_content()?;
+            stmt.using_expr = Option.Some(using_str)
+        }
+
+        # Optional WITH CHECK (expr)
+        I self.check(With) {
+            self.advance()
+            self.expect(Check)?;
+            check_str := self.read_paren_content()?;
+            stmt.check_expr = Option.Some(check_str)
+        }
+
+        Ok(stmt)
+    }
+
+    # Parse DROP POLICY [IF EXISTS] name ON table
+    F parse_drop_policy(mut self) -> Result<Statement, VaisError> {
+        if_exists := mut false
+        I self.check_identifier("IF") {
+            self.advance()
+            I self.check_identifier("EXISTS") {
+                self.advance()
+            } E {
+                R Err(self.parse_error("expected EXISTS after IF"))
+            }
+            if_exists = true
+        }
+
+        name := self.expect_identifier()?;
+        self.expect(On)?;
+        table_name := self.expect_identifier()?;
+
+        Ok(DropPolicy { name, table_name, if_exists })
+    }
+
+    # Helper: read raw content between parentheses, tracking nested parens.
+    # Used for USING (expr) and WITH CHECK (expr) in CREATE POLICY.
+    # Returns the raw SQL text between the outer parens (exclusive).
+    F read_paren_content(mut self) -> Result<str, VaisError> {
+        self.expect(LParen)?;
+
+        depth := mut 1
+        start_pos := mut self.pos
+
+        L depth > 0 {
+            I self.is_at_end() {
+                R Err(self.parse_error("unterminated parenthesized expression"))
+            }
+            M self.peek() {
+                LParen => {
+                    depth = depth + 1
+                    self.advance()
+                },
+                RParen => {
+                    depth = depth - 1
+                    I depth > 0 {
+                        self.advance()
+                    }
+                    # When depth == 0, we don't advance yet; we do so below.
+                },
+                _ => {
+                    self.advance()
+                },
+            }
+        }
+
+        # Build the raw content string from the tokens between start_pos and current pos
+        parts := mut Vec.with_capacity(0)
+        i := mut start_pos
+        L i < self.pos {
+            tok := &self.tokens[i]
+            part := self.token_to_string(tok)
+            parts.push(part)
+            i = i + 1
+        }
+
+        # Consume the closing RParen
+        self.expect(RParen)?;
+
+        Ok(parts.join(" "))
+    }
+
+    # Helper: convert a token back to its approximate SQL string representation
+    F token_to_string(self, tok: &Token) -> str {
+        M tok.kind {
+            Select => "SELECT",
+            Insert => "INSERT",
+            Into => "INTO",
+            Update => "UPDATE",
+            Delete => "DELETE",
+            From => "FROM",
+            Where => "WHERE",
+            Set => "SET",
+            Create => "CREATE",
+            Drop => "DROP",
+            Alter => "ALTER",
+            Table => "TABLE",
+            Index => "INDEX",
+            Column => "COLUMN",
+            Add => "ADD",
+            Rename => "RENAME",
+            Values => "VALUES",
+            And => "AND",
+            Or => "OR",
+            Not => "NOT",
+            Null => "NULL",
+            Is => "IS",
+            In => "IN",
+            Between => "BETWEEN",
+            Like => "LIKE",
+            Exists => "EXISTS",
+            Join => "JOIN",
+            Inner => "INNER",
+            Left => "LEFT",
+            Right => "RIGHT",
+            Cross => "CROSS",
+            On => "ON",
+            Using => "USING",
+            As => "AS",
+            Order => "ORDER",
+            By => "BY",
+            Asc => "ASC",
+            Desc => "DESC",
+            Group => "GROUP",
+            Having => "HAVING",
+            Limit => "LIMIT",
+            Offset => "OFFSET",
+            All => "ALL",
+            Distinct => "DISTINCT",
+            Case => "CASE",
+            When => "WHEN",
+            Then => "THEN",
+            Else => "ELSE",
+            End => "END",
+            With => "WITH",
+            Primary => "PRIMARY",
+            Key => "KEY",
+            Unique => "UNIQUE",
+            Check => "CHECK",
+            Default => "DEFAULT",
+            True_Kw => "TRUE",
+            False_Kw => "FALSE",
+            Cast => "CAST",
+            Nulls => "NULLS",
+            First => "FIRST",
+            Last => "LAST",
+            Explain => "EXPLAIN",
+            Analyze => "ANALYZE",
+            Begin => "BEGIN",
+            Commit => "COMMIT",
+            Rollback => "ROLLBACK",
+            User_Kw => "USER",
+            Role_Kw => "ROLE",
+            Grant_Kw => "GRANT",
+            Revoke_Kw => "REVOKE",
+            Password_Kw => "PASSWORD",
+            Login_Kw => "LOGIN",
+            Connection_Kw => "CONNECTION",
+            Policy_Kw => "POLICY",
+            Enable_Kw => "ENABLE",
+            Disable_Kw => "DISABLE",
+            Row_Kw => "ROW",
+            Level_Kw => "LEVEL",
+            IntLit { v } => "{v}",
+            FloatLit { v } => "{v}",
+            StringLit { v } => "'{v}'",
+            Identifier { v } => v.clone(),
+            Parameter { idx } => "${idx}",
+            Plus => "+",
+            Minus => "-",
+            Star => "*",
+            Slash => "/",
+            Percent => "%",
+            Eq => "=",
+            Neq => "<>",
+            Lt => "<",
+            Gt => ">",
+            Le => "<=",
+            Ge => ">=",
+            Dot => ".",
+            Comma => ",",
+            Semicolon => ";",
+            LParen => "(",
+            RParen => ")",
+            Pipe => "||",
+            _ => "?",
+        }
+    }
+
+    # Helper: expect an identifier token, also accepting security keywords as identifiers
+    # (USER, ROLE, GRANT, REVOKE etc. can appear as identifiers in some contexts)
+    F expect_identifier_or_security_keyword(mut self) -> Result<str, VaisError> {
+        M self.peek() {
+            Identifier { .. } => self.expect_identifier(),
+            User_Kw => { self.advance(); Ok("USER") },
+            Role_Kw => { self.advance(); Ok("ROLE") },
+            Login_Kw => { self.advance(); Ok("LOGIN") },
+            Password_Kw => { self.advance(); Ok("PASSWORD") },
+            Connection_Kw => { self.advance(); Ok("CONNECTION") },
+            Policy_Kw => { self.advance(); Ok("POLICY") },
+            Enable_Kw => { self.advance(); Ok("ENABLE") },
+            Disable_Kw => { self.advance(); Ok("DISABLE") },
+            Row_Kw => { self.advance(); Ok("ROW") },
+            Level_Kw => { self.advance(); Ok("LEVEL") },
+            _ => Err(self.parse_error("expected identifier")),
+        }
+    }
+}

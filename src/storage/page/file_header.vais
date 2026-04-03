@@ -2,29 +2,29 @@
 # vectors.vdb, graph.vdb, fulltext.vdb, undo.vdb each have this at page 0
 # Total used: 256 bytes (48 header + rest as data)
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{
-    VAISDB_MAGIC, DB_FORMAT_VERSION, PAGE_HEADER_SIZE,
-    FILE_HEADER_RESERVED_SIZE,
-};
-U storage/error.{VaisError, err_invalid_magic, err_internal};
-U storage/page/header.{PageHeader};
-U storage/page/types.{PAGE_TYPE_META, ENGINE_TAG_COMMON};
+U storage/bytes
+U std/vec
+U storage/constants
+U storage/error
+U storage/page/header
+U storage/page/types
 
 # File header data (after 48B page header)
 S FileHeader {
-    magic: u64,                # 0x5641495344422031 ("VAISDB 1")
+    magic: u64,                # 6215329582724292657 ("VAISDB 1")
     db_format_version: u32,    # Database format version
     page_size: u32,            # Page size in bytes
     file_id: u8,               # This file's ID (1=vectors, 2=graph, 3=fulltext, 4=undo)
     total_pages: u32,          # Total pages allocated in this file
     freelist_page: u32,        # Page ID of first freelist page (always 1)
-    reserved: [u8; 183],       # Reserved (must be 0)
+    reserved: Vec<u8>,         # Reserved (must be 0, 183 bytes)
 }
 
 X FileHeader {
     # Create a new file header
     F new(file_id: u8, page_size: u32, total_pages: u32) -> FileHeader {
+        reserved := mut Vec.with_capacity(183)
+        reserved.resize(183, 0u8)
         FileHeader {
             magic: VAISDB_MAGIC,
             db_format_version: DB_FORMAT_VERSION,
@@ -32,75 +32,90 @@ X FileHeader {
             file_id,
             total_pages,
             freelist_page: 1,  # Freelist always at page 1
-            reserved: [0u8; 183],
+            reserved,
         }
     }
 
     # Serialize file header data (after page header)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u64_le(self.magic);
-        buf.put_u32_le(self.db_format_version);
-        buf.put_u32_le(self.page_size);
-        buf.put_u8(self.file_id);
-        buf.put_u32_le(self.total_pages);
-        buf.put_u32_le(self.freelist_page);
-        buf.put_bytes(&self.reserved);
+        buf.write_i64_le(self.magic)
+        buf.write_i32_le(self.db_format_version)
+        buf.write_i32_le(self.page_size)
+        buf.write_u8(self.file_id)
+        buf.write_i32_le(self.total_pages)
+        buf.write_i32_le(self.freelist_page)
+        L i: 0..183 {
+            buf.write_u8(self.reserved[i])
+        }
     }
 
     # Deserialize file header data
     F deserialize(buf: &ByteBuffer) -> Result<FileHeader, VaisError> {
-        magic := mut buf.get_u64_le()?;
+        magic := mut read_i64_le_checked(buf)?;
         I magic != VAISDB_MAGIC {
-            R Err(err_invalid_magic());
+            R Err(err_invalid_magic())
+        }
+        db_format_version := mut read_i32_le_checked(buf)?;
+        page_size := mut read_i32_le_checked(buf)?;
+        file_id := mut read_u8_checked(buf)?;
+        total_pages := mut read_i32_le_checked(buf)?;
+        freelist_page := mut read_i32_le_checked(buf)?;
+        reserved := mut Vec.with_capacity(183)
+        L _: 0..183 {
+            reserved.push(read_u8_checked(buf)?)
         }
         Ok(FileHeader {
             magic,
-            db_format_version: buf.get_u32_le()?,
-            page_size: buf.get_u32_le()?,
-            file_id: buf.get_u8()?,
-            total_pages: buf.get_u32_le()?,
-            freelist_page: buf.get_u32_le()?,
-            reserved: buf.get_bytes(183)?.try_into()?,
+            db_format_version,
+            page_size,
+            file_id,
+            total_pages,
+            freelist_page,
+            reserved,
         })
     }
 
     # Write complete file header page to a page-sized buffer
     F write_to_page(self, page_data: &mut [u8]) {
-        header := mut PageHeader.new(0, PAGE_TYPE_META, ENGINE_TAG_COMMON);
-        buf := mut ByteBuffer.wrap(page_data);
-        header.serialize(&buf);
-        self.serialize(&buf);
+        header := mut PageHeader.new(0, PAGE_TYPE_META, ENGINE_TAG_COMMON)
+        buf := mut ByteBuffer.with_capacity(page_data.len())
+        header.serialize(&buf)
+        self.serialize(&buf)
+        page_bytes := mut buf.to_vec()
+        L i: 0..page_bytes.len() {
+            page_data[i] = page_bytes[i]
+        }
     }
 
     # Read file header from a page-sized buffer
     F read_from_page(page_data: &[u8]) -> Result<FileHeader, VaisError> {
-        buf := mut ByteBuffer.wrap_readonly(page_data);
-        buf.set_position(PAGE_HEADER_SIZE as u64);
+        buf := mut ByteBuffer.wrap_readonly(page_data)
+        buf.seek(PAGE_HEADER_SIZE as u64)
         FileHeader.deserialize(&buf)
     }
 
     # Validate file header
     F validate(self) -> Result<(), VaisError> {
         I self.magic != VAISDB_MAGIC {
-            R Err(err_invalid_magic());
+            R Err(err_invalid_magic())
         }
         I self.page_size != 8192 && self.page_size != 16384 {
-            R Err(err_internal("Invalid page size in file header"));
+            R Err(err_internal("Invalid page size in file header"))
         }
         I self.file_id > 4 {
-            R Err(err_internal("Invalid file_id in file header"));
+            R Err(err_internal("Invalid file_id in file header"))
         }
         Ok(())
     }
 
     # Update total page count
     F set_total_pages(mut self, total: u32) {
-        self.total_pages = total;
+        self.total_pages = total
     }
 }
 
 # Get file name for a given file_id
-F file_name_for_id(file_id: u8) -> Str {
+F file_name_for_id(file_id: u8) -> str {
     M file_id {
         0 => "data.vdb",
         1 => "vectors.vdb",
@@ -114,11 +129,11 @@ F file_name_for_id(file_id: u8) -> Str {
 # Get engine tag for a file_id
 F engine_tag_for_file(file_id: u8) -> u8 {
     M file_id {
-        0 => 0x01,  # sql
-        1 => 0x02,  # vector
-        2 => 0x03,  # graph
-        3 => 0x04,  # fulltext
-        4 => 0x00,  # common (undo)
-        _ => 0x00,
+        0 => 1,  # sql
+        1 => 2,  # vector
+        2 => 3,  # graph
+        3 => 4,  # fulltext
+        4 => 0,  # common (undo)
+        _ => 0,
     }
 }

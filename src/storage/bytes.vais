@@ -2,21 +2,119 @@
 # All on-disk formats use little-endian, ByteBuffer-based serialization
 # Based on Stage 7: Implementation Mapping, Pattern 1-13
 
-U std/bytes.{ByteBuffer};
+U std/bytebuffer
+U std/vec
+
+U storage/error
+
+X F store_f64(ptr: i64, val: f64)
+X F load_i64(ptr: i64) -> i64
+
+# Reinterpret f64 as i64 bit pattern (for write_f64_le which expects i64)
+F f64_bits(v: f64) -> i64 {
+    ptr := mut malloc(8)
+    store_f64(ptr, v)
+    bits := mut load_i64(ptr)
+    free(ptr)
+    bits
+}
 
 # Re-export ByteBuffer from std for convenience and add storage-specific helpers
+
+# ByteBuffer to_vec, as_bytes, wrap, wrap_readonly, put_f32_le now in std/bytebuffer.vais
+
+
+F err_bytebuffer_read(kind: str) -> VaisError {
+    err_internal("ByteBuffer underflow while reading {kind}")
+}
+
+F read_u8_checked(buf: &ByteBuffer) -> Result<i64, VaisError> {
+    value := mut buf.read_u8()
+    I value < 0 {
+        R Err(err_bytebuffer_read("u8"))
+    }
+    Ok(value)
+}
+
+F read_u16_le_checked(buf: &ByteBuffer) -> Result<i64, VaisError> {
+    value := mut buf.read_u16_le()
+    I value < 0 {
+        R Err(err_bytebuffer_read("u16"))
+    }
+    Ok(value)
+}
+
+F read_i32_le_checked(buf: &ByteBuffer) -> Result<i64, VaisError> {
+    I buf.position() + 4 > buf.len() {
+        R Err(err_bytebuffer_read("i32"))
+    }
+    Ok(buf.read_i32_le())
+}
+
+F read_i64_le_checked(buf: &ByteBuffer) -> Result<i64, VaisError> {
+    I buf.position() + 8 > buf.len() {
+        R Err(err_bytebuffer_read("i64"))
+    }
+    Ok(buf.read_i64_le())
+}
+
+F read_f64_le_checked(buf: &ByteBuffer) -> Result<f64, VaisError> {
+    bits := mut read_i64_le_checked(buf)?;
+    ptr := mut malloc(8)
+    store_i64(ptr, bits)
+    value := mut load_f64(ptr)
+    free(ptr)
+    Ok(value)
+}
+
+F get_f32_le_checked(buf: &ByteBuffer) -> Result<f64, VaisError> {
+    bits := mut read_i32_le_checked(buf)?;
+    ptr := mut malloc(4)
+    store_i32(ptr, bits)
+    value := mut load_f32(ptr)
+    free(ptr)
+    Ok(value)
+}
+
+F read_str_checked(buf: &ByteBuffer) -> Result<str, VaisError> {
+    ptr := mut buf.read_str()
+    I ptr == 0 {
+        R Err(err_bytebuffer_read("str"))
+    }
+    Ok(ptr_to_str(ptr))
+}
+
+# Convert a byte slice to str (UTF-8), returning an error on invalid bytes
+F from_utf8(bytes: &[u8]) -> Result<str, VaisError> {
+    # FUTURE(integration): validate UTF-8 encoding
+    Ok(bytes as str)
+}
+
+# Convert a byte slice to str (UTF-8), replacing invalid bytes with replacement char
+F from_utf8_lossy(bytes: &[u8]) -> str {
+    # FUTURE(integration): handle invalid UTF-8 sequences
+    bytes as str
+}
 
 # Encode a TID (Tuple ID) from page_id and slot_id
 # Upper 20 bits = page_id, lower 12 bits = slot_id
 F encode_tid(page_id: u32, slot_id: u16) -> u32 {
-    ((page_id & 0xFFFFF) << 12) | ((slot_id & 0xFFF) as u32)
+    ((page_id & 1048575) << 12) | ((slot_id & 4095) as u32)
 }
 
-# Decode a TID into (page_id, slot_id)
-F decode_tid(tid: u32) -> (u32, u16) {
-    page_id := mut (tid >> 12) & 0xFFFFF;
-    slot_id := mut (tid & 0xFFF) as u16;
-    (page_id, slot_id)
+# Decoded TID components
+S DecodedTid {
+    page_id: u32,
+    slot_id: u16,
+}
+
+# Decode a TID into page_id and slot_id
+F decode_tid(tid: u32) -> DecodedTid {
+    page_bits: u32 := mut (tid >> 12) as u32
+    page_id: u32 := mut page_bits & 1048575
+    slot_bits: u32 := mut tid & 4095
+    slot_id: u16 := mut slot_bits as u16
+    DecodedTid { page_id, slot_id }
 }
 
 # Encode an undo pointer from components
@@ -30,12 +128,22 @@ F encode_undo_ptr(file_id: u8, page_id: u32, offset: u16) -> u64 {
     ((offset as u64) << 8)
 }
 
-# Decode an undo pointer into (file_id, page_id, offset)
-F decode_undo_ptr(undo_ptr: u64) -> (u8, u32, u16) {
-    file_id := mut ((undo_ptr >> 56) & 0xFF) as u8;
-    page_id := mut ((undo_ptr >> 24) & 0xFFFFFFFF) as u32;
-    offset := mut ((undo_ptr >> 8) & 0xFFFF) as u16;
-    (file_id, page_id, offset)
+# Decoded undo pointer components
+S DecodedUndoPtr {
+    file_id: u8,
+    page_id: u32,
+    offset: u16,
+}
+
+# Decode an undo pointer into file_id, page_id, offset
+F decode_undo_ptr(undo_ptr: u64) -> DecodedUndoPtr {
+    file_bits: u64 := mut undo_ptr >> 56
+    file_id: u8 := mut (file_bits & 255) as u8
+    page_bits: u64 := mut undo_ptr >> 24
+    page_id: u32 := mut page_bits as u32
+    offset_bits: u64 := mut undo_ptr >> 8
+    offset: u16 := mut offset_bits as u16
+    DecodedUndoPtr { file_id, page_id, offset }
 }
 
 # Encode an LSN from segment_number and offset_in_segment
@@ -43,71 +151,110 @@ F encode_lsn(segment_number: u32, offset: u32) -> u64 {
     ((segment_number as u64) << 32) | (offset as u64)
 }
 
-# Decode an LSN into (segment_number, offset_in_segment)
-F decode_lsn(lsn: u64) -> (u32, u32) {
-    segment_number := mut ((lsn >> 32) & 0xFFFFFFFF) as u32;
-    offset := mut (lsn & 0xFFFFFFFF) as u32;
-    (segment_number, offset)
+# Decoded LSN components
+S DecodedLsn {
+    segment_number: u32,
+    offset: u32,
+}
+
+# Decode an LSN into segment_number and offset_in_segment
+F decode_lsn(lsn: u64) -> DecodedLsn {
+    segment_number: u32 := mut (lsn >> 32) as u32
+    offset: u32 := mut lsn as u32
+    DecodedLsn { segment_number, offset }
 }
 
 # Write a length-prefixed string to ByteBuffer
-F write_string(buf: &mut ByteBuffer, s: &Str) {
-    bytes := mut s.as_bytes();
-    buf.put_u32_le(bytes.len() as u32);
-    buf.put_bytes(bytes);
+# Uses ByteBuffer.write_str which handles length prefix + bytes
+F write_string(buf: &mut ByteBuffer, s: str) {
+    buf.write_str(s)
 }
 
 # Read a length-prefixed string from ByteBuffer
-F read_string(buf: &ByteBuffer) -> Result<Str, VaisError> {
-    len := mut buf.get_u32_le()? as u64;
-    bytes := mut buf.get_bytes(len)?;
-    Str.from_utf8(bytes)
+F read_string(buf: &ByteBuffer) -> Result<str, VaisError> {
+    read_str_checked(buf)
 }
 
 # Write a length-prefixed byte array to ByteBuffer
 F write_bytes(buf: &mut ByteBuffer, data: &[u8]) {
-    buf.put_u32_le(data.len() as u32);
-    buf.put_bytes(data);
+    dlen := mut data.len()
+    buf.write_i32_le(dlen as u32)
+    # FUTURE(slice-api): use buf.write_bytes(data.as_ptr(), dlen) when slice API available
+    i := mut 0
+    L i < dlen {
+        buf.write_u8(data[i])
+        i += 1
+    }
+}
+
+# Write raw bytes without a length prefix.
+F write_raw_bytes(buf: &mut ByteBuffer, data: &[u8]) {
+    i := mut 0
+    L i < data.len() {
+        buf.write_u8(data[i])
+        i += 1
+    }
 }
 
 # Read a length-prefixed byte array from ByteBuffer
 F read_bytes(buf: &ByteBuffer) -> Result<Vec<u8>, VaisError> {
-    len := mut buf.get_u32_le()? as u64;
-    buf.get_bytes(len)
+    len := mut read_i32_le_checked(buf)? as u64;
+    result := mut Vec.with_capacity(len)
+    i := mut 0
+    L i < len {
+        result.push(read_u8_checked(buf)? as u8)
+        i += 1
+    }
+    Ok(result)
+}
+
+# Read exactly len raw bytes without expecting a length prefix.
+F read_exact_bytes(buf: &ByteBuffer, len: u64) -> Result<Vec<u8>, VaisError> {
+    result := mut Vec.with_capacity(len)
+    i := mut 0
+    L i < len {
+        result.push(read_u8_checked(buf)? as u8)
+        i += 1
+    }
+    Ok(result)
 }
 
 # Write a Vec<u32> with length prefix
 F write_vec_u32(buf: &mut ByteBuffer, vec: &Vec<u32>) {
-    buf.put_u32_le(vec.len() as u32);
-    L val: vec {
-        buf.put_u32_le(val);
+    buf.write_i32_le(vec.len() as u32)
+    i := mut 0
+    L i < vec.len() {
+        buf.write_i32_le(vec[i])
+        i += 1
     }
 }
 
 # Read a Vec<u32> with length prefix
 F read_vec_u32(buf: &ByteBuffer) -> Result<Vec<u32>, VaisError> {
-    count := mut buf.get_u32_le()? as u64;
-    vec := mut Vec.with_capacity(count);
+    count := mut read_i32_le_checked(buf)? as u64;
+    vec := mut Vec.with_capacity(count)
     L _: 0..count {
-        vec.push(buf.get_u32_le()?);
+        vec.push(read_i32_le_checked(buf)? as u32)
     }
     Ok(vec)
 }
 
 # Write a Vec<u64> with length prefix
 F write_vec_u64(buf: &mut ByteBuffer, vec: &Vec<u64>) {
-    buf.put_u32_le(vec.len() as u32);
-    L val: vec {
-        buf.put_u64_le(val);
+    buf.write_i32_le(vec.len() as u32)
+    i := mut 0
+    L i < vec.len() {
+        buf.write_i64_le(vec[i])
+        i += 1
     }
 }
 
 # Read a Vec<u64> with length prefix
 F read_vec_u64(buf: &ByteBuffer) -> Result<Vec<u64>, VaisError> {
-    count := mut buf.get_u32_le()? as u64;
-    vec := mut Vec.with_capacity(count);
+    count := mut read_i32_le_checked(buf)? as u64;
+    vec := mut Vec.with_capacity(count)
     L _: 0..count {
-        vec.push(buf.get_u64_le()?);
+        vec.push(read_i64_le_checked(buf)? as u64)
     }
     Ok(vec)
 }
@@ -115,6 +262,13 @@ F read_vec_u64(buf: &ByteBuffer) -> Result<Vec<u64>, VaisError> {
 # Zero a range in a byte slice (used for checksum computation)
 F zero_range(data: &mut [u8], offset: u64, len: u64) {
     L i: offset..(offset + len) {
-        data[i] = 0;
+        data[i] = 0
     }
 }
+
+X F store_i64(ptr: i64, val: i64)
+X F load_f64(ptr: i64) -> f64
+X F store_i32(ptr: i64, val: i64)
+X F load_f32(ptr: i64) -> f64
+X F store_f32(ptr: i64, val: f64)
+X F load_i32(ptr: i64) -> i64

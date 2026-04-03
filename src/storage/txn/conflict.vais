@@ -1,30 +1,39 @@
 # Write-Write Conflict Detector
-# Implements first-writer-wins for Snapshot Isolation
+# Implements first-writer-wins for TxnSnapshot Isolation
 # Based on Stage 3 Section 7: Write-Write Conflict Detection
 
-U std/sync.{Mutex};
-U std/hashmap.{HashMap};
-U storage/error.{VaisError, err_write_conflict};
+U std/sync
+U std/hashmap
+U storage/error
 
 # Conflict detector: tracks which rows are locked by which transactions
 S ConflictDetector {
     # Key: encoded lock key (file_id, page_id, slot_id) -> txn_id holding the lock
     locks: HashMap<u64, u64>,
-    lock: Mutex,
+    key_list: Vec<u64>,  # Parallel list of all current lock keys for iteration
+    lock: Mutex<()>,
+}
+
+# Decoded lock key components
+S DecodedLockKey {
+    file_id: u8,
+    page_id: u32,
+    slot_id: u16,
 }
 
 X ConflictDetector {
     # Create a new conflict detector
     F new() -> ConflictDetector {
         ConflictDetector {
-            locks: HashMap.new(),
-            lock: Mutex.new(),
+            locks: HashMap.with_capacity(16),
+            key_list: Vec.with_capacity(16),
+            lock: Mutex.new(()),
         }
     }
 
     # Check for conflict and acquire write lock if available
     # Returns error if row is locked by another transaction
-    # For Snapshot Isolation: first-writer-wins
+    # For TxnSnapshot Isolation: first-writer-wins
     F check_and_lock(
         mut self,
         file_id: u8,
@@ -32,30 +41,31 @@ X ConflictDetector {
         slot_id: u16,
         txn_id: u64,
     ) -> Result<(), VaisError> {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
-        lock_key := mut ConflictDetector.encode_lock_key(file_id, page_id, slot_id);
+        lock_key := mut ConflictDetector.encode_lock_key(file_id, page_id, slot_id)
 
         # Check if already locked
-        M self.locks.get(&lock_key) {
+        M self.locks.get_opt(&lock_key) {
             Some(holder_txn_id) => {
                 # If locked by the same transaction, it's OK
-                I *holder_txn_id == txn_id {
-                    drop(guard);
-                    R Ok(());
+                I holder_txn_id == txn_id {
+                    # guard.drop() # disabled for dev compiler
+                    R Ok(())
                 }
 
                 # Locked by another transaction - conflict!
-                drop(guard);
+                # guard.drop() # disabled for dev compiler
                 R Err(err_write_conflict(
                     "table",  # NOTE: Use actual table name when catalog context is available
-                    *holder_txn_id
-                ));
+                    holder_txn_id
+                ))
             },
             None => {
                 # Not locked, acquire it
-                self.locks.insert(lock_key, txn_id);
-                drop(guard);
+                self.locks.insert(lock_key, txn_id)
+                self.key_list.push(lock_key)
+                # guard.drop() # disabled for dev compiler
                 Ok(())
             }
         }
@@ -63,22 +73,45 @@ X ConflictDetector {
 
     # Release all locks held by a transaction (after commit/abort)
     F release_locks(mut self, txn_id: u64) {
-        guard := mut self.lock.lock();
+        guard := mut self.lock.lock()
 
-        # Collect keys to remove
-        keys_to_remove := mut Vec.new();
-        L (key, holder): self.locks.iter() {
-            I *holder == txn_id {
-                keys_to_remove.push(*key);
+        # Collect keys to remove (keys where holder == txn_id)
+        keys_to_remove := mut Vec.with_capacity(0)
+        ki := mut 0
+        L ki < self.key_list.len() {
+            key := self.key_list[ki]
+            M self.locks.get_opt(&key) {
+                Some(holder) => {
+                    I holder == txn_id {
+                        keys_to_remove.push(key)
+                    }
+                },
+                None => {},
             }
+            ki += 1
         }
 
         # Remove them
         L key: keys_to_remove {
-            self.locks.remove(&key);
+            self.locks.remove(&key)
         }
 
-        drop(guard);
+        # Rebuild key_list without removed keys
+        new_key_list := mut Vec.with_capacity(0)
+        ki2 := mut 0
+        L ki2 < self.key_list.len() {
+            k := self.key_list[ki2]
+            M self.locks.get_opt(&k) {
+                Some(_) => {
+                    new_key_list.push(k)
+                },
+                None => {},
+            }
+            ki2 += 1
+        }
+        self.key_list = new_key_list
+
+        # guard.drop() # disabled for dev compiler
     }
 
     # Encode a lock key from tuple location
@@ -91,56 +124,71 @@ X ConflictDetector {
     }
 
     # Decode a lock key back to components (for debugging)
-    F decode_lock_key(lock_key: u64) -> (u8, u32, u16) {
-        file_id := mut ((lock_key >> 48) & 0xFF) as u8;
-        page_id := mut ((lock_key >> 16) & 0xFFFFFFFF) as u32;
-        slot_id := mut (lock_key & 0xFFFF) as u16;
-        (file_id, page_id, slot_id)
+    F decode_lock_key(lock_key: u64) -> DecodedLockKey {
+        file_id := mut ((lock_key >> 48) & 255) as u8
+        page_id := mut ((lock_key >> 16) & 4294967295) as u32
+        slot_id := mut (lock_key & 65535) as u16
+        DecodedLockKey { file_id, page_id, slot_id }
     }
 
     # Get number of locks held by a transaction
     F count_locks_for_txn(self, txn_id: u64) -> u64 {
-        guard := mut self.lock.lock();
-        count := mut 0u64;
-        L (_, holder): self.locks.iter() {
-            I *holder == txn_id {
-                count += 1;
+        guard := mut self.lock.lock()
+        count := mut 0u64
+        ki := mut 0
+        L ki < self.key_list.len() {
+            M self.locks.get_opt(&self.key_list[ki]) {
+                Some(holder) => {
+                    I holder == txn_id {
+                        count += 1
+                    }
+                },
+                None => {},
             }
+            ki += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         count
     }
 
     # Get total number of locks
     F count_total_locks(self) -> u64 {
-        guard := mut self.lock.lock();
-        count := mut self.locks.len();
-        drop(guard);
+        guard := mut self.lock.lock()
+        count := mut self.locks.len()
+        # guard.drop() # disabled for dev compiler
         count
     }
 
     # Check if a specific row is locked (without acquiring)
     F is_locked(self, file_id: u8, page_id: u32, slot_id: u16) -> Option<u64> {
-        guard := mut self.lock.lock();
-        lock_key := mut ConflictDetector.encode_lock_key(file_id, page_id, slot_id);
-        result := mut M self.locks.get(&lock_key) {
-            Some(holder) => Some(*holder),
+        guard := mut self.lock.lock()
+        lock_key := mut ConflictDetector.encode_lock_key(file_id, page_id, slot_id)
+        result := mut M self.locks.get_opt(&lock_key) {
+            Some(holder) => Some(holder),
             None => None,
-        };
-        drop(guard);
+        }
+        # guard.drop() # disabled for dev compiler
         result
     }
 
     # Get all locks held by a transaction (for debugging)
     F get_locks_for_txn(self, txn_id: u64) -> Vec<(u8, u32, u16)> {
-        guard := mut self.lock.lock();
-        locks := mut Vec.new();
-        L (key, holder): self.locks.iter() {
-            I *holder == txn_id {
-                locks.push(ConflictDetector.decode_lock_key(*key));
+        guard := mut self.lock.lock()
+        locks := mut Vec.with_capacity(0)
+        ki := mut 0
+        L ki < self.key_list.len() {
+            key := self.key_list[ki]
+            M self.locks.get_opt(&key) {
+                Some(holder) => {
+                    I holder == txn_id {
+                        locks.push(ConflictDetector.decode_lock_key(key))
+                    }
+                },
+                None => {},
             }
+            ki += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         locks
     }
 }

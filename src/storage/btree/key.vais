@@ -6,8 +6,16 @@ U storage/error.{VaisError, err_internal};
 U storage/btree/entry.{compare_keys, key_less_than, key_equal, KeyCmp};
 U std/bytes.{ByteBuffer};
 
+X F __strlen(s: str) -> i64
+
 # Key types for type-aware comparison
-L KeyType = Integer | Float | Str | Bytes | Composite;
+E KeyType {
+    Integer,
+    Float,
+    Str,
+    Bytes,
+    Composite,
+}
 
 # Encode an integer key (i64) as big-endian bytes for correct lexicographic order
 # Flip the sign bit so negative sorts before positive
@@ -16,15 +24,15 @@ F encode_i64_key(value: i64) -> Vec<u8> {
     encoded.resize(8, 0u8);
 
     # Flip sign bit for correct sort order: XOR with 0x80 on high byte
-    v := mut (value as u64) ^ 0x8000000000000000;
-    encoded[0] = ((v >> 56) & 0xFF) as u8;
-    encoded[1] = ((v >> 48) & 0xFF) as u8;
-    encoded[2] = ((v >> 40) & 0xFF) as u8;
-    encoded[3] = ((v >> 32) & 0xFF) as u8;
-    encoded[4] = ((v >> 24) & 0xFF) as u8;
-    encoded[5] = ((v >> 16) & 0xFF) as u8;
-    encoded[6] = ((v >> 8) & 0xFF) as u8;
-    encoded[7] = (v & 0xFF) as u8;
+    v := mut (value as u64) ^ (1u64 << 63);
+    encoded[0] = ((v >> 56) & 255u64) as u8;
+    encoded[1] = ((v >> 48) & 255u64) as u8;
+    encoded[2] = ((v >> 40) & 255u64) as u8;
+    encoded[3] = ((v >> 32) & 255u64) as u8;
+    encoded[4] = ((v >> 24) & 255u64) as u8;
+    encoded[5] = ((v >> 16) & 255u64) as u8;
+    encoded[6] = ((v >> 8) & 255u64) as u8;
+    encoded[7] = (v & 255u64) as u8;
     encoded
 }
 
@@ -40,21 +48,21 @@ F decode_i64_key(data: &[u8]) -> i64 {
     v |= (data[6] as u64) << 8;
     v |= data[7] as u64;
     # Flip sign bit back
-    (v ^ 0x8000000000000000) as i64
+    (v ^ (1u64 << 63)) as i64
 }
 
 # Encode a u64 key as big-endian bytes
 F encode_u64_key(value: u64) -> Vec<u8> {
     encoded := mut Vec.with_capacity(8);
     encoded.resize(8, 0u8);
-    encoded[0] = ((value >> 56) & 0xFF) as u8;
-    encoded[1] = ((value >> 48) & 0xFF) as u8;
-    encoded[2] = ((value >> 40) & 0xFF) as u8;
-    encoded[3] = ((value >> 32) & 0xFF) as u8;
-    encoded[4] = ((value >> 24) & 0xFF) as u8;
-    encoded[5] = ((value >> 16) & 0xFF) as u8;
-    encoded[6] = ((value >> 8) & 0xFF) as u8;
-    encoded[7] = (value & 0xFF) as u8;
+    encoded[0] = ((value >> 56) & 255u64) as u8;
+    encoded[1] = ((value >> 48) & 255u64) as u8;
+    encoded[2] = ((value >> 40) & 255u64) as u8;
+    encoded[3] = ((value >> 32) & 255u64) as u8;
+    encoded[4] = ((value >> 24) & 255u64) as u8;
+    encoded[5] = ((value >> 16) & 255u64) as u8;
+    encoded[6] = ((value >> 8) & 255u64) as u8;
+    encoded[7] = (value & 255u64) as u8;
     encoded
 }
 
@@ -74,10 +82,11 @@ F decode_u64_key(data: &[u8]) -> u64 {
 
 # Encode a string key with null-termination
 # Strings sort lexicographically as raw bytes (UTF-8 preserves order for ASCII)
-F encode_string_key(value: &str) -> Vec<u8> {
-    encoded := mut Vec.with_capacity(value.len());
-    L b: value.as_bytes() {
-        encoded.push(b);
+F encode_string_key(value: str) -> Vec<u8> {
+    slen := mut __strlen(value) as u64;
+    encoded := mut Vec.with_capacity(slen);
+    L i: 0..slen {
+        encoded.push(value[i]);
     }
     encoded
 }
@@ -86,17 +95,18 @@ F encode_string_key(value: &str) -> Vec<u8> {
 # Each component is length-prefixed: [u16 len][key bytes]
 F encode_composite_key(components: &[&[u8]]) -> Vec<u8> {
     total_len: u64 := mut 0;
-    L comp: components {
-        total_len += 2 + comp.len();
+    L i: 0..components.len() {
+        total_len += 2 + components[i].len();
     }
 
     encoded := mut Vec.with_capacity(total_len);
-    L comp: components {
+    L i: 0..components.len() {
+        comp := mut &components[i];
         len := mut comp.len() as u16;
         encoded.push((len >> 8) as u8);
-        encoded.push((len & 0xFF) as u8);
-        L b: *comp {
-            encoded.push(b);
+        encoded.push((len & 255u16) as u8);
+        L j: 0..comp.len() {
+            encoded.push(comp[j]);
         }
     }
     encoded
@@ -114,7 +124,11 @@ F decode_composite_key(data: &[u8]) -> Vec<Vec<u8>> {
         I pos + len as u64 > data.len() {
             valid = false;
         } E {
-            comp := mut data[pos..pos + len as u64].to_vec();
+            comp_end := mut pos + len as u64;
+            comp := mut Vec.with_capacity(len as u64);
+            L k: pos..comp_end {
+                comp.push(data[k]);
+            }
             components.push(comp);
             pos += len as u64;
         }
@@ -140,12 +154,23 @@ F common_prefix_length(a: &[u8], b: &[u8]) -> u64 {
     prefix_len
 }
 
+# Strip prefix result struct
+S StripPrefixResult {
+    prefix_len: u16,
+    suffix: Vec<u8>,
+}
+
 # Strip common prefix from a key (for prefix compression)
-# Returns (prefix_len, suffix)
-F strip_prefix(key: &[u8], prev_key: &[u8]) -> (u16, Vec<u8>) {
+# Returns StripPrefixResult with prefix_len and suffix
+F strip_prefix(key: &[u8], prev_key: &[u8]) -> StripPrefixResult {
     prefix_len := mut common_prefix_length(key, prev_key);
-    suffix := mut key[prefix_len..].to_vec();
-    (prefix_len as u16, suffix)
+    suffix_start := mut prefix_len;
+    suffix_end := mut key.len();
+    suffix := mut Vec.with_capacity(suffix_end - suffix_start);
+    L i: suffix_start..suffix_end {
+        suffix.push(key[i]);
+    }
+    StripPrefixResult { prefix_len: prefix_len as u16, suffix }
 }
 
 # Reconstruct a key from prefix length and suffix
@@ -154,8 +179,8 @@ F reconstruct_key(prev_key: &[u8], prefix_len: u16, suffix: &[u8]) -> Vec<u8> {
     L i: 0..prefix_len as u64 {
         key.push(prev_key[i]);
     }
-    L b: suffix {
-        key.push(b);
+    L i: 0..suffix.len() {
+        key.push(suffix[i]);
     }
     key
 }
@@ -203,7 +228,7 @@ X KeyRange {
     F contains(self, key: &[u8]) -> bool {
         # Check start bound
         M &self.start {
-            Some(ref start_key) => {
+            Some(start_key) => {
                 M compare_keys(key, start_key) {
                     KeyCmp.Less => { R false; },
                     KeyCmp.Equal => {
@@ -217,7 +242,7 @@ X KeyRange {
 
         # Check end bound
         M &self.end {
-            Some(ref end_key) => {
+            Some(end_key) => {
                 M compare_keys(key, end_key) {
                     KeyCmp.Greater => { R false; },
                     KeyCmp.Equal => {
@@ -235,7 +260,7 @@ X KeyRange {
     # Check if key is past end of range
     F is_past_end(self, key: &[u8]) -> bool {
         M &self.end {
-            Some(ref end_key) => {
+            Some(end_key) => {
                 M compare_keys(key, end_key) {
                     KeyCmp.Greater => true,
                     KeyCmp.Equal => !self.end_inclusive,

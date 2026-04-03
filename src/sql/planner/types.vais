@@ -1,0 +1,222 @@
+# SQL Planner Types
+# Lightweight planner data structures extracted from sql/planner/mod
+# so higher-level hybrid planner modules can depend on plan/cost types
+# without importing the full SQL planner implementation graph.
+
+U storage/error
+U sql/parser/ast
+U sql/catalog/schema
+
+# ============================================================================
+# Error Code Constants (EE=01 SQL Engine, CC=08 Planner)
+# ============================================================================
+
+C ERR_CODE_TABLE_NOT_FOUND_PLAN: str = "VAIS-0108001"
+C ERR_CODE_COLUMN_NOT_FOUND_PLAN: str = "VAIS-0108002"
+C ERR_CODE_INVALID_JOIN_CONDITION: str = "VAIS-0108003"
+C ERR_CODE_COST_ESTIMATION_FAILED: str = "VAIS-0108004"
+C ERR_CODE_PLAN_BUILD_FAILED: str = "VAIS-0108005"
+
+F pla_err_table_not_found_plan(name: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_TABLE_NOT_FOUND_PLAN,
+        "Table '{name}' not found during planning"
+    )
+}
+
+F pla_err_column_not_found_plan(name: str, table: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_COLUMN_NOT_FOUND_PLAN,
+        "Column '{name}' not found in table '{table}' during planning"
+    )
+}
+
+F pla_err_invalid_join_condition(reason: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_INVALID_JOIN_CONDITION,
+        "Invalid join condition: {reason}"
+    )
+}
+
+F pla_err_cost_estimation_failed(reason: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_COST_ESTIMATION_FAILED,
+        "Cost estimation failed: {reason}"
+    )
+}
+
+F pla_err_plan_build_failed(reason: str) -> VaisError {
+    VaisError.new(
+        ERR_CODE_PLAN_BUILD_FAILED,
+        "Plan build failed: {reason}"
+    )
+}
+
+# ============================================================================
+# Cost Estimation
+# ============================================================================
+
+S CostEstimate {
+    io_cost: f64,
+    cpu_cost: f64,
+    row_estimate: u64,
+}
+
+X CostEstimate {
+    F new(io_cost: f64, cpu_cost: f64, row_estimate: u64) -> CostEstimate {
+        CostEstimate { io_cost, cpu_cost, row_estimate }
+    }
+
+    F total(self) -> f64 {
+        self.io_cost * 1.0 + self.cpu_cost * 0.1
+    }
+
+    F add(self, other: &CostEstimate) -> CostEstimate {
+        CostEstimate {
+            io_cost: self.io_cost + other.io_cost,
+            cpu_cost: self.cpu_cost + other.cpu_cost,
+            row_estimate: self.row_estimate,
+        }
+    }
+}
+
+# ============================================================================
+# Plan Node Types
+# ============================================================================
+
+S KeyRange {
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    start_inclusive: bool,
+    end_inclusive: bool,
+}
+
+X KeyRange {
+    F all() -> KeyRange {
+        KeyRange {
+            start: None,
+            end: None,
+            start_inclusive: true,
+            end_inclusive: true,
+        }
+    }
+
+    F closed(start: Vec<u8>, end: Vec<u8>) -> KeyRange {
+        start_bytes := mut start.clone()
+        end_bytes := mut end.clone()
+        KeyRange {
+            start: Some(start_bytes),
+            end: Some(end_bytes),
+            start_inclusive: true,
+            end_inclusive: true,
+        }
+    }
+
+    F half_open(start: Vec<u8>, end: Vec<u8>) -> KeyRange {
+        start_bytes := mut start.clone()
+        end_bytes := mut end.clone()
+        KeyRange {
+            start: Some(start_bytes),
+            end: Some(end_bytes),
+            start_inclusive: true,
+            end_inclusive: false,
+        }
+    }
+}
+
+E PlanNode {
+    SeqScan { table: str, alias: Option<str>, filter: Option<Expr> },
+    IndexScan { table: str, index: str, key_range: KeyRange, residual: Option<Expr> },
+    Filter { input: Box<PlanNode>, predicate: Expr },
+    Project { input: Box<PlanNode>, columns: Vec<ProjectColumn> },
+    NestedLoopJoin { left: Box<PlanNode>, right: Box<PlanNode>, join_type: JoinType, condition: Option<Expr> },
+    HashJoin { build: Box<PlanNode>, probe: Box<PlanNode>, join_type: JoinType, left_keys: Vec<u64>, right_keys: Vec<u64> },
+    Sort { input: Box<PlanNode>, order_by: Vec<OrderByItem> },
+    Aggregate { input: Box<PlanNode>, group_by: Vec<Expr>, aggregates: Vec<AggregateSpec>, having: Option<Expr> },
+    Limit { input: Box<PlanNode>, limit: Option<u64>, offset: Option<u64> },
+    Distinct { input: Box<PlanNode> },
+    Window { input: Box<PlanNode>, window_specs: Vec<WindowSpec> },
+    Values { rows: Vec<Vec<Expr>> },
+    Empty,
+}
+
+S ProjectColumn {
+    expr: Expr,
+    alias: Option<str>,
+}
+
+X ProjectColumn {
+    F new(expr: Expr) -> ProjectColumn {
+        expr_value := mut expr.clone()
+        ProjectColumn { expr: expr_value, alias: None }
+    }
+
+    F with_alias(expr: Expr, alias: str) -> ProjectColumn {
+        expr_value := mut expr.clone()
+        alias_value := mut alias.clone()
+        ProjectColumn { expr: expr_value, alias: Some(alias_value) }
+    }
+}
+
+S AggregateSpec {
+    func_name: str,
+    arg_expr: Expr,
+    is_distinct: bool,
+}
+
+X AggregateSpec {
+    F new(func_name: str, arg_expr: Expr) -> AggregateSpec {
+        func_name_value := mut func_name.clone()
+        arg_expr_value := mut arg_expr.clone()
+        AggregateSpec { func_name: func_name_value, arg_expr: arg_expr_value, is_distinct: false }
+    }
+
+    F with_distinct(func_name: str, arg_expr: Expr) -> AggregateSpec {
+        func_name_value := mut func_name.clone()
+        arg_expr_value := mut arg_expr.clone()
+        AggregateSpec { func_name: func_name_value, arg_expr: arg_expr_value, is_distinct: true }
+    }
+}
+
+S WindowSpec {
+    func: Expr,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderByItem>,
+}
+
+X WindowSpec {
+    F new(func: Expr, partition_by: Vec<Expr>, order_by: Vec<OrderByItem>) -> WindowSpec {
+        func_value := mut func.clone()
+        partition_by_value := mut partition_by.clone()
+        order_by_value := mut order_by.clone()
+        WindowSpec { func: func_value, partition_by: partition_by_value, order_by: order_by_value }
+    }
+}
+
+# ============================================================================
+# Table Statistics
+# ============================================================================
+
+S TableStats {
+    table_id: u32,
+    name: str,
+    row_count: u64,
+    page_count: u32,
+    avg_row_size: u32,
+}
+
+X TableStats {
+    F from_table_info(info: &TableInfo) -> TableStats {
+        row_count := mut info.row_count_estimate
+        page_count := mut I row_count == 0 { 1 } E { (row_count / 50) as u32 }
+        avg_row_size := mut 200
+
+        TableStats {
+            table_id: info.table_id,
+            name: info.name.clone(),
+            row_count,
+            page_count,
+            avg_row_size,
+        }
+    }
+}

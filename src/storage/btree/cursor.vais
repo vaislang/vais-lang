@@ -2,12 +2,12 @@
 # Provides iteration over leaf entries for range scans and sequential access
 # Follows the doubly-linked leaf chain
 
-U storage/constants.{NULL_PAGE};
-U storage/error.{VaisError};
-U storage/buffer/pool.{BufferPool};
-U storage/btree/node.{BTreeLeafNode};
-U storage/btree/entry.{BTreeLeafEntry, compare_keys, KeyCmp};
-U storage/btree/latch.{LatchTable, LatchGuard};
+U storage/constants
+U storage/error
+U storage/buffer/pool
+U storage/btree/node
+U storage/btree/entry
+U storage/btree/latch
 
 # Cursor position within the B+Tree
 S BTreeCursor {
@@ -21,7 +21,16 @@ S BTreeCursor {
     latch_table: Option<&LatchTable>,  # Latch table for leaf latch management
 }
 
-L ScanDirection = Forward | Backward;
+E ScanDirection {
+    Forward,
+    Backward,
+}
+
+# Key-TID pair from cursor
+S CursorEntry {
+    key: Vec<u8>,
+    tid: u32,
+}
 
 X BTreeCursor {
     # Create a cursor positioned at a specific leaf entry
@@ -33,7 +42,7 @@ X BTreeCursor {
             current_index: index,
             current_frame: frame_id,
             is_valid: true,
-            direction: ScanDirection.Forward,
+            direction: Forward,
             latch_table: None,
         }
     }
@@ -48,7 +57,7 @@ X BTreeCursor {
             current_index: index,
             current_frame: frame_id,
             is_valid: true,
-            direction: ScanDirection.Forward,
+            direction: Forward,
             latch_table: Some(latch_table),
         }
     }
@@ -62,7 +71,7 @@ X BTreeCursor {
             current_index: 0,
             current_frame: 0,
             is_valid: false,
-            direction: ScanDirection.Forward,
+            direction: Forward,
             latch_table: None,
         }
     }
@@ -73,17 +82,17 @@ X BTreeCursor {
     }
 
     # Get current entry's key and TID
-    F current(self, pool: &BufferPool) -> Result<(Vec<u8>, u32), VaisError> {
+    F current(self, pool: &BufferPool) -> Result<CursorEntry, VaisError> {
         I !self.is_valid {
-            R Err(err_internal("Cursor is not valid"));
+            R Err(err_internal("Cursor is not valid"))
         }
 
-        page_data := mut pool.get_page(self.current_frame);
+        page_data := mut pool.get_page(self.current_frame)
         leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
-        key := mut leaf.get_key(self.current_index).to_vec();
-        tid := mut leaf.entries[self.current_index].tid;
+        key := mut leaf.get_key(self.current_index).clone()
+        tid := mut leaf.entries[self.current_index].tid
 
-        Ok((key, tid))
+        Ok(CursorEntry { key, tid })
     }
 
     # Advance cursor to next entry (forward scan)
@@ -91,48 +100,48 @@ X BTreeCursor {
     # before releasing current leaf
     F next(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
         I !self.is_valid {
-            R Ok(false);
+            R Ok(false)
         }
 
-        page_data := mut pool.get_page(self.current_frame);
+        page_data := mut pool.get_page(self.current_frame)
         leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
 
-        self.current_index += 1;
+        self.current_index += 1
 
         I self.current_index >= leaf.entry_count() as u64 {
             # Move to next leaf page with latch crabbing
-            next_page := mut leaf.next_leaf();
+            next_page := mut leaf.next_leaf()
 
             I next_page == NULL_PAGE {
-                pool.unpin_page(self.current_frame, false);
-                self.is_valid = false;
-                R Ok(false);
+                pool.unpin_page(self.current_frame, false)
+                self.is_valid = false
+                R Ok(false)
             }
 
             # Acquire read latch on next leaf before releasing current (if latch table available)
             M &self.latch_table {
                 Some(lt) => {
-                    next_guard := mut LatchGuard.new_read(*lt, next_page);
-                    pool.unpin_page(self.current_frame, false);
+                    next_guard := mut LatchGuard.new_read(*lt, next_page)
+                    pool.unpin_page(self.current_frame, false)
                     # Next guard is released immediately — the buffer pin provides protection
-                    next_guard.release();
+                    next_guard.release()
                 },
                 None => {
-                    pool.unpin_page(self.current_frame, false);
+                    pool.unpin_page(self.current_frame, false)
                 },
             }
 
             self.current_frame = pool.fetch_page(self.file_id, next_page)?;
-            self.current_page_id = next_page;
-            self.current_index = 0;
+            self.current_page_id = next_page
+            self.current_index = 0
 
             # Check if new leaf has entries
-            new_page_data := mut pool.get_page(self.current_frame);
+            new_page_data := mut pool.get_page(self.current_frame)
             new_leaf := mut BTreeLeafNode.from_page_data(new_page_data, self.page_size)?;
             I new_leaf.entry_count() == 0 {
-                pool.unpin_page(self.current_frame, false);
-                self.is_valid = false;
-                R Ok(false);
+                pool.unpin_page(self.current_frame, false)
+                self.is_valid = false
+                R Ok(false)
             }
         }
 
@@ -143,49 +152,49 @@ X BTreeCursor {
     # Uses latch crabbing when moving to previous leaf
     F prev(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
         I !self.is_valid {
-            R Ok(false);
+            R Ok(false)
         }
 
         I self.current_index > 0 {
-            self.current_index -= 1;
-            R Ok(true);
+            self.current_index -= 1
+            R Ok(true)
         }
 
         # Move to previous leaf page with latch crabbing
-        page_data := mut pool.get_page(self.current_frame);
+        page_data := mut pool.get_page(self.current_frame)
         leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
-        prev_page := mut leaf.prev_leaf();
+        prev_page := mut leaf.prev_leaf()
 
         I prev_page == NULL_PAGE {
-            pool.unpin_page(self.current_frame, false);
-            self.is_valid = false;
-            R Ok(false);
+            pool.unpin_page(self.current_frame, false)
+            self.is_valid = false
+            R Ok(false)
         }
 
         # Acquire read latch on prev leaf before releasing current (if latch table available)
         M &self.latch_table {
             Some(lt) => {
-                prev_guard := mut LatchGuard.new_read(*lt, prev_page);
-                pool.unpin_page(self.current_frame, false);
-                prev_guard.release();
+                prev_guard := mut LatchGuard.new_read(*lt, prev_page)
+                pool.unpin_page(self.current_frame, false)
+                prev_guard.release()
             },
             None => {
-                pool.unpin_page(self.current_frame, false);
+                pool.unpin_page(self.current_frame, false)
             },
         }
 
         self.current_frame = pool.fetch_page(self.file_id, prev_page)?;
-        self.current_page_id = prev_page;
+        self.current_page_id = prev_page
 
         # Position at last entry of previous leaf
-        prev_page_data := mut pool.get_page(self.current_frame);
+        prev_page_data := mut pool.get_page(self.current_frame)
         prev_leaf := mut BTreeLeafNode.from_page_data(prev_page_data, self.page_size)?;
         I prev_leaf.entry_count() == 0 {
-            pool.unpin_page(self.current_frame, false);
-            self.is_valid = false;
-            R Ok(false);
+            pool.unpin_page(self.current_frame, false)
+            self.is_valid = false
+            R Ok(false)
         }
-        self.current_index = (prev_leaf.entry_count() - 1) as u64;
+        self.current_index = (prev_leaf.entry_count() - 1) as u64
 
         Ok(true)
     }
@@ -193,10 +202,10 @@ X BTreeCursor {
     # Release cursor resources
     F close(mut self, pool: &mut BufferPool) {
         I self.is_valid {
-            pool.unpin_page(self.current_frame, false);
-            self.is_valid = false;
+            pool.unpin_page(self.current_frame, false)
+            self.is_valid = false
         }
     }
 }
 
-U storage/error.{err_internal};
+U storage/error

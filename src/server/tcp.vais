@@ -3,35 +3,28 @@
 # Requires std/net for actual TCP I/O — placeholder implementation
 # Error codes: EE=06 (server), CC=03 (connection), CC=07 (listener)
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/sync.{Mutex, AtomicU64, Ordering};
-U storage/error.{VaisError, ErrorSeverity};
-U server/types.{
-    ConnectionState, TransactionState,
-    StartupPayload, ErrorResponse,
-    MSG_TYPE_STARTUP, MSG_TYPE_AUTH_RESPONSE, MSG_TYPE_TERMINATE,
-    PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR,
-    err_protocol_error, err_protocol_version, err_max_connections,
-    err_connection_reset,
-};
-U server/config.{ServerConfig, GlobalConfig};
-U server/connection.{Connection, ConnectionPool};
-U server/auth.{Authenticator, AuthResult, TlsConfig};
-U server/handler.QueryHandler;
-U server/protocol.{
-    read_framed_message, FramedMessage,
-    serialize_auth_request, serialize_auth_ok,
-    serialize_ready, serialize_error,
-    deserialize_startup, deserialize_auth_response,
-};
+U std/vec
+U std/string
+U std/option
+U std/sync
+U storage/error
+U server/types
+U server/config
+U server/connection
+U server/auth
+U server/handler
+U server/protocol
 
 # ============================================================================
 # Server State
 # ============================================================================
 
-L ServerState = Starting | Running | ShuttingDown | Stopped;
+E ServerState {
+    Starting,
+    Running,
+    ShuttingDown,
+    Stopped,
+}
 
 # ============================================================================
 # TcpServer — Main server struct
@@ -44,8 +37,8 @@ S TcpServer {
     auth: Authenticator,
     tls_config: TlsConfig,
     state: ServerState,
-    total_queries: AtomicU64,
-    total_connections: AtomicU64,
+    total_queries: AtomicI64,
+    total_connections: AtomicI64,
     # FUTURE(std/net): TcpListener handle
 }
 
@@ -55,10 +48,10 @@ X TcpServer {
         # Validate configuration
         config.validate()?;
 
-        global_config := mut GlobalConfig.new(config);
-        pool := mut ConnectionPool.from_config(&config);
-        auth := mut Authenticator.default();
-        tls_config := mut TlsConfig.from_server_config(&config);
+        global_config := mut GlobalConfig.new(config)
+        pool := mut ConnectionPool.from_config(&config)
+        auth := mut Authenticator.default()
+        tls_config := mut TlsConfig.from_server_config(&config)
 
         Ok(TcpServer {
             config,
@@ -66,9 +59,9 @@ X TcpServer {
             pool,
             auth,
             tls_config,
-            state: ServerState.Starting,
-            total_queries: AtomicU64.new(0),
-            total_connections: AtomicU64.new(0),
+            state: Starting,
+            total_queries: AtomicI64.new(0),
+            total_connections: AtomicI64.new(0),
         })
     }
 
@@ -76,31 +69,31 @@ X TcpServer {
     # FUTURE(std/net): Bind address, accept loop, startup logging
     F start(mut self) -> Result<(), VaisError> {
         # Placeholder: transition state without actual TCP bind
-        self.state = ServerState.Running;
+        self.state = Running
         Ok(())
     }
 
     # Stop the server gracefully
     F stop(mut self) -> Result<(), VaisError> {
-        self.state = ServerState.ShuttingDown;
+        self.state = ShuttingDown
 
         # Close all active connections
-        conn_ids := mut self.pool.connection_ids();
-        i: u64 := mut 0;
+        conn_ids := mut self.pool.connection_ids()
+        i := mut 0
         L i < conn_ids.len() {
-            self.pool.remove_connection(conn_ids[i]);
-            i += 1;
+            self.pool.remove_connection(conn_ids[i])
+            i += 1
         }
 
         # FUTURE(std/net): Close TcpListener, drain in-flight queries, flush WAL + checkpoint
-        self.state = ServerState.Stopped;
+        self.state = Stopped
         Ok(())
     }
 
     # Check if server is running
     F is_running(self) -> bool {
         M &self.state {
-            ServerState.Running => true,
+            Running => true,
             _ => false,
         }
     }
@@ -109,8 +102,8 @@ X TcpServer {
     F get_stats(self) -> ServerStats {
         ServerStats {
             active_connections: self.pool.active_count(),
-            total_connections: self.total_connections.load(Ordering.Relaxed),
-            total_queries: self.total_queries.load(Ordering.Relaxed),
+            total_connections: self.total_connections.load(),
+            total_queries: self.total_queries.load(),
             max_connections: self.config.max_connections,
             port: self.config.port,
         }
@@ -125,16 +118,16 @@ X TcpServer {
     # Returns the connection ID.
     F accept_connection(mut self, timestamp: u64) -> Result<u64, VaisError> {
         I !self.is_running() {
-            R Err(err_server_not_running());
+            R Err(err_server_not_running())
         }
 
         I !self.pool.has_capacity() {
-            R Err(err_max_connections(self.config.max_connections));
+            R Err(err_max_connections(self.config.max_connections))
         }
 
         # Create connection with placeholder user/database (filled in during startup)
         conn_id := mut self.pool.create_connection("", "", timestamp)?;
-        self.total_connections.fetch_add(1, Ordering.Relaxed);
+        self.total_connections.fetch_add(1)
 
         Ok(conn_id)
     }
@@ -148,37 +141,37 @@ X TcpServer {
     ) -> Result<Vec<Vec<u8>>, VaisError> {
         # Check protocol version
         I startup.protocol_major != PROTOCOL_VERSION_MAJOR {
-            R Err(err_protocol_version(startup.protocol_major, startup.protocol_minor));
+            R Err(err_protocol_version(startup.protocol_major, startup.protocol_minor))
         }
 
         # Extract user and database
         user := mut M startup.get_param(&"user") {
             Some(u) => u.clone(),
             None => "vaisdb",
-        };
+        }
 
         database := mut M startup.get_param(&"database") {
             Some(d) => d.clone(),
             None => "vaisdb",
-        };
+        }
 
         app_name := mut M startup.get_param(&"application_name") {
             Some(a) => a.clone(),
             None => "",
-        };
+        }
 
         # Update connection with user info
         self.pool.with_connection(conn_id, |conn| {
-            conn.user = user.clone();
-            conn.database = database.clone();
-            conn.application_name = app_name;
-            conn.set_state(ConnectionState.Authenticating)
+            conn.user = user.clone()
+            conn.database = database.clone()
+            conn.application_name = app_name
+            conn.set_state(Authenticating)
         })??;
 
         # Send auth request
-        responses := mut Vec.new();
-        auth_method_byte := mut self.auth.auth_method_byte();
-        responses.push(serialize_auth_request(auth_method_byte));
+        responses := mut Vec.with_capacity(0)
+        auth_method_byte := mut self.auth.auth_method_byte()
+        responses.push(serialize_auth_request(auth_method_byte))
 
         Ok(responses)
     }
@@ -187,9 +180,9 @@ X TcpServer {
     F handle_auth_response(
         mut self,
         conn_id: u64,
-        credentials: &Str,
+        credentials: &str,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        responses := mut Vec.new();
+        responses := mut Vec.with_capacity(0)
 
         # Get user from connection
         user := mut self.pool.with_connection_ref(conn_id, |conn| {
@@ -205,11 +198,11 @@ X TcpServer {
 
         # Auth succeeded — transition to Ready
         self.pool.with_connection(conn_id, |conn| {
-            conn.set_state(ConnectionState.Ready)
+            conn.set_state(Ready)
         })??;
 
-        responses.push(serialize_auth_ok());
-        responses.push(serialize_ready(&TransactionState.Idle));
+        responses.push(serialize_auth_ok())
+        responses.push(serialize_ready(&Idle))
 
         Ok(responses)
     }
@@ -220,10 +213,10 @@ X TcpServer {
         conn_id: u64,
         msg: &FramedMessage,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        handler := mut QueryHandler.new(conn_id);
+        handler := mut QueryHandler.new(conn_id)
 
         I msg.msg_type == MSG_TYPE_QUERY {
-            self.total_queries.fetch_add(1, Ordering.Relaxed);
+            self.total_queries.fetch_add(1)
         }
 
         handler.handle_message(msg, &self.pool)
@@ -231,7 +224,7 @@ X TcpServer {
 
     # Disconnect a client (cleanup)
     F disconnect(mut self, conn_id: u64) {
-        self.pool.remove_connection(conn_id);
+        self.pool.remove_connection(conn_id)
     }
 
     # ========================================================================
@@ -305,7 +298,7 @@ X ConnectionProcessor {
     F new(conn_id: u64) -> ConnectionProcessor {
         ConnectionProcessor {
             conn_id,
-            recv_buffer: Vec.new(),
+            recv_buffer: Vec.with_capacity(0),
             is_authenticated: false,
             is_startup_done: false,
         }
@@ -319,57 +312,57 @@ X ConnectionProcessor {
         server: &mut TcpServer,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
         # Append to recv buffer
-        i: u64 := mut 0;
+        i := mut 0
         L i < data.len() {
-            self.recv_buffer.push(data[i]);
-            i += 1;
+            self.recv_buffer.push(data[i])
+            i += 1
         }
 
-        all_responses := mut Vec.new();
+        all_responses := mut Vec.with_capacity(0)
 
         # Try to parse and process complete messages
-        processing := mut true;
+        processing := mut true
         L processing {
             M read_framed_message(&self.recv_buffer) {
                 Ok(msg) => {
                     # Remove consumed bytes from buffer
-                    consumed := mut msg.total_wire_len as u64;
-                    new_buf := mut Vec.new();
-                    j: u64 := mut consumed;
+                    consumed := mut msg.total_wire_len as u64
+                    new_buf := mut Vec.with_capacity(0)
+                    j := mut consumed
                     L j < self.recv_buffer.len() {
-                        new_buf.push(self.recv_buffer[j]);
-                        j += 1;
+                        new_buf.push(self.recv_buffer[j])
+                        j += 1
                     }
-                    self.recv_buffer = new_buf;
+                    self.recv_buffer = new_buf
 
                     # Route message
                     responses := mut I !self.is_startup_done {
                         # First message must be Startup
-                        reader := mut msg.payload_reader();
+                        reader := mut msg.payload_reader()
                         startup := mut deserialize_startup(&reader)?;
-                        self.is_startup_done = true;
-                        server.handle_startup(self.conn_id, &startup)?
+                        self.is_startup_done = true
+                        server.handle_startup(self.conn_id, &startup)?;
                     } E I !self.is_authenticated {
                         # Next message should be AuthResponse
-                        reader := mut msg.payload_reader();
+                        reader := mut msg.payload_reader()
                         credentials := mut deserialize_auth_response(&reader)?;
-                        self.is_authenticated = true;
-                        server.handle_auth_response(self.conn_id, &credentials)?
+                        self.is_authenticated = true
+                        server.handle_auth_response(self.conn_id, &credentials)?;
                     } E {
                         # Normal message processing
-                        server.process_message(self.conn_id, &msg)?
-                    };
+                        server.process_message(self.conn_id, &msg)?;
+                    }
 
                     # Collect responses
-                    r: u64 := mut 0;
+                    r := mut 0
                     L r < responses.len() {
-                        all_responses.push(responses[r].clone());
-                        r += 1;
+                        all_responses.push(responses[r].clone())
+                        r += 1
                     }
                 },
                 Err(_) => {
                     # Incomplete message — wait for more data
-                    processing = false;
+                    processing = false
                 },
             }
         }
@@ -391,14 +384,14 @@ F err_server_not_running() -> VaisError {
     VaisError.new(
         "VAIS-0607001",
         "Server is not running"
-    ).with_severity(ErrorSeverity.Fatal)
+    ).with_severity(Fatal)
 }
 
-F err_server_bind_failed(addr: Str, port: u16) -> VaisError {
+F err_server_bind_failed(addr: str, port: u16) -> VaisError {
     VaisError.new(
         "VAIS-0607002",
         "Failed to bind to {addr}:{port}"
-    ).with_severity(ErrorSeverity.Fatal)
+    ).with_severity(Fatal)
 }
 
 F err_server_accept_failed() -> VaisError {

@@ -1,22 +1,19 @@
 # src/fulltext/ddl.vais
 # CREATE/DROP FULLTEXT INDEX DDL operations and incremental maintenance
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/constants.{FILE_ID_FULLTEXT, NULL_PAGE};
-U storage/error.{VaisError};
-U storage/buffer/pool.{BufferPool};
-U storage/page/allocator.{PageAllocator};
-U storage/wal/group_commit.{GroupCommitManager};
-U fulltext/types.{
-    FullTextConfig, FullTextMeta, PostingEntry,
-    DictEntry, err_fulltext_index_not_found
-};
-U storage/hash.{fnv1a_hash};
-U fulltext/tokenizer.{Tokenizer, TermFreqInfo};
-U fulltext/index/dictionary.{DictionaryIndex};
-U fulltext/index/posting.{PostingStore};
+U std/vec
+U std/string
+U std/option
+U storage/constants
+U storage/error
+U storage/buffer/pool
+U storage/page/allocator
+U storage/wal/group_commit
+U fulltext/types
+U storage/hash
+U fulltext/tokenizer
+U fulltext/index/dictionary
+U fulltext/index/posting
 
 # Result of building a full-text index
 S BuildResult {
@@ -29,9 +26,9 @@ X BuildResult {
     # Create a new build result
     F new(docs_indexed: u32, terms_created: u32, total_tokens: u64) -> BuildResult {
         BuildResult {
-            docs_indexed: docs_indexed,
-            terms_created: terms_created,
-            total_tokens: total_tokens,
+            docs_indexed,
+            terms_created,
+            total_tokens,
         }
     }
 
@@ -55,8 +52,8 @@ X FullTextDDL {
     # Create a new full-text DDL handler
     F new(allocator: PageAllocator, pool: BufferPool) -> FullTextDDL {
         FullTextDDL {
-            allocator: allocator,
-            pool: pool,
+            allocator,
+            pool,
         }
     }
 
@@ -87,25 +84,25 @@ X FullTextDDL {
                     column_id,
                     dict_root_page,
                     config.clone(),
-                );
+                )
 
                 # Step 3: Register in catalog
                 # Note: Actual catalog registration done by caller
                 # For now, we generate a synthetic index_id based on table_id and column_id
-                index_id := mut (table_id << 16) | (column_id as u32);
+                index_id := mut (table_id << 16) | (column_id as u32)
 
                 # Step 4: Initialize dictionary B+Tree root page
                 M self.pool.pin_page(FILE_ID_FULLTEXT, dict_root_page, txn_id) {
-                    Ok(mut page_guard) => {
+                    Ok(page_guard) => {
                         # Initialize as empty B+Tree leaf node
                         # Format: [is_leaf: u8 = 1][num_keys: u16 = 0][...]
-                        page_data := mut page_guard.data_mut();
+                        page_data := mut page_guard.data_mut()
                         page_data[0] = 1u8; # is_leaf
                         page_data[1] = 0u8; # num_keys low byte
                         page_data[2] = 0u8; # num_keys high byte
 
-                        page_guard.mark_dirty();
-                        self.pool.unpin_page(FILE_ID_FULLTEXT, dict_root_page);
+                        page_guard.mark_dirty()
+                        self.pool.unpin_page(FILE_ID_FULLTEXT, dict_root_page)
 
                         Ok(index_id)
                     }
@@ -145,7 +142,7 @@ X FullTextDDL {
         M self.allocator.free_page(FILE_ID_FULLTEXT, meta.dict_root_page, txn_id, cmd_id, gcm) {
             Ok(_) => {}
             Err(e) => {
-                R Err(e);
+                R Err(e)
             }
         }
 
@@ -173,40 +170,40 @@ X FullTextDDL {
         mut self,
         index_id: u32,
         meta: &FullTextMeta,
-        rows: &Vec<(u64, Str)>,
+        rows: &Vec<(u64, str)>,
         txn_id: u64,
         cmd_id: u32,
         gcm: &GroupCommitManager,
     ) -> Result<BuildResult, VaisError> {
-        tokenizer := mut Tokenizer.new(meta.config.clone());
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
-        posting_store := mut PostingStore.new(self.allocator.clone());
+        tokenizer := mut Tokenizer.new(meta.config.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
+        posting_store := mut PostingStore.new(self.allocator.clone())
 
-        docs_indexed := mut 0u32;
-        terms_created := mut 0u32;
-        total_tokens := mut 0u64;
+        docs_indexed := mut 0u32
+        terms_created := mut 0u32
+        total_tokens := mut 0u64
 
         # Step 1 & 2: Scan rows and tokenize
         L row: rows {
-            doc_id := mut row.0;
-            text_content := mut &row.1;
+            doc_id := mut row.0
+            text_content := mut &row.1
 
             # Tokenize the text
-            term_freqs := mut tokenizer.tokenize_with_freqs(text_content);
+            term_freqs := mut tokenizer.tokenize_with_freqs(text_content)
 
-            I !term_freqs.is_empty() {
-                doc_length := mut 0u32;
+            I !term_freqs.len() == 0 {
+                doc_length := mut 0u32
                 L tf_info: &term_freqs {
-                    doc_length += tf_info.freq;
+                    doc_length += tf_info.freq
                 }
 
                 # Step 3: Build posting lists for each term
                 L tf_info: term_freqs {
-                    term := mut &tf_info.term;
-                    term_freq := mut tf_info.freq;
-                    positions := mut &tf_info.positions;
+                    term := mut &tf_info.term
+                    term_freq := mut tf_info.freq
+                    positions := mut &tf_info.positions
 
-                    total_tokens += term_freq as u64;
+                    total_tokens += term_freq as u64
 
                     # Lookup or create dictionary entry
                     M dict_index.lookup_term(term, &self.pool) {
@@ -220,9 +217,9 @@ X FullTextDDL {
                                 doc_length,
                                 txn_id,
                                 cmd_id,
-                            );
+                            )
 
-                            term_hash := mut fnv1a_hash(term);
+                            term_hash := mut fnv1a_hash(term)
                             M posting_store.append_entry(
                                 dict_entry.posting_head_page,
                                 &posting_entry,
@@ -233,7 +230,7 @@ X FullTextDDL {
                             ) {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    R Err(e);
+                                    R Err(e)
                                 }
                             }
                         }
@@ -251,7 +248,7 @@ X FullTextDDL {
                                         &self.pool,
                                     ) {
                                         Ok(_) => {
-                                            terms_created += 1;
+                                            terms_created += 1
 
                                             # Create first posting entry
                                             posting_entry := mut PostingEntry.new(
@@ -262,9 +259,9 @@ X FullTextDDL {
                                                 doc_length,
                                                 txn_id,
                                                 cmd_id,
-                                            );
+                                            )
 
-                                            term_hash := mut fnv1a_hash(term);
+                                            term_hash := mut fnv1a_hash(term)
                                             M posting_store.append_entry(
                                                 posting_head_page,
                                                 &posting_entry,
@@ -275,28 +272,28 @@ X FullTextDDL {
                                             ) {
                                                 Ok(_) => {}
                                                 Err(e) => {
-                                                    R Err(e);
+                                                    R Err(e)
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            R Err(e);
+                                            R Err(e)
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    R Err(e);
+                                    R Err(e)
                                 }
                             }
                         }
                         Err(e) => {
-                            R Err(e);
+                            R Err(e)
                         }
                     }
                 }
             }
 
-            docs_indexed += 1;
+            docs_indexed += 1
         }
 
         Ok(BuildResult.new(docs_indexed, terms_created, total_tokens))
@@ -313,8 +310,8 @@ X IndexEntry {
     # Create a new index entry handler
     F new(allocator: PageAllocator, pool: BufferPool) -> IndexEntry {
         IndexEntry {
-            allocator: allocator,
-            pool: pool,
+            allocator,
+            pool,
         }
     }
 
@@ -331,33 +328,33 @@ X IndexEntry {
         index_id: u32,
         meta: &FullTextMeta,
         doc_id: u64,
-        text: &Str,
+        text: &str,
         table_id: u32,
         row_tid: u32,
         txn_id: u64,
         cmd_id: u32,
         gcm: &GroupCommitManager,
     ) -> Result<(), VaisError> {
-        tokenizer := mut Tokenizer.new(meta.config.clone());
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
-        posting_store := mut PostingStore.new(self.allocator.clone());
+        tokenizer := mut Tokenizer.new(meta.config.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
+        posting_store := mut PostingStore.new(self.allocator.clone())
 
         # Step 1: Tokenize text
-        term_freqs := mut tokenizer.tokenize_with_freqs(text);
+        term_freqs := mut tokenizer.tokenize_with_freqs(text)
 
-        I term_freqs.is_empty() {
-            R Ok(());
+        I term_freqs.len() == 0 {
+            R Ok(())
         }
 
-        doc_length := mut 0u32;
+        doc_length := mut 0u32
         L tf_info: &term_freqs {
-            doc_length += tf_info.freq;
+            doc_length += tf_info.freq
         }
 
         # Step 2 & 3: Process each term
         L tf_info: term_freqs {
-            term := mut &tf_info.term;
-            term_freq := mut tf_info.freq;
+            term := mut &tf_info.term
+            term_freq := mut tf_info.freq
 
             # Lookup or create dictionary entry
             M dict_index.lookup_term(term, &self.pool) {
@@ -371,9 +368,9 @@ X IndexEntry {
                         doc_length,
                         txn_id,
                         cmd_id,
-                    );
+                    )
 
-                    term_hash := mut fnv1a_hash(term);
+                    term_hash := mut fnv1a_hash(term)
                     M posting_store.append_entry(
                         dict_entry.posting_head_page,
                         &posting_entry,
@@ -384,7 +381,7 @@ X IndexEntry {
                     ) {
                         Ok(_) => {}
                         Err(e) => {
-                            R Err(e);
+                            R Err(e)
                         }
                     }
                 }
@@ -408,9 +405,9 @@ X IndexEntry {
                                         doc_length,
                                         txn_id,
                                         cmd_id,
-                                    );
+                                    )
 
-                                    term_hash := mut fnv1a_hash(term);
+                                    term_hash := mut fnv1a_hash(term)
                                     M posting_store.append_entry(
                                         posting_head_page,
                                         &posting_entry,
@@ -421,22 +418,22 @@ X IndexEntry {
                                     ) {
                                         Ok(_) => {}
                                         Err(e) => {
-                                            R Err(e);
+                                            R Err(e)
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    R Err(e);
+                                    R Err(e)
                                 }
                             }
                         }
                         Err(e) => {
-                            R Err(e);
+                            R Err(e)
                         }
                     }
                 }
                 Err(e) => {
-                    R Err(e);
+                    R Err(e)
                 }
             }
         }
@@ -459,25 +456,25 @@ X IndexEntry {
         index_id: u32,
         meta: &FullTextMeta,
         doc_id: u64,
-        text: &Str,
+        text: &str,
         txn_id: u64,
         cmd_id: u32,
         gcm: &GroupCommitManager,
     ) -> Result<(), VaisError> {
-        tokenizer := mut Tokenizer.new(meta.config.clone());
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page);
-        posting_store := mut PostingStore.new(self.allocator.clone());
+        tokenizer := mut Tokenizer.new(meta.config.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
+        posting_store := mut PostingStore.new(self.allocator.clone())
 
         # Step 1: Tokenize text to find affected terms
-        term_freqs := mut tokenizer.tokenize_with_freqs(text);
+        term_freqs := mut tokenizer.tokenize_with_freqs(text)
 
-        I term_freqs.is_empty() {
-            R Ok(());
+        I term_freqs.len() == 0 {
+            R Ok(())
         }
 
         # Step 2 & 3: Process each term
         L tf_info: term_freqs {
-            term := mut &tf_info.term;
+            term := mut &tf_info.term
 
             # Lookup dictionary entry
             M dict_index.lookup_term(term, &self.pool) {
@@ -486,7 +483,7 @@ X IndexEntry {
                     M posting_store.read_all_entries(dict_entry.posting_head_page, &self.pool) {
                         Ok(postings) => {
                             # Find posting entry with matching doc_id
-                            found_posting := mut false;
+                            found_posting := mut false
                             L posting: postings {
                                 I !found_posting && posting.doc_id == doc_id {
                                     # Mark as expired
@@ -495,12 +492,12 @@ X IndexEntry {
                                     # For now, we acknowledge that this requires page-level update
                                     # which should be done via posting_store.expire_entry()
                                     # (not yet implemented in posting.vais)
-                                    found_posting = true;
+                                    found_posting = true
                                 }
                             }
                         }
                         Err(e) => {
-                            R Err(e);
+                            R Err(e)
                         }
                     }
                 }
@@ -508,7 +505,7 @@ X IndexEntry {
                     # Term not found, nothing to delete
                 }
                 Err(e) => {
-                    R Err(e);
+                    R Err(e)
                 }
             }
         }

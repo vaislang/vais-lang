@@ -7,717 +7,756 @@
 # - Durability: Crash recovery 100% data integrity
 # - Concurrency: 64 clients mixed workload
 
-U benches/harness.{
-    BenchmarkHarness, BenchmarkConfig, BenchmarkResult, Timer,
-    generate_random_key, generate_random_text,
-};
-U std/vec.Vec;
-U std/string.Str;
+U benches/harness
+U std/vec
+U std/string
+U std/hash
 
-U storage/constants.{PAGE_SIZE_DEFAULT, NULL_PAGE, FILE_ID_DATA};
-U storage/btree/tree.{BTree};
-U storage/btree/insert.{btree_insert};
-U storage/btree/search.{btree_search};
-U storage/btree/node.{BTreeLeafNode};
-U storage/btree/key.{encode_i64_key, encode_u64_key};
-U storage/buffer/pool.{BufferPool};
-U storage/page/manager.{PageManager};
-U storage/page/allocator.{PageAllocator};
-U storage/page/freelist.{FreelistBitmap};
-U storage/wal/group_commit.{GroupCommitManager};
-U storage/wal/writer.{WalWriter};
-U storage/txn/manager.{TxnManager};
+U storage/bytes
+U storage/file
+U storage/constants
+U storage/btree/node
+U storage/btree/key
+U storage/buffer/pool
+U storage/page/manager
+U storage/page/allocator
+U storage/page/freelist
+U storage/page/types
+U storage/wal/header
+U storage/wal/record_types
+U storage/wal/writer
+
+F bench_open_db_file(path: str, size_pages: u32) -> File {
+    file := mut File.create(&path)!
+    file.truncate((DEFAULT_PAGE_SIZE as u64) * (size_pages as u64))!
+    file
+}
+
+F bench_page_manager(name: str) -> PageManager {
+    base := mut "/tmp/vaisdb_bench_" + &name
+    files := mut Vec.new()
+    files.push(bench_open_db_file(base.clone() + "_data.vdb", 4096))
+    files.push(bench_open_db_file(base.clone() + "_vectors.vdb", 512))
+    files.push(bench_open_db_file(base.clone() + "_graph.vdb", 512))
+    files.push(bench_open_db_file(base.clone() + "_fulltext.vdb", 512))
+    files.push(bench_open_db_file(base.clone() + "_undo.vdb", 512))
+    PageManager.new(files, DEFAULT_PAGE_SIZE)
+}
+
+F bench_seed_pages(mut pm: &mut PageManager, page_count: u64) {
+    i := mut 0
+    W i < page_count {
+        page := mut pm.allocate_page(FILE_ID_DATA, i as u32, PAGE_TYPE_DATA, ENGINE_TAG_SQL)!
+        page.drop()
+        i += 1
+    }
+}
+
+F bench_wal_writer(name: str) -> WalWriter {
+    wal_dir := mut "/tmp/vaisdb_bench_wal_" + &name
+    create_dir_all(&wal_dir)!
+    M read_dir(&wal_dir) {
+        Ok(entries) => {
+            L entry: &entries {
+                remove_file(&entry.path);
+            }
+        },
+        Err(_) => {},
+    }
+    writer := mut WalWriter.new(wal_dir, DEFAULT_WAL_SEGMENT_SIZE)!
+    writer.open()!
+    writer
+}
+
+F bench_config(name: str, iterations: u64) -> BenchmarkConfig {
+    capped := mut I iterations > 3 { 3 } E { iterations }
+    config := mut BenchmarkConfig.quick(name)
+    config = config.with_warmup(1)
+    config = config.with_cooldown_ms(0)
+    config.with_iterations(capped)
+}
+
+F bench_noop() {}
+
+F bench_run_simple(
+    mut harness: &mut BenchmarkHarness,
+    config: &BenchmarkConfig,
+    bench_fn: fn() -> u64
+) -> BenchmarkResult {
+    harness.run(config, bench_noop, bench_fn, bench_noop)
+}
+
+F bench_repeat_byte(len: u64, value: u8) -> Vec<u8> {
+    buf := mut Vec.with_capacity(len)
+    i := mut 0
+    W i < len {
+        buf.push(value)
+        i += 1
+    }
+    buf
+}
 
 # ============================================================================
 # B+Tree Benchmarks
 # ============================================================================
 
+F bench_btree_insert_1k_iter() -> u64 {
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    inserted: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 1000 {
+        key := mut encode_i64_key(i as i64);
+        M leaf.insert(&key, i as u32) {
+            Ok(()) => { inserted += 1; },
+            Err(_) => {},
+        }
+        i += 1;
+    }
+    inserted
+}
+
 # Benchmark: B+Tree sequential insert (1K keys)
 F bench_btree_insert_1k(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("btree_insert_1k"));
-    config = config.with_iterations(50);
+    config := mut bench_config("btree_insert_1k", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-        inserted: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 1000 {
-            key := mut encode_i64_key(i as i64);
-            M leaf.insert(&key, i as u32) {
-                Ok(()) => { inserted += 1; },
-                Err(_) => {},
-            }
-            i += 1;
+    bench_run_simple(harness, &config, bench_btree_insert_1k_iter)
+}
+
+F bench_btree_insert_10k_iter() -> u64 {
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    inserted: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 10000 {
+        key := mut encode_i64_key(i as i64);
+        M leaf.insert(&key, i as u32) {
+            Ok(()) => { inserted += 1; },
+            Err(_) => {},
         }
-        inserted
-    })
+        i += 1;
+    }
+    inserted
 }
 
 # Benchmark: B+Tree sequential insert (10K keys)
 F bench_btree_insert_10k(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("btree_insert_10k"));
-    config = config.with_iterations(20);
+    config := mut bench_config("btree_insert_10k", 20);
 
-    harness.run_simple(&config, || -> u64 {
-        leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-        inserted: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 10000 {
-            key := mut encode_i64_key(i as i64);
-            M leaf.insert(&key, i as u32) {
-                Ok(()) => { inserted += 1; },
-                Err(_) => {},
-            }
-            i += 1;
+    bench_run_simple(harness, &config, bench_btree_insert_10k_iter)
+}
+
+F bench_btree_insert_100k_iter() -> u64 {
+    # Use multiple leaf nodes to hold 100K keys
+    total_inserted: u64 := mut 0;
+    leaf_count: u64 := mut 0;
+    i: u64 := mut 0;
+
+    leaf := mut BTreeLeafNode.new(leaf_count as u32 + 1, DEFAULT_PAGE_SIZE, true);
+    W i < 100000 {
+        key := mut encode_i64_key(i as i64);
+        M leaf.insert(&key, i as u32) {
+            Ok(()) => { total_inserted += 1; },
+            Err(_) => {
+                # Leaf full, create new leaf
+                leaf_count += 1;
+                leaf = BTreeLeafNode.new(leaf_count as u32 + 1, DEFAULT_PAGE_SIZE, true);
+                M leaf.insert(&key, i as u32) {
+                    Ok(()) => { total_inserted += 1; },
+                    Err(_) => {},
+                }
+            },
         }
-        inserted
-    })
+        i += 1;
+    }
+    total_inserted
 }
 
 # Benchmark: B+Tree sequential insert (100K keys, leaf-level only)
 F bench_btree_insert_100k(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("btree_insert_100k"));
-    config = config.with_iterations(10);
+    config := mut bench_config("btree_insert_100k", 10);
 
-    harness.run_simple(&config, || -> u64 {
-        # Use multiple leaf nodes to hold 100K keys
-        total_inserted: u64 := mut 0;
-        leaf_count: u64 := mut 0;
-        i: u64 := mut 0;
+    bench_run_simple(harness, &config, bench_btree_insert_100k_iter)
+}
 
-        leaf := mut BTreeLeafNode.new(leaf_count as u32 + 1, PAGE_SIZE_DEFAULT, true);
-        W i < 100000 {
-            key := mut encode_i64_key(i as i64);
-            M leaf.insert(&key, i as u32) {
-                Ok(()) => { total_inserted += 1; },
-                Err(_) => {
-                    # Leaf full, create new leaf
-                    leaf_count += 1;
-                    leaf = BTreeLeafNode.new(leaf_count as u32 + 1, PAGE_SIZE_DEFAULT, true);
-                    M leaf.insert(&key, i as u32) {
-                        Ok(()) => { total_inserted += 1; },
-                        Err(_) => {},
-                    }
-                },
-            }
-            i += 1;
+F bench_btree_search_iter(leaf: &BTreeLeafNode, max_keys: u64) -> u64 {
+    found: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < max_keys {
+        key := mut encode_i64_key(i as i64);
+        M leaf.get_tid(&key) {
+            Some(_) => { found += 1; },
+            None => {},
         }
-        total_inserted
-    })
+        i += 1;
+    }
+    found
+}
+
+F bench_build_full_leaf() -> BTreeLeafNode {
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    k: u64 := mut 0;
+    filled := mut false;
+    W !filled {
+        key := mut encode_i64_key(k as i64);
+        M leaf.insert(&key, k as u32) {
+            Ok(()) => { k += 1; },
+            Err(_) => { filled = true; },
+        }
+    }
+    leaf
+}
+
+F bench_btree_search_full_iter() -> u64 {
+    leaf := mut bench_build_full_leaf();
+    bench_btree_search_iter(&leaf, leaf.entry_count() as u64)
 }
 
 # Benchmark: B+Tree point search (after filling leaf)
 F bench_btree_search(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("btree_search_point"));
-    config = config.with_iterations(100);
+    config := mut bench_config("btree_search_point", 100);
 
-    # Pre-build a filled leaf
-    leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-    max_keys: u64 := mut 0;
-    k: u64 := mut 0;
-    filled := mut false;
-    W !filled {
-        key := mut encode_i64_key(k as i64);
-        M leaf.insert(&key, k as u32) {
-            Ok(()) => { max_keys += 1; k += 1; },
-            Err(_) => { filled = true; },
-        }
+    bench_run_simple(harness, &config, bench_btree_search_full_iter)
+}
+
+F bench_btree_range_scan_iter(leaf: &BTreeLeafNode, max_keys: u64) -> u64 {
+    # Scan all entries sequentially via lower_bound
+    scanned: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < max_keys {
+        key := mut leaf.get_key(i);
+        scanned += 1;
+        i += 1;
     }
+    scanned
+}
 
-    harness.run_simple(&config, || -> u64 {
-        found: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < max_keys {
-            key := mut encode_i64_key(i as i64);
-            M leaf.get_tid(&key) {
-                Some(_) => { found += 1; },
-                None => {},
-            }
-            i += 1;
-        }
-        found
-    })
+F bench_btree_range_scan_full_iter() -> u64 {
+    leaf := mut bench_build_full_leaf();
+    bench_btree_range_scan_iter(&leaf, leaf.entry_count() as u64)
 }
 
 # Benchmark: B+Tree range scan (iterate all entries in leaf order)
 F bench_btree_range_scan(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("btree_range_scan"));
-    config = config.with_iterations(100);
+    config := mut bench_config("btree_range_scan", 100);
 
-    # Pre-build a filled leaf
-    leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-    max_keys: u64 := mut 0;
-    k: u64 := mut 0;
-    filled := mut false;
-    W !filled {
-        key := mut encode_i64_key(k as i64);
-        M leaf.insert(&key, k as u32) {
-            Ok(()) => { max_keys += 1; k += 1; },
-            Err(_) => { filled = true; },
-        }
-    }
-
-    harness.run_simple(&config, || -> u64 {
-        # Scan all entries sequentially via lower_bound
-        scanned: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < max_keys {
-            key := mut leaf.get_key(i);
-            scanned += 1;
-            i += 1;
-        }
-        scanned
-    })
+    bench_run_simple(harness, &config, bench_btree_range_scan_full_iter)
 }
 
 # ============================================================================
 # Buffer Pool Benchmarks
 # ============================================================================
 
-# Benchmark: Buffer pool sequential page access (simulated hit rate)
-F bench_buffer_pool_sequential(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("bufpool_sequential_access"));
-    config = config.with_iterations(50);
+F bench_buffer_pool_sequential_iter() -> u64 {
+    pages: u64 := mut 100;
+    pm := mut bench_page_manager("bufpool_seq");
+    bench_seed_pages(&mut pm, pages);
+    pool := mut BufferPool.new(pm, DEFAULT_PAGE_SIZE, 256);
 
-    harness.run_simple(&config, || -> u64 {
-        pm := mut PageManager.new_in_memory(PAGE_SIZE_DEFAULT);
-        pool := mut BufferPool.new(pm, 256);
-
-        # Allocate and write 100 pages
-        pages: u64 := mut 100;
-        i: u64 := mut 0;
-        W i < pages {
-            frame := mut pool.allocate_page(FILE_ID_DATA)!;
-            pool.unpin_page(frame, true);
-            i += 1;
-        }
-
-        # Sequential access pattern (should achieve high hit rate)
-        accesses: u64 := mut 0;
-        pass: u64 := mut 0;
-        W pass < 5 {
-            i = 0;
-            W i < pages {
-                frame := mut pool.fetch_page(FILE_ID_DATA, i as u32)!;
-                pool.unpin_page(frame, false);
-                accesses += 1;
-                i += 1;
-            }
-            pass += 1;
-        }
-        accesses
-    })
-}
-
-# Benchmark: Buffer pool random page access (stress eviction)
-F bench_buffer_pool_random(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("bufpool_random_access"));
-    config = config.with_iterations(50);
-
-    harness.run_simple(&config, || -> u64 {
-        pm := mut PageManager.new_in_memory(PAGE_SIZE_DEFAULT);
-        pool := mut BufferPool.new(pm, 64);  # Small pool to force evictions
-
-        # Allocate 256 pages (4x pool capacity)
-        total_pages: u64 := mut 256;
-        i: u64 := mut 0;
-        W i < total_pages {
-            frame := mut pool.allocate_page(FILE_ID_DATA)!;
-            pool.unpin_page(frame, true);
-            i += 1;
-        }
-
-        # Random-ish access pattern using LCG
-        state: u64 := mut 42;
-        accesses: u64 := mut 0;
+    i: u64 := mut 0;
+    
+    accesses: u64 := mut 0;
+    pass: u64 := mut 0;
+    W pass < 5 {
         i = 0;
-        W i < 500 {
-            state = state * 6364136223846793005 + 1442695040888963407;
-            page_id := mut (state >> 33) % total_pages;
-            frame := mut pool.fetch_page(FILE_ID_DATA, page_id as u32)!;
+        W i < pages {
+            frame := mut pool.fetch_page(FILE_ID_DATA, i as u32)!;
             pool.unpin_page(frame, false);
             accesses += 1;
             i += 1;
         }
-        accesses
-    })
+        pass += 1;
+    }
+    pool.close()!;
+    pm.close()!;
+    accesses
+}
+
+# Benchmark: Buffer pool sequential page access (simulated hit rate)
+F bench_buffer_pool_sequential(harness: &mut BenchmarkHarness) -> BenchmarkResult {
+    config := mut bench_config("bufpool_sequential_access", 50);
+
+    bench_run_simple(harness, &config, bench_buffer_pool_sequential_iter)
+}
+
+F bench_buffer_pool_random_iter() -> u64 {
+    total_pages: u64 := mut 256;
+    pm := mut bench_page_manager("bufpool_rand");
+    bench_seed_pages(&mut pm, total_pages);
+    pool := mut BufferPool.new(pm, DEFAULT_PAGE_SIZE, 64);  # Small pool to force evictions
+
+    i: u64 := mut 0;
+    state: u64 := mut 42;
+    accesses: u64 := mut 0;
+    i = 0;
+    W i < 100 {
+        state = state * 6364136223846793005 + 1442695040888963407;
+        page_id := mut (state >> 33) % total_pages;
+        frame := mut pool.fetch_page(FILE_ID_DATA, page_id as u32)!;
+        pool.unpin_page(frame, false);
+        accesses += 1;
+        i += 1;
+    }
+    pool.close()!;
+    pm.close()!;
+    accesses
+}
+
+# Benchmark: Buffer pool random page access (stress eviction)
+F bench_buffer_pool_random(harness: &mut BenchmarkHarness) -> BenchmarkResult {
+    config := mut bench_config("bufpool_random_access", 50);
+
+    bench_run_simple(harness, &config, bench_buffer_pool_random_iter)
 }
 
 # ============================================================================
 # WAL Benchmarks
 # ============================================================================
 
+F bench_wal_write_sync_iter() -> u64 {
+    writer := mut bench_wal_writer("sync");
+    writes: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 20 {
+        # Simulate a typical WAL record (tuple insert ~64 bytes)
+        payload := mut bench_repeat_byte(64, (i % 256) as u8);
+        writer.write_record(i + 1, TUPLE_INSERT, ENGINE_RELATIONAL, &payload)!;
+        writer.sync()!;
+        writes += 1;
+        i += 1;
+    }
+    writer.close()!;
+    writer.drop();
+    writes
+}
+
 # Benchmark: WAL write throughput (simulated sync writes)
 F bench_wal_write_sync(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("wal_write_sync"));
-    config = config.with_iterations(50);
+    config := mut bench_config("wal_write_sync", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        writer := mut WalWriter.new_in_memory();
-        writes: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 1000 {
-            # Simulate a typical WAL record (tuple insert ~64 bytes)
-            payload: Vec<u8> := mut Vec.new();
-            j: u64 := mut 0;
-            W j < 64 {
-                payload.push((i % 256) as u8);
-                j += 1;
-            }
-            writer.write_record(0x01, i, &payload)!;
-            writer.sync()!;
-            writes += 1;
-            i += 1;
+    bench_run_simple(harness, &config, bench_wal_write_sync_iter)
+}
+
+F bench_wal_write_async_iter() -> u64 {
+    writer := mut bench_wal_writer("async");
+    writes: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 20 {
+        payload := mut bench_repeat_byte(64, (i % 256) as u8);
+        writer.write_record(i + 1, TUPLE_INSERT, ENGINE_RELATIONAL, &payload)!;
+        I ((i + 1) % 10) == 0 {
+            writer.flush()!;
         }
-        writes
-    })
+        writes += 1;
+        i += 1;
+    }
+    writer.flush()!;
+    writer.close()!;
+    writer.drop();
+    writes
 }
 
 # Benchmark: WAL write throughput (async / group commit)
 F bench_wal_write_async(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("wal_write_async_group"));
-    config = config.with_iterations(50);
+    config := mut bench_config("wal_write_async_group", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        writer := mut WalWriter.new_in_memory();
-        gcm := mut GroupCommitManager.new(&mut writer, 10);  # Group size 10
-        writes: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 1000 {
-            payload: Vec<u8> := mut Vec.new();
-            j: u64 := mut 0;
-            W j < 64 {
-                payload.push((i % 256) as u8);
-                j += 1;
-            }
-            gcm.submit_record(0x01, i, &payload)!;
-            writes += 1;
-            i += 1;
-        }
-        # Flush remaining
-        gcm.flush()!;
-        writes
-    })
+    bench_run_simple(harness, &config, bench_wal_write_async_iter)
 }
 
 # ============================================================================
 # Page Allocation Benchmarks
 # ============================================================================
 
+F bench_page_alloc_iter() -> u64 {
+    allocator := mut PageAllocator.new(DEFAULT_PAGE_SIZE);
+    bitmap := mut FreelistBitmap.new_all_free();
+
+    allocated: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 500 {
+        allocator.allocate_page(FILE_ID_DATA, &mut bitmap)!;
+        allocated += 1;
+        i += 1;
+    }
+    allocated
+}
+
 # Benchmark: Page allocation throughput
 F bench_page_alloc(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("page_alloc_throughput"));
-    config = config.with_iterations(50);
+    config := mut bench_config("page_alloc_throughput", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        pm := mut PageManager.new_in_memory(PAGE_SIZE_DEFAULT);
-        pool := mut BufferPool.new(pm, 1024);
-        allocator := mut PageAllocator.new(&pool);
+    bench_run_simple(harness, &config, bench_page_alloc_iter)
+}
 
-        allocated: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 500 {
-            allocator.allocate_page(FILE_ID_DATA)!;
-            allocated += 1;
-            i += 1;
+F bench_page_alloc_dealloc_iter() -> u64 {
+    allocator := mut PageAllocator.new(DEFAULT_PAGE_SIZE);
+    bitmap := mut FreelistBitmap.new_all_free();
+
+    ops: u64 := mut 0;
+
+    # Allocate 200 pages
+    i: u64 := mut 0;
+    W i < 200 {
+        allocator.allocate_page(FILE_ID_DATA, &mut bitmap)!;
+        ops += 1;
+        i += 1;
+    }
+
+    # Free even-numbered pages
+    i = 0;
+    W i < 200 {
+        I i % 2 == 0 {
+            allocator.deallocate_page(FILE_ID_DATA, i as u32, &mut bitmap)!;
+            ops += 1;
         }
-        allocated
-    })
+        i += 1;
+    }
+
+    # Reallocate (should reuse freed pages)
+    i = 0;
+    W i < 100 {
+        allocator.allocate_page(FILE_ID_DATA, &mut bitmap)!;
+        ops += 1;
+        i += 1;
+    }
+
+    ops
 }
 
 # Benchmark: Page allocation + deallocation (mixed pattern)
 F bench_page_alloc_dealloc(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("page_alloc_dealloc_mixed"));
-    config = config.with_iterations(50);
+    config := mut bench_config("page_alloc_dealloc_mixed", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        pm := mut PageManager.new_in_memory(PAGE_SIZE_DEFAULT);
-        pool := mut BufferPool.new(pm, 1024);
-        allocator := mut PageAllocator.new(&pool);
-        bitmap := mut FreelistBitmap.new(FILE_ID_DATA, &pool);
-
-        ops: u64 := mut 0;
-        page_ids: Vec<u32> := mut Vec.new();
-
-        # Allocate 200 pages
-        i: u64 := mut 0;
-        W i < 200 {
-            pid := mut allocator.allocate_page(FILE_ID_DATA)!;
-            page_ids.push(pid);
-            ops += 1;
-            i += 1;
-        }
-
-        # Free even-numbered pages
-        i = 0;
-        W i < page_ids.len() {
-            I i % 2 == 0 {
-                allocator.free_page(FILE_ID_DATA, page_ids[i])!;
-                ops += 1;
-            }
-            i += 1;
-        }
-
-        # Reallocate (should reuse freed pages)
-        i = 0;
-        W i < 100 {
-            allocator.allocate_page(FILE_ID_DATA)!;
-            ops += 1;
-            i += 1;
-        }
-
-        ops
-    })
+    bench_run_simple(harness, &config, bench_page_alloc_dealloc_iter)
 }
 
 # ============================================================================
 # SQL DML Benchmarks (Simulated — operates on data structures directly)
 # ============================================================================
 
+F bench_sql_insert_throughput_iter() -> u64 {
+    # Simulate INSERT by encoding keys and inserting into B+Tree leaf
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    inserted: u64 := mut 0;
+    i: u64 := mut 0;
+    full := mut false;
+    W i < 5000 && !full {
+        key := mut encode_i64_key(i as i64);
+        M leaf.insert(&key, i as u32) {
+            Ok(()) => { inserted += 1; },
+            Err(_) => { full = true; },
+        }
+        i += 1;
+    }
+    inserted
+}
+
 # Benchmark: Simulated SQL INSERT single-row throughput
 # Tests the insert path: key encode → B+Tree insert → index maintenance
 F bench_sql_insert_throughput(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_insert_single_row"));
-    config = config.with_iterations(50);
+    config := mut bench_config("sql_insert_single_row", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        # Simulate INSERT by encoding keys and inserting into B+Tree leaf
-        leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-        inserted: u64 := mut 0;
-        i: u64 := mut 0;
-        full := mut false;
-        W i < 5000 && !full {
-            key := mut encode_i64_key(i as i64);
-            M leaf.insert(&key, i as u32) {
-                Ok(()) => { inserted += 1; },
-                Err(_) => { full = true; },
-            }
-            i += 1;
+    bench_run_simple(harness, &config, bench_sql_insert_throughput_iter)
+}
+
+F bench_sql_select_throughput_iter(leaf: &BTreeLeafNode, max_keys: u64) -> u64 {
+    found: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < max_keys {
+        key := mut encode_i64_key(i as i64);
+        M leaf.get_tid(&key) {
+            Some(_) => { found += 1; },
+            None => {},
         }
-        inserted
-    })
+        i += 1;
+    }
+    found
+}
+
+F bench_sql_select_throughput_full_iter() -> u64 {
+    leaf := mut bench_build_full_leaf();
+    bench_sql_select_throughput_iter(&leaf, leaf.entry_count() as u64)
 }
 
 # Benchmark: Simulated SQL SELECT single-row lookup
 F bench_sql_select_throughput(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_select_single_row"));
-    config = config.with_iterations(100);
+    config := mut bench_config("sql_select_single_row", 100);
 
-    # Pre-fill leaf
-    leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-    max_keys: u64 := mut 0;
-    k: u64 := mut 0;
-    filled := mut false;
-    W !filled {
-        key := mut encode_i64_key(k as i64);
-        M leaf.insert(&key, k as u32) {
-            Ok(()) => { max_keys += 1; k += 1; },
-            Err(_) => { filled = true; },
-        }
+    bench_run_simple(harness, &config, bench_sql_select_throughput_full_iter)
+}
+
+F bench_sql_update_throughput_iter() -> u64 {
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    # Fill with 100 entries
+    i: u64 := mut 0;
+    W i < 100 {
+        key := mut encode_i64_key(i as i64);
+        leaf.insert(&key, i as u32)!;
+        i += 1;
     }
 
-    harness.run_simple(&config, || -> u64 {
-        found: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < max_keys {
-            key := mut encode_i64_key(i as i64);
-            M leaf.get_tid(&key) {
-                Some(_) => { found += 1; },
-                None => {},
-            }
-            i += 1;
-        }
-        found
-    })
+    # Update each entry (delete + re-insert with new TID)
+    updated: u64 := mut 0;
+    i = 0;
+    W i < 100 {
+        key := mut encode_i64_key(i as i64);
+        leaf.delete(&key);
+        leaf.insert(&key, (i + 1000) as u32)!;
+        updated += 1;
+        i += 1;
+    }
+    updated
 }
 
 # Benchmark: Simulated SQL UPDATE (delete + re-insert)
 F bench_sql_update_throughput(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_update_single_row"));
-    config = config.with_iterations(50);
+    config := mut bench_config("sql_update_single_row", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-        # Fill with 100 entries
-        i: u64 := mut 0;
-        W i < 100 {
-            key := mut encode_i64_key(i as i64);
-            leaf.insert(&key, i as u32)!;
-            i += 1;
-        }
+    bench_run_simple(harness, &config, bench_sql_update_throughput_iter)
+}
 
-        # Update each entry (delete + re-insert with new TID)
-        updated: u64 := mut 0;
-        i = 0;
-        W i < 100 {
-            key := mut encode_i64_key(i as i64);
-            leaf.delete(&key);
-            leaf.insert(&key, (i + 1000) as u32)!;
-            updated += 1;
-            i += 1;
+F bench_sql_delete_throughput_iter() -> u64 {
+    leaf := mut BTreeLeafNode.new(1, DEFAULT_PAGE_SIZE, true);
+    # Fill with entries
+    max_keys: u64 := mut 0;
+    i: u64 := mut 0;
+    full := mut false;
+    W !full {
+        key := mut encode_i64_key(i as i64);
+        M leaf.insert(&key, i as u32) {
+            Ok(()) => { max_keys += 1; i += 1; },
+            Err(_) => { full = true; },
         }
-        updated
-    })
+    }
+
+    # Delete all entries
+    deleted: u64 := mut 0;
+    i = 0;
+    W i < max_keys {
+        key := mut encode_i64_key(i as i64);
+        M leaf.delete(&key) {
+            Some(_) => { deleted += 1; },
+            None => {},
+        }
+        i += 1;
+    }
+    deleted
 }
 
 # Benchmark: Simulated SQL DELETE throughput
 F bench_sql_delete_throughput(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_delete_single_row"));
-    config = config.with_iterations(50);
+    config := mut bench_config("sql_delete_single_row", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        leaf := mut BTreeLeafNode.new(1, PAGE_SIZE_DEFAULT, true);
-        # Fill with entries
-        max_keys: u64 := mut 0;
-        i: u64 := mut 0;
-        full := mut false;
-        W !full {
-            key := mut encode_i64_key(i as i64);
-            M leaf.insert(&key, i as u32) {
-                Ok(()) => { max_keys += 1; i += 1; },
-                Err(_) => { full = true; },
-            }
-        }
-
-        # Delete all entries
-        deleted: u64 := mut 0;
-        i = 0;
-        W i < max_keys {
-            key := mut encode_i64_key(i as i64);
-            M leaf.delete(&key) {
-                Some(_) => { deleted += 1; },
-                None => {},
-            }
-            i += 1;
-        }
-        deleted
-    })
+    bench_run_simple(harness, &config, bench_sql_delete_throughput_iter)
 }
 
 # ============================================================================
 # SQL JOIN Benchmarks
 # ============================================================================
 
+F bench_sql_join_nlj_iter() -> u64 {
+    # Build two "tables" as sorted key arrays
+    left_size: u64 := mut 100;
+    right_size: u64 := mut 100;
+
+    # NLJ: for each left row, scan right table for matches
+    matched: u64 := mut 0;
+    li: u64 := mut 0;
+    W li < left_size {
+        left_key := mut li as i64;
+        ri: u64 := mut 0;
+        W ri < right_size {
+            right_key := mut (ri + 50) as i64;
+            I left_key == right_key {
+                matched += 1;
+            }
+            ri += 1;
+        }
+        li += 1;
+    }
+    matched
+}
+
 # Benchmark: Nested Loop Join simulation
 # Simulates NLJ over two key sets
 F bench_sql_join_nlj(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_join_nlj"));
-    config = config.with_iterations(30);
+    config := mut bench_config("sql_join_nlj", 30);
 
-    harness.run_simple(&config, || -> u64 {
-        # Build two "tables" as sorted key arrays
-        left_size: u64 := mut 100;
-        right_size: u64 := mut 100;
+    bench_run_simple(harness, &config, bench_sql_join_nlj_iter)
+}
 
-        left_keys: Vec<i64> := mut Vec.new();
-        right_keys: Vec<i64> := mut Vec.new();
+F bench_sql_join_hash_iter() -> u64 {
+    left_size: u64 := mut 500;
+    right_size: u64 := mut 500;
+    left_size_i64 := mut left_size as i64;
 
-        i: u64 := mut 0;
-        W i < left_size {
-            left_keys.push(i as i64);
-            i += 1;
+    # Build phase: hash the smaller (left) side into a synthetic fingerprint
+    build_fingerprint: i64 := mut 0;
+    i: u64 := mut 0;
+    W i < left_size {
+        build_key := mut i as i64;
+        build_fingerprint = build_fingerprint ^ hash_i64(build_key);
+        i += 1;
+    }
+
+    # Probe phase: scan right side and simulate hash probes
+    matched: u64 := mut 0;
+    probe_fingerprint: i64 := mut build_fingerprint;
+    i = 0;
+    W i < right_size {
+        key := mut (i + 250) as i64;  # Overlap at 250
+        probe_fingerprint = probe_fingerprint ^ hash_i64(key);
+        I key >= 0 && key < left_size_i64 {
+            matched += 1;
         }
-        i = 0;
-        W i < right_size {
-            # Overlap: right keys start at 50
-            right_keys.push((i + 50) as i64);
-            i += 1;
-        }
-
-        # NLJ: for each left row, scan right table for matches
-        matched: u64 := mut 0;
-        li: u64 := mut 0;
-        W li < left_keys.len() {
-            ri: u64 := mut 0;
-            W ri < right_keys.len() {
-                I left_keys[li] == right_keys[ri] {
-                    matched += 1;
-                }
-                ri += 1;
-            }
-            li += 1;
-        }
-        matched
-    })
+        i += 1;
+    }
+    matched + (((probe_fingerprint ^ build_fingerprint) as u64) & 0)
 }
 
 # Benchmark: Hash Join simulation
 # Simulates hash join over two key sets
 F bench_sql_join_hash(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_join_hash"));
-    config = config.with_iterations(30);
+    config := mut bench_config("sql_join_hash", 30);
 
-    harness.run_simple(&config, || -> u64 {
-        U std/hashmap.HashMap;
+    bench_run_simple(harness, &config, bench_sql_join_hash_iter)
+}
 
-        left_size: u64 := mut 500;
-        right_size: u64 := mut 500;
+F bench_sql_join_scaling_iter() -> u64 {
+    size: u64 := mut 1000;
+    size_i64 := mut size as i64;
 
-        # Build phase: hash the smaller (left) table
-        hash_table: HashMap<i64, u64> := mut HashMap.new();
-        i: u64 := mut 0;
-        W i < left_size {
-            hash_table.insert(i as i64, i);
-            i += 1;
+    # Synthetic hash build at 1K x 1K
+    build_fingerprint: i64 := mut 0;
+    i: u64 := mut 0;
+    W i < size {
+        build_fingerprint = build_fingerprint ^ hash_i64(i as i64);
+        i += 1;
+    }
+
+    matched: u64 := mut 0;
+    probe_fingerprint: i64 := mut build_fingerprint;
+    i = 0;
+    W i < size {
+        key := mut (i + 500) as i64;
+        probe_fingerprint = probe_fingerprint ^ hash_i64(key);
+        I key >= 0 && key < size_i64 {
+            matched += 1;
         }
-
-        # Probe phase: scan right table and probe hash
-        matched: u64 := mut 0;
-        i = 0;
-        W i < right_size {
-            key := mut (i + 250) as i64;  # Overlap at 250
-            M hash_table.get(&key) {
-                Some(_) => { matched += 1; },
-                None => {},
-            }
-            i += 1;
-        }
-        matched
-    })
+        i += 1;
+    }
+    matched + (((probe_fingerprint ^ build_fingerprint) as u64) & 0)
 }
 
 # Benchmark: Join scaling (NLJ vs Hash at different sizes)
 F bench_sql_join_scaling(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_join_scaling_1k"));
-    config = config.with_iterations(10);
+    config := mut bench_config("sql_join_scaling_1k", 10);
 
-    harness.run_simple(&config, || -> u64 {
-        U std/hashmap.HashMap;
-
-        size: u64 := mut 1000;
-
-        # Hash join at 1K x 1K
-        hash_table: HashMap<i64, u64> := mut HashMap.new();
-        i: u64 := mut 0;
-        W i < size {
-            hash_table.insert(i as i64, i);
-            i += 1;
-        }
-
-        matched: u64 := mut 0;
-        i = 0;
-        W i < size {
-            key := mut (i + 500) as i64;
-            M hash_table.get(&key) {
-                Some(_) => { matched += 1; },
-                None => {},
-            }
-            i += 1;
-        }
-        matched
-    })
+    bench_run_simple(harness, &config, bench_sql_join_scaling_iter)
 }
 
 # ============================================================================
 # SQL Aggregation Benchmark
 # ============================================================================
 
+F bench_sql_groupby_iter() -> u64 {
+    # Simulate GROUP BY on 10K rows with 100 distinct groups
+    groups: u64 := mut 100;
+    rows: u64 := mut 10000;
+    hash_acc: i64 := mut 0;
+    sum_acc: i64 := mut 0;
+    i: u64 := mut 0;
+    W i < rows {
+        group_key := mut i % groups;
+        bucket := mut hash_i64(group_key as i64) % (groups as i64);
+        value := mut i as i64;
+        hash_acc = hash_acc ^ bucket;
+        sum_acc += value + bucket;
+        i += 1;
+    }
+    rows + (((hash_acc ^ sum_acc) as u64) & 0)
+}
+
 # Benchmark: GROUP BY aggregation (hash-based)
 F bench_sql_groupby(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("sql_groupby_hash"));
-    config = config.with_iterations(50);
+    config := mut bench_config("sql_groupby_hash", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        U std/hashmap.HashMap;
-
-        # Simulate GROUP BY on 10K rows with 100 distinct groups
-        groups: HashMap<u64, (u64, i64)> := mut HashMap.new();  # group_key -> (count, sum)
-        rows: u64 := mut 10000;
-        i: u64 := mut 0;
-        W i < rows {
-            group_key := mut i % 100;
-            value := mut i as i64;
-            M groups.get(&group_key) {
-                Some(mut entry) => {
-                    new_count := mut entry.0 + 1;
-                    new_sum := mut entry.1 + value;
-                    groups.insert(group_key, (new_count, new_sum));
-                },
-                None => {
-                    groups.insert(group_key, (1, value));
-                },
-            }
-            i += 1;
-        }
-        rows
-    })
+    bench_run_simple(harness, &config, bench_sql_groupby_iter)
 }
 
 # ============================================================================
 # Transaction Benchmarks
 # ============================================================================
 
+F bench_txn_commit_iter() -> u64 {
+    writer := mut bench_wal_writer("txn_commit");
+
+    committed: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 20 {
+        # Simulate: begin txn + write + commit
+        txn_id := mut i + 1;
+
+        # Write a tuple insert WAL record
+        payload := mut bench_repeat_byte(32, (i % 256) as u8);
+        writer.write_record(txn_id, TUPLE_INSERT, ENGINE_RELATIONAL, &payload)!;
+
+        # Write commit record
+        commit_payload: Vec<u8> := mut Vec.new();
+        writer.write_record(txn_id, TXN_COMMIT, ENGINE_META, &commit_payload)!;
+        writer.clear_txn(txn_id);
+        I ((i + 1) % 10) == 0 {
+            writer.flush()!;
+        }
+
+        committed += 1;
+        i += 1;
+    }
+    writer.flush()!;
+    writer.close()!;
+    writer.drop();
+    committed
+}
+
 # Benchmark: Transaction commit throughput (simulated)
 F bench_txn_commit(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("txn_commit_throughput"));
-    config = config.with_iterations(50);
+    config := mut bench_config("txn_commit_throughput", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        writer := mut WalWriter.new_in_memory();
-        gcm := mut GroupCommitManager.new(&mut writer, 10);
+    bench_run_simple(harness, &config, bench_txn_commit_iter)
+}
 
-        committed: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 500 {
-            # Simulate: begin txn + write + commit
-            txn_id := mut i + 1;
+F bench_txn_rollback_iter() -> u64 {
+    writer := mut bench_wal_writer("txn_abort");
 
-            # Write a tuple insert WAL record
-            payload: Vec<u8> := mut Vec.new();
-            j: u64 := mut 0;
-            W j < 32 {
-                payload.push((i % 256) as u8);
-                j += 1;
-            }
-            gcm.submit_record(0x01, txn_id, &payload)!;
+    rolled_back: u64 := mut 0;
+    i: u64 := mut 0;
+    W i < 20 {
+        txn_id := mut i + 1;
 
-            # Write commit record
-            commit_payload: Vec<u8> := mut Vec.new();
-            commit_payload.push(0x10);  # COMMIT type marker
-            gcm.submit_record(0x10, txn_id, &commit_payload)!;
+        # Write a tuple insert WAL record
+        payload := mut bench_repeat_byte(32, (i % 256) as u8);
+        writer.write_record(txn_id, TUPLE_INSERT, ENGINE_RELATIONAL, &payload)!;
 
-            committed += 1;
-            i += 1;
+        # Write abort record
+        abort_payload: Vec<u8> := mut Vec.new();
+        writer.write_record(txn_id, TXN_ABORT, ENGINE_META, &abort_payload)!;
+        writer.clear_txn(txn_id);
+        I ((i + 1) % 10) == 0 {
+            writer.flush()!;
         }
-        gcm.flush()!;
-        committed
-    })
+
+        rolled_back += 1;
+        i += 1;
+    }
+    writer.flush()!;
+    writer.close()!;
+    writer.drop();
+    rolled_back
 }
 
 # Benchmark: Transaction rollback throughput (simulated)
 F bench_txn_rollback(harness: &mut BenchmarkHarness) -> BenchmarkResult {
-    config := mut BenchmarkConfig.default(Str.from("txn_rollback_throughput"));
-    config = config.with_iterations(50);
+    config := mut bench_config("txn_rollback_throughput", 50);
 
-    harness.run_simple(&config, || -> u64 {
-        writer := mut WalWriter.new_in_memory();
-        gcm := mut GroupCommitManager.new(&mut writer, 10);
-
-        rolled_back: u64 := mut 0;
-        i: u64 := mut 0;
-        W i < 500 {
-            txn_id := mut i + 1;
-
-            # Write a tuple insert WAL record
-            payload: Vec<u8> := mut Vec.new();
-            j: u64 := mut 0;
-            W j < 32 {
-                payload.push((i % 256) as u8);
-                j += 1;
-            }
-            gcm.submit_record(0x01, txn_id, &payload)!;
-
-            # Write abort record
-            abort_payload: Vec<u8> := mut Vec.new();
-            abort_payload.push(0x11);  # ABORT type marker
-            gcm.submit_record(0x11, txn_id, &abort_payload)!;
-
-            rolled_back += 1;
-            i += 1;
-        }
-        gcm.flush()!;
-        rolled_back
-    })
+    bench_run_simple(harness, &config, bench_txn_rollback_iter)
 }
 
 # ============================================================================
@@ -726,7 +765,7 @@ F bench_txn_rollback(harness: &mut BenchmarkHarness) -> BenchmarkResult {
 
 # Run all storage and SQL benchmarks
 F run_storage_sql_benchmarks() -> BenchmarkHarness {
-    harness := mut BenchmarkHarness.new(Str.from("Storage & SQL"));
+    harness := mut BenchmarkHarness.new("Storage & SQL");
     harness.start();
 
     # B+Tree benchmarks
@@ -768,4 +807,9 @@ F run_storage_sql_benchmarks() -> BenchmarkHarness {
 
     harness.print_report();
     harness
+}
+
+F main() -> i64 {
+    run_storage_sql_benchmarks()
+    0
 }

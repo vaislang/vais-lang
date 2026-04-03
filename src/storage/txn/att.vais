@@ -2,65 +2,77 @@
 # Tracks all active transactions with their state and metadata
 # Based on Stage 3 MVCC Strategy
 
-U std/sync.{RwLock};
-U std/hashmap.{HashMap};
-U std/time.{now_micros};
-U storage/txn/snapshot.{Snapshot, IsolationLevel};
-U storage/constants.{INVALID_TXN_ID, NULL_UNDO_PTR};
+U std/sync
+U std/hashmap
+U std/time
+U storage/txn/snapshot
+U storage/constants
+
+# Helper to create TxnSnapshot outside ActiveTransactionEntry context
+# (avoids compiler type propagation bug)
+F make_txn_snapshot(txn_id: u64, active_txns: Vec<u64>) -> TxnSnapshot {
+    TxnSnapshot { txn_id: txn_id, current_cmd_id: 0, active_txns: active_txns.clone(), min_active_txn: txn_id }
+}
 
 # Transaction state enum
-L TxnState = Active | Committing | Aborting | Committed | Aborted;
+E TxnState {
+    Active,
+    Committing,
+    Aborting,
+    Committed,
+    Aborted,
+}
 
 X TxnState {
     F is_active(self) -> bool {
         M self {
-            TxnState.Active => true,
+            Active => true,
             _ => false,
         }
     }
 
     F is_committing(self) -> bool {
         M self {
-            TxnState.Committing => true,
+            Committing => true,
             _ => false,
         }
     }
 
     F is_aborting(self) -> bool {
         M self {
-            TxnState.Aborting => true,
+            Aborting => true,
             _ => false,
         }
     }
 
     F is_committed(self) -> bool {
         M self {
-            TxnState.Committed => true,
+            Committed => true,
             _ => false,
         }
     }
 
     F is_aborted(self) -> bool {
         M self {
-            TxnState.Aborted => true,
+            Aborted => true,
             _ => false,
         }
     }
 
     F is_finished(self) -> bool {
         M self {
-            TxnState.Committed | TxnState.Aborted => true,
+            Committed | Aborted => true,
             _ => false,
         }
     }
 
-    F to_string(self) -> Str {
+    F to_string(self) -> str {
         M self {
-            TxnState.Active => "Active",
-            TxnState.Committing => "Committing",
-            TxnState.Aborting => "Aborting",
-            TxnState.Committed => "Committed",
-            TxnState.Aborted => "Aborted",
+            Active => "Active",
+            Committing => "Committing",
+            Aborting => "Aborting",
+            Committed => "Committed",
+            Aborted => "Aborted",
         }
     }
 }
@@ -71,7 +83,7 @@ S ActiveTransactionEntry {
     start_time: u64,           # Unix timestamp in microseconds
     state: TxnState,
     last_undo_ptr: u64,        # Latest undo entry for this txn
-    snapshot: Snapshot,
+    snapshot: TxnSnapshot,
     isolation_level: IsolationLevel,
 }
 
@@ -82,13 +94,14 @@ X ActiveTransactionEntry {
         isolation_level: IsolationLevel,
         active_txns: Vec<u64>,
     ) -> ActiveTransactionEntry {
+        snap := mut make_txn_snapshot(txn_id, active_txns.clone())
         ActiveTransactionEntry {
             txn_id,
-            start_time: now_micros(),
-            state: TxnState.Active,
+            start_time: time_micros(),
+            state: Active,
             last_undo_ptr: NULL_UNDO_PTR,
-            snapshot: Snapshot.new(txn_id, active_txns),
-            isolation_level,
+            snapshot: snap,
+            isolation_level: isolation_level.clone(),
         }
     }
 
@@ -114,7 +127,7 @@ X ActiveTransactionEntry {
 
     # Get elapsed time in microseconds
     F elapsed_micros(self) -> u64 {
-        now_micros() - self.start_time
+        time_micros() - self.start_time
     }
 
     # Get elapsed time in seconds
@@ -127,9 +140,9 @@ X ActiveTransactionEntry {
         self.state
     }
 
-    # Get snapshot reference
-    F get_snapshot(self) -> &Snapshot {
-        &self.snapshot
+    # Get snapshot (returns a copy)
+    F get_snapshot(self) -> TxnSnapshot {
+        self.snapshot.clone()
     }
 
     # Get last undo pointer
@@ -146,15 +159,17 @@ X ActiveTransactionEntry {
 # Active Transaction Table: tracks all in-flight transactions
 S ActiveTransactionTable {
     entries: HashMap<u64, ActiveTransactionEntry>,
-    lock: RwLock,   # RwLock for read-heavy access
+    id_list: Vec<u64>,   # Parallel list of all txn IDs for iteration
+    lock: RwLock<()>,    # RwLock for read-heavy access
 }
 
 X ActiveTransactionTable {
     # Create an empty ATT
     F new() -> ActiveTransactionTable {
         ActiveTransactionTable {
-            entries: HashMap.new(),
-            lock: RwLock.new(),
+            entries: HashMap.with_capacity(16),
+            id_list: Vec.with_capacity(16),
+            lock: RwLock.new(()),
         }
     }
 
@@ -165,94 +180,157 @@ X ActiveTransactionTable {
         txn_id: u64,
         isolation_level: IsolationLevel,
     ) -> ActiveTransactionEntry {
-        guard := mut self.lock.write();
+        guard := mut self.lock.write()
 
         # Collect active transaction IDs for the snapshot
-        active_txns := mut Vec.new();
-        L (id, entry): self.entries.iter() {
-            I entry.is_active() {
-                active_txns.push(*id);
+        active_txns := mut Vec.with_capacity(0)
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    I entry.is_active() {
+                        active_txns.push(id)
+                    }
+                },
+                None => {},
             }
+            ai += 1
         }
 
-        # Create the new transaction entry
-        entry := mut ActiveTransactionEntry.new(txn_id, isolation_level, active_txns);
-        self.entries.insert(txn_id, entry.clone());
+        # Create the new transaction entry — inline to avoid TxnSnapshot struct literal collision
+        snap2 := mut make_txn_snapshot(txn_id, active_txns.clone())
+        entry := mut ActiveTransactionEntry {
+            txn_id,
+            start_time: time_micros(),
+            state: Active,
+            last_undo_ptr: NULL_UNDO_PTR,
+            snapshot: snap2,
+            isolation_level: isolation_level.clone(),
+        }
+        self.entries.set(txn_id, entry.clone())
+        self.id_list.push(txn_id)
 
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         entry
     }
 
-    # Get a transaction entry by ID
-    F get(self, txn_id: u64) -> Option<&ActiveTransactionEntry> {
-        guard := mut self.lock.read();
-        result := mut self.entries.get(&txn_id);
-        drop(guard);
+    # Get a transaction entry by ID (returns a copy via Option)
+    F get(self, txn_id: u64) -> Option<ActiveTransactionEntry> {
+        guard := mut self.lock.read()
+        result := mut self.entries.get_opt(&txn_id)
+        # guard.drop() # disabled for dev compiler
         result
     }
 
     # Set transaction state
     F set_state(mut self, txn_id: u64, state: TxnState) {
-        guard := mut self.lock.write();
-        M self.entries.get_mut(&txn_id) {
+        guard := mut self.lock.write()
+        M self.entries.get_opt(&txn_id) {
             Some(entry) => {
-                entry.state = state;
+                updated := mut ActiveTransactionEntry {
+                    txn_id: entry.txn_id,
+                    start_time: entry.start_time,
+                    state: state.clone(),
+                    last_undo_ptr: entry.last_undo_ptr,
+                    snapshot: make_txn_snapshot(entry.txn_id, entry.snapshot.active_txns.clone()),
+                    isolation_level: entry.isolation_level,
+                }
+                self.entries.set(txn_id, updated)
             },
             None => {},
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
     }
 
     # Set last undo pointer for a transaction
     F set_last_undo_ptr(mut self, txn_id: u64, undo_ptr: u64) {
-        guard := mut self.lock.write();
-        M self.entries.get_mut(&txn_id) {
+        guard := mut self.lock.write()
+        M self.entries.get_opt(&txn_id) {
             Some(entry) => {
-                entry.last_undo_ptr = undo_ptr;
+                updated := mut ActiveTransactionEntry {
+                    txn_id: entry.txn_id,
+                    start_time: entry.start_time,
+                    state: entry.state,
+                    last_undo_ptr: undo_ptr,
+                    snapshot: make_txn_snapshot(entry.txn_id, entry.snapshot.active_txns.clone()),
+                    isolation_level: entry.isolation_level,
+                }
+                self.entries.set(txn_id, updated)
             },
             None => {},
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
     }
 
     # Remove a transaction from the ATT (after GC)
     F remove(mut self, txn_id: u64) {
-        guard := mut self.lock.write();
-        self.entries.remove(&txn_id);
-        drop(guard);
+        guard := mut self.lock.write()
+        self.entries.remove(txn_id)
+        # Remove from id_list
+        new_list := mut Vec.with_capacity(self.id_list.len())
+        ri := mut 0
+        L ri < self.id_list.len() {
+            I self.id_list[ri] != txn_id {
+                new_list.push(self.id_list[ri])
+            }
+            ri += 1
+        }
+        self.id_list = new_list
+        # guard.drop() # disabled for dev compiler
     }
 
     # Get all active transaction IDs
     # Used for creating new snapshots
     F get_active_txn_ids(self) -> Vec<u64> {
-        guard := mut self.lock.read();
-        active_ids := mut Vec.new();
-        L (id, entry): self.entries.iter() {
-            I entry.is_active() {
-                active_ids.push(*id);
+        guard := mut self.lock.read()
+        active_ids := mut Vec.with_capacity(0)
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    I entry.is_active() {
+                        active_ids.push(id)
+                    }
+                },
+                None => {},
             }
+            ai += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         active_ids
     }
 
     # Get the minimum active transaction ID (low water mark)
     # Used for GC to determine which versions can be cleaned
     F get_min_active_txn(self) -> u64 {
-        guard := mut self.lock.read();
-        min_txn := mut u64.MAX;
+        guard := mut self.lock.read()
+        min_found := mut false
+        min_txn := mut 0u64
 
-        L (id, entry): self.entries.iter() {
-            I entry.is_active() && *id < min_txn {
-                min_txn = *id;
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    I entry.is_active() {
+                        I !min_found || id < min_txn {
+                            min_txn = id
+                            min_found = true
+                        }
+                    }
+                },
+                None => {},
             }
+            ai += 1
         }
 
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
 
-        # If no active transactions, return MAX
-        I min_txn == u64.MAX {
-            u64.MAX
+        # If no active transactions, return u64::MAX
+        I !min_found {
+            9999999999999
         } E {
             min_txn
         }
@@ -260,80 +338,114 @@ X ActiveTransactionTable {
 
     # Count active transactions
     F count_active(self) -> u64 {
-        guard := mut self.lock.read();
-        count := mut 0u64;
-        L (_, entry): self.entries.iter() {
-            I entry.is_active() {
-                count += 1;
+        guard := mut self.lock.read()
+        count := mut 0u64
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    I entry.is_active() {
+                        count += 1
+                    }
+                },
+                None => {},
             }
+            ai += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         count
     }
 
     # Check if a transaction is active
     F is_active(self, txn_id: u64) -> bool {
-        guard := mut self.lock.read();
-        result := mut M self.entries.get(&txn_id) {
+        guard := mut self.lock.read()
+        result := mut M self.entries.get_opt(&txn_id) {
             Some(entry) => entry.is_active(),
             None => false,
-        };
-        drop(guard);
+        }
+        # guard.drop() # disabled for dev compiler
         result
     }
 
-    # Get snapshot for a transaction
-    F get_snapshot(self, txn_id: u64) -> Option<&Snapshot> {
-        guard := mut self.lock.read();
-        result := mut M self.entries.get(&txn_id) {
-            Some(entry) => Some(&entry.snapshot),
-            None => None,
-        };
-        drop(guard);
-        result
+    # Get snapshot for a transaction (returns a copy)
+    F get_snapshot(self, txn_id: u64) -> Option<TxnSnapshot> {
+        guard := mut self.lock.read()
+        I self.entries.contains_key(txn_id) > 0 {
+            entry := mut self.entries.get(txn_id)
+            Some(make_txn_snapshot(entry.txn_id, entry.snapshot.active_txns.clone()))
+        } E {
+            None
+        }
     }
 
     # Get all transactions (for debugging/monitoring)
     F get_all_entries(self) -> Vec<(u64, TxnState, u64)> {
-        guard := mut self.lock.read();
-        result := mut Vec.new();
-        L (id, entry): self.entries.iter() {
-            result.push((*id, entry.state, entry.start_time));
+        guard := mut self.lock.read()
+        result := mut Vec.with_capacity(0)
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    result.push((id, entry.state, entry.start_time))
+                },
+                None => {},
+            }
+            ai += 1
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         result
     }
 
     # Find transactions exceeding timeout threshold
     # Returns list of (txn_id, elapsed_seconds)
     F find_timed_out_transactions(self, timeout_sec: u32) -> Vec<(u64, u32)> {
-        guard := mut self.lock.read();
-        timed_out := mut Vec.new();
-        now := mut now_micros();
+        guard := mut self.lock.read()
+        timed_out := mut Vec.with_capacity(0)
+        now := mut time_micros()
 
-        L (id, entry): self.entries.iter() {
-            I entry.is_active() {
-                elapsed_sec := mut ((now - entry.start_time) / 1000000) as u32;
-                I elapsed_sec >= timeout_sec {
-                    timed_out.push((*id, elapsed_sec));
-                }
+        ai := mut 0
+        L ai < self.id_list.len() {
+            id := self.id_list[ai]
+            M self.entries.get_opt(&id) {
+                Some(entry) => {
+                    I entry.is_active() {
+                        elapsed_sec := mut ((now - entry.start_time) / 1000000) as u32
+                        I elapsed_sec >= timeout_sec {
+                            timed_out.push((id, elapsed_sec))
+                        }
+                    }
+                },
+                None => {},
             }
+            ai += 1
         }
 
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
         timed_out
     }
 
     # Advance command ID in a transaction's snapshot
     # Called at the start of each statement within a transaction
     F advance_cmd_id(mut self, txn_id: u64) {
-        guard := mut self.lock.write();
-        M self.entries.get_mut(&txn_id) {
+        guard := mut self.lock.write()
+        M self.entries.get_opt(&txn_id) {
             Some(entry) => {
-                entry.snapshot.advance_cmd();
+                snap := mut make_txn_snapshot(entry.txn_id, entry.snapshot.active_txns.clone())
+                snap.advance_cmd()
+                updated := mut ActiveTransactionEntry {
+                    txn_id: entry.txn_id,
+                    start_time: entry.start_time,
+                    state: entry.state,
+                    last_undo_ptr: entry.last_undo_ptr,
+                    snapshot: snap,
+                    isolation_level: entry.isolation_level,
+                }
+                self.entries.set(txn_id, updated)
             },
             None => {},
         }
-        drop(guard);
+        # guard.drop() # disabled for dev compiler
     }
 }

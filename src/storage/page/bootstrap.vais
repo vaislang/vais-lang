@@ -2,103 +2,123 @@
 # Contains minimal info to locate meta.vdb: magic, format version, page size, path
 # Total used: 256 bytes (48 header + 208 data)
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{
-    VAISDB_MAGIC, DB_FORMAT_VERSION, PAGE_HEADER_SIZE,
-    BOOTSTRAP_META_PATH_SIZE,
-};
-U storage/error.{VaisError, err_invalid_magic, err_internal};
-U storage/page/header.{PageHeader};
-U storage/page/types.{PAGE_TYPE_META, ENGINE_TAG_COMMON};
+U storage/bytes
+U std/vec
+U storage/constants
+U storage/error
+U storage/page/header
+U storage/page/types
 
 # Bootstrap page data (after 48B page header)
 S BootstrapPage {
-    magic: u64,                        # 0x5641495344422031 ("VAISDB 1")
+    magic: u64,                        # 6215329582724292657 ("VAISDB 1")
     db_format_version: u32,            # Database format version
     page_size: u32,                    # Page size in bytes
-    meta_vdb_path: [u8; 32],           # Relative path to meta.vdb (null-padded)
-    reserved: [u8; 160],               # Reserved (must be 0)
+    meta_vdb_path: Vec<u8>,            # Relative path to meta.vdb (null-padded, 32 bytes)
+    reserved: Vec<u8>,                 # Reserved (must be 0, 160 bytes)
 }
 
 X BootstrapPage {
     # Create a new bootstrap page
     F new(page_size: u32) -> BootstrapPage {
-        meta_path := mut [0u8; 32];
+        meta_path := mut Vec.with_capacity(32)
+        meta_path.resize(32, 0u8)
         # Write "meta.vdb\0" into the path field
-        path_bytes := mut "meta.vdb".as_bytes();
+        path_bytes := mut "meta.vdb".as_bytes()
         L i: 0..path_bytes.len() {
-            meta_path[i] = path_bytes[i];
+            meta_path[i] = path_bytes[i]
         }
+
+        reserved := mut Vec.with_capacity(160)
+        reserved.resize(160, 0u8)
 
         BootstrapPage {
             magic: VAISDB_MAGIC,
             db_format_version: DB_FORMAT_VERSION,
             page_size,
             meta_vdb_path: meta_path,
-            reserved: [0u8; 160],
+            reserved,
         }
     }
 
     # Serialize bootstrap data (writes 208 bytes after page header)
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u64_le(self.magic);
-        buf.put_u32_le(self.db_format_version);
-        buf.put_u32_le(self.page_size);
-        buf.put_bytes(&self.meta_vdb_path);
-        buf.put_bytes(&self.reserved);
+        buf.write_i64_le(self.magic)
+        buf.write_i32_le(self.db_format_version)
+        buf.write_i32_le(self.page_size)
+        L i: 0..32 {
+            buf.write_u8(self.meta_vdb_path[i])
+        }
+        L i: 0..160 {
+            buf.write_u8(self.reserved[i])
+        }
     }
 
     # Deserialize bootstrap data (reads 208 bytes)
     F deserialize(buf: &ByteBuffer) -> Result<BootstrapPage, VaisError> {
-        magic := mut buf.get_u64_le()?;
+        magic := mut read_i64_le_checked(buf)?;
         I magic != VAISDB_MAGIC {
-            R Err(err_invalid_magic());
+            R Err(err_invalid_magic())
+        }
+        db_format_version := mut read_i32_le_checked(buf)?;
+        page_size := mut read_i32_le_checked(buf)?;
+        meta_vdb_path := mut Vec.with_capacity(32)
+        L _: 0..32 {
+            meta_vdb_path.push(read_u8_checked(buf)?)
+        }
+        reserved := mut Vec.with_capacity(160)
+        L _: 0..160 {
+            reserved.push(read_u8_checked(buf)?)
         }
         Ok(BootstrapPage {
             magic,
-            db_format_version: buf.get_u32_le()?,
-            page_size: buf.get_u32_le()?,
-            meta_vdb_path: buf.get_bytes(32)?.try_into()?,
-            reserved: buf.get_bytes(160)?.try_into()?,
+            db_format_version,
+            page_size,
+            meta_vdb_path,
+            reserved,
         })
     }
 
     # Write complete bootstrap page to a page-sized buffer
     F write_to_page(self, page_data: &mut [u8]) {
-        header := mut PageHeader.new(0, PAGE_TYPE_META, ENGINE_TAG_COMMON);
-        buf := mut ByteBuffer.wrap(page_data);
-        header.serialize(&buf);
-        self.serialize(&buf);
+        header := mut PageHeader.new(0, PAGE_TYPE_META, ENGINE_TAG_COMMON)
+        buf := mut ByteBuffer.with_capacity(page_data.len())
+        header.serialize(&buf)
+        self.serialize(&buf)
+        page_bytes := mut buf.to_vec()
+        L i: 0..page_bytes.len() {
+            page_data[i] = page_bytes[i]
+        }
     }
 
     # Read bootstrap data from a page-sized buffer
     F read_from_page(page_data: &[u8]) -> Result<BootstrapPage, VaisError> {
-        buf := mut ByteBuffer.wrap_readonly(page_data);
-        buf.set_position(PAGE_HEADER_SIZE as u64);
+        buf := mut ByteBuffer.wrap_readonly(page_data)
+        buf.seek(PAGE_HEADER_SIZE as u64)
         BootstrapPage.deserialize(&buf)
     }
 
     # Get meta.vdb path as string (strip null padding)
-    F get_meta_path(self) -> Str {
-        end := mut 0;
-        null_found := mut false;
-        L i: 0..32 {
+    F get_meta_path(self) -> str {
+        end := mut 0
+        null_found := mut false
+        L i: 0..self.meta_vdb_path.len() {
             I !null_found && self.meta_vdb_path[i] == 0 {
-                end = i;
-                null_found = true;
+                end = i
+                null_found = true
             }
-            I !null_found && i == 31 { end = 32; }
+            I !null_found && i == self.meta_vdb_path.len() - 1 { end = self.meta_vdb_path.len(); }
         }
-        Str.from_utf8(&self.meta_vdb_path[0..end]).unwrap_or("meta.vdb")
+        from_utf8(&self.meta_vdb_path[0..end]).unwrap_or("meta.vdb")
     }
 
     # Validate bootstrap page
     F validate(self) -> Result<(), VaisError> {
         I self.magic != VAISDB_MAGIC {
-            R Err(err_invalid_magic());
+            R Err(err_invalid_magic())
         }
         I self.page_size != 8192 && self.page_size != 16384 {
-            R Err(err_internal("Invalid page size in bootstrap page"));
+            R Err(err_internal("Invalid page size in bootstrap page"))
         }
         Ok(())
     }

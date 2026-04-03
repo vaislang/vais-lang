@@ -2,9 +2,9 @@
 # Internal node entries (8B directory + variable key) and leaf entries (8B + variable key)
 # Based on Stage 1 Section 9 and Stage 7 Patterns
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{BTREE_INTERNAL_ENTRY_SIZE, BTREE_LEAF_ENTRY_SIZE, TID_PAGE_BITS, TID_SLOT_BITS};
-U storage/error.{VaisError};
+U storage/bytes
+U storage/constants
+U storage/error
 
 # Internal node key directory entry (8 bytes)
 S BTreeInternalEntry {
@@ -19,16 +19,16 @@ X BTreeInternalEntry {
     }
 
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u16_le(self.key_off);
-        buf.put_u16_le(self.key_len);
-        buf.put_u32_le(self.child_page);
+        buf.write_u16_le(self.key_off)
+        buf.write_u16_le(self.key_len)
+        buf.write_i32_le(self.child_page)
     }
 
     F deserialize(buf: &ByteBuffer) -> Result<BTreeInternalEntry, VaisError> {
         Ok(BTreeInternalEntry {
-            key_off: buf.get_u16_le()?,
-            key_len: buf.get_u16_le()?,
-            child_page: buf.get_u32_le()?,
+            key_off: read_u16_le_checked(buf)?,
+            key_len: read_u16_le_checked(buf)?,
+            child_page: read_i32_le_checked(buf)?,
         })
     }
 
@@ -50,36 +50,36 @@ X BTreeLeafEntry {
     }
 
     F serialize(self, buf: &mut ByteBuffer) {
-        buf.put_u16_le(self.key_off);
-        buf.put_u16_le(self.key_len);
-        buf.put_u32_le(self.tid);
+        buf.write_u16_le(self.key_off)
+        buf.write_u16_le(self.key_len)
+        buf.write_i32_le(self.tid)
     }
 
     F deserialize(buf: &ByteBuffer) -> Result<BTreeLeafEntry, VaisError> {
         Ok(BTreeLeafEntry {
-            key_off: buf.get_u16_le()?,
-            key_len: buf.get_u16_le()?,
-            tid: buf.get_u32_le()?,
+            key_off: read_u16_le_checked(buf)?,
+            key_len: read_u16_le_checked(buf)?,
+            tid: read_i32_le_checked(buf)?,
         })
     }
 
     # TID encoding: upper 20 bits = page_id, lower 12 bits = slot_id
     F encode_tid(page_id: u32, slot_id: u16) -> u32 {
-        ((page_id & 0xFFFFF) << 12) | ((slot_id & 0xFFF) as u32)
+        ((page_id & 1048575) << 12) | ((slot_id & 4095) as u32)
     }
 
-    F decode_tid(tid: u32) -> (u32, u16) {
-        page_id := mut (tid >> 12) & 0xFFFFF;
-        slot_id := mut (tid & 0xFFF) as u16;
-        (page_id, slot_id)
+    F decode_tid(tid: u32) -> DecodedTid {
+        page_id := mut (tid >> 12) & 1048575
+        slot_id := mut (tid & 4095) as u16
+        DecodedTid { page_id, slot_id }
     }
 
     F get_page_id(self) -> u32 {
-        (self.tid >> 12) & 0xFFFFF
+        (self.tid >> 12) & 1048575
     }
 
     F get_slot_id(self) -> u16 {
-        (self.tid & 0xFFF) as u16
+        (self.tid & 4095) as u16
     }
 
     F entry_size() -> u32 {
@@ -88,24 +88,28 @@ X BTreeLeafEntry {
 }
 
 # Key comparison result
-L KeyCmp = Less | Equal | Greater;
+E KeyCmp {
+    Less,
+    Equal,
+    Greater,
+}
 
 # Compare two byte-slice keys lexicographically
 F compare_keys(a: &[u8], b: &[u8]) -> KeyCmp {
-    min_len := mut I a.len() < b.len() { a.len() } E { b.len() };
+    min_len := mut I a.len() < b.len() { a.len() } E { b.len() }
     L i: 0..min_len {
-        I a[i] < b[i] { R KeyCmp.Less; }
-        I a[i] > b[i] { R KeyCmp.Greater; }
+        I a[i] < b[i] { R Less; }
+        I a[i] > b[i] { R Greater; }
     }
-    I a.len() < b.len() { KeyCmp.Less }
-    E I a.len() > b.len() { KeyCmp.Greater }
-    E { KeyCmp.Equal }
+    I a.len() < b.len() { Less }
+    E I a.len() > b.len() { Greater }
+    E { Equal }
 }
 
 # Check if key a < key b
 F key_less_than(a: &[u8], b: &[u8]) -> bool {
     M compare_keys(a, b) {
-        KeyCmp.Less => true,
+        Less => true,
         _ => false,
     }
 }
@@ -113,7 +117,7 @@ F key_less_than(a: &[u8], b: &[u8]) -> bool {
 # Check if key a == key b
 F key_equal(a: &[u8], b: &[u8]) -> bool {
     M compare_keys(a, b) {
-        KeyCmp.Equal => true,
+        Equal => true,
         _ => false,
     }
 }

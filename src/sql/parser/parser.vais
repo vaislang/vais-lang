@@ -1,29 +1,21 @@
-# SQL Parser - Recursive Descent
-# Converts a token stream into an AST
+# SQL Parser — Core
+# Parser struct, statement dispatch, and all helper/utility methods.
+#
 # Expression precedence (low to high):
 #   OR < AND < NOT < comparison < addition < multiplication < unary < primary
 #
-# Handles: SELECT (with CTEs, set ops, joins, subqueries, window functions),
-#          INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, ALTER TABLE,
-#          CREATE INDEX, DROP INDEX, EXPLAIN, BEGIN/COMMIT/ROLLBACK,
-#          SET, PREPARE, EXECUTE, CAST, CASE WHEN, BETWEEN, IN, LIKE, EXISTS
+# Statement parsing is split across multiple files:
+#   parser_select.vais  — SELECT, CTEs, JOINs, set operations
+#   parser_dml.vais     — INSERT, UPDATE, DELETE
+#   parser_ddl.vais     — CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX
+#   parser_command.vais — SET, PREPARE, EXECUTE, VACUUM, REINDEX, BACKUP, RESTORE
+#   parser_security.vais — Security DDL (USER, ROLE, GRANT, REVOKE, POLICY)
+#   parser_expr.vais    — Expression parsing
 
-U storage/error.{VaisError};
-U sql/types.{SqlType, SqlValue};
-U sql/parser/token.{Token, TokenKind, Tokenizer};
-U sql/parser/ast.{
-    Statement, SelectQuery, SelectItem, Cte, SetOperation, SetOpKind,
-    TableRef, JoinClause, JoinType, JoinCondition,
-    Expr, BinOp, UnaryOp, WhenClause, OrderByItem,
-    CreateTableStmt, ColumnDef, CreateIndexStmt, AlterTableStmt, AlterAction,
-    InsertStmt, InsertSource, UpdateStmt, Assignment, DeleteStmt,
-    SetTarget,
-    # Security DDL (Phase 10)
-    CreateUserStmt, AlterUserStmt, CreateRoleStmt,
-    GrantStmt, GrantType, RevokeStmt, RevokeType,
-    PrivilegeKind, ObjectKind,
-    CreatePolicyStmt, PolicyCmdScope, PolicyType,
-};
+U storage/error
+U sql/types
+U sql/parser/token
+U sql/parser/ast
 
 # SQL Parser
 S Parser {
@@ -41,24 +33,24 @@ X Parser {
     F parse(mut self) -> Result<Statement, VaisError> {
         stmt := self.parse_statement()?;
         # Consume optional trailing semicolon
-        self.match_token(TokenKind.Semicolon);
+        self.match_token(Semicolon)
         Ok(stmt)
     }
 
     # Parse multiple SQL statements separated by semicolons
     F parse_all(mut self) -> Result<Vec<Statement>, VaisError> {
-        stmts := mut Vec.new();
+        stmts := mut Vec.with_capacity(0)
 
         L !(self.is_at_end()) {
             # Skip stray semicolons between statements
-            L self.match_token(TokenKind.Semicolon) {}
+            L self.match_token(Semicolon) {}
 
             I !(self.is_at_end()) {
                 stmt := self.parse_statement()?;
-                stmts.push(stmt);
+                stmts.push(stmt)
 
                 # Consume optional semicolon after statement
-                self.match_token(TokenKind.Semicolon);
+                self.match_token(Semicolon)
             }
         }
 
@@ -72,2569 +64,142 @@ X Parser {
     # Dispatch to specific statement parser based on the first token
     F parse_statement(mut self) -> Result<Statement, VaisError> {
         M self.peek() {
-            TokenKind.Select => {
+            Select => {
                 query := self.parse_select()?;
-                Ok(Statement.Select { query })
+                Ok(Select { query })
             },
-            TokenKind.With => {
+            With => {
                 # WITH ... SELECT (CTE)
                 query := self.parse_select()?;
-                Ok(Statement.Select { query })
+                Ok(Select { query })
             },
-            TokenKind.Insert => {
-                self.advance();
+            Insert => {
+                self.advance()
                 insert := self.parse_insert()?;
-                Ok(Statement.Insert { insert })
+                Ok(Insert { insert })
             },
-            TokenKind.Update => {
-                self.advance();
+            Update => {
+                self.advance()
                 update := self.parse_update()?;
-                Ok(Statement.Update { update })
+                Ok(Update { update })
             },
-            TokenKind.Delete => {
-                self.advance();
+            Delete => {
+                self.advance()
                 delete := self.parse_delete()?;
-                Ok(Statement.Delete { delete })
+                Ok(Delete { delete })
             },
-            TokenKind.Create => {
-                self.advance();
+            Create => {
+                self.advance()
                 self.parse_create()
             },
-            TokenKind.Drop => {
-                self.advance();
+            Drop => {
+                self.advance()
                 self.parse_drop()
             },
-            TokenKind.Alter => {
-                self.advance();
+            Alter => {
+                self.advance()
                 # ALTER TABLE or ALTER USER
                 M self.peek() {
-                    TokenKind.Table => {
-                        self.advance();
+                    Table => {
+                        self.advance()
                         alter := self.parse_alter_table()?;
-                        Ok(Statement.AlterTable { alter })
+                        Ok(AlterTable { alter })
                     },
-                    TokenKind.User_Kw => {
-                        self.advance();
+                    User_Kw => {
+                        self.advance()
                         alter := self.parse_alter_user()?;
-                        Ok(Statement.AlterUser { alter })
+                        Ok(AlterUser { alter })
                     },
                     _ => {
                         Err(self.parse_error("expected TABLE or USER after ALTER"))
                     },
                 }
             },
-            TokenKind.Explain => {
-                self.advance();
-                analyze := mut false;
-                I self.match_token(TokenKind.Analyze) {
-                    analyze = true;
+            Explain => {
+                self.advance()
+                analyze := mut false
+                I self.match_token(Analyze) {
+                    analyze = true
                 }
                 stmt := self.parse_statement()?;
-                Ok(Statement.Explain { stmt: Box.new(stmt), analyze })
+                Ok(Explain { stmt: Box.new(stmt), analyze })
             },
-            TokenKind.Begin => {
-                self.advance();
+            Begin => {
+                self.advance()
                 # Optional TRANSACTION keyword
-                self.match_token(TokenKind.Transaction);
+                self.match_token(Transaction)
                 # Optional isolation level (parsed as identifier)
-                isolation := mut Option.None;
+                isolation := mut Option.None
                 I self.check_identifier("ISOLATION") {
-                    self.advance();
+                    self.advance()
                     # Expect "LEVEL"
                     I self.check_identifier("LEVEL") {
-                        self.advance();
+                        self.advance()
                     }
                     # Read isolation level name (e.g., "SERIALIZABLE", "READ COMMITTED")
                     level_str := mut self.expect_identifier()?;
                     # Handle two-word levels like "READ COMMITTED" or "REPEATABLE READ"
                     I self.check_identifier("COMMITTED") || self.check_identifier("UNCOMMITTED") || self.check_identifier("READ") {
                         second := self.expect_identifier()?;
-                        level_str = "{level_str} {second}";
+                        level_str = "{level_str} {second}"
                     }
-                    isolation = Option.Some(level_str);
+                    isolation = Option.Some(level_str)
                 }
-                Ok(Statement.BeginTxn { isolation })
+                Ok(BeginTxn { isolation })
             },
-            TokenKind.Commit => {
-                self.advance();
-                self.match_token(TokenKind.Transaction);
-                Ok(Statement.CommitTxn)
+            Commit => {
+                self.advance()
+                self.match_token(Transaction)
+                Ok(CommitTxn)
             },
-            TokenKind.Rollback => {
-                self.advance();
-                self.match_token(TokenKind.Transaction);
-                Ok(Statement.RollbackTxn)
+            Rollback => {
+                self.advance()
+                self.match_token(Transaction)
+                Ok(RollbackTxn)
             },
-            TokenKind.Set => {
-                self.advance();
+            Set => {
+                self.advance()
                 self.parse_set_statement()
             },
             # Security DDL: GRANT / REVOKE (Phase 10)
-            TokenKind.Grant_Kw => {
-                self.advance();
+            Grant_Kw => {
+                self.advance()
                 self.parse_grant()
             },
-            TokenKind.Revoke_Kw => {
-                self.advance();
+            Revoke_Kw => {
+                self.advance()
                 self.parse_revoke()
             },
             _ => {
                 # Check for contextual keywords that are identifiers
                 I self.check_identifier("PREPARE") {
-                    self.advance();
-                    R self.parse_prepare();
+                    self.advance()
+                    R self.parse_prepare()
                 }
                 I self.check_identifier("EXECUTE") || self.check_identifier("EXEC") {
-                    self.advance();
-                    R self.parse_execute();
+                    self.advance()
+                    R self.parse_execute()
                 }
                 # Maintenance commands (Phase 9)
                 I self.check_identifier("VACUUM") {
-                    self.advance();
-                    R self.parse_vacuum();
+                    self.advance()
+                    R self.parse_vacuum()
                 }
                 I self.check_identifier("REINDEX") {
-                    self.advance();
-                    R self.parse_reindex();
+                    self.advance()
+                    R self.parse_reindex()
                 }
                 I self.check_identifier("BACKUP") {
-                    self.advance();
-                    R self.parse_backup();
+                    self.advance()
+                    R self.parse_backup()
                 }
                 I self.check_identifier("RESTORE") {
-                    self.advance();
-                    R self.parse_restore();
+                    self.advance()
+                    R self.parse_restore()
                 }
                 Err(self.parse_error("expected statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, EXPLAIN, BEGIN, COMMIT, ROLLBACK, SET, PREPARE, EXECUTE, GRANT, REVOKE, VACUUM, REINDEX, BACKUP, or RESTORE)"))
             },
         }
-    }
-
-    # ========================================================================
-    # SELECT
-    # ========================================================================
-
-    # Parse a full SELECT query including CTEs and set operations
-    F parse_select(mut self) -> Result<SelectQuery, VaisError> {
-        # Parse optional WITH clause (CTEs)
-        ctes := mut Vec.new();
-        I self.match_token(TokenKind.With) {
-            ctes = self.parse_cte()?;
-        }
-
-        self.expect(TokenKind.Select)?;
-
-        # Parse optional DISTINCT
-        distinct := mut false;
-        I self.match_token(TokenKind.Distinct) {
-            distinct = true;
-        }
-
-        # Parse select list
-        select_list := self.parse_select_list()?;
-
-        # Parse optional FROM clause
-        from := mut Option.None;
-        I self.match_token(TokenKind.From) {
-            refs := self.parse_from_clause()?;
-            from = Option.Some(refs);
-        }
-
-        # Parse optional WHERE clause
-        where_clause := self.parse_where_clause()?;
-
-        # Parse optional GROUP BY clause
-        group_by := self.parse_group_by()?;
-
-        # Parse optional HAVING clause
-        having := self.parse_having()?;
-
-        # Parse optional ORDER BY clause
-        order_by := self.parse_order_by()?;
-
-        # Parse optional LIMIT/OFFSET
-        (limit, offset) := self.parse_limit_offset()?;
-
-        # Build the query
-        query := mut SelectQuery {
-            ctes,
-            select_list,
-            from,
-            where_clause,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-            distinct,
-            set_op: Option.None,
-        };
-
-        # Parse optional set operations (UNION, INTERSECT, EXCEPT)
-        query.set_op = self.parse_set_operation()?;
-
-        Ok(query)
-    }
-
-    # Parse WITH clause containing one or more CTEs
-    F parse_cte(mut self) -> Result<Vec<Cte>, VaisError> {
-        ctes := mut Vec.new();
-
-        more_ctes := mut true;
-        L more_ctes {
-            recursive := mut false;
-            I self.match_token(TokenKind.Recursive) {
-                recursive = true;
-            }
-
-            name := self.expect_identifier()?;
-
-            # Optional column alias list
-            columns := mut Vec.new();
-            I self.match_token(TokenKind.LParen) {
-                more_cols := mut true;
-                L more_cols {
-                    col := self.expect_identifier()?;
-                    columns.push(col);
-                    I !self.match_token(TokenKind.Comma) {
-                        more_cols = false;
-                    }
-                }
-                self.expect(TokenKind.RParen)?;
-            }
-
-            self.expect(TokenKind.As)?;
-            self.expect(TokenKind.LParen)?;
-            query := self.parse_select()?;
-            self.expect(TokenKind.RParen)?;
-
-            ctes.push(Cte { name, columns, query, recursive });
-
-            I !self.match_token(TokenKind.Comma) {
-                more_ctes = false;
-            }
-        }
-
-        Ok(ctes)
-    }
-
-    # Parse the select list (between SELECT and FROM)
-    F parse_select_list(mut self) -> Result<Vec<SelectItem>, VaisError> {
-        items := mut Vec.new();
-
-        more_items := mut true;
-        L more_items {
-            item := self.parse_select_item()?;
-            items.push(item);
-            I !self.match_token(TokenKind.Comma) {
-                more_items = false;
-            }
-        }
-
-        Ok(items)
-    }
-
-    # Parse a single select item
-    F parse_select_item(mut self) -> Result<SelectItem, VaisError> {
-        # Check for * (all columns)
-        I self.match_token(TokenKind.Star) {
-            R Ok(SelectItem.AllColumns);
-        }
-
-        # Check for table.* (all columns from table)
-        # Peek: identifier DOT STAR
-        I self.is_identifier() {
-            saved_pos := self.pos;
-            table_name := self.expect_identifier()?;
-            I self.match_token(TokenKind.Dot) {
-                I self.match_token(TokenKind.Star) {
-                    R Ok(SelectItem.AllColumnsFrom { table: table_name });
-                }
-                # Not table.*, backtrack
-                self.pos = saved_pos;
-            } E {
-                # No dot, backtrack and parse as expression
-                self.pos = saved_pos;
-            }
-        }
-
-        # Parse expression with optional alias
-        expr := self.parse_expr()?;
-        alias := mut Option.None;
-        I self.match_token(TokenKind.As) {
-            a := self.expect_identifier()?;
-            alias = Option.Some(a);
-        } E I self.is_identifier() {
-            # Alias without AS keyword
-            a := self.expect_identifier()?;
-            alias = Option.Some(a);
-        }
-
-        Ok(SelectItem.Expr { expr, alias })
-    }
-
-    # Parse FROM clause (comma-separated table references with joins)
-    F parse_from_clause(mut self) -> Result<Vec<TableRef>, VaisError> {
-        refs := mut Vec.new();
-
-        more_refs := mut true;
-        L more_refs {
-            table_ref := self.parse_table_ref()?;
-            # Check for joins attached to this table reference
-            joined := self.parse_joins(table_ref)?;
-            refs.push(joined);
-            I !self.match_token(TokenKind.Comma) {
-                more_refs = false;
-            }
-        }
-
-        Ok(refs)
-    }
-
-    # Parse a single table reference (table name, subquery, or parenthesized ref)
-    F parse_table_ref(mut self) -> Result<TableRef, VaisError> {
-        # Subquery: (SELECT ...)
-        I self.match_token(TokenKind.LParen) {
-            query := self.parse_select()?;
-            self.expect(TokenKind.RParen)?;
-            # Subquery in FROM requires an alias
-            self.match_token(TokenKind.As);
-            alias := self.expect_identifier()?;
-            R Ok(TableRef.Subquery { query: Box.new(query), alias });
-        }
-
-        # Check for table-valued function: VECTOR_SEARCH(...), GRAPH_TRAVERSE(...), FULLTEXT_MATCH(...)
-        I self.is_identifier() {
-            saved_pos := self.pos;
-            name := self.expect_identifier()?;
-            name_upper := name.to_uppercase();
-
-            # Check if this is a known table-valued function followed by LParen
-            I (name_upper == "VECTOR_SEARCH" || name_upper == "GRAPH_TRAVERSE" || name_upper == "FULLTEXT_MATCH")
-                && self.check(TokenKind.LParen) {
-                # Parse table function: name(args...) AS alias
-                self.expect(TokenKind.LParen)?;
-
-                # Parse comma-separated argument expressions
-                args := mut Vec.new();
-                I !self.check(TokenKind.RParen) {
-                    more_args := mut true;
-                    L more_args {
-                        arg := self.parse_expr()?;
-                        args.push(arg);
-                        I !self.match_token(TokenKind.Comma) {
-                            more_args = false;
-                        }
-                    }
-                }
-                self.expect(TokenKind.RParen)?;
-
-                # Parse optional alias
-                alias := mut Option.None;
-                I self.match_token(TokenKind.As) {
-                    a := self.expect_identifier()?;
-                    alias = Option.Some(a);
-                } E I self.is_identifier() && !self.is_join_keyword() {
-                    # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
-                    a := self.expect_identifier()?;
-                    alias = Option.Some(a);
-                }
-
-                R Ok(TableRef.TableFunction { name, args, alias });
-            }
-
-            # Not a table function, backtrack and parse as regular table name
-            self.pos = saved_pos;
-        }
-
-        # Table name with optional alias
-        name := self.expect_identifier()?;
-        alias := mut Option.None;
-        I self.match_token(TokenKind.As) {
-            a := self.expect_identifier()?;
-            alias = Option.Some(a);
-        } E I self.is_identifier() && !self.is_join_keyword() {
-            # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
-            a := self.expect_identifier()?;
-            alias = Option.Some(a);
-        }
-
-        Ok(TableRef.Table { name, alias })
-    }
-
-    # Parse zero or more joins following a table reference
-    F parse_joins(mut self, left: TableRef) -> Result<TableRef, VaisError> {
-        current := mut left;
-
-        L self.is_join_keyword() {
-            current = self.parse_join(current)?;
-        }
-
-        Ok(current)
-    }
-
-    # Parse a single JOIN clause
-    F parse_join(mut self, left: TableRef) -> Result<TableRef, VaisError> {
-        # Determine join type
-        join_type := mut JoinType.Inner;
-        is_natural := mut false;
-
-        # NATURAL keyword
-        I self.check_identifier("NATURAL") {
-            is_natural = true;
-            self.advance();
-        }
-
-        M self.peek() {
-            TokenKind.Inner => {
-                self.advance();
-                join_type = JoinType.Inner;
-            },
-            TokenKind.Left => {
-                self.advance();
-                join_type = JoinType.Left;
-                # Optional OUTER keyword
-                I self.check_identifier("OUTER") {
-                    self.advance();
-                }
-            },
-            TokenKind.Right => {
-                self.advance();
-                join_type = JoinType.Right;
-                # Optional OUTER keyword
-                I self.check_identifier("OUTER") {
-                    self.advance();
-                }
-            },
-            TokenKind.Cross => {
-                self.advance();
-                join_type = JoinType.Cross;
-            },
-            TokenKind.Join => {
-                # Plain JOIN = INNER JOIN
-                join_type = JoinType.Inner;
-            },
-            _ => {
-                R Err(self.parse_error("expected JOIN keyword"));
-            },
-        }
-
-        self.expect(TokenKind.Join)?;
-
-        # Parse the right side table reference
-        right := self.parse_table_ref()?;
-
-        # Parse join condition
-        condition := mut JoinCondition.Natural;
-
-        I is_natural {
-            condition = JoinCondition.Natural;
-        } E {
-            M join_type {
-                JoinType.Cross => {
-                    # CROSS JOIN has no condition; use Natural as placeholder
-                    R Ok(TableRef.CrossJoin {
-                        left: Box.new(left),
-                        right: Box.new(right),
-                    });
-                },
-                _ => {
-                    I self.match_token(TokenKind.On) {
-                        expr := self.parse_expr()?;
-                        condition = JoinCondition.On { expr };
-                    } E I self.match_token(TokenKind.Using) {
-                        self.expect(TokenKind.LParen)?;
-                        columns := mut Vec.new();
-                        more_cols := mut true;
-                        L more_cols {
-                            col := self.expect_identifier()?;
-                            columns.push(col);
-                            I !self.match_token(TokenKind.Comma) {
-                                more_cols = false;
-                            }
-                        }
-                        self.expect(TokenKind.RParen)?;
-                        condition = JoinCondition.Using { columns };
-                    } E {
-                        R Err(self.parse_error("expected ON or USING after JOIN"));
-                    }
-                },
-            }
-        }
-
-        Ok(TableRef.Join {
-            join: JoinClause {
-                join_type,
-                left: Box.new(left),
-                right: Box.new(right),
-                condition,
-            },
-        })
-    }
-
-    # Parse optional WHERE clause
-    F parse_where_clause(mut self) -> Result<Option<Expr>, VaisError> {
-        I self.match_token(TokenKind.Where) {
-            expr := self.parse_expr()?;
-            Ok(Option.Some(expr))
-        } E {
-            Ok(Option.None)
-        }
-    }
-
-    # Parse optional GROUP BY clause
-    F parse_group_by(mut self) -> Result<Vec<Expr>, VaisError> {
-        I self.match_token(TokenKind.Group) {
-            self.expect(TokenKind.By)?;
-            exprs := mut Vec.new();
-            more_exprs := mut true;
-            L more_exprs {
-                expr := self.parse_expr()?;
-                exprs.push(expr);
-                I !self.match_token(TokenKind.Comma) {
-                    more_exprs = false;
-                }
-            }
-            Ok(exprs)
-        } E {
-            Ok(Vec.new())
-        }
-    }
-
-    # Parse optional HAVING clause
-    F parse_having(mut self) -> Result<Option<Expr>, VaisError> {
-        I self.match_token(TokenKind.Having) {
-            expr := self.parse_expr()?;
-            Ok(Option.Some(expr))
-        } E {
-            Ok(Option.None)
-        }
-    }
-
-    # Parse optional ORDER BY clause
-    F parse_order_by(mut self) -> Result<Vec<OrderByItem>, VaisError> {
-        I self.match_token(TokenKind.Order) {
-            self.expect(TokenKind.By)?;
-            items := mut Vec.new();
-            more_items := mut true;
-            L more_items {
-                expr := self.parse_expr()?;
-                asc := mut true;
-                I self.match_token(TokenKind.Asc) {
-                    asc = true;
-                } E I self.match_token(TokenKind.Desc) {
-                    asc = false;
-                }
-
-                # Optional NULLS FIRST / NULLS LAST
-                nulls_first := mut Option.None;
-                I self.match_token(TokenKind.Nulls) {
-                    I self.match_token(TokenKind.First) {
-                        nulls_first = Option.Some(true);
-                    } E I self.match_token(TokenKind.Last) {
-                        nulls_first = Option.Some(false);
-                    } E {
-                        R Err(self.parse_error("expected FIRST or LAST after NULLS"));
-                    }
-                }
-
-                items.push(OrderByItem { expr, asc, nulls_first });
-                I !self.match_token(TokenKind.Comma) {
-                    more_items = false;
-                }
-            }
-            Ok(items)
-        } E {
-            Ok(Vec.new())
-        }
-    }
-
-    # Parse optional LIMIT and OFFSET clauses
-    F parse_limit_offset(mut self) -> Result<(Option<Expr>, Option<Expr>), VaisError> {
-        limit := mut Option.None;
-        offset := mut Option.None;
-
-        I self.match_token(TokenKind.Limit) {
-            expr := self.parse_expr()?;
-            limit = Option.Some(expr);
-        }
-
-        I self.match_token(TokenKind.Offset) {
-            expr := self.parse_expr()?;
-            offset = Option.Some(expr);
-        }
-
-        # Also allow LIMIT after OFFSET if LIMIT was not yet parsed
-        I limit.is_none() && self.match_token(TokenKind.Limit) {
-            expr := self.parse_expr()?;
-            limit = Option.Some(expr);
-        }
-
-        Ok((limit, offset))
-    }
-
-    # Parse optional set operation (UNION/INTERSECT/EXCEPT)
-    F parse_set_operation(mut self) -> Result<Option<SetOperation>, VaisError> {
-        op_kind := mut Option.None;
-
-        M self.peek() {
-            TokenKind.Union => {
-                self.advance();
-                op_kind = Option.Some(SetOpKind.Union);
-            },
-            TokenKind.Intersect => {
-                self.advance();
-                op_kind = Option.Some(SetOpKind.Intersect);
-            },
-            TokenKind.Except => {
-                self.advance();
-                op_kind = Option.Some(SetOpKind.Except);
-            },
-            _ => {
-                R Ok(Option.None);
-            },
-        }
-
-        # Check for ALL
-        all := mut false;
-        I self.match_token(TokenKind.All) {
-            all = true;
-        }
-
-        # Parse the right side query
-        right := self.parse_select()?;
-
-        M op_kind {
-            Option.Some(op) => {
-                Ok(Option.Some(SetOperation {
-                    op,
-                    all,
-                    right: Box.new(right),
-                }))
-            },
-            Option.None => Ok(Option.None),
-        }
-    }
-
-    # ========================================================================
-    # INSERT
-    # ========================================================================
-
-    # Parse INSERT INTO table [(columns)] VALUES (...) | SELECT ...
-    F parse_insert(mut self) -> Result<InsertStmt, VaisError> {
-        self.expect(TokenKind.Into)?;
-        table_name := self.expect_identifier()?;
-
-        # Optional column list
-        columns := mut Vec.new();
-        I self.match_token(TokenKind.LParen) {
-            more_cols := mut true;
-            L more_cols {
-                col := self.expect_identifier()?;
-                columns.push(col);
-                I !self.match_token(TokenKind.Comma) {
-                    more_cols = false;
-                }
-            }
-            self.expect(TokenKind.RParen)?;
-        }
-
-        # VALUES (...) or SELECT ...
-        source := I self.match_token(TokenKind.Values) {
-            rows := mut Vec.new();
-            more_rows := mut true;
-            L more_rows {
-                self.expect(TokenKind.LParen)?;
-                row := mut Vec.new();
-                more_vals := mut true;
-                L more_vals {
-                    expr := self.parse_expr()?;
-                    row.push(expr);
-                    I !self.match_token(TokenKind.Comma) {
-                        more_vals = false;
-                    }
-                }
-                self.expect(TokenKind.RParen)?;
-                rows.push(row);
-                I !self.match_token(TokenKind.Comma) {
-                    more_rows = false;
-                }
-            }
-            InsertSource.Values { rows }
-        } E {
-            # INSERT ... SELECT
-            query := self.parse_select()?;
-            InsertSource.Query { query }
-        };
-
-        Ok(InsertStmt { table_name, columns, source })
-    }
-
-    # ========================================================================
-    # UPDATE
-    # ========================================================================
-
-    # Parse UPDATE table SET col=val, ... [WHERE ...]
-    F parse_update(mut self) -> Result<UpdateStmt, VaisError> {
-        table_name := self.expect_identifier()?;
-        self.expect(TokenKind.Set)?;
-
-        assignments := mut Vec.new();
-        more_assigns := mut true;
-        L more_assigns {
-            column := self.expect_identifier()?;
-            self.expect(TokenKind.Eq)?;
-            value := self.parse_expr()?;
-            assignments.push(Assignment { column, value });
-            I !self.match_token(TokenKind.Comma) {
-                more_assigns = false;
-            }
-        }
-
-        where_clause := self.parse_where_clause()?;
-
-        Ok(UpdateStmt { table_name, assignments, where_clause })
-    }
-
-    # ========================================================================
-    # DELETE
-    # ========================================================================
-
-    # Parse DELETE FROM table [WHERE ...]
-    F parse_delete(mut self) -> Result<DeleteStmt, VaisError> {
-        self.expect(TokenKind.From)?;
-        table_name := self.expect_identifier()?;
-        where_clause := self.parse_where_clause()?;
-
-        Ok(DeleteStmt { table_name, where_clause })
-    }
-
-    # ========================================================================
-    # CREATE (TABLE / INDEX)
-    # ========================================================================
-
-    # Dispatch CREATE TABLE / INDEX / USER / ROLE / POLICY
-    F parse_create(mut self) -> Result<Statement, VaisError> {
-        # CREATE UNIQUE INDEX ...
-        I self.match_token(TokenKind.Unique) {
-            self.expect(TokenKind.Index)?;
-            create := self.parse_create_index_body(true)?;
-            R Ok(Statement.CreateIndex { create });
-        }
-
-        M self.peek() {
-            TokenKind.Table => {
-                self.advance();
-                create := self.parse_create_table()?;
-                Ok(Statement.CreateTable { create })
-            },
-            TokenKind.Index => {
-                self.advance();
-                create := self.parse_create_index_body(false)?;
-                Ok(Statement.CreateIndex { create })
-            },
-            # Security DDL (Phase 10)
-            TokenKind.User_Kw => {
-                self.advance();
-                create := self.parse_create_user()?;
-                Ok(Statement.CreateUser { create })
-            },
-            TokenKind.Role_Kw => {
-                self.advance();
-                create := self.parse_create_role()?;
-                Ok(Statement.CreateRole { create })
-            },
-            TokenKind.Policy_Kw => {
-                self.advance();
-                create := self.parse_create_policy()?;
-                Ok(Statement.CreatePolicy { create })
-            },
-            _ => {
-                Err(self.parse_error("expected TABLE, INDEX, USER, ROLE, or POLICY after CREATE"))
-            },
-        }
-    }
-
-    # Parse CREATE TABLE [IF NOT EXISTS] name (column_defs...)
-    F parse_create_table(mut self) -> Result<CreateTableStmt, VaisError> {
-        if_not_exists := mut false;
-
-        # Check for IF NOT EXISTS (IF is not a keyword, it is an identifier)
-        I self.check_identifier("IF") {
-            self.advance();
-            self.expect(TokenKind.Not)?;
-            I self.check_identifier("EXISTS") {
-                self.advance();
-            } E {
-                R Err(self.parse_error("expected EXISTS after NOT"));
-            }
-            if_not_exists = true;
-        }
-
-        name := self.expect_identifier()?;
-        self.expect(TokenKind.LParen)?;
-
-        columns := mut Vec.new();
-        more_cols := mut true;
-        L more_cols {
-            col := self.parse_column_def()?;
-            columns.push(col);
-            I !self.match_token(TokenKind.Comma) {
-                more_cols = false;
-            }
-        }
-        self.expect(TokenKind.RParen)?;
-
-        Ok(CreateTableStmt { name, columns, if_not_exists })
-    }
-
-    # Parse a single column definition: name TYPE [constraints...]
-    F parse_column_def(mut self) -> Result<ColumnDef, VaisError> {
-        name := self.expect_identifier()?;
-        data_type := self.parse_data_type()?;
-
-        nullable := mut true;
-        default_value := mut Option.None;
-        is_primary_key := mut false;
-        is_unique := mut false;
-        check_expr := mut Option.None;
-
-        # Parse column constraints (can appear in any order, multiple times)
-        more_constraints := mut true;
-        L more_constraints {
-            I self.match_token(TokenKind.Not) {
-                self.expect(TokenKind.Null)?;
-                nullable = false;
-            } E I self.match_token(TokenKind.Null) {
-                nullable = true;
-            } E I self.match_token(TokenKind.Primary) {
-                self.expect(TokenKind.Key)?;
-                is_primary_key = true;
-                nullable = false;  # PRIMARY KEY implies NOT NULL
-            } E I self.match_token(TokenKind.Unique) {
-                is_unique = true;
-            } E I self.match_token(TokenKind.Default) {
-                expr := self.parse_primary()?;
-                default_value = Option.Some(expr);
-            } E I self.match_token(TokenKind.Check) {
-                self.expect(TokenKind.LParen)?;
-                expr := self.parse_expr()?;
-                self.expect(TokenKind.RParen)?;
-                check_expr = Option.Some(expr);
-            } E I self.match_token(TokenKind.References) {
-                # REFERENCES table(column) -- parse but ignore for now
-                _ref_table := self.expect_identifier()?;
-                I self.match_token(TokenKind.LParen) {
-                    _ref_col := self.expect_identifier()?;
-                    self.expect(TokenKind.RParen)?;
-                }
-            } E {
-                more_constraints = false;
-            }
-        }
-
-        Ok(ColumnDef {
-            name,
-            data_type,
-            nullable,
-            default_value,
-            is_primary_key,
-            is_unique,
-            check_expr,
-        })
-    }
-
-    # Parse a SQL data type: INT, VARCHAR(n), VECTOR(dim), FLOAT, BOOL, TEXT,
-    # BLOB, DATE, TIMESTAMP
-    F parse_data_type(mut self) -> Result<SqlType, VaisError> {
-        M self.peek() {
-            TokenKind.Int_Kw => {
-                self.advance();
-                Ok(SqlType.Int)
-            },
-            TokenKind.Float_Kw => {
-                self.advance();
-                Ok(SqlType.Float)
-            },
-            TokenKind.Bool_Kw => {
-                self.advance();
-                Ok(SqlType.Bool)
-            },
-            TokenKind.Varchar => {
-                self.advance();
-                # VARCHAR requires (max_len)
-                self.expect(TokenKind.LParen)?;
-                max_len := self.expect_int_literal()? as u32;
-                self.expect(TokenKind.RParen)?;
-                Ok(SqlType.Varchar { max_len })
-            },
-            TokenKind.Text_Kw => {
-                self.advance();
-                Ok(SqlType.Text)
-            },
-            TokenKind.Blob_Kw => {
-                self.advance();
-                Ok(SqlType.Blob)
-            },
-            TokenKind.Date_Kw => {
-                self.advance();
-                Ok(SqlType.Date)
-            },
-            TokenKind.Timestamp_Kw => {
-                self.advance();
-                Ok(SqlType.Timestamp)
-            },
-            TokenKind.Vector_Kw => {
-                self.advance();
-                # VECTOR requires (dim)
-                self.expect(TokenKind.LParen)?;
-                dim := self.expect_int_literal()? as u32;
-                self.expect(TokenKind.RParen)?;
-                Ok(SqlType.Vector { dim })
-            },
-            _ => {
-                Err(self.parse_error("expected data type (INT, FLOAT, BOOL, VARCHAR, TEXT, BLOB, DATE, TIMESTAMP, VECTOR)"))
-            },
-        }
-    }
-
-    # Parse CREATE INDEX body (after INDEX keyword, unique flag already known)
-    F parse_create_index(mut self) -> Result<CreateIndexStmt, VaisError> {
-        self.parse_create_index_body(false)
-    }
-
-    # Parse CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (columns...)
-    F parse_create_index_body(mut self, unique: bool) -> Result<CreateIndexStmt, VaisError> {
-        if_not_exists := mut false;
-
-        # Check for IF NOT EXISTS
-        I self.check_identifier("IF") {
-            self.advance();
-            self.expect(TokenKind.Not)?;
-            I self.check_identifier("EXISTS") {
-                self.advance();
-            } E {
-                R Err(self.parse_error("expected EXISTS after NOT"));
-            }
-            if_not_exists = true;
-        }
-
-        name := self.expect_identifier()?;
-        self.expect(TokenKind.On)?;
-        table_name := self.expect_identifier()?;
-
-        self.expect(TokenKind.LParen)?;
-        columns := mut Vec.new();
-        more_cols := mut true;
-        L more_cols {
-            col := self.expect_identifier()?;
-            columns.push(col);
-            I !self.match_token(TokenKind.Comma) {
-                more_cols = false;
-            }
-        }
-        self.expect(TokenKind.RParen)?;
-
-        Ok(CreateIndexStmt { name, table_name, columns, unique, if_not_exists })
-    }
-
-    # ========================================================================
-    # DROP (TABLE / INDEX)
-    # ========================================================================
-
-    # Dispatch DROP TABLE / INDEX / USER / ROLE / POLICY
-    F parse_drop(mut self) -> Result<Statement, VaisError> {
-        M self.peek() {
-            TokenKind.Table => {
-                self.advance();
-                if_exists := mut false;
-                I self.check_identifier("IF") {
-                    self.advance();
-                    I self.check_identifier("EXISTS") {
-                        self.advance();
-                    } E {
-                        R Err(self.parse_error("expected EXISTS after IF"));
-                    }
-                    if_exists = true;
-                }
-                name := self.expect_identifier()?;
-                Ok(Statement.DropTable { name, if_exists })
-            },
-            TokenKind.Index => {
-                self.advance();
-                if_exists := mut false;
-                I self.check_identifier("IF") {
-                    self.advance();
-                    I self.check_identifier("EXISTS") {
-                        self.advance();
-                    } E {
-                        R Err(self.parse_error("expected EXISTS after IF"));
-                    }
-                    if_exists = true;
-                }
-                name := self.expect_identifier()?;
-                Ok(Statement.DropIndex { name, if_exists })
-            },
-            # Security DDL (Phase 10)
-            TokenKind.User_Kw => {
-                self.advance();
-                self.parse_drop_user()
-            },
-            TokenKind.Role_Kw => {
-                self.advance();
-                self.parse_drop_role()
-            },
-            TokenKind.Policy_Kw => {
-                self.advance();
-                self.parse_drop_policy()
-            },
-            _ => {
-                Err(self.parse_error("expected TABLE, INDEX, USER, ROLE, or POLICY after DROP"))
-            },
-        }
-    }
-
-    # ========================================================================
-    # ALTER TABLE
-    # ========================================================================
-
-    # Parse ALTER TABLE table_name action
-    F parse_alter_table(mut self) -> Result<AlterTableStmt, VaisError> {
-        table_name := self.expect_identifier()?;
-
-        action := I self.match_token(TokenKind.Add) {
-            # ADD [COLUMN] column_def
-            self.match_token(TokenKind.Column);
-            column := self.parse_column_def()?;
-            AlterAction.AddColumn { column }
-        } E I self.match_token(TokenKind.Drop) {
-            # DROP [COLUMN] name
-            self.match_token(TokenKind.Column);
-            name := self.expect_identifier()?;
-            AlterAction.DropColumn { name }
-        } E I self.match_token(TokenKind.Rename) {
-            # RENAME [COLUMN] old_name TO new_name
-            self.match_token(TokenKind.Column);
-            old_name := self.expect_identifier()?;
-            # Expect TO (parsed as identifier since it is not a keyword)
-            I !self.check_identifier("TO") {
-                R Err(self.parse_error("expected TO after column name in RENAME"));
-            }
-            self.advance();
-            new_name := self.expect_identifier()?;
-            AlterAction.RenameColumn { old_name, new_name }
-        } E I self.match_token(TokenKind.Alter) {
-            # ALTER [COLUMN] name TYPE new_type
-            self.match_token(TokenKind.Column);
-            name := self.expect_identifier()?;
-            # Expect TYPE (parsed as identifier since not a keyword)
-            I !self.check_identifier("TYPE") {
-                R Err(self.parse_error("expected TYPE after column name in ALTER COLUMN"));
-            }
-            self.advance();
-            new_type := self.parse_data_type()?;
-            AlterAction.AlterColumnType { name, new_type }
-        } E I self.match_token(TokenKind.Enable_Kw) {
-            # ENABLE ROW LEVEL SECURITY
-            self.expect(TokenKind.Row_Kw)?;
-            self.expect(TokenKind.Level_Kw)?;
-            I !self.check_identifier("SECURITY") {
-                R Err(self.parse_error("expected SECURITY after ROW LEVEL"));
-            }
-            self.advance();
-            AlterAction.EnableRls
-        } E I self.match_token(TokenKind.Disable_Kw) {
-            # DISABLE ROW LEVEL SECURITY
-            self.expect(TokenKind.Row_Kw)?;
-            self.expect(TokenKind.Level_Kw)?;
-            I !self.check_identifier("SECURITY") {
-                R Err(self.parse_error("expected SECURITY after ROW LEVEL"));
-            }
-            self.advance();
-            AlterAction.DisableRls
-        } E {
-            R Err(self.parse_error("expected ADD, DROP, RENAME, ALTER, ENABLE, or DISABLE after table name"));
-        };
-
-        Ok(AlterTableStmt { table_name, action })
-    }
-
-    # ========================================================================
-    # SET, PREPARE, EXECUTE
-    # ========================================================================
-
-    # Parse SET SESSION|GLOBAL key = value
-    F parse_set_statement(mut self) -> Result<Statement, VaisError> {
-        is_global := mut false;
-        I self.check_identifier("SESSION") {
-            self.advance();
-        } E I self.check_identifier("GLOBAL") {
-            self.advance();
-            is_global = true;
-        }
-
-        key := self.expect_identifier()?;
-        self.expect(TokenKind.Eq)?;
-        value := self.parse_expr()?;
-
-        target := I is_global {
-            SetTarget.Global { key, value }
-        } E {
-            SetTarget.Session { key, value }
-        };
-
-        Ok(Statement.SetExpr { target })
-    }
-
-    # Parse PREPARE name AS statement
-    F parse_prepare(mut self) -> Result<Statement, VaisError> {
-        name := self.expect_identifier()?;
-        self.expect(TokenKind.As)?;
-        stmt := self.parse_statement()?;
-        Ok(Statement.Prepare { name, stmt: Box.new(stmt) })
-    }
-
-    # Parse EXECUTE name [(params...)]
-    F parse_execute(mut self) -> Result<Statement, VaisError> {
-        name := self.expect_identifier()?;
-        params := mut Vec.new();
-
-        I self.match_token(TokenKind.LParen) {
-            I !self.check(TokenKind.RParen) {
-                more_params := mut true;
-                L more_params {
-                    expr := self.parse_expr()?;
-                    params.push(expr);
-                    I !self.match_token(TokenKind.Comma) {
-                        more_params = false;
-                    }
-                }
-            }
-            self.expect(TokenKind.RParen)?;
-        }
-
-        Ok(Statement.Execute { name, params })
-    }
-
-    # ========================================================================
-    # Maintenance commands (Phase 9)
-    # ========================================================================
-
-    # Parse VACUUM [FULL] [ANALYZE] [table_name] [(SKIP_LOCKED)]
-    # Examples:
-    #   VACUUM
-    #   VACUUM my_table
-    #   VACUUM FULL
-    #   VACUUM FULL my_table
-    #   VACUUM ANALYZE my_table
-    #   VACUUM (SKIP_LOCKED)
-    #   VACUUM (SKIP_LOCKED) my_table
-    F parse_vacuum(mut self) -> Result<Statement, VaisError> {
-        full := mut false;
-        analyze := mut false;
-        skip_locked := mut false;
-        table_name := mut Option.None;
-
-        # Parse optional FULL keyword
-        I self.check_identifier("FULL") {
-            self.advance();
-            full = true;
-        }
-
-        # Parse optional ANALYZE keyword (after VACUUM or VACUUM FULL)
-        I self.match_token(TokenKind.Analyze) || self.check_identifier("ANALYZE") {
-            I self.check_identifier("ANALYZE") {
-                self.advance();
-            }
-            analyze = true;
-        }
-
-        # Parse optional (SKIP_LOCKED) option
-        I self.match_token(TokenKind.LParen) {
-            I self.check_identifier("SKIP_LOCKED") {
-                self.advance();
-                skip_locked = true;
-            } E {
-                R Err(self.parse_error("expected SKIP_LOCKED in VACUUM options"));
-            }
-            self.expect(TokenKind.RParen)?;
-        }
-
-        # Parse optional table name
-        I self.is_identifier() {
-            name := self.expect_identifier()?;
-            table_name = Option.Some(name);
-        }
-
-        Ok(Statement.Vacuum { table_name, full, analyze, skip_locked })
-    }
-
-    # Parse REINDEX [CONCURRENTLY] { TABLE | INDEX | DATABASE } [name]
-    # Examples:
-    #   REINDEX TABLE my_table
-    #   REINDEX INDEX my_index
-    #   REINDEX DATABASE
-    #   REINDEX CONCURRENTLY TABLE my_table
-    F parse_reindex(mut self) -> Result<Statement, VaisError> {
-        concurrently := mut false;
-        target := mut Option.None;
-
-        # Parse optional CONCURRENTLY keyword
-        I self.check_identifier("CONCURRENTLY") {
-            self.advance();
-            concurrently = true;
-        }
-
-        # Parse optional target type (TABLE, INDEX, DATABASE)
-        I self.check_identifier("TABLE") {
-            self.advance();
-            name := self.expect_identifier()?;
-            target = Option.Some(name);
-        } E I self.check_identifier("INDEX") {
-            self.advance();
-            name := self.expect_identifier()?;
-            target = Option.Some(name);
-        } E I self.check_identifier("DATABASE") {
-            self.advance();
-            # DATABASE reindex has no name argument (applies to current DB)
-        } E I self.is_identifier() {
-            # Bare name (treat as table)
-            name := self.expect_identifier()?;
-            target = Option.Some(name);
-        }
-
-        Ok(Statement.Reindex { target, concurrently })
-    }
-
-    # Parse BACKUP TO 'path' [LABEL 'label']
-    # Examples:
-    #   BACKUP TO '/backups/2026-02-27'
-    #   BACKUP TO '/backups/daily' LABEL 'pre-migration'
-    F parse_backup(mut self) -> Result<Statement, VaisError> {
-        # Expect TO keyword
-        I !self.check_identifier("TO") {
-            R Err(self.parse_error("expected TO after BACKUP"));
-        }
-        self.advance();
-
-        # Expect path as string literal
-        path := self.expect_string_literal()?;
-
-        # Parse optional LABEL 'label'
-        label := mut Option.None;
-        I self.check_identifier("LABEL") {
-            self.advance();
-            label_str := self.expect_string_literal()?;
-            label = Option.Some(label_str);
-        }
-
-        Ok(Statement.Backup { path, label })
-    }
-
-    # Parse RESTORE FROM 'path' [TO TIMESTAMP 'ts' | TO LSN 'lsn']
-    # Examples:
-    #   RESTORE FROM '/backups/2026-02-27'
-    #   RESTORE FROM '/backups/daily' TO TIMESTAMP '2026-02-27T12:00:00Z'
-    #   RESTORE FROM '/backups/daily' TO LSN '0x0000000100000042'
-    F parse_restore(mut self) -> Result<Statement, VaisError> {
-        # Expect FROM keyword
-        I !self.check_identifier("FROM") {
-            R Err(self.parse_error("expected FROM after RESTORE"));
-        }
-        self.advance();
-
-        # Expect path as string literal
-        path := self.expect_string_literal()?;
-
-        # Parse optional PITR target: TO TIMESTAMP 'ts' | TO LSN 'lsn'
-        pitr_timestamp := mut Option.None;
-        pitr_lsn := mut Option.None;
-
-        I self.check_identifier("TO") {
-            self.advance();
-            I self.check_identifier("TIMESTAMP") {
-                self.advance();
-                ts := self.expect_string_literal()?;
-                pitr_timestamp = Option.Some(ts);
-            } E I self.check_identifier("LSN") {
-                self.advance();
-                lsn := self.expect_string_literal()?;
-                pitr_lsn = Option.Some(lsn);
-            } E {
-                R Err(self.parse_error("expected TIMESTAMP or LSN after TO in RESTORE"));
-            }
-        }
-
-        Ok(Statement.Restore { path, pitr_timestamp, pitr_lsn })
-    }
-
-    # ========================================================================
-    # Security DDL commands (Phase 10)
-    # ========================================================================
-
-    # Parse CREATE USER username [WITH] PASSWORD 'password' [options...]
-    # Options: SUPERUSER | NOSUPERUSER | LOGIN | NOLOGIN
-    #          CONNECTION LIMIT n | IN ROLE role1, role2, ...
-    F parse_create_user(mut self) -> Result<CreateUserStmt, VaisError> {
-        username := self.expect_identifier()?;
-
-        # Optional WITH keyword
-        I self.check(TokenKind.With) {
-            self.advance();
-        }
-
-        # PASSWORD 'password' is required
-        self.expect(TokenKind.Password_Kw)?;
-        password := self.expect_string_literal()?;
-
-        stmt := mut CreateUserStmt.new(username, password);
-
-        # Parse optional user options
-        more_opts := mut true;
-        L more_opts {
-            I self.check_identifier("SUPERUSER") {
-                self.advance();
-                stmt.is_superuser = Option.Some(true);
-            } E I self.check_identifier("NOSUPERUSER") {
-                self.advance();
-                stmt.is_superuser = Option.Some(false);
-            } E I self.match_token(TokenKind.Login_Kw) {
-                stmt.can_login = Option.Some(true);
-            } E I self.check_identifier("NOLOGIN") {
-                self.advance();
-                stmt.can_login = Option.Some(false);
-            } E I self.match_token(TokenKind.Connection_Kw) {
-                self.expect(TokenKind.Limit)?;
-                limit_val := self.expect_int_literal()?;
-                stmt.connection_limit = Option.Some(limit_val);
-            } E I self.match_token(TokenKind.In) {
-                self.expect(TokenKind.Role_Kw)?;
-                # Parse comma-separated role names
-                more_roles := mut true;
-                L more_roles {
-                    role := self.expect_identifier()?;
-                    stmt.in_roles.push(role);
-                    I !self.match_token(TokenKind.Comma) {
-                        more_roles = false;
-                    }
-                }
-            } E {
-                more_opts = false;
-            }
-        }
-
-        Ok(stmt)
-    }
-
-    # Parse ALTER USER username [SET PASSWORD 'pw'] [RENAME TO name] [options...]
-    F parse_alter_user(mut self) -> Result<AlterUserStmt, VaisError> {
-        username := self.expect_identifier()?;
-        stmt := mut AlterUserStmt.new(username);
-
-        # Parse one or more options
-        more_opts := mut true;
-        L more_opts {
-            I self.match_token(TokenKind.Set) {
-                # SET PASSWORD 'new_password'
-                self.expect(TokenKind.Password_Kw)?;
-                pw := self.expect_string_literal()?;
-                stmt.password = Option.Some(pw);
-            } E I self.match_token(TokenKind.Rename) {
-                # RENAME TO new_name
-                I !self.check_identifier("TO") {
-                    R Err(self.parse_error("expected TO after RENAME"));
-                }
-                self.advance();
-                new_name := self.expect_identifier()?;
-                stmt.rename_to = Option.Some(new_name);
-            } E I self.check_identifier("SUPERUSER") {
-                self.advance();
-                stmt.is_superuser = Option.Some(true);
-            } E I self.check_identifier("NOSUPERUSER") {
-                self.advance();
-                stmt.is_superuser = Option.Some(false);
-            } E I self.match_token(TokenKind.Login_Kw) {
-                stmt.can_login = Option.Some(true);
-            } E I self.check_identifier("NOLOGIN") {
-                self.advance();
-                stmt.can_login = Option.Some(false);
-            } E I self.check_identifier("LOCK") {
-                self.advance();
-                stmt.is_locked = Option.Some(true);
-            } E I self.check_identifier("UNLOCK") {
-                self.advance();
-                stmt.is_locked = Option.Some(false);
-            } E I self.match_token(TokenKind.Connection_Kw) {
-                self.expect(TokenKind.Limit)?;
-                limit_val := self.expect_int_literal()?;
-                stmt.connection_limit = Option.Some(limit_val);
-            } E {
-                more_opts = false;
-            }
-        }
-
-        Ok(stmt)
-    }
-
-    # Parse DROP USER [IF EXISTS] username [CASCADE]
-    F parse_drop_user(mut self) -> Result<Statement, VaisError> {
-        if_exists := mut false;
-        I self.check_identifier("IF") {
-            self.advance();
-            I self.check_identifier("EXISTS") {
-                self.advance();
-            } E {
-                R Err(self.parse_error("expected EXISTS after IF"));
-            }
-            if_exists = true;
-        }
-
-        name := self.expect_identifier()?;
-
-        cascade := mut false;
-        I self.check_identifier("CASCADE") {
-            self.advance();
-            cascade = true;
-        }
-
-        Ok(Statement.DropUser { name, if_exists, cascade })
-    }
-
-    # Parse CREATE ROLE role_name [IN ROLE parent1, parent2, ...]
-    F parse_create_role(mut self) -> Result<CreateRoleStmt, VaisError> {
-        role_name := self.expect_identifier()?;
-        stmt := mut CreateRoleStmt.new(role_name);
-
-        # Optional IN ROLE parent roles
-        I self.match_token(TokenKind.In) {
-            self.expect(TokenKind.Role_Kw)?;
-            more_roles := mut true;
-            L more_roles {
-                parent := self.expect_identifier()?;
-                stmt.in_roles.push(parent);
-                I !self.match_token(TokenKind.Comma) {
-                    more_roles = false;
-                }
-            }
-        }
-
-        Ok(stmt)
-    }
-
-    # Parse DROP ROLE [IF EXISTS] role_name [CASCADE]
-    F parse_drop_role(mut self) -> Result<Statement, VaisError> {
-        if_exists := mut false;
-        I self.check_identifier("IF") {
-            self.advance();
-            I self.check_identifier("EXISTS") {
-                self.advance();
-            } E {
-                R Err(self.parse_error("expected EXISTS after IF"));
-            }
-            if_exists = true;
-        }
-
-        name := self.expect_identifier()?;
-
-        cascade := mut false;
-        I self.check_identifier("CASCADE") {
-            self.advance();
-            cascade = true;
-        }
-
-        Ok(Statement.DropRole { name, if_exists, cascade })
-    }
-
-    # Parse GRANT statement:
-    #   GRANT ROLE role_name TO grantee
-    #   GRANT priv1, priv2, ... ON [TABLE|DATABASE|SCHEMA] object TO grantee [WITH GRANT OPTION]
-    F parse_grant(mut self) -> Result<Statement, VaisError> {
-        # Check for GRANT ROLE role_name TO user_or_role
-        I self.check(TokenKind.Role_Kw) {
-            self.advance();
-            role_name := self.expect_identifier()?;
-            # Expect TO (identifier, not a keyword)
-            I !self.check_identifier("TO") {
-                R Err(self.parse_error("expected TO after role name in GRANT ROLE"));
-            }
-            self.advance();
-            grantee := self.expect_identifier()?;
-            R Ok(Statement.Grant {
-                grant: GrantStmt {
-                    grant_type: GrantType.RoleMembership { role_name, grantee },
-                },
-            });
-        }
-
-        # Parse privilege list
-        privileges := self.parse_privilege_list()?;
-
-        # Expect ON [TABLE|DATABASE|SCHEMA] object_name
-        self.expect(TokenKind.On)?;
-        (object_type, object_name) := self.parse_grant_object()?;
-
-        # Expect TO grantee
-        I !self.check_identifier("TO") {
-            R Err(self.parse_error("expected TO after object name in GRANT"));
-        }
-        self.advance();
-        grantee := self.expect_identifier()?;
-
-        # Optional WITH GRANT OPTION
-        with_grant_option := mut false;
-        I self.check(TokenKind.With) {
-            self.advance();
-            I !self.check(TokenKind.Grant_Kw) {
-                R Err(self.parse_error("expected GRANT after WITH"));
-            }
-            self.advance();
-            I !self.check_identifier("OPTION") {
-                R Err(self.parse_error("expected OPTION after GRANT"));
-            }
-            self.advance();
-            with_grant_option = true;
-        }
-
-        Ok(Statement.Grant {
-            grant: GrantStmt {
-                grant_type: GrantType.Privileges {
-                    privileges,
-                    object_type,
-                    object_name,
-                    grantee,
-                    with_grant_option,
-                },
-            },
-        })
-    }
-
-    # Parse REVOKE statement:
-    #   REVOKE ROLE role_name FROM grantee
-    #   REVOKE priv1, priv2, ... ON [TABLE|DATABASE|SCHEMA] object FROM grantee [CASCADE]
-    F parse_revoke(mut self) -> Result<Statement, VaisError> {
-        # Check for REVOKE ROLE role_name FROM user_or_role
-        I self.check(TokenKind.Role_Kw) {
-            self.advance();
-            role_name := self.expect_identifier()?;
-            self.expect(TokenKind.From)?;
-            grantee := self.expect_identifier()?;
-            R Ok(Statement.Revoke {
-                revoke: RevokeStmt {
-                    revoke_type: RevokeType.RoleMembership { role_name, grantee },
-                },
-            });
-        }
-
-        # Parse privilege list
-        privileges := self.parse_privilege_list()?;
-
-        # Expect ON [TABLE|DATABASE|SCHEMA] object_name
-        self.expect(TokenKind.On)?;
-        (object_type, object_name) := self.parse_grant_object()?;
-
-        # Expect FROM grantee
-        self.expect(TokenKind.From)?;
-        grantee := self.expect_identifier()?;
-
-        # Optional CASCADE
-        cascade := mut false;
-        I self.check_identifier("CASCADE") {
-            self.advance();
-            cascade = true;
-        }
-
-        Ok(Statement.Revoke {
-            revoke: RevokeStmt {
-                revoke_type: RevokeType.Privileges {
-                    privileges,
-                    object_type,
-                    object_name,
-                    grantee,
-                    cascade,
-                },
-            },
-        })
-    }
-
-    # Parse a comma-separated list of privilege names:
-    # ALL [PRIVILEGES] | SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER
-    F parse_privilege_list(mut self) -> Result<Vec<PrivilegeKind>, VaisError> {
-        privs := mut Vec.new();
-
-        # Check for ALL [PRIVILEGES]
-        I self.match_token(TokenKind.All) {
-            # Optional PRIVILEGES keyword (identifier)
-            I self.check_identifier("PRIVILEGES") {
-                self.advance();
-            }
-            privs.push(PrivilegeKind.All);
-            R Ok(privs);
-        }
-
-        # Parse individual privilege keywords
-        more_privs := mut true;
-        L more_privs {
-            priv := M self.peek() {
-                TokenKind.Select => {
-                    self.advance();
-                    PrivilegeKind.Select
-                },
-                TokenKind.Insert => {
-                    self.advance();
-                    PrivilegeKind.Insert
-                },
-                TokenKind.Update => {
-                    self.advance();
-                    PrivilegeKind.Update
-                },
-                TokenKind.Delete => {
-                    self.advance();
-                    PrivilegeKind.Delete
-                },
-                TokenKind.Create => {
-                    self.advance();
-                    PrivilegeKind.Create
-                },
-                TokenKind.Drop => {
-                    self.advance();
-                    PrivilegeKind.Drop
-                },
-                TokenKind.Alter => {
-                    self.advance();
-                    PrivilegeKind.Alter
-                },
-                _ => {
-                    R Err(self.parse_error("expected privilege name (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or ALL)"));
-                },
-            };
-            privs.push(priv);
-            I !self.match_token(TokenKind.Comma) {
-                more_privs = false;
-            }
-        }
-
-        Ok(privs)
-    }
-
-    # Parse the object reference in GRANT/REVOKE: [TABLE|DATABASE|SCHEMA] name
-    F parse_grant_object(mut self) -> Result<(ObjectKind, Str), VaisError> {
-        obj_type := mut ObjectKind.Table;  # Default is TABLE
-
-        M self.peek() {
-            TokenKind.Table => {
-                self.advance();
-                obj_type = ObjectKind.Table;
-            },
-            _ => {
-                I self.check_identifier("DATABASE") {
-                    self.advance();
-                    obj_type = ObjectKind.Database;
-                } E I self.check_identifier("SCHEMA") {
-                    self.advance();
-                    obj_type = ObjectKind.Schema;
-                }
-                # If none matched, default to Table and next token is the name
-            },
-        }
-
-        obj_name := self.expect_identifier()?;
-        Ok((obj_type, obj_name))
-    }
-
-    # Parse CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE]
-    #   [FOR {ALL|SELECT|INSERT|UPDATE|DELETE}] [TO role]
-    #   USING (expr) [WITH CHECK (expr)]
-    F parse_create_policy(mut self) -> Result<CreatePolicyStmt, VaisError> {
-        policy_name := self.expect_identifier()?;
-        self.expect(TokenKind.On)?;
-        table_name := self.expect_identifier()?;
-
-        stmt := mut CreatePolicyStmt.new(policy_name, table_name);
-
-        # Optional AS PERMISSIVE | RESTRICTIVE
-        I self.match_token(TokenKind.As) {
-            I self.check_identifier("PERMISSIVE") {
-                self.advance();
-                stmt.policy_type = PolicyType.Permissive;
-            } E I self.check_identifier("RESTRICTIVE") {
-                self.advance();
-                stmt.policy_type = PolicyType.Restrictive;
-            } E {
-                R Err(self.parse_error("expected PERMISSIVE or RESTRICTIVE after AS"));
-            }
-        }
-
-        # Optional FOR {ALL|SELECT|INSERT|UPDATE|DELETE}
-        I self.check_identifier("FOR") {
-            self.advance();
-            cmd := M self.peek() {
-                TokenKind.All => {
-                    self.advance();
-                    PolicyCmdScope.All
-                },
-                TokenKind.Select => {
-                    self.advance();
-                    PolicyCmdScope.Select
-                },
-                TokenKind.Insert => {
-                    self.advance();
-                    PolicyCmdScope.Insert
-                },
-                TokenKind.Update => {
-                    self.advance();
-                    PolicyCmdScope.Update
-                },
-                TokenKind.Delete => {
-                    self.advance();
-                    PolicyCmdScope.Delete
-                },
-                _ => {
-                    R Err(self.parse_error("expected ALL, SELECT, INSERT, UPDATE, or DELETE after FOR"));
-                },
-            };
-            stmt.cmd_scope = cmd;
-        }
-
-        # Optional TO role
-        I self.check_identifier("TO") {
-            self.advance();
-            role := self.expect_identifier()?;
-            stmt.role_name = Option.Some(role);
-        }
-
-        # USING (expr) — read as raw SQL string between parentheses
-        I self.check_identifier("USING") {
-            self.advance();
-            using_str := self.read_paren_content()?;
-            stmt.using_expr = Option.Some(using_str);
-        }
-
-        # Optional WITH CHECK (expr)
-        I self.check(TokenKind.With) {
-            self.advance();
-            self.expect(TokenKind.Check)?;
-            check_str := self.read_paren_content()?;
-            stmt.check_expr = Option.Some(check_str);
-        }
-
-        Ok(stmt)
-    }
-
-    # Parse DROP POLICY [IF EXISTS] name ON table
-    F parse_drop_policy(mut self) -> Result<Statement, VaisError> {
-        if_exists := mut false;
-        I self.check_identifier("IF") {
-            self.advance();
-            I self.check_identifier("EXISTS") {
-                self.advance();
-            } E {
-                R Err(self.parse_error("expected EXISTS after IF"));
-            }
-            if_exists = true;
-        }
-
-        name := self.expect_identifier()?;
-        self.expect(TokenKind.On)?;
-        table_name := self.expect_identifier()?;
-
-        Ok(Statement.DropPolicy { name, table_name, if_exists })
-    }
-
-    # Helper: read raw content between parentheses, tracking nested parens.
-    # Used for USING (expr) and WITH CHECK (expr) in CREATE POLICY.
-    # Returns the raw SQL text between the outer parens (exclusive).
-    F read_paren_content(mut self) -> Result<Str, VaisError> {
-        self.expect(TokenKind.LParen)?;
-
-        depth: u32 := mut 1;
-        start_pos := mut self.pos;
-
-        L depth > 0 {
-            I self.is_at_end() {
-                R Err(self.parse_error("unterminated parenthesized expression"));
-            }
-            M self.peek() {
-                TokenKind.LParen => {
-                    depth = depth + 1;
-                    self.advance();
-                },
-                TokenKind.RParen => {
-                    depth = depth - 1;
-                    I depth > 0 {
-                        self.advance();
-                    }
-                    # When depth == 0, we don't advance yet; we do so below.
-                },
-                _ => {
-                    self.advance();
-                },
-            }
-        }
-
-        # Build the raw content string from the tokens between start_pos and current pos
-        parts := mut Vec.new();
-        i := mut start_pos;
-        L i < self.pos {
-            tok := &self.tokens[i];
-            part := self.token_to_string(tok);
-            parts.push(part);
-            i = i + 1;
-        }
-
-        # Consume the closing RParen
-        self.expect(TokenKind.RParen)?;
-
-        Ok(parts.join(" "))
-    }
-
-    # Helper: convert a token back to its approximate SQL string representation
-    F token_to_string(self, tok: &Token) -> Str {
-        M tok.kind {
-            TokenKind.Select => "SELECT",
-            TokenKind.Insert => "INSERT",
-            TokenKind.Into => "INTO",
-            TokenKind.Update => "UPDATE",
-            TokenKind.Delete => "DELETE",
-            TokenKind.From => "FROM",
-            TokenKind.Where => "WHERE",
-            TokenKind.Set => "SET",
-            TokenKind.Create => "CREATE",
-            TokenKind.Drop => "DROP",
-            TokenKind.Alter => "ALTER",
-            TokenKind.Table => "TABLE",
-            TokenKind.Index => "INDEX",
-            TokenKind.Column => "COLUMN",
-            TokenKind.Add => "ADD",
-            TokenKind.Rename => "RENAME",
-            TokenKind.Values => "VALUES",
-            TokenKind.And => "AND",
-            TokenKind.Or => "OR",
-            TokenKind.Not => "NOT",
-            TokenKind.Null => "NULL",
-            TokenKind.Is => "IS",
-            TokenKind.In => "IN",
-            TokenKind.Between => "BETWEEN",
-            TokenKind.Like => "LIKE",
-            TokenKind.Exists => "EXISTS",
-            TokenKind.Join => "JOIN",
-            TokenKind.Inner => "INNER",
-            TokenKind.Left => "LEFT",
-            TokenKind.Right => "RIGHT",
-            TokenKind.Cross => "CROSS",
-            TokenKind.On => "ON",
-            TokenKind.Using => "USING",
-            TokenKind.As => "AS",
-            TokenKind.Order => "ORDER",
-            TokenKind.By => "BY",
-            TokenKind.Asc => "ASC",
-            TokenKind.Desc => "DESC",
-            TokenKind.Group => "GROUP",
-            TokenKind.Having => "HAVING",
-            TokenKind.Limit => "LIMIT",
-            TokenKind.Offset => "OFFSET",
-            TokenKind.All => "ALL",
-            TokenKind.Distinct => "DISTINCT",
-            TokenKind.Case => "CASE",
-            TokenKind.When => "WHEN",
-            TokenKind.Then => "THEN",
-            TokenKind.Else => "ELSE",
-            TokenKind.End => "END",
-            TokenKind.With => "WITH",
-            TokenKind.Primary => "PRIMARY",
-            TokenKind.Key => "KEY",
-            TokenKind.Unique => "UNIQUE",
-            TokenKind.Check => "CHECK",
-            TokenKind.Default => "DEFAULT",
-            TokenKind.True_Kw => "TRUE",
-            TokenKind.False_Kw => "FALSE",
-            TokenKind.Cast => "CAST",
-            TokenKind.Nulls => "NULLS",
-            TokenKind.First => "FIRST",
-            TokenKind.Last => "LAST",
-            TokenKind.Explain => "EXPLAIN",
-            TokenKind.Analyze => "ANALYZE",
-            TokenKind.Begin => "BEGIN",
-            TokenKind.Commit => "COMMIT",
-            TokenKind.Rollback => "ROLLBACK",
-            TokenKind.User_Kw => "USER",
-            TokenKind.Role_Kw => "ROLE",
-            TokenKind.Grant_Kw => "GRANT",
-            TokenKind.Revoke_Kw => "REVOKE",
-            TokenKind.Password_Kw => "PASSWORD",
-            TokenKind.Login_Kw => "LOGIN",
-            TokenKind.Connection_Kw => "CONNECTION",
-            TokenKind.Policy_Kw => "POLICY",
-            TokenKind.Enable_Kw => "ENABLE",
-            TokenKind.Disable_Kw => "DISABLE",
-            TokenKind.Row_Kw => "ROW",
-            TokenKind.Level_Kw => "LEVEL",
-            TokenKind.IntLit { v } => "{v}",
-            TokenKind.FloatLit { v } => "{v}",
-            TokenKind.StringLit { v } => "'{v}'",
-            TokenKind.Identifier { v } => v.clone(),
-            TokenKind.Parameter { idx } => "${idx}",
-            TokenKind.Plus => "+",
-            TokenKind.Minus => "-",
-            TokenKind.Star => "*",
-            TokenKind.Slash => "/",
-            TokenKind.Percent => "%",
-            TokenKind.Eq => "=",
-            TokenKind.Neq => "<>",
-            TokenKind.Lt => "<",
-            TokenKind.Gt => ">",
-            TokenKind.Le => "<=",
-            TokenKind.Ge => ">=",
-            TokenKind.Dot => ".",
-            TokenKind.Comma => ",",
-            TokenKind.Semicolon => ";",
-            TokenKind.LParen => "(",
-            TokenKind.RParen => ")",
-            TokenKind.Pipe => "||",
-            _ => "?",
-        }
-    }
-
-    # Helper: expect an identifier token, also accepting security keywords as identifiers
-    # (USER, ROLE, GRANT, REVOKE etc. can appear as identifiers in some contexts)
-    F expect_identifier_or_security_keyword(mut self) -> Result<Str, VaisError> {
-        M self.peek() {
-            TokenKind.Identifier { .. } => self.expect_identifier(),
-            TokenKind.User_Kw => { self.advance(); Ok("USER") },
-            TokenKind.Role_Kw => { self.advance(); Ok("ROLE") },
-            TokenKind.Login_Kw => { self.advance(); Ok("LOGIN") },
-            TokenKind.Password_Kw => { self.advance(); Ok("PASSWORD") },
-            TokenKind.Connection_Kw => { self.advance(); Ok("CONNECTION") },
-            TokenKind.Policy_Kw => { self.advance(); Ok("POLICY") },
-            TokenKind.Enable_Kw => { self.advance(); Ok("ENABLE") },
-            TokenKind.Disable_Kw => { self.advance(); Ok("DISABLE") },
-            TokenKind.Row_Kw => { self.advance(); Ok("ROW") },
-            TokenKind.Level_Kw => { self.advance(); Ok("LEVEL") },
-            _ => Err(self.parse_error("expected identifier")),
-        }
-    }
-
-    # Helper: expect a string literal token and return its value
-    F expect_string_literal(mut self) -> Result<Str, VaisError> {
-        M self.peek() {
-            TokenKind.StringLit { .. } => {
-                tok := self.advance();
-                M tok.kind {
-                    TokenKind.StringLit { v } => Ok(v),
-                    _ => Err(self.parse_error("internal error: expected string literal")),
-                }
-            },
-            _ => {
-                Err(self.parse_error("expected string literal"))
-            },
-        }
-    }
-
-    # ========================================================================
-    # Expression parsing (precedence climbing)
-    # ========================================================================
-
-    # Entry point for expression parsing
-    F parse_expr(mut self) -> Result<Expr, VaisError> {
-        self.parse_or_expr()
-    }
-
-    # OR (lowest precedence)
-    F parse_or_expr(mut self) -> Result<Expr, VaisError> {
-        left := mut self.parse_and_expr()?;
-
-        L {
-        L self.match_token(TokenKind.Or) {
-            right := self.parse_and_expr()?;
-            left = Expr.BinaryOp {
-                left: Box.new(left),
-                op: BinOp.Or,
-                right: Box.new(right),
-            };
-        }
-
-        Ok(left)
-    }
-
-    # AND
-    F parse_and_expr(mut self) -> Result<Expr, VaisError> {
-        left := mut self.parse_not_expr()?;
-
-        L {
-        L self.match_token(TokenKind.And) {
-            right := self.parse_not_expr()?;
-            left = Expr.BinaryOp {
-                left: Box.new(left),
-                op: BinOp.And,
-                right: Box.new(right),
-            };
-        }
-
-        Ok(left)
-    }
-
-    # NOT (prefix unary)
-    F parse_not_expr(mut self) -> Result<Expr, VaisError> {
-        I self.match_token(TokenKind.Not) {
-            operand := self.parse_not_expr()?;
-            Ok(Expr.UnaryOp { op: UnaryOp.Not, operand: Box.new(operand) })
-        } E {
-            self.parse_comparison()
-        }
-    }
-
-    # Comparison: =, <>, <, >, <=, >=, IS [NOT] NULL, BETWEEN, IN, LIKE, EXISTS
-    F parse_comparison(mut self) -> Result<Expr, VaisError> {
-        # Handle EXISTS (subquery) at comparison level
-        I self.match_token(TokenKind.Exists) {
-            self.expect(TokenKind.LParen)?;
-            query := self.parse_select()?;
-            self.expect(TokenKind.RParen)?;
-            R Ok(Expr.Exists { query: Box.new(query), negated: false });
-        }
-
-        # Handle NOT EXISTS (subquery)
-        I self.check(TokenKind.Not) {
-            saved_pos := self.pos;
-            self.advance();
-            I self.match_token(TokenKind.Exists) {
-                self.expect(TokenKind.LParen)?;
-                query := self.parse_select()?;
-                self.expect(TokenKind.RParen)?;
-                R Ok(Expr.Exists { query: Box.new(query), negated: true });
-            }
-            # Not NOT EXISTS, backtrack
-            self.pos = saved_pos;
-        }
-
-        expr := mut self.parse_addition()?;
-
-        # Check for comparison operators and postfix operators
-        more_ops := mut true;
-        L more_ops {
-            M self.peek() {
-                TokenKind.Eq => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Eq, right: Box.new(right) };
-                },
-                TokenKind.Neq => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Neq, right: Box.new(right) };
-                },
-                TokenKind.Lt => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Lt, right: Box.new(right) };
-                },
-                TokenKind.Gt => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Gt, right: Box.new(right) };
-                },
-                TokenKind.Le => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Le, right: Box.new(right) };
-                },
-                TokenKind.Ge => {
-                    self.advance();
-                    right := self.parse_addition()?;
-                    expr = Expr.BinaryOp { left: Box.new(expr), op: BinOp.Ge, right: Box.new(right) };
-                },
-                TokenKind.Is => {
-                    self.advance();
-                    negated := mut false;
-                    I self.match_token(TokenKind.Not) {
-                        negated = true;
-                    }
-                    self.expect(TokenKind.Null)?;
-                    expr = Expr.IsNull { expr: Box.new(expr), negated };
-                },
-                TokenKind.Between => {
-                    self.advance();
-                    low := self.parse_addition()?;
-                    self.expect(TokenKind.And)?;
-                    high := self.parse_addition()?;
-                    expr = Expr.Between {
-                        expr: Box.new(expr),
-                        low: Box.new(low),
-                        high: Box.new(high),
-                        negated: false,
-                    };
-                },
-                TokenKind.Not => {
-                    # NOT BETWEEN, NOT IN, NOT LIKE
-                    saved_pos := self.pos;
-                    self.advance();
-                    M self.peek() {
-                        TokenKind.Between => {
-                            self.advance();
-                            low := self.parse_addition()?;
-                            self.expect(TokenKind.And)?;
-                            high := self.parse_addition()?;
-                            expr = Expr.Between {
-                                expr: Box.new(expr),
-                                low: Box.new(low),
-                                high: Box.new(high),
-                                negated: true,
-                            };
-                        },
-                        TokenKind.In => {
-                            self.advance();
-                            expr = self.parse_in_expr(expr, true)?;
-                        },
-                        TokenKind.Like => {
-                            self.advance();
-                            pattern := self.parse_addition()?;
-                            expr = Expr.Like {
-                                expr: Box.new(expr),
-                                pattern: Box.new(pattern),
-                                negated: true,
-                            };
-                        },
-                        _ => {
-                            # Not a postfix NOT, backtrack
-                            self.pos = saved_pos;
-                            more_ops = false;
-                        },
-                    }
-                },
-                TokenKind.In => {
-                    self.advance();
-                    expr = self.parse_in_expr(expr, false)?;
-                },
-                TokenKind.Like => {
-                    self.advance();
-                    pattern := self.parse_addition()?;
-                    expr = Expr.Like {
-                        expr: Box.new(expr),
-                        pattern: Box.new(pattern),
-                        negated: false,
-                    };
-                },
-                _ => {
-                    more_ops = false;
-                },
-            }
-        }
-
-        Ok(expr)
-    }
-
-    # Parse IN (list) or IN (subquery) after the IN keyword
-    F parse_in_expr(mut self, left: Expr, negated: bool) -> Result<Expr, VaisError> {
-        self.expect(TokenKind.LParen)?;
-
-        # Distinguish subquery from value list by checking for SELECT/WITH
-        M self.peek() {
-            TokenKind.Select | TokenKind.With => {
-                query := self.parse_select()?;
-                self.expect(TokenKind.RParen)?;
-                Ok(Expr.InSubquery {
-                    expr: Box.new(left),
-                    query: Box.new(query),
-                    negated,
-                })
-            },
-            _ => {
-                list := mut Vec.new();
-                I !self.check(TokenKind.RParen) {
-                    more_list := mut true;
-                    L more_list {
-                        expr := self.parse_expr()?;
-                        list.push(expr);
-                        I !self.match_token(TokenKind.Comma) {
-                            more_list = false;
-                        }
-                    }
-                }
-                self.expect(TokenKind.RParen)?;
-                Ok(Expr.InList {
-                    expr: Box.new(left),
-                    list,
-                    negated,
-                })
-            },
-        }
-    }
-
-    # Addition/subtraction and string concatenation (||)
-    F parse_addition(mut self) -> Result<Expr, VaisError> {
-        left := mut self.parse_multiplication()?;
-
-        more_add := mut true;
-        L more_add {
-            M self.peek() {
-                TokenKind.Plus => {
-                    self.advance();
-                    right := self.parse_multiplication()?;
-                    left = Expr.BinaryOp { left: Box.new(left), op: BinOp.Add, right: Box.new(right) };
-                },
-                TokenKind.Minus => {
-                    self.advance();
-                    right := self.parse_multiplication()?;
-                    left = Expr.BinaryOp { left: Box.new(left), op: BinOp.Sub, right: Box.new(right) };
-                },
-                TokenKind.Pipe => {
-                    self.advance();
-                    right := self.parse_multiplication()?;
-                    left = Expr.Concat { left: Box.new(left), right: Box.new(right) };
-                },
-                _ => {
-                    more_add = false;
-                },
-            }
-        }
-
-        Ok(left)
-    }
-
-    # Multiplication, division, modulo
-    F parse_multiplication(mut self) -> Result<Expr, VaisError> {
-        left := mut self.parse_unary()?;
-
-        more_mul := mut true;
-        L more_mul {
-            M self.peek() {
-                TokenKind.Star => {
-                    self.advance();
-                    right := self.parse_unary()?;
-                    left = Expr.BinaryOp { left: Box.new(left), op: BinOp.Mul, right: Box.new(right) };
-                },
-                TokenKind.Slash => {
-                    self.advance();
-                    right := self.parse_unary()?;
-                    left = Expr.BinaryOp { left: Box.new(left), op: BinOp.Div, right: Box.new(right) };
-                },
-                TokenKind.Percent => {
-                    self.advance();
-                    right := self.parse_unary()?;
-                    left = Expr.BinaryOp { left: Box.new(left), op: BinOp.Mod, right: Box.new(right) };
-                },
-                _ => {
-                    more_mul = false;
-                },
-            }
-        }
-
-        Ok(left)
-    }
-
-    # Unary minus and NOT
-    F parse_unary(mut self) -> Result<Expr, VaisError> {
-        I self.match_token(TokenKind.Minus) {
-            operand := self.parse_unary()?;
-            R Ok(Expr.UnaryOp { op: UnaryOp.Neg, operand: Box.new(operand) });
-        }
-
-        self.parse_primary()
-    }
-
-    # Primary expressions: literals, identifiers, function calls, parenthesized
-    # expressions, CASE, CAST, subquery, parameter marker, star
-    F parse_primary(mut self) -> Result<Expr, VaisError> {
-        M self.peek() {
-            # Integer literal
-            TokenKind.IntLit { .. } => {
-                tok := self.advance();
-                M tok.kind {
-                    TokenKind.IntLit { v } => Ok(Expr.Literal { value: SqlValue.IntVal { v } }),
-                    _ => Err(self.parse_error("internal error: expected integer literal")),
-                }
-            },
-            # Float literal
-            TokenKind.FloatLit { .. } => {
-                tok := self.advance();
-                M tok.kind {
-                    TokenKind.FloatLit { v } => Ok(Expr.Literal { value: SqlValue.FloatVal { v } }),
-                    _ => Err(self.parse_error("internal error: expected float literal")),
-                }
-            },
-            # String literal
-            TokenKind.StringLit { .. } => {
-                tok := self.advance();
-                M tok.kind {
-                    TokenKind.StringLit { v } => Ok(Expr.Literal { value: SqlValue.StringVal { v } }),
-                    _ => Err(self.parse_error("internal error: expected string literal")),
-                }
-            },
-            # TRUE literal
-            TokenKind.True_Kw => {
-                self.advance();
-                Ok(Expr.Literal { value: SqlValue.BoolVal { v: true } })
-            },
-            # FALSE literal
-            TokenKind.False_Kw => {
-                self.advance();
-                Ok(Expr.Literal { value: SqlValue.BoolVal { v: false } })
-            },
-            # NULL literal
-            TokenKind.Null => {
-                self.advance();
-                Ok(Expr.Literal { value: SqlValue.Null })
-            },
-            # Parameter marker ($1, $2, ...)
-            TokenKind.Parameter { .. } => {
-                tok := self.advance();
-                M tok.kind {
-                    TokenKind.Parameter { idx } => Ok(Expr.Parameter { idx }),
-                    _ => Err(self.parse_error("internal error: expected parameter")),
-                }
-            },
-            # Star (for COUNT(*))
-            TokenKind.Star => {
-                self.advance();
-                Ok(Expr.Star)
-            },
-            # CASE expression
-            TokenKind.Case => {
-                self.parse_case_expr()
-            },
-            # CAST expression
-            TokenKind.Cast => {
-                self.parse_cast_expr()
-            },
-            # EXISTS (subquery) -- also handled in comparison, but can appear as primary
-            TokenKind.Exists => {
-                self.advance();
-                self.expect(TokenKind.LParen)?;
-                query := self.parse_select()?;
-                self.expect(TokenKind.RParen)?;
-                Ok(Expr.Exists { query: Box.new(query), negated: false })
-            },
-            # Aggregate / window function keywords: COUNT, SUM, AVG, MIN, MAX
-            TokenKind.Count | TokenKind.Sum | TokenKind.Avg |
-            TokenKind.Min | TokenKind.Max => {
-                self.parse_aggregate_function()
-            },
-            # Window function keywords: ROW_NUMBER, RANK, DENSE_RANK
-            TokenKind.Row_Number | TokenKind.Rank | TokenKind.Dense_Rank => {
-                self.parse_window_function_keyword()
-            },
-            # Parenthesized expression or scalar subquery
-            TokenKind.LParen => {
-                self.advance();
-                # Check if it is a subquery
-                M self.peek() {
-                    TokenKind.Select | TokenKind.With => {
-                        query := self.parse_select()?;
-                        self.expect(TokenKind.RParen)?;
-                        Ok(Expr.Subquery { query: Box.new(query) })
-                    },
-                    _ => {
-                        expr := self.parse_expr()?;
-                        self.expect(TokenKind.RParen)?;
-                        Ok(expr)
-                    },
-                }
-            },
-            # Identifier: column reference, table.column, or function call
-            TokenKind.Identifier { .. } => {
-                self.parse_identifier_expr()
-            },
-            _ => {
-                Err(self.parse_error("expected expression"))
-            },
-        }
-    }
-
-    # Parse an identifier expression: column ref, table.column, or function call
-    F parse_identifier_expr(mut self) -> Result<Expr, VaisError> {
-        name := self.expect_identifier()?;
-
-        # Check for function call: name(...)
-        I self.check(TokenKind.LParen) {
-            R self.parse_function_call(name);
-        }
-
-        # Check for table.column reference
-        I self.match_token(TokenKind.Dot) {
-            column := self.expect_identifier()?;
-            R Ok(Expr.ColumnRef { table: Option.Some(name), column });
-        }
-
-        # Plain column reference
-        Ok(Expr.ColumnRef { table: Option.None, column: name })
-    }
-
-    # Parse a function call: name(args...) with optional DISTINCT and OVER clause
-    F parse_function_call(mut self, name: Str) -> Result<Expr, VaisError> {
-        self.expect(TokenKind.LParen)?;
-
-        # Check for empty arg list
-        I self.match_token(TokenKind.RParen) {
-            func_expr := Expr.FunctionCall { name, args: Vec.new(), distinct: false };
-            # Check for OVER clause (window function)
-            R self.maybe_parse_over(func_expr);
-        }
-
-        # Check for DISTINCT keyword
-        distinct := mut false;
-        I self.match_token(TokenKind.Distinct) {
-            distinct = true;
-        }
-
-        # Check for * (e.g., COUNT(*))
-        I self.match_token(TokenKind.Star) {
-            self.expect(TokenKind.RParen)?;
-            func_expr := Expr.FunctionCall {
-                name,
-                args: Vec.from([Expr.Star]),
-                distinct: false,
-            };
-            R self.maybe_parse_over(func_expr);
-        }
-
-        # Parse argument list
-        args := mut Vec.new();
-        more_args := mut true;
-        L more_args {
-            arg := self.parse_expr()?;
-            args.push(arg);
-            I !self.match_token(TokenKind.Comma) {
-                more_args = false;
-            }
-        }
-        self.expect(TokenKind.RParen)?;
-
-        func_expr := Expr.FunctionCall { name, args, distinct };
-        # Check for OVER clause (window function)
-        self.maybe_parse_over(func_expr)
-    }
-
-    # Parse an aggregate function keyword (COUNT, SUM, AVG, MIN, MAX)
-    F parse_aggregate_function(mut self) -> Result<Expr, VaisError> {
-        tok := self.advance();
-        name := M tok.kind {
-            TokenKind.Count => "COUNT",
-            TokenKind.Sum => "SUM",
-            TokenKind.Avg => "AVG",
-            TokenKind.Min => "MIN",
-            TokenKind.Max => "MAX",
-            _ => "UNKNOWN",
-        };
-        self.parse_function_call(name.to_string())
-    }
-
-    # Parse a window function keyword (ROW_NUMBER, RANK, DENSE_RANK)
-    F parse_window_function_keyword(mut self) -> Result<Expr, VaisError> {
-        tok := self.advance();
-        name := M tok.kind {
-            TokenKind.Row_Number => "ROW_NUMBER",
-            TokenKind.Rank => "RANK",
-            TokenKind.Dense_Rank => "DENSE_RANK",
-            _ => "UNKNOWN",
-        };
-        self.parse_function_call(name.to_string())
-    }
-
-    # If an OVER clause follows, wrap the expression as a WindowFunc
-    F maybe_parse_over(mut self, func: Expr) -> Result<Expr, VaisError> {
-        I !self.match_token(TokenKind.Over) {
-            R Ok(func);
-        }
-
-        self.expect(TokenKind.LParen)?;
-
-        # Parse optional PARTITION BY
-        partition_by := mut Vec.new();
-        I self.match_token(TokenKind.Partition) {
-            self.expect(TokenKind.By)?;
-            more_parts := mut true;
-            L more_parts {
-                expr := self.parse_expr()?;
-                partition_by.push(expr);
-                I !self.match_token(TokenKind.Comma) {
-                    more_parts = false;
-                }
-            }
-        }
-
-        # Parse optional ORDER BY
-        order_by := mut Vec.new();
-        I self.match_token(TokenKind.Order) {
-            self.expect(TokenKind.By)?;
-            more_order := mut true;
-            L more_order {
-                expr := self.parse_expr()?;
-                asc := mut true;
-                I self.match_token(TokenKind.Asc) {
-                    asc = true;
-                } E I self.match_token(TokenKind.Desc) {
-                    asc = false;
-                }
-                nulls_first := mut Option.None;
-                I self.match_token(TokenKind.Nulls) {
-                    I self.match_token(TokenKind.First) {
-                        nulls_first = Option.Some(true);
-                    } E I self.match_token(TokenKind.Last) {
-                        nulls_first = Option.Some(false);
-                    } E {
-                        R Err(self.parse_error("expected FIRST or LAST after NULLS"));
-                    }
-                }
-                order_by.push(OrderByItem { expr, asc, nulls_first });
-                I !self.match_token(TokenKind.Comma) {
-                    more_order = false;
-                }
-            }
-        }
-
-        self.expect(TokenKind.RParen)?;
-
-        Ok(Expr.WindowFunc {
-            func: Box.new(func),
-            partition_by,
-            order_by,
-        })
-    }
-
-    # Parse CASE [operand] WHEN condition THEN result ... [ELSE result] END
-    F parse_case_expr(mut self) -> Result<Expr, VaisError> {
-        self.expect(TokenKind.Case)?;
-
-        # Check for simple CASE (CASE expr WHEN ...) vs searched CASE (CASE WHEN ...)
-        operand := mut Option.None;
-        I !self.check(TokenKind.When) {
-            expr := self.parse_expr()?;
-            operand = Option.Some(Box.new(expr));
-        }
-
-        # Parse WHEN clauses
-        when_clauses := mut Vec.new();
-        L self.match_token(TokenKind.When) {
-            condition := self.parse_expr()?;
-            self.expect(TokenKind.Then)?;
-            result := self.parse_expr()?;
-            when_clauses.push(WhenClause { condition, result });
-        }
-
-        I when_clauses.len() == 0 {
-            R Err(self.parse_error("CASE expression must have at least one WHEN clause"));
-        }
-
-        # Parse optional ELSE
-        else_result := mut Option.None;
-        I self.match_token(TokenKind.Else) {
-            expr := self.parse_expr()?;
-            else_result = Option.Some(Box.new(expr));
-        }
-
-        self.expect(TokenKind.End)?;
-
-        Ok(Expr.Case { operand, when_clauses, else_result })
-    }
-
-    # Parse CAST(expr AS type)
-    F parse_cast_expr(mut self) -> Result<Expr, VaisError> {
-        self.expect(TokenKind.Cast)?;
-        self.expect(TokenKind.LParen)?;
-        expr := self.parse_expr()?;
-        self.expect(TokenKind.As)?;
-        target_type := self.parse_data_type()?;
-        self.expect(TokenKind.RParen)?;
-        Ok(Expr.Cast { expr: Box.new(expr), target_type })
     }
 
     # ========================================================================
@@ -2646,15 +211,15 @@ X Parser {
         I self.pos < self.tokens.len() {
             &self.tokens[self.pos].kind
         } E {
-            &TokenKind.Eof
+            &Eof
         }
     }
 
     # Advance to the next token, returning the current one
     F advance(mut self) -> &Token {
-        tok := &self.tokens[self.pos];
+        tok := &self.tokens[self.pos]
         I self.pos < self.tokens.len() {
-            self.pos += 1;
+            self.pos += 1
         }
         tok
     }
@@ -2668,11 +233,11 @@ X Parser {
         }
     }
 
-    # If the current token matches the given kind, consume it and return true;
+    # If the current token matches the given kind, consume it and return true
     # otherwise return false
     F match_token(mut self, kind: TokenKind) -> bool {
         I self.check(kind) {
-            self.advance();
+            self.advance()
             true
         } E {
             false
@@ -2683,11 +248,11 @@ X Parser {
     F check(self, kind: TokenKind) -> bool {
         M (self.peek(), &kind) {
             # For enum variants with data, we compare the discriminant only
-            (TokenKind.IntLit { .. }, TokenKind.IntLit { .. }) => true,
-            (TokenKind.FloatLit { .. }, TokenKind.FloatLit { .. }) => true,
-            (TokenKind.StringLit { .. }, TokenKind.StringLit { .. }) => true,
-            (TokenKind.Identifier { .. }, TokenKind.Identifier { .. }) => true,
-            (TokenKind.Parameter { .. }, TokenKind.Parameter { .. }) => true,
+            (IntLit { .. }, IntLit { .. }) => true,
+            (FloatLit { .. }, FloatLit { .. }) => true,
+            (StringLit { .. }, StringLit { .. }) => true,
+            (Identifier { .. }, Identifier { .. }) => true,
+            (Parameter { .. }, Parameter { .. }) => true,
             (a, b) => a == b,
         }
     }
@@ -2695,15 +260,15 @@ X Parser {
     # Check if we have reached the end of the token stream
     F is_at_end(self) -> bool {
         M self.peek() {
-            TokenKind.Eof => true,
+            Eof => true,
             _ => false,
         }
     }
 
     # Create a parse error with position information from the current token
-    F parse_error(self, msg: Str) -> VaisError {
+    F parse_error(self, msg: str) -> VaisError {
         I self.pos < self.tokens.len() {
-            tok := &self.tokens[self.pos];
+            tok := &self.tokens[self.pos]
             VaisError.new(
                 "VAIS-0101001",
                 "SQL parse error at line {tok.line}, col {tok.col}: {msg}"
@@ -2721,13 +286,13 @@ X Parser {
     # in non-dispatch contexts (table names, column names, aliases)
     F is_identifier(self) -> bool {
         M self.peek() {
-            TokenKind.Identifier { .. } => true,
+            Identifier { .. } => true,
             # Security keywords can appear as identifiers in many contexts
-            TokenKind.User_Kw | TokenKind.Role_Kw |
-            TokenKind.Password_Kw | TokenKind.Login_Kw |
-            TokenKind.Connection_Kw | TokenKind.Policy_Kw |
-            TokenKind.Enable_Kw | TokenKind.Disable_Kw |
-            TokenKind.Row_Kw | TokenKind.Level_Kw => true,
+            User_Kw | Role_Kw |
+            Password_Kw | Login_Kw |
+            Connection_Kw | Policy_Kw |
+            Enable_Kw | Disable_Kw |
+            Row_Kw | Level_Kw => true,
             _ => false,
         }
     }
@@ -2736,44 +301,44 @@ X Parser {
     # Also checks security keywords that may appear as identifiers
     F check_identifier(self, name: &str) -> bool {
         M self.peek() {
-            TokenKind.Identifier { v } => v.to_uppercase() == name,
+            Identifier { v } => v.to_uppercase() == name,
             # Security keywords can be checked as identifiers
-            TokenKind.User_Kw => name == "USER",
-            TokenKind.Role_Kw => name == "ROLE",
-            TokenKind.Password_Kw => name == "PASSWORD",
-            TokenKind.Login_Kw => name == "LOGIN",
-            TokenKind.Connection_Kw => name == "CONNECTION",
-            TokenKind.Policy_Kw => name == "POLICY",
-            TokenKind.Enable_Kw => name == "ENABLE",
-            TokenKind.Disable_Kw => name == "DISABLE",
-            TokenKind.Row_Kw => name == "ROW",
-            TokenKind.Level_Kw => name == "LEVEL",
+            User_Kw => name == "USER",
+            Role_Kw => name == "ROLE",
+            Password_Kw => name == "PASSWORD",
+            Login_Kw => name == "LOGIN",
+            Connection_Kw => name == "CONNECTION",
+            Policy_Kw => name == "POLICY",
+            Enable_Kw => name == "ENABLE",
+            Disable_Kw => name == "DISABLE",
+            Row_Kw => name == "ROW",
+            Level_Kw => name == "LEVEL",
             _ => false,
         }
     }
 
     # Expect an identifier token and return its string value
     # Security keywords are accepted as identifiers in general contexts
-    F expect_identifier(mut self) -> Result<Str, VaisError> {
+    F expect_identifier(mut self) -> Result<str, VaisError> {
         M self.peek() {
-            TokenKind.Identifier { .. } => {
-                tok := self.advance();
+            Identifier { .. } => {
+                tok := self.advance()
                 M tok.kind {
-                    TokenKind.Identifier { v } => Ok(v),
+                    Identifier { v } => Ok(v),
                     _ => Err(self.parse_error("internal error: expected identifier")),
                 }
             },
             # Security keywords accepted as identifiers
-            TokenKind.User_Kw => { self.advance(); Ok("user".to_string()) },
-            TokenKind.Role_Kw => { self.advance(); Ok("role".to_string()) },
-            TokenKind.Password_Kw => { self.advance(); Ok("password".to_string()) },
-            TokenKind.Login_Kw => { self.advance(); Ok("login".to_string()) },
-            TokenKind.Connection_Kw => { self.advance(); Ok("connection".to_string()) },
-            TokenKind.Policy_Kw => { self.advance(); Ok("policy".to_string()) },
-            TokenKind.Enable_Kw => { self.advance(); Ok("enable".to_string()) },
-            TokenKind.Disable_Kw => { self.advance(); Ok("disable".to_string()) },
-            TokenKind.Row_Kw => { self.advance(); Ok("row".to_string()) },
-            TokenKind.Level_Kw => { self.advance(); Ok("level".to_string()) },
+            User_Kw => { self.advance(); Ok("user".to_string()) },
+            Role_Kw => { self.advance(); Ok("role".to_string()) },
+            Password_Kw => { self.advance(); Ok("password".to_string()) },
+            Login_Kw => { self.advance(); Ok("login".to_string()) },
+            Connection_Kw => { self.advance(); Ok("connection".to_string()) },
+            Policy_Kw => { self.advance(); Ok("policy".to_string()) },
+            Enable_Kw => { self.advance(); Ok("enable".to_string()) },
+            Disable_Kw => { self.advance(); Ok("disable".to_string()) },
+            Row_Kw => { self.advance(); Ok("row".to_string()) },
+            Level_Kw => { self.advance(); Ok("level".to_string()) },
             _ => {
                 Err(self.parse_error("expected identifier"))
             },
@@ -2783,10 +348,10 @@ X Parser {
     # Expect an integer literal token and return its value
     F expect_int_literal(mut self) -> Result<i64, VaisError> {
         M self.peek() {
-            TokenKind.IntLit { .. } => {
-                tok := self.advance();
+            IntLit { .. } => {
+                tok := self.advance()
                 M tok.kind {
-                    TokenKind.IntLit { v } => Ok(v),
+                    IntLit { v } => Ok(v),
                     _ => Err(self.parse_error("internal error: expected integer literal")),
                 }
             },
@@ -2796,12 +361,28 @@ X Parser {
         }
     }
 
+    # Helper: expect a string literal token and return its value
+    F expect_string_literal(mut self) -> Result<str, VaisError> {
+        M self.peek() {
+            StringLit { .. } => {
+                tok := self.advance()
+                M tok.kind {
+                    StringLit { v } => Ok(v),
+                    _ => Err(self.parse_error("internal error: expected string literal")),
+                }
+            },
+            _ => {
+                Err(self.parse_error("expected string literal"))
+            },
+        }
+    }
+
     # Check if the current token starts a JOIN keyword sequence
     F is_join_keyword(self) -> bool {
         M self.peek() {
-            TokenKind.Join | TokenKind.Inner | TokenKind.Left |
-            TokenKind.Right | TokenKind.Cross => true,
-            TokenKind.Identifier { v } => v.to_uppercase() == "NATURAL",
+            Join | Inner | Left |
+            Right | Cross => true,
+            Identifier { v } => v.to_uppercase() == "NATURAL",
             _ => false,
         }
     }
@@ -2812,9 +393,9 @@ X Parser {
 # ============================================================================
 
 # Parse a SQL string into a list of statements
-F parse_sql(sql: Str) -> Result<Vec<Statement>, VaisError> {
-    tokenizer := mut Tokenizer.new(sql);
+F parse_sql(sql: str) -> Result<Vec<Statement>, VaisError> {
+    tokenizer := mut Tokenizer.new(sql)
     tokens := tokenizer.tokenize_all()?;
-    parser := mut Parser.new(tokens);
+    parser := mut Parser.new(tokens)
     parser.parse_all()
 }

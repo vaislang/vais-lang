@@ -2,19 +2,15 @@
 # Applies undo log chain to rollback transaction changes
 # Based on Stage 3 Section 6 (Transaction Timeout) and Stage 1 Section 10
 
-U std/bytes.{ByteBuffer};
-U storage/constants.{
-    NULL_UNDO_PTR, PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE,
-    MVCC_TUPLE_META_SIZE, FLAG_HAS_TOMBSTONES,
-    UNDO_INSERT, UNDO_DELETE, UNDO_UPDATE
-};
-U storage/error.{VaisError, err_internal};
-U storage/txn/undo.{UndoLog};
-U storage/txn/undo_entry.{UndoEntry};
-U storage/buffer/pool.{BufferPool};
-U storage/page/header.{PageHeader};
-U storage/page/slot.{HeapPageSlot};
-U storage/page/mvcc.{MvccTupleMeta};
+U storage/bytes
+U storage/constants
+U storage/error
+U storage/txn/undo
+U storage/txn/undo_entry
+U storage/buffer/pool
+U storage/page/header
+U storage/page/slot
+U storage/page/mvcc
 
 # Rollback executor: traverses undo chain and reverses operations
 S RollbackExecutor {
@@ -37,12 +33,12 @@ X RollbackExecutor {
     ) -> Result<u32, VaisError> {
         I undo_ptr == NULL_UNDO_PTR {
             # No undo entries, nothing to rollback
-            R Ok(0);
+            R Ok(0)
         }
 
         # Read the entire undo chain
         entries := mut self.undo_log.read_chain(undo_ptr, pool)?;
-        count := mut 0u32;
+        count := mut 0u32
 
         # Process each undo entry in reverse chronological order (newest first)
         L entry: entries {
@@ -50,7 +46,7 @@ X RollbackExecutor {
             I entry.txn_id != txn_id {
                 R Err(err_internal(
                     "Undo entry txn_id mismatch: expected {txn_id}, got {entry.txn_id}"
-                ));
+                ))
             }
 
             # Apply the reverse operation
@@ -68,11 +64,11 @@ X RollbackExecutor {
                     self.undo_update(&entry, pool)?;
                 },
                 _ => {
-                    R Err(err_internal("Invalid undo entry type: {entry.entry_type}"));
+                    R Err(err_internal("Invalid undo entry type: {entry.entry_type}"))
                 }
             }
 
-            count += 1;
+            count += 1
         }
 
         Ok(count)
@@ -82,27 +78,28 @@ X RollbackExecutor {
     F undo_insert(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page containing the tuple
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
-        frame := mut pool.get_frame_mut(frame_id);
-        page_data := mut frame.get_data_mut();
+        frame := mut pool.get_frame_mut(frame_id)
+        frame.prepare_write()
+        page_data := mut &frame.data
 
         # Calculate slot offset
         slot_offset := mut PAGE_HEADER_SIZE as u64 +
-            (entry.slot_id as u64 * SLOT_ENTRY_SIZE as u64);
+            (entry.slot_id as u64 * SLOT_ENTRY_SIZE as u64)
 
         # Read the slot entry
         slot := mut HeapPageSlot.read_at_index(page_data, entry.slot_id)?;
 
         # Mark slot as dead (tuple_off = 0)
-        dead_slot := mut HeapPageSlot.dead();
-        dead_slot.write_at_index(page_data, entry.slot_id);
+        dead_slot := mut HeapPageSlot.dead()
+        dead_slot.write_at_index(page_data, entry.slot_id)
 
         # Update page header to set HAS_TOMBSTONES flag
         header := mut PageHeader.read_from_page(page_data)?;
-        header.flags |= FLAG_HAS_TOMBSTONES;
-        header.write_to_page(page_data);
+        header.flags |= FLAG_HAS_TOMBSTONES
+        header.write_to_page(page_data)
 
         # Mark page as dirty
-        frame.mark_dirty();
+        frame.mark_dirty()
 
         # Unpin
         pool.unpin_page(frame_id)?;
@@ -114,33 +111,34 @@ X RollbackExecutor {
     F undo_delete(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
-        frame := mut pool.get_frame_mut(frame_id);
-        page_data := mut frame.get_data_mut();
+        frame := mut pool.get_frame_mut(frame_id)
+        frame.prepare_write()
+        page_data := mut &frame.data
 
         # Read the slot entry to find the tuple location
         slot := mut HeapPageSlot.read_at_index(page_data, entry.slot_id)?;
 
         I slot.tuple_off == 0 {
-            R Err(err_internal("Cannot undo DELETE: slot is already dead"));
+            R Err(err_internal("Cannot undo DELETE: slot is already dead"))
         }
 
         # Read the MVCC metadata at the tuple location
-        tuple_offset := mut slot.tuple_off as u64;
-        mvcc_data := mut &page_data[tuple_offset..(tuple_offset + MVCC_TUPLE_META_SIZE as u64)];
-        mvcc_buf := mut ByteBuffer.from_slice(mvcc_data);
+        tuple_offset := mut slot.tuple_off as u64
+        mvcc_data := mut &page_data[tuple_offset..(tuple_offset + MVCC_TUPLE_META_SIZE as u64)]
+        mvcc_buf := mut ByteBuffer.from_slice(mvcc_data)
         mvcc := mut MvccTupleMeta.deserialize(&mvcc_buf)?;
 
         # Clear the expiration (restore to active state)
-        mvcc.clear_expired();
+        mvcc.clear_expired()
 
         # Write back the MVCC metadata
-        write_buf := mut ByteBuffer.with_capacity(MVCC_TUPLE_META_SIZE as u64);
-        mvcc.serialize(&write_buf);
+        write_buf := mut ByteBuffer.with_capacity(MVCC_TUPLE_META_SIZE as u64)
+        mvcc.serialize(&write_buf)
         page_data[tuple_offset..(tuple_offset + MVCC_TUPLE_META_SIZE as u64)]
-            .copy_from_slice(write_buf.as_bytes());
+            .copy_from_slice(write_buf.as_bytes())
 
         # Mark page as dirty
-        frame.mark_dirty();
+        frame.mark_dirty()
 
         # Unpin
         pool.unpin_page(frame_id)?;
@@ -152,36 +150,37 @@ X RollbackExecutor {
     F undo_update(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
-        frame := mut pool.get_frame_mut(frame_id);
-        page_data := mut frame.get_data_mut();
+        frame := mut pool.get_frame_mut(frame_id)
+        frame.prepare_write()
+        page_data := mut &frame.data
 
         # Read the slot entry to find the tuple location
         slot := mut HeapPageSlot.read_at_index(page_data, entry.slot_id)?;
 
         I slot.tuple_off == 0 {
-            R Err(err_internal("Cannot undo UPDATE: slot is dead"));
+            R Err(err_internal("Cannot undo UPDATE: slot is dead"))
         }
 
         # Verify the old_data fits in the current slot
         I entry.data_len > slot.tuple_len as u32 {
             R Err(err_internal(
                 "Undo UPDATE data too large: {entry.data_len} > {slot.tuple_len}"
-            ));
+            ))
         }
 
         # Restore the old tuple data (MVCC metadata + user data)
-        tuple_offset := mut slot.tuple_off as u64;
+        tuple_offset := mut slot.tuple_off as u64
         page_data[tuple_offset..(tuple_offset + entry.data_len as u64)]
-            .copy_from_slice(&entry.old_data);
+            .copy_from_slice(&entry.old_data)
 
         # Update slot length if the old data is smaller
         I entry.data_len < slot.tuple_len as u32 {
-            updated_slot := mut HeapPageSlot.new(slot.tuple_off, entry.data_len as u16);
-            updated_slot.write_at_index(page_data, entry.slot_id);
+            updated_slot := mut HeapPageSlot.new(slot.tuple_off, entry.data_len as u16)
+            updated_slot.write_at_index(page_data, entry.slot_id)
         }
 
         # Mark page as dirty
-        frame.mark_dirty();
+        frame.mark_dirty()
 
         # Unpin
         pool.unpin_page(frame_id)?;
