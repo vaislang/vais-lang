@@ -137,9 +137,9 @@ impl<'a> JsCodegen<'a> {
         let mut imports: Vec<&str> = self.runtime_imports.iter().copied().collect();
         imports.sort();
 
-        write!(
+        writeln!(
             self.output,
-            "import {{ {} }} from \"@vaisx/runtime\";\n",
+            "import {{ {} }} from \"@vaisx/runtime\";",
             imports.join(", ")
         )
         .unwrap();
@@ -516,8 +516,8 @@ impl<'a> JsCodegen<'a> {
             if has_named_slots {
                 // Named slots: <:slotName>content</:slotName>
                 for child in &element.children {
-                    if let TemplateNode::Element(slot_el) = &child.node {
-                        if slot_el.tag.starts_with(':') {
+                    if let TemplateNode::Element(slot_el) = &child.node
+                        && slot_el.tag.starts_with(':') {
                             let slot_name = &slot_el.tag[1..];
                             let slot_var = format!("$$slot_{}_{}", comp_id, slot_name);
                             self.runtime_imports.insert("$$create_fragment");
@@ -532,7 +532,6 @@ impl<'a> JsCodegen<'a> {
                                 comp_var, comp_var, slot_name, slot_var
                             ));
                         }
-                    }
                 }
             } else {
                 // Default slot: all children go into the default slot
@@ -573,7 +572,7 @@ impl<'a> JsCodegen<'a> {
         // Branch 0: @if consequent
         self.writeln(&format!("function $$if{}_branch0($$parent) {{", block_id));
         self.indent += 1;
-        self.writeln(&format!("let $$frag = $$create_fragment();"));
+        self.writeln("let $$frag = $$create_fragment();");
         self.emit_template_nodes(&if_block.consequent, "$$frag");
         self.writeln("return $$frag;");
         self.indent -= 1;
@@ -587,7 +586,7 @@ impl<'a> JsCodegen<'a> {
                 i + 1
             ));
             self.indent += 1;
-            self.writeln(&format!("let $$frag = $$create_fragment();"));
+            self.writeln("let $$frag = $$create_fragment();");
             self.emit_template_nodes(&elif.body, "$$frag");
             self.writeln("return $$frag;");
             self.indent -= 1;
@@ -602,7 +601,7 @@ impl<'a> JsCodegen<'a> {
                 block_id, else_idx
             ));
             self.indent += 1;
-            self.writeln(&format!("let $$frag = $$create_fragment();"));
+            self.writeln("let $$frag = $$create_fragment();");
             self.emit_template_nodes(alternate, "$$frag");
             self.writeln("return $$frag;");
             self.indent -= 1;
@@ -612,9 +611,7 @@ impl<'a> JsCodegen<'a> {
         // Initial evaluation
         self.writeln(&format!("function $$if{}_update() {{", block_id));
         self.indent += 1;
-        self.writeln(&format!(
-            "let $$new_branch = null;"
-        ));
+        self.writeln("let $$new_branch = null;");
 
         // Condition chain
         self.writeln(&format!("if ({}) {{", if_block.condition.raw));
@@ -1054,7 +1051,7 @@ impl<'a> JsCodegen<'a> {
         self.writeln("// Effects");
         self.runtime_imports.insert("$$schedule");
         for effect in &self.ir.dependency_graph.effects {
-            self.writeln(&format!("$$schedule(() => {{"));
+            self.writeln("$$schedule(() => {");
             self.indent += 1;
             self.writeln(&effect.body);
             self.indent -= 1;

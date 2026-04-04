@@ -255,7 +255,7 @@ impl<'a> CssParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while !self.at_end() && self.peek().map_or(false, |c| c.is_whitespace()) {
+        while !self.at_end() && self.peek().is_some_and(|c| c.is_whitespace()) {
             self.advance(1);
         }
     }
@@ -340,7 +340,7 @@ impl<'a> CssParser<'a> {
         while !self.at_end()
             && self
                 .peek()
-                .map_or(false, |c| c.is_ascii_alphanumeric() || c == '-')
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             self.advance(1);
         }

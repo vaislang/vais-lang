@@ -346,7 +346,7 @@ fn find_function_start(source: &str) -> Option<usize> {
             true
         } else {
             let before = &source[..i];
-            let trimmed = before.trim_end_matches(|c: char| c == ' ' || c == '\t');
+            let trimmed = before.trim_end_matches([' ', '\t']);
             trimmed.is_empty() || trimmed.ends_with('\n')
         };
         if !at_line_start {

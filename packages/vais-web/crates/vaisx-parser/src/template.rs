@@ -73,8 +73,8 @@ impl<'a> TemplateParser<'a> {
 
         while !self.at_end() {
             // Check for closing tag
-            if let Some(tag) = parent_tag {
-                if self.remaining().starts_with("</") {
+            if let Some(tag) = parent_tag
+                && self.remaining().starts_with("</") {
                     // Check if this is the matching closing tag
                     let close_check = &self.remaining()[2..];
                     let close_tag = close_check
@@ -85,11 +85,10 @@ impl<'a> TemplateParser<'a> {
                         break;
                     }
                     // Named slot closing: </:name>
-                    if close_tag.starts_with(':') && parent_tag.map_or(false, |t| t.starts_with(':')) {
+                    if close_tag.starts_with(':') && parent_tag.is_some_and(|t| t.starts_with(':')) {
                         break;
                     }
                 }
-            }
 
             // Check for end of directive block
             if parent_tag.is_none() {
@@ -182,7 +181,7 @@ impl<'a> TemplateParser<'a> {
 
         // Parse tag name
         let tag_start = self.pos;
-        while !self.at_end() && !self.peek().map_or(true, |c| c.is_whitespace() || c == '>' || c == '/') {
+        while !self.at_end() && !self.peek().is_none_or(|c| c.is_whitespace() || c == '>' || c == '/') {
             self.advance(1);
         }
         let tag = self.source[tag_start..self.pos].to_string();
@@ -196,7 +195,7 @@ impl<'a> TemplateParser<'a> {
             return None;
         }
 
-        let is_component = tag.chars().next().map_or(false, |c| c.is_uppercase());
+        let is_component = tag.chars().next().is_some_and(|c| c.is_uppercase());
 
         // Parse attributes
         let attributes = self.parse_attributes();
@@ -255,7 +254,7 @@ impl<'a> TemplateParser<'a> {
             self.advance(2); // skip </
             // Read closing tag name
             let close_start = self.pos;
-            while !self.at_end() && self.peek().map_or(false, |c| c != '>') {
+            while !self.at_end() && self.peek().is_some_and(|c| c != '>') {
                 self.advance(1);
             }
             let close_tag = self.source[close_start..self.pos].trim();
@@ -308,20 +307,18 @@ impl<'a> TemplateParser<'a> {
             let start = self.abs_pos();
 
             // Event binding: @name={handler}
-            if self.remaining().starts_with('@') {
-                if let Some(attr) = self.parse_event_attr() {
+            if self.remaining().starts_with('@')
+                && let Some(attr) = self.parse_event_attr() {
                     attrs.push(Spanned::new(attr, start..self.abs_pos()));
                     continue;
                 }
-            }
 
             // Two-way binding: :name={expr}
-            if self.remaining().starts_with(':') {
-                if let Some(attr) = self.parse_bind_attr() {
+            if self.remaining().starts_with(':')
+                && let Some(attr) = self.parse_bind_attr() {
                     attrs.push(Spanned::new(attr, start..self.abs_pos()));
                     continue;
                 }
-            }
 
             // Shorthand or spread: {name} or {...expr}
             if self.remaining().starts_with('{') {
@@ -330,11 +327,9 @@ impl<'a> TemplateParser<'a> {
                         attrs.push(Spanned::new(attr, start..self.abs_pos()));
                         continue;
                     }
-                } else {
-                    if let Some(attr) = self.parse_shorthand_attr() {
-                        attrs.push(Spanned::new(attr, start..self.abs_pos()));
-                        continue;
-                    }
+                } else if let Some(attr) = self.parse_shorthand_attr() {
+                    attrs.push(Spanned::new(attr, start..self.abs_pos()));
+                    continue;
                 }
             }
 
@@ -357,7 +352,7 @@ impl<'a> TemplateParser<'a> {
         // Parse event name
         let name_start = self.pos;
         while !self.at_end()
-            && self.peek().map_or(false, |c| {
+            && self.peek().is_some_and(|c| {
                 c.is_ascii_alphanumeric() || c == '_' || c == '-'
             })
         {
@@ -373,7 +368,7 @@ impl<'a> TemplateParser<'a> {
             while !self.at_end()
                 && self
                     .peek()
-                    .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_')
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 self.advance(1);
             }
@@ -401,7 +396,7 @@ impl<'a> TemplateParser<'a> {
 
         let name_start = self.pos;
         while !self.at_end()
-            && self.peek().map_or(false, |c| {
+            && self.peek().is_some_and(|c| {
                 c.is_ascii_alphanumeric() || c == '_' || c == '-'
             })
         {
@@ -461,7 +456,7 @@ impl<'a> TemplateParser<'a> {
     fn parse_regular_attr(&mut self) -> Option<Attribute> {
         let name_start = self.pos;
         while !self.at_end()
-            && self.peek().map_or(false, |c| {
+            && self.peek().is_some_and(|c| {
                 c.is_ascii_alphanumeric() || c == '_' || c == '-'
             })
         {
@@ -511,7 +506,7 @@ impl<'a> TemplateParser<'a> {
         while !self.at_end()
             && self
                 .peek()
-                .map_or(false, |c| !c.is_whitespace() && c != '>' && c != '/')
+                .is_some_and(|c| !c.is_whitespace() && c != '>' && c != '/')
         {
             self.advance(1);
         }
@@ -672,7 +667,7 @@ impl<'a> TemplateParser<'a> {
 
         // Parse bindings: item or item, index
         let bind_start = self.pos;
-        while !self.at_end() && self.peek().map_or(false, |c| c != '{') {
+        while !self.at_end() && self.peek().is_some_and(|c| c != '{') {
             self.advance(1);
         }
         let bindings = self.source[bind_start..self.pos].trim();

@@ -157,7 +157,7 @@ fn desugar_props_block(
         let trimmed = after_p.trim_start();
 
         if !trimmed.starts_with('{') {
-            result.push_str("P");
+            result.push('P');
             remaining = after_p;
             continue;
         }
@@ -190,7 +190,7 @@ fn desugar_props_block(
 
             remaining = &trimmed[close + 1..];
         } else {
-            result.push_str("P");
+            result.push('P');
             remaining = after_p;
         }
     }
@@ -204,7 +204,7 @@ fn desugar_props_block(
 /// `P` must be:
 /// - At the start of the string, or
 /// - Preceded by a newline + optional whitespace
-/// And must be followed by whitespace then `{` or directly `{`.
+///   And must be followed by whitespace then `{` or directly `{`.
 fn find_props_block_start(source: &str) -> Option<usize> {
     let bytes = source.as_bytes();
     for i in 0..bytes.len() {
@@ -218,7 +218,7 @@ fn find_props_block_start(source: &str) -> Option<usize> {
         } else {
             // Walk backwards to find newline or start
             let before = &source[..i];
-            let trimmed = before.trim_end_matches(|c: char| c == ' ' || c == '\t');
+            let trimmed = before.trim_end_matches([' ', '\t']);
             trimmed.is_empty() || trimmed.ends_with('\n')
         };
 
@@ -250,9 +250,9 @@ fn parse_props_body(
             continue;
         }
 
-        if trimmed.starts_with("emit ") {
+        if let Some(stripped) = trimmed.strip_prefix("emit ") {
             // emit eventName(params)
-            let rest = trimmed[5..].trim();
+            let rest = stripped.trim();
             if let Some(paren_pos) = rest.find('(') {
                 let name = rest[..paren_pos].trim().to_string();
                 let close_paren = rest.rfind(')').unwrap_or(rest.len());

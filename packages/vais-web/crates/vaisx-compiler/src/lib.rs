@@ -44,6 +44,7 @@ pub use ir::{
 
 /// Options for the compiler.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct CompileOptions {
     /// Component name (if not provided, defaults to `"Component"`).
     pub component_name: Option<String>,
@@ -53,15 +54,6 @@ pub struct CompileOptions {
     pub dev_mode: bool,
 }
 
-impl Default for CompileOptions {
-    fn default() -> Self {
-        Self {
-            component_name: None,
-            source_map: false,
-            dev_mode: false,
-        }
-    }
-}
 
 /// The result of compiling a `.vaisx` file.
 #[derive(Debug, Clone)]

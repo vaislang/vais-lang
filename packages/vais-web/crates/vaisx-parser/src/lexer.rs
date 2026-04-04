@@ -263,10 +263,10 @@ fn parse_script_context(attrs: &str) -> ScriptContext {
         let after_ctx = &attrs[ctx_pos + 7..].trim_start();
         if let Some(after_eq) = after_ctx.strip_prefix('=') {
             let after_eq = after_eq.trim_start();
-            let value = if after_eq.starts_with('"') {
-                after_eq[1..].split('"').next().unwrap_or("")
-            } else if after_eq.starts_with('\'') {
-                after_eq[1..].split('\'').next().unwrap_or("")
+            let value = if let Some(stripped) = after_eq.strip_prefix('"') {
+                stripped.split('"').next().unwrap_or("")
+            } else if let Some(stripped) = after_eq.strip_prefix('\'') {
+                stripped.split('\'').next().unwrap_or("")
             } else {
                 after_eq.split_whitespace().next().unwrap_or("")
             };
