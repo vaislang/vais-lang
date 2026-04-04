@@ -12,6 +12,10 @@
 U storage/error.{VaisError};
 U sql/types.{SqlValue, SqlType};
 U sql/row.{Row};
+
+# Helper structs to replace tuples (Vais has no native tuple-in-generic support)
+S IndexPair { idx: u64, rank: u64 }
+S BucketEntry { key: u64, row_idx: u64 }
 U sql/parser/ast.{Expr, BinOp, JoinType};
 U sql/executor/mod.{ExecutorRow, ExecContext, ExecStats};
 U sql/executor/expr_eval.{eval_expr, eval_predicate, EvalContext, ColumnBinding};
@@ -196,10 +200,10 @@ F fuse_rrf(
     # RRF score = Σ 1/(k + rank_i) across all result lists
 
     # Build HashMap from right results: row_key (as String) → (index, rank)
-    right_map: HashMap<(u64, u64)> := mut HashMap.new();
+    right_map: HashMap<IndexPair> := mut HashMap.new();
     L j: 0..right.len() {
         key := mut row_hash_key(&right[j].row);
-        right_map.insert(key.to_string(), (j, j));  # value = (index, rank)
+        right_map.insert(key.to_string(), IndexPair { idx: j as u64, rank: j as u64 });  # value = (index, rank)
     }
 
     combined: Vec<ScoredResult> := mut Vec.new();
@@ -323,9 +327,9 @@ F execute_plan(
     ctx: &ExecContext,
 ) -> Result<Vec<ExecutorRow>, VaisError> {
     M plan {
-        HybridPlanNode.SqlPlan { plan: sql_plan, .. } => {
+        HybridPlanNode.SqlPlan { plan, .. } => {
             # Delegate to existing SQL executor
-            execute_sql_plan(sql_plan, ctx)
+            execute_sql_plan(plan, ctx)
         },
 
         HybridPlanNode.VectorScan { params, .. } => {
@@ -394,7 +398,8 @@ F execute_sql_plan(plan: &PlanNode, ctx: &ExecContext) -> Result<Vec<ExecutorRow
 
             rows := mut Vec.new();
             L true {
-                M scan.next(ctx)? {
+                next_row := mut scan.next(ctx)?;
+                M next_row {
                     Some(row) => rows.push(row),
                     None => { R Ok(rows); },
                 }
@@ -500,7 +505,8 @@ F execute_vector_scan(
 
     rows := mut Vec.new();
     L true {
-        M executor.next()? {
+        next_row := mut executor.next()?;
+        M next_row {
             Some(row) => rows.push(row),
             None => { executor.close()?; R Ok(rows); },
         }
@@ -657,12 +663,12 @@ F execute_score_fusion(
 F rows_to_scored(rows: &Vec<ExecutorRow>, engine: EngineType) -> Vec<ScoredResult> {
     scored: Vec<ScoredResult> := mut Vec.new();
     L row: rows.iter() {
-        score := mut 0.0f64;
+        score := mut 0.0;
         col_count := mut row.column_count();
         I col_count > 0 {
             M row.get(col_count - 1) {
-                SqlValue.FloatVal { v: f } => { score = *f; },
-                SqlValue.IntVal { v: i } => { score = *i as f64; },
+                SqlValue.FloatVal { v } => { score = *v; },
+                SqlValue.IntVal { v } => { score = *v as f64; },
                 _ => {},
             }
         }
@@ -696,9 +702,10 @@ F execute_cross_engine_join(
     # Build phase: hash-bucketed table indexed by first column hash
     # Use a fixed number of buckets for O(1) average lookup
     NUM_BUCKETS: u64 := 256;
-    buckets: Vec<Vec<(u64, u64)>> := mut Vec.with_capacity(NUM_BUCKETS);
+    buckets: Vec<Vec<BucketEntry>> := mut Vec.with_capacity(NUM_BUCKETS);
     L _: 0..NUM_BUCKETS {
-        buckets.push(Vec.new());
+        empty_bucket: Vec<BucketEntry> := mut Vec.new();
+        buckets.push(empty_bucket);
     }
     build_rows_vec: Vec<ExecutorRow> := mut Vec.new();
 
@@ -711,7 +718,7 @@ F execute_cross_engine_join(
         bucket_idx := mut (key as u64) % NUM_BUCKETS;
         row_idx := mut build_rows_vec.len();
         build_rows_vec.push(row.clone());
-        buckets[bucket_idx].push((key, row_idx));
+        buckets[bucket_idx].push(BucketEntry { key: key, row_idx: row_idx });
     }
 
     # Probe phase: O(1) average per probe via bucket lookup
@@ -773,23 +780,23 @@ F hash_value(value: &SqlValue) -> u64 {
     h := mut FNV_OFFSET;
 
     M value {
-        SqlValue.IntVal { v: n } => {
-            bytes := mut (*n as u64).to_le_bytes();
+        SqlValue.IntVal { v } => {
+            bytes := mut (*v as u64).to_le_bytes();
             L b: bytes.iter() {
                 h ^= *b as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
         },
-        SqlValue.FloatVal { v: f } => {
-            bits := mut f.to_bits();
+        SqlValue.FloatVal { v } => {
+            bits := mut v.to_bits();
             bytes := mut bits.to_le_bytes();
             L b: bytes.iter() {
                 h ^= *b as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
         },
-        SqlValue.StringVal { v: ref s } => {
-            L b: s.bytes() {
+        SqlValue.StringVal { v } => {
+            L b: v.bytes() {
                 h ^= b as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
@@ -875,10 +882,27 @@ F execute_hybrid_sort(
             va := mut eval_expr(&order_by[0].expr, a.get_row(), &eval_ctx).unwrap_or(SqlValue.Null);
             vb := mut eval_expr(&order_by[0].expr, b.get_row(), &eval_ctx).unwrap_or(SqlValue.Null);
             # Compare values
-            M (&va, &vb) {
-                (SqlValue.IntVal { v: ia }, SqlValue.IntVal { v: ib }) => ia.cmp(ib),
-                (SqlValue.FloatVal { v: fa }, SqlValue.FloatVal { v: fb }) => fa.partial_cmp(fb).unwrap_or(std.cmp.Ordering.Equal),
-                (SqlValue.StringVal { v: sa }, SqlValue.StringVal { v: sb }) => sa.cmp(sb),
+            M &va {
+                SqlValue.IntVal { v } => {
+                    ia := *v;
+                    M &vb {
+                        SqlValue.IntVal { v } => ia.cmp(v),
+                        _ => std.cmp.Ordering.Equal,
+                    }
+                },
+                SqlValue.FloatVal { v } => {
+                    fa := *v;
+                    M &vb {
+                        SqlValue.FloatVal { v } => fa.partial_cmp(v).unwrap_or(std.cmp.Ordering.Equal),
+                        _ => std.cmp.Ordering.Equal,
+                    }
+                },
+                SqlValue.StringVal { v } => {
+                    M &vb {
+                        SqlValue.StringVal { v: v2 } => v.cmp(v2),
+                        _ => std.cmp.Ordering.Equal,
+                    }
+                },
                 _ => std.cmp.Ordering.Equal,
             }
         });
