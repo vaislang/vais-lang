@@ -1,0 +1,179 @@
+# GraphQL Execution Engine
+# Provides GqlExecutor with query/mutation execution, argument extraction,
+# and resolver dispatch with error wrapping.
+
+U std/string
+U std/vec
+U std/option
+U api/graphql
+
+# ============================================================================
+# GqlOperation — parsed, enriched operation ready for execution
+# ============================================================================
+
+S GqlOperation {
+    op_type:    str,   # "query" | "mutation"
+    field_name: str,   # root field being selected
+    raw_query:  str,   # original query string (used by extract_arguments)
+    variables:  str,   # JSON-encoded variable map (may be "")
+}
+
+X GqlOperation {
+    F new(op_type: str, field_name: str, raw_query: str, variables: str) -> GqlOperation {
+        GqlOperation {
+            op_type:    op_type,
+            field_name: field_name,
+            raw_query:  raw_query,
+            variables:  variables,
+        }
+    }
+}
+
+# ============================================================================
+# GqlExecutor
+# ============================================================================
+
+S GqlExecutor {
+    # Stateless executor; schema is passed per-call so the same executor
+    # instance can serve multiple schemas (e.g. in tests).
+    _marker: i64,
+}
+
+X GqlExecutor {
+    F new() -> GqlExecutor {
+        GqlExecutor { _marker: 0 }
+    }
+
+    # -------------------------------------------------------------------------
+    # execute_query — run a query operation
+    # -------------------------------------------------------------------------
+    F execute_query(self, schema: GqlSchema, operation: GqlOperation) -> GqlResponse {
+        resolver_id := find_resolver_id(schema.queries, operation.field_name)
+        I resolver_id < 0 {
+            R GqlResponse.error("Unknown query field: " + operation.field_name)
+        }
+
+        args := extract_arguments(operation.raw_query, operation)
+        result := dispatch_resolver(resolver_id, operation.field_name, args)
+        M result {
+            Ok(data)  => { GqlResponse.success(data) },
+            Err(e)    => {
+                errors := Vec.new()
+                errors.push(e)
+                GqlResponse {
+                    data:   "null",
+                    errors: errors,
+                    ok:     0,
+                }
+            },
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # execute_mutation — run a mutation operation
+    # -------------------------------------------------------------------------
+    F execute_mutation(self, schema: GqlSchema, operation: GqlOperation) -> GqlResponse {
+        resolver_id := find_resolver_id(schema.mutations, operation.field_name)
+        I resolver_id < 0 {
+            R GqlResponse.error("Unknown mutation field: " + operation.field_name)
+        }
+
+        args := extract_arguments(operation.raw_query, operation)
+        result := dispatch_resolver(resolver_id, operation.field_name, args)
+        M result {
+            Ok(data)  => { GqlResponse.success(data) },
+            Err(e)    => {
+                errors := Vec.new()
+                errors.push(e)
+                GqlResponse {
+                    data:   "null",
+                    errors: errors,
+                    ok:     0,
+                }
+            },
+        }
+    }
+}
+
+# ============================================================================
+# extract_arguments
+# Extract the argument string from inside the parentheses of the root field.
+# e.g. "query { user(id: 42) { name } }" -> "id: 42"
+# Returns "" when no argument list is present.
+# ============================================================================
+
+F extract_arguments(query: str, operation: GqlOperation) -> str {
+    # Locate the field name inside the query string, then look for '('
+    field := operation.field_name
+    field_pos := str_find_substr(query, field, 0)
+    I field_pos < 0 { R "" }
+
+    # Advance past the field name
+    after_field := field_pos + str_len(field)
+
+    # Skip whitespace
+    i := skip_ws_exec(query, after_field)
+
+    # Check for opening paren
+    c := str_char_at(query, i)
+    I c != 40 { R "" }   # 40 = '('
+
+    # Find matching closing paren
+    open := i + 1
+    close := find_close_paren(query, open)
+    I close < 0 { R "" }
+
+    str_slice(query, open, close)
+}
+
+# Skip whitespace from position i; return index of first non-space character.
+F skip_ws_exec(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0  { R i }
+    I c == 32 { R skip_ws_exec(s, i + 1) }   # space
+    I c == 9  { R skip_ws_exec(s, i + 1) }   # tab
+    I c == 10 { R skip_ws_exec(s, i + 1) }   # \n
+    I c == 13 { R skip_ws_exec(s, i + 1) }   # \r
+    i
+}
+
+# Find the index of the closing ')' starting from position i.
+# Returns -1 if not found.
+F find_close_paren(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0  { R 0 - 1 }
+    I c == 41 { R i }    # 41 = ')'
+    find_close_paren(s, i + 1)
+}
+
+# ============================================================================
+# dispatch_resolver
+# Look up and call the resolver registered under resolver_id.
+# Returns Ok(json_data) or Err(GqlError) on failure.
+# ============================================================================
+
+F dispatch_resolver(resolver_id: i64, field_name: str, args: str) -> Result<str, GqlError> {
+    # Delegate to the host-environment resolver registry.
+    # resolver_call_by_id is declared as an external function (X F) so the
+    # vaisc linker resolves it at link time from the runtime resolver table.
+    result := resolver_call_by_id(resolver_id, field_name, args)
+    M result {
+        Ok(data) => { Ok(data) },
+        Err(msg) => {
+            Err(GqlError.new(msg))
+        },
+    }
+}
+
+# ============================================================================
+# External declarations
+# ============================================================================
+
+X F str_char_at(s: str, i: i64) -> i64
+X F str_len(s: str) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+
+# Host-environment resolver registry.
+# Must be provided by the embedding runtime.
+# On success: Ok(json_string); on failure: Err(error_message).
+X F resolver_call_by_id(resolver_id: i64, field_name: str, args: str) -> Result<str, str>

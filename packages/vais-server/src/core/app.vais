@@ -7,6 +7,7 @@ U std/net
 U core/config
 U core/error
 U core/context
+U core/shutdown
 
 # ============================================================================
 # Handler type alias
@@ -51,7 +52,8 @@ S App {
     config: ServerConfig,
     routes: Vec<Route>,
     middlewares: Vec<MiddlewareEntry>,
-    prefix: str,      # Non-empty only for sub-apps created by group()
+    prefix: str,                          # Non-empty only for sub-apps created by group()
+    shutdown_coordinator: ShutdownCoordinator,
 }
 
 X App {
@@ -62,6 +64,7 @@ X App {
             routes: Vec.new(),
             middlewares: Vec.new(),
             prefix: "",
+            shutdown_coordinator: ShutdownCoordinator.new(),
         }
     }
 
@@ -126,6 +129,7 @@ X App {
             routes: Vec.new(),
             middlewares: Vec.new(),
             prefix: self.prefix + prefix,
+            shutdown_coordinator: ShutdownCoordinator.new(),
         }
     }
 
@@ -172,18 +176,24 @@ X App {
             R Err(VaisServerError.new("failed to bind on port " + addr))
         }
 
-        accept_loop(listener, self.routes)
+        accept_loop(listener, self.routes, self.shutdown_coordinator)
         Ok(())
     }
 }
 
 # ============================================================================
-# TCP accept loop — runs forever, blocking on each new connection
+# TCP accept loop — runs until shutdown is requested
 # ============================================================================
 
-F accept_loop(listener: TcpListener, routes: Vec<Route>) {
+F accept_loop(listener: TcpListener, routes: Vec<Route>, coord: mut ShutdownCoordinator) {
+    I coord.is_shutdown_requested() {
+        println("Shutting down gracefully...")
+        coord.wait_for_drain(30000)
+        R
+    }
     stream := listener.accept()
     I stream.is_valid() {
+        coord.increment_connections()
         buf := mut [0u8; 4096]
         n := stream.read(&mut buf, 4096)
         I n > 0 {
@@ -207,8 +217,9 @@ F accept_loop(listener: TcpListener, routes: Vec<Route>) {
             stream.write(http_resp as i64, str_len(http_resp))
         }
         stream.close()
+        coord.decrement_connections()
     }
-    accept_loop(listener, routes)
+    accept_loop(listener, routes, coord)
 }
 
 # ============================================================================

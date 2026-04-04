@@ -1,0 +1,127 @@
+# MigrationTracker — Tracks applied migrations
+# Manages the _vaisdb_migrations system table:
+#   CREATE TABLE IF NOT EXISTS _vaisdb_migrations (
+#       version    INTEGER PRIMARY KEY,
+#       name       TEXT    NOT NULL,
+#       applied_at INTEGER NOT NULL,
+#       status     TEXT    NOT NULL
+#   )
+#
+# In-memory mode:
+#   Since actual DB execution may not be available in all contexts (e.g., unit tests),
+#   this module uses an in-memory Vec<MigrationRecord> as the authoritative store.
+#   SQL generation methods are provided so callers can execute them against a real DB.
+
+U sql/migrate/migration
+
+# ============================================================================
+# MigrationTracker
+# ============================================================================
+
+S MigrationTracker {
+    applied_versions: Vec<MigrationRecord>,
+}
+
+X MigrationTracker {
+    # Create a new, empty tracker
+    F new() -> MigrationTracker {
+        MigrationTracker {
+            applied_versions: Vec.new(),
+        }
+    }
+
+    # Initialize the tracking table.
+    # Returns the CREATE TABLE IF NOT EXISTS SQL that should be executed by the caller.
+    F init(&mut self) -> str {
+        "CREATE TABLE IF NOT EXISTS _vaisdb_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL, status TEXT NOT NULL)"
+    }
+
+    # Record a successfully applied migration.
+    # Inserts into the in-memory store and returns the INSERT SQL for persistence.
+    F record_applied(&mut self, version: i64, name: &str) -> str {
+        record := mut MigrationRecord.new_applied(version, name, 0)
+        sql := mut record.to_insert_sql()
+        self.applied_versions.push(record)
+        sql
+    }
+
+    # Record a failed migration attempt.
+    # Inserts into the in-memory store with Failed status and returns INSERT SQL.
+    F record_failed(&mut self, version: i64, name: &str) -> str {
+        record := mut MigrationRecord.new_failed(version, name, 0)
+        sql := mut record.to_insert_sql()
+        self.applied_versions.push(record)
+        sql
+    }
+
+    # Remove a migration record (used during rollback).
+    # Returns the DELETE SQL for persistence.
+    F remove_record(&mut self, version: i64) -> str {
+        new_vec := mut Vec.new()
+        i := mut 0
+        L i < self.applied_versions.len() {
+            tmp := mut self.applied_versions[i]
+            I tmp.version != version {
+                keep := mut MigrationRecord.new_applied(tmp.version, &tmp.name, tmp.applied_at)
+                new_vec.push(keep)
+            }
+            i = i + 1
+        }
+        self.applied_versions = new_vec
+        "DELETE FROM _vaisdb_migrations WHERE version = {version}"
+    }
+
+    # Return all versions that are in Applied status.
+    F get_applied_versions(&self) -> Vec<i64> {
+        result := mut Vec.new()
+        i := mut 0
+        L i < self.applied_versions.len() {
+            tmp := mut self.applied_versions[i]
+            M tmp.status {
+                MigrationStatus.Applied => {
+                    result.push(tmp.version)
+                },
+                _ => {},
+            }
+            i = i + 1
+        }
+        result
+    }
+
+    # Check whether a specific version has already been applied.
+    F is_applied(&self, version: i64) -> bool {
+        i := mut 0
+        L i < self.applied_versions.len() {
+            tmp := mut self.applied_versions[i]
+            M tmp.status {
+                MigrationStatus.Applied => {
+                    I tmp.version == version {
+                        R true
+                    }
+                },
+                _ => {},
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    # Return the highest applied version number, or -1 if none.
+    F max_applied_version(&self) -> i64 {
+        max := mut -1 as i64
+        i := mut 0
+        L i < self.applied_versions.len() {
+            tmp := mut self.applied_versions[i]
+            M tmp.status {
+                MigrationStatus.Applied => {
+                    I tmp.version > max {
+                        max = tmp.version
+                    }
+                },
+                _ => {},
+            }
+            i = i + 1
+        }
+        max
+    }
+}

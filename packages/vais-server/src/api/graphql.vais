@@ -398,12 +398,10 @@ F execute(schema: GqlSchema, request: GqlRequest) -> GqlResponse {
         R GqlResponse.error("Unknown field: " + op.field_name)
     }
 
-    # Resolver invocation is host-environment specific; return a stub that
-    # includes the resolver_id so the host can complete dispatch.
-    data := "{\"_resolver_id\": " + i64_to_str(resolver_id)
-          + ", \"_field\": \"" + op.field_name + "\""
-          + ", \"_op\": \"" + op.op_type + "\"}"
-    GqlResponse.success(data)
+    # Delegate to the execution engine via the gql_dispatch stub.
+    # The runtime resolves this to GqlExecutor.execute_query / execute_mutation
+    # (implemented in api/graphql_execute).
+    gql_dispatch(schema, op.op_type, op.field_name, request.query, request.variables)
 }
 
 # Minimal helper: extract "name" string value from a variables JSON blob.
@@ -445,6 +443,61 @@ F str_match_prefix(a: str, ai: i64, b: str, bi: i64) -> i64 {
 }
 
 # ============================================================================
+# Dispatch stub — resolved by the runtime to GqlExecutor in graphql_execute
+# ============================================================================
+
+# Resolved by the runtime dispatcher; concrete implementation lives in
+# api/graphql_execute (GqlExecutor.execute_query / execute_mutation).
+# This stub ensures graphql.vais compiles stand-alone for testing.
+F gql_dispatch(schema: GqlSchema, op_type: str, field_name: str, raw_query: str, variables: str) -> GqlResponse {
+    args := gql_extract_args_stub(raw_query, field_name)
+    result := resolver_call_by_id(gql_resolve_id(schema, op_type, field_name), field_name, args)
+    M result {
+        Ok(data) => { GqlResponse.success(data) },
+        Err(msg) => { GqlResponse.error(msg) },
+    }
+}
+
+# Helper: resolve resolver_id from schema given op_type and field_name.
+F gql_resolve_id(schema: GqlSchema, op_type: str, field_name: str) -> i64 {
+    M op_type {
+        "mutation" => { find_resolver_id(schema.mutations, field_name) },
+        _          => { find_resolver_id(schema.queries, field_name) },
+    }
+}
+
+# Minimal argument extractor used by the stub (mirrors extract_arguments in graphql_execute).
+F gql_extract_args_stub(query: str, field_name: str) -> str {
+    field_pos := str_find_substr(query, field_name, 0)
+    I field_pos < 0 { R "" }
+    after_field := field_pos + str_len(field_name)
+    i := gql_skip_ws(query, after_field)
+    c := str_char_at(query, i)
+    I c != 40 { R "" }   # 40 = '('
+    open := i + 1
+    close := gql_find_close_paren(query, open)
+    I close < 0 { R "" }
+    str_slice(query, open, close)
+}
+
+F gql_skip_ws(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0  { R i }
+    I c == 32 { R gql_skip_ws(s, i + 1) }
+    I c == 9  { R gql_skip_ws(s, i + 1) }
+    I c == 10 { R gql_skip_ws(s, i + 1) }
+    I c == 13 { R gql_skip_ws(s, i + 1) }
+    i
+}
+
+F gql_find_close_paren(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 0  { R 0 - 1 }
+    I c == 41 { R i }
+    gql_find_close_paren(s, i + 1)
+}
+
+# ============================================================================
 # External helpers
 # ============================================================================
 
@@ -452,3 +505,7 @@ X F str_char_at(s: str, i: i64) -> i64
 X F str_len(s: str) -> i64
 X F str_slice(s: str, start: i64, end: i64) -> str
 X F i64_to_str(n: i64) -> str
+
+# Host-environment resolver registry (also declared in graphql_execute).
+# Provided by the embedding runtime; resolved at link time.
+X F resolver_call_by_id(resolver_id: i64, field_name: str, args: str) -> Result<str, str>

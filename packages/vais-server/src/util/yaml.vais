@@ -1,0 +1,506 @@
+# Minimal YAML Parser
+# Supports key-value pairs, nested objects (2-space indent), simple lists, and comments.
+# No external YAML library — pure Vais string manipulation.
+
+U std/string
+U std/vec
+
+# ============================================================================
+# YamlType — discriminates what kind of value a YamlNode holds
+# ============================================================================
+
+E YamlType {
+    Str,
+    Int,
+    Float,
+    Bool,
+    Map,
+    List,
+}
+
+# ============================================================================
+# YamlNode — a single node in the parsed YAML tree
+# ============================================================================
+
+S YamlNode {
+    node_type:  YamlType,
+    str_val:    str,
+    int_val:    i64,
+    float_val:  f64,
+    bool_val:   bool,
+    keys:       Vec<str>,       # Parallel arrays: keys[i] pairs with values[i]
+    values:     Vec<YamlNode>,  # For Map nodes
+    list_items: Vec<YamlNode>,  # For List nodes
+}
+
+X YamlNode {
+    # Construct a Str node
+    F make_str(v: str) -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.Str,
+            str_val:    v,
+            int_val:    0,
+            float_val:  0.0,
+            bool_val:   false,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # Construct an Int node
+    F make_int(v: i64) -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.Int,
+            str_val:    "",
+            int_val:    v,
+            float_val:  0.0,
+            bool_val:   false,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # Construct a Float node
+    F make_float(v: f64) -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.Float,
+            str_val:    "",
+            int_val:    0,
+            float_val:  v,
+            bool_val:   false,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # Construct a Bool node
+    F make_bool(v: bool) -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.Bool,
+            str_val:    "",
+            int_val:    0,
+            float_val:  0.0,
+            bool_val:   v,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # Construct an empty Map node
+    F make_map() -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.Map,
+            str_val:    "",
+            int_val:    0,
+            float_val:  0.0,
+            bool_val:   false,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # Construct an empty List node
+    F make_list() -> YamlNode {
+        YamlNode {
+            node_type:  YamlType.List,
+            str_val:    "",
+            int_val:    0,
+            float_val:  0.0,
+            bool_val:   false,
+            keys:       Vec.new(),
+            values:     Vec.new(),
+            list_items: Vec.new(),
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Accessors
+    # -------------------------------------------------------------------------
+
+    # Get a string field from a Map node by key.
+    # Returns Err if this is not a Map node, or the key is missing, or the
+    # value is not a Str node.
+    F yaml_get_str(self, key: str) -> Result<str, str> {
+        M self.node_type {
+            YamlType.Map => {},
+            _ => { R Err("yaml_get_str: node is not a Map") },
+        }
+        idx := yaml_node_find_key(self.keys, key, 0, self.keys.len())
+        I idx < 0 {
+            R Err("yaml_get_str: key not found: " + key)
+        }
+        child := self.values.get(idx)
+        M child.node_type {
+            YamlType.Str => { Ok(child.str_val) },
+            YamlType.Int => { Ok(i64_to_str(child.int_val)) },
+            YamlType.Bool => {
+                I child.bool_val {
+                    Ok("true")
+                } E {
+                    Ok("false")
+                }
+            },
+            _ => { Err("yaml_get_str: value for key '" + key + "' is not a scalar") },
+        }
+    }
+
+    # Get an integer field from a Map node by key.
+    # Returns Err if this is not a Map node, or the key is missing, or the
+    # value cannot be interpreted as an integer.
+    F yaml_get_int(self, key: str) -> Result<i64, str> {
+        M self.node_type {
+            YamlType.Map => {},
+            _ => { R Err("yaml_get_int: node is not a Map") },
+        }
+        idx := yaml_node_find_key(self.keys, key, 0, self.keys.len())
+        I idx < 0 {
+            R Err("yaml_get_int: key not found: " + key)
+        }
+        child := self.values.get(idx)
+        M child.node_type {
+            YamlType.Int => { Ok(child.int_val) },
+            YamlType.Str => {
+                parsed := str_to_i64(child.str_val)
+                I parsed == -9999999999 {
+                    Err("yaml_get_int: cannot parse '" + child.str_val + "' as integer")
+                } E {
+                    Ok(parsed)
+                }
+            },
+            _ => { Err("yaml_get_int: value for key '" + key + "' is not an integer") },
+        }
+    }
+
+    # Navigate a dot-separated path (e.g. "database.host") into nested Map nodes.
+    # Returns a copy of the target YamlNode, or Err if any segment is missing.
+    F yaml_get_nested(self, path: str) -> Result<YamlNode, str> {
+        yaml_get_nested_impl(self, path, 0, str_len(path))
+    }
+}
+
+# ============================================================================
+# parse_yaml — top-level entry point
+#
+# Splits the content into lines and delegates to the recursive line parser.
+# Returns the root Map node on success, or an Err string describing the
+# first syntax problem encountered.
+# ============================================================================
+
+F parse_yaml(content: str) -> Result<YamlNode, str> {
+    lines := str_split_newline(content)
+    root  := mut YamlNode.make_map()
+    result := yaml_parse_block(lines, 0, lines.len(), 0, mut root)
+    M result {
+        Ok(_)  => { Ok(root) },
+        Err(e) => { Err(e) },
+    }
+}
+
+# ============================================================================
+# yaml_parse_block — parse a block of lines at a given indent level
+#
+# Iterates over lines[start..end).  For each non-blank, non-comment line at
+# exactly `indent` spaces of leading whitespace:
+#   - If the value after ':' is empty → nested Map; recursively collect
+#     child lines (deeper indent) and parse them.
+#   - If the value starts with '-' and is on a line by itself → start List.
+#   - Otherwise → scalar value, deduce type and store.
+#
+# Returns Ok(next_line_index) so the caller knows where to resume.
+# ============================================================================
+
+F yaml_parse_block(
+    lines:    Vec<str>,
+    start:    i64,
+    end:      i64,
+    indent:   i64,
+    mut node: YamlNode,
+) -> Result<i64, str> {
+    yaml_parse_lines(lines, start, end, indent, mut node)
+}
+
+F yaml_parse_lines(
+    lines:    Vec<str>,
+    i:        i64,
+    end:      i64,
+    indent:   i64,
+    mut node: YamlNode,
+) -> Result<i64, str> {
+    I i >= end { R Ok(i) }
+
+    line := lines.get(i)
+    llen := str_len(line)
+
+    # Skip blank lines and comment lines at any indent level
+    I llen == 0 {
+        R yaml_parse_lines(lines, i + 1, end, indent, mut node)
+    }
+    trimmed_first := str_char_at(line, 0)
+    I trimmed_first == "#" {
+        R yaml_parse_lines(lines, i + 1, end, indent, mut node)
+    }
+
+    # Count leading spaces for this line
+    line_indent := yaml_count_indent(line, 0)
+
+    # If this line is less indented than our block, stop — caller handles it
+    I line_indent < indent {
+        R Ok(i)
+    }
+
+    # If this line is MORE indented than our block, skip (orphan content)
+    I line_indent > indent {
+        R yaml_parse_lines(lines, i + 1, end, indent, mut node)
+    }
+
+    # Line is at exactly our indent level
+    # Strip the leading indent
+    content := str_slice(line, indent, llen)
+    clen    := str_len(content)
+
+    # Check if it is a list item: starts with "- "
+    I clen >= 2 && str_char_at(content, 0) == "-" && str_char_at(content, 1) == " " {
+        # List item — parse the value after "- "
+        item_str := str_slice(content, 2, clen)
+        item_val := yaml_parse_scalar(item_str)
+        node.list_items.push(item_val)
+        node.node_type = YamlType.List
+        R yaml_parse_lines(lines, i + 1, end, indent, mut node)
+    }
+
+    # Otherwise, expect a key: value line
+    colon_idx := yaml_find_colon(content, 0, clen)
+    I colon_idx < 0 {
+        R Err("yaml: expected 'key: value' at line " + i64_to_str(i) + ": " + line)
+    }
+
+    key        := str_slice(content, 0, colon_idx)
+    after_colon := str_slice(content, colon_idx + 1, clen)
+    value_raw  := yaml_ltrim(after_colon)
+
+    I str_len(value_raw) == 0 {
+        # Nested Map — collect child lines (indent + 2)
+        child_node := mut YamlNode.make_map()
+        next_i := mut i + 1
+        M yaml_parse_block(lines, next_i, end, indent + 2, mut child_node) {
+            Ok(ni) => { next_i = ni },
+            Err(e) => { R Err(e) },
+        }
+        node.keys.push(key)
+        node.values.push(child_node)
+        R yaml_parse_lines(lines, next_i, end, indent, mut node)
+    }
+
+    # Scalar value on the same line
+    val_node := yaml_parse_scalar(value_raw)
+    node.keys.push(key)
+    node.values.push(val_node)
+    yaml_parse_lines(lines, i + 1, end, indent, mut node)
+}
+
+# ============================================================================
+# yaml_parse_scalar — classify a raw string value
+# ============================================================================
+
+F yaml_parse_scalar(raw: str) -> YamlNode {
+    # Strip inline comment: everything after unquoted ' #'
+    stripped := yaml_strip_comment(raw)
+    v        := yaml_trim(stripped)
+
+    I v == "true"  { R YamlNode.make_bool(true)  }
+    I v == "false" { R YamlNode.make_bool(false) }
+
+    # Try integer
+    M yaml_try_parse_int(v) {
+        Some(n) => { R YamlNode.make_int(n) },
+        None    => {},
+    }
+
+    # Try float
+    M yaml_try_parse_float(v) {
+        Some(f) => { R YamlNode.make_float(f) },
+        None    => {},
+    }
+
+    # Strip optional surrounding quotes for strings
+    unquoted := yaml_unquote(v)
+    YamlNode.make_str(unquoted)
+}
+
+# ============================================================================
+# Nested path accessor implementation
+# ============================================================================
+
+F yaml_get_nested_impl(node: YamlNode, path: str, start: i64, plen: i64) -> Result<YamlNode, str> {
+    # Find next '.' separator
+    dot_idx := yaml_find_char_in(path, ".", start, plen)
+
+    segment := I dot_idx < 0 {
+        str_slice(path, start, plen)
+    } E {
+        str_slice(path, start, dot_idx)
+    }
+
+    I str_len(segment) == 0 {
+        R Err("yaml_get_nested: empty path segment in: " + path)
+    }
+
+    # Look up the segment in this node's keys
+    M node.node_type {
+        YamlType.Map => {},
+        _ => { R Err("yaml_get_nested: intermediate node is not a Map for segment: " + segment) },
+    }
+
+    idx := yaml_node_find_key(node.keys, segment, 0, node.keys.len())
+    I idx < 0 {
+        R Err("yaml_get_nested: key not found: " + segment)
+    }
+
+    child := node.values.get(idx)
+
+    I dot_idx < 0 {
+        # Last segment — return the child node itself
+        R Ok(child)
+    }
+
+    # More segments to traverse
+    yaml_get_nested_impl(child, path, dot_idx + 1, plen)
+}
+
+# ============================================================================
+# Helper utilities
+# ============================================================================
+
+# Find the index of key in keys[start..end); returns -1 if absent.
+F yaml_node_find_key(keys: Vec<str>, key: str, i: i64, n: i64) -> i64 {
+    I i >= n { R -1 }
+    I keys.get(i) == key { R i }
+    yaml_node_find_key(keys, key, i + 1, n)
+}
+
+# Count leading space characters.
+F yaml_count_indent(s: str, i: i64) -> i64 {
+    I i >= str_len(s) { R i }
+    I str_char_at(s, i) != " " { R i }
+    yaml_count_indent(s, i + 1)
+}
+
+# Find first ':' that is not inside a quoted section (simple heuristic: first ':').
+F yaml_find_colon(s: str, i: i64, n: i64) -> i64 {
+    I i >= n { R -1 }
+    ch := str_char_at(s, i)
+    I ch == ":" { R i }
+    yaml_find_colon(s, i + 1, n)
+}
+
+# Find first occurrence of ch in s[start..end); returns -1 if absent.
+F yaml_find_char_in(s: str, ch: str, start: i64, end: i64) -> i64 {
+    I start >= end { R -1 }
+    I str_char_at(s, start) == ch { R start }
+    yaml_find_char_in(s, ch, start + 1, end)
+}
+
+# Left-trim spaces.
+F yaml_ltrim(s: str) -> str {
+    slen := str_len(s)
+    yaml_ltrim_rec(s, slen, 0)
+}
+
+F yaml_ltrim_rec(s: str, slen: i64, i: i64) -> str {
+    I i >= slen { R "" }
+    I str_char_at(s, i) != " " { R str_slice(s, i, slen) }
+    yaml_ltrim_rec(s, slen, i + 1)
+}
+
+# Right-trim spaces.
+F yaml_rtrim(s: str) -> str {
+    slen := str_len(s)
+    yaml_rtrim_rec(s, slen, slen)
+}
+
+F yaml_rtrim_rec(s: str, slen: i64, end: i64) -> str {
+    I end <= 0 { R "" }
+    I str_char_at(s, end - 1) != " " { R str_slice(s, 0, end) }
+    yaml_rtrim_rec(s, slen, end - 1)
+}
+
+# Trim both sides.
+F yaml_trim(s: str) -> str {
+    yaml_rtrim(yaml_ltrim(s))
+}
+
+# Strip an inline comment (first ' #' that appears).
+F yaml_strip_comment(s: str) -> str {
+    slen := str_len(s)
+    yaml_strip_comment_rec(s, slen, 0)
+}
+
+F yaml_strip_comment_rec(s: str, slen: i64, i: i64) -> str {
+    I i + 1 >= slen { R s }
+    I str_char_at(s, i) == " " && str_char_at(s, i + 1) == "#" {
+        R str_slice(s, 0, i)
+    }
+    yaml_strip_comment_rec(s, slen, i + 1)
+}
+
+# Remove surrounding single or double quotes from a string.
+F yaml_unquote(s: str) -> str {
+    slen := str_len(s)
+    I slen < 2 { R s }
+    first := str_char_at(s, 0)
+    last  := str_char_at(s, slen - 1)
+    I (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+        R str_slice(s, 1, slen - 1)
+    }
+    s
+}
+
+# Try to parse s as i64. Returns None on failure.
+# Uses sentinel -9999999999 internally; a proper runtime would provide str_to_i64.
+F yaml_try_parse_int(s: str) -> Option<i64> {
+    slen := str_len(s)
+    I slen == 0 { R None }
+    start := I str_char_at(s, 0) == "-" { 1 } E { 0 }
+    I start >= slen { R None }
+    all_digits := yaml_all_digits(s, start, slen)
+    I !all_digits { R None }
+    Some(str_to_i64(s))
+}
+
+F yaml_all_digits(s: str, i: i64, n: i64) -> bool {
+    I i >= n { R true }
+    ch := str_char_at(s, i)
+    digit := ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9"
+    I !digit { R false }
+    yaml_all_digits(s, i + 1, n)
+}
+
+# Try to parse s as f64. Detects at least one '.' with surrounding digits.
+F yaml_try_parse_float(s: str) -> Option<f64> {
+    slen := str_len(s)
+    I slen == 0 { R None }
+    dot_idx := yaml_find_char_in(s, ".", 0, slen)
+    I dot_idx < 0 { R None }
+    # Ensure there is at least one digit before and after the dot
+    I dot_idx == 0 || dot_idx == slen - 1 { R None }
+    Some(str_to_f64(s))
+}
+
+# ============================================================================
+# External runtime stubs
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_char_at(s: str, i: i64) -> str
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F str_split_newline(s: str) -> Vec<str>
+X F i64_to_str(n: i64) -> str
+X F str_to_i64(s: str) -> i64
+X F str_to_f64(s: str) -> f64
+X F yaml_read_file(path: str) -> str
+X F env_get(key: str) -> str          # Returns "" when variable is not set

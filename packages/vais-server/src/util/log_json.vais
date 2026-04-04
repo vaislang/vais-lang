@@ -1,0 +1,127 @@
+# log_json.vais — Structured JSON log entry for vais-server
+# Provides JsonLogEntry serialization and request ID generation.
+
+U std/string
+
+# ============================================================================
+# JsonLogEntry — one structured log line per request
+# ============================================================================
+
+S JsonLogEntry {
+    ts:         str,   # ISO-8601 timestamp or ms-since-epoch string
+    level:      str,   # "INFO" | "DEBUG" | ...
+    method:     str,   # HTTP method, e.g. "GET"
+    path:       str,   # Request path, e.g. "/users/42"
+    status:     i64,   # HTTP status code
+    latency_ms: i64,   # Elapsed time in milliseconds
+    request_id: str,   # Unique request identifier
+}
+
+X JsonLogEntry {
+    F new(ts: str, level: str, method: str, path: str, status: i64, latency_ms: i64, request_id: str) -> JsonLogEntry {
+        JsonLogEntry { ts, level, method, path, status, latency_ms, request_id }
+    }
+
+    # -------------------------------------------------------------------------
+    # to_json — manual JSON serialization
+    # Produces: {"ts":"...","level":"...","method":"...","path":"...","status":N,"latency_ms":N,"request_id":"..."}
+    # -------------------------------------------------------------------------
+    F to_json(self) -> str {
+        status_str     := i64_to_str(self.status)
+        latency_str    := i64_to_str(self.latency_ms)
+        ts_esc         := json_escape(self.ts)
+        level_esc      := json_escape(self.level)
+        method_esc     := json_escape(self.method)
+        path_esc       := json_escape(self.path)
+        request_id_esc := json_escape(self.request_id)
+
+        "{"
+            + "\"ts\":\"" + ts_esc + "\","
+            + "\"level\":\"" + level_esc + "\","
+            + "\"method\":\"" + method_esc + "\","
+            + "\"path\":\"" + path_esc + "\","
+            + "\"status\":" + status_str + ","
+            + "\"latency_ms\":" + latency_str + ","
+            + "\"request_id\":\"" + request_id_esc + "\""
+            + "}"
+    }
+}
+
+# ============================================================================
+# generate_request_id — counter-based unique ID
+# Returns a string like "req-00000001", "req-00000002", etc.
+# The counter is stored as a module-level mutable i64 updated via external call.
+# ============================================================================
+
+F generate_request_id() -> str {
+    n := next_request_counter()
+    "req-" + pad_left_zeros(i64_to_str(n), 8)
+}
+
+# ============================================================================
+# Helpers — i64 <-> str, JSON escaping, zero-padding
+# ============================================================================
+
+F i64_to_str(n: i64) -> str {
+    I n == 0 { R "0" }
+    I n < 0  { R "-" + i64_to_str(0 - n) }
+    i64_to_str_rec(n, "")
+}
+
+F i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { R acc }
+    digit := n % 10
+    ch    := digit_char(digit)
+    i64_to_str_rec(n / 10, ch + acc)
+}
+
+F digit_char(d: i64) -> str {
+    M d {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "0",
+    }
+}
+
+# Pad s with leading zeros until total length equals width.
+F pad_left_zeros(s: str, width: i64) -> str {
+    current_len := str_len(s)
+    I current_len >= width { R s }
+    pad_left_zeros("0" + s, width)
+}
+
+# Minimal JSON string escaping: handles " and \
+F json_escape(s: str) -> str {
+    slen := str_len(s)
+    json_escape_rec(s, slen, 0, "")
+}
+
+F json_escape_rec(s: str, slen: i64, i: i64, acc: str) -> str {
+    I i >= slen { R acc }
+    ch := str_char_at(s, i)
+    I ch == "\"" {
+        R json_escape_rec(s, slen, i + 1, acc + "\\\"")
+    }
+    I ch == "\\" {
+        R json_escape_rec(s, slen, i + 1, acc + "\\\\")
+    }
+    json_escape_rec(s, slen, i + 1, acc + ch)
+}
+
+# ============================================================================
+# External runtime functions
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_char_at(s: str, i: i64) -> str
+
+# Provides a monotonically-increasing integer each call (atomically incremented).
+X F next_request_counter() -> i64

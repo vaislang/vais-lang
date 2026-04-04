@@ -1,10 +1,12 @@
 # Logger Middleware
 # Logs request start and completion.
-# Format: "[METHOD] /path -> STATUS (Xms)"
+# Text format:  "[METHOD] /path -> STATUS (Xms)"
+# JSON format:  {"ts":"...","level":"...","method":"...","path":"...","status":N,"latency_ms":N,"request_id":"..."}
 
 U std/string
 U core/context
 U middleware/pipeline
+U util/log_json
 
 # ============================================================================
 # LogLevel
@@ -16,20 +18,34 @@ E LogLevel {
 }
 
 # ============================================================================
+# LogFormat
+# ============================================================================
+
+E LogFormat {
+    Text,
+    Json,
+}
+
+# ============================================================================
 # LoggerConfig
 # ============================================================================
 
 S LoggerConfig {
-    level: LogLevel,
+    level:  LogLevel,
+    format: LogFormat,
 }
 
 X LoggerConfig {
     F default() -> LoggerConfig {
-        LoggerConfig { level: LogLevel.Info }
+        LoggerConfig { level: LogLevel.Info, format: LogFormat.Text }
     }
 
     F debug() -> LoggerConfig {
-        LoggerConfig { level: LogLevel.Debug }
+        LoggerConfig { level: LogLevel.Debug, format: LogFormat.Text }
+    }
+
+    F json() -> LoggerConfig {
+        LoggerConfig { level: LogLevel.Info, format: LogFormat.Json }
     }
 }
 
@@ -50,6 +66,11 @@ X LoggerMiddleware {
         LoggerMiddleware.new(LoggerConfig.default())
     }
 
+    # Convenience constructor: JSON-format logger at INFO level
+    F json() -> LoggerMiddleware {
+        LoggerMiddleware.new(LoggerConfig.json())
+    }
+
     # -------------------------------------------------------------------------
     # before — log the incoming request and record the start timestamp
     # -------------------------------------------------------------------------
@@ -59,7 +80,7 @@ X LoggerMiddleware {
 
         # Store the start time (ms since epoch) in ctx.state for after()
         # External runtime provides current_time_ms(); we embed it in state.
-        start_ms := current_time_ms()
+        start_ms  := current_time_ms()
         start_str := i64_to_str(start_ms)
         updated_ctx := ctx.set_state("start_ms=" + start_str)
 
@@ -74,12 +95,29 @@ X LoggerMiddleware {
         start_ms := logger_parse_start_ms(ctx.state)
         end_ms   := current_time_ms()
         elapsed  := end_ms - start_ms
+        level_str := logger_level_str(self.config.level)
 
-        status_str  := u16_to_str(response.status)
-        elapsed_str := i64_to_str(elapsed)
-        level_str   := logger_level_str(self.config.level)
-
-        println("[{level_str}] [{ctx.method}] {ctx.path} -> {status_str} ({elapsed_str}ms)")
+        M self.config.format {
+            LogFormat.Json => {
+                ts_str     := i64_to_str(current_time_ms())
+                status_i64 := u16_to_i64(response.status)
+                entry := JsonLogEntry.new(
+                    ts_str,
+                    level_str,
+                    ctx.method,
+                    ctx.path,
+                    status_i64,
+                    elapsed,
+                    ctx.request_id,
+                )
+                println(entry.to_json())
+            },
+            LogFormat.Text => {
+                status_str  := u16_to_str(response.status)
+                elapsed_str := i64_to_str(elapsed)
+                println("[{level_str}] [{ctx.method}] {ctx.path} -> {status_str} ({elapsed_str}ms)")
+            },
+        }
 
         response
     }
@@ -161,6 +199,11 @@ F digit_char(d: i64) -> str {
 # u16 -> str (status code is u16 in Response)
 F u16_to_str(n: u16) -> str {
     i64_to_str(n)
+}
+
+# u16 -> i64 (for JsonLogEntry.status field)
+F u16_to_i64(n: u16) -> i64 {
+    n
 }
 
 # External runtime functions

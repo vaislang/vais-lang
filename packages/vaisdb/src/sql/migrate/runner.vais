@@ -1,0 +1,257 @@
+# MigrationRunner — Orchestrates applying and rolling back migrations
+# Maintains an ordered list of Migration structs and delegates tracking to MigrationTracker.
+#
+# Workflow:
+#   runner := mut MigrationRunner.new()
+#   runner.add(Migration.new(1, "create_users", up, down))
+#   runner.apply_all()?  → applies all pending migrations in version order
+#   runner.rollback_last()?  → rolls back the most recently applied migration
+#
+# Error handling:
+#   - On apply failure: records Failed status in tracker, returns Err with message
+#   - On rollback: removes record from tracker
+
+U sql/migrate/migration
+U sql/migrate/tracker
+
+# ============================================================================
+# MigrationRunner
+# ============================================================================
+
+S MigrationRunner {
+    migrations: Vec<Migration>,
+    tracker: MigrationTracker,
+}
+
+X MigrationRunner {
+    # Create a new, empty runner
+    F new() -> MigrationRunner {
+        MigrationRunner {
+            migrations: Vec.new(),
+            tracker: MigrationTracker.new(),
+        }
+    }
+
+    # Register a migration with the runner.
+    # Migrations are stored in insertion order; apply_all() sorts by version.
+    F add(&mut self, migration: Migration) {
+        self.migrations.push(migration)
+    }
+
+    # Apply all pending migrations in ascending version order.
+    # Returns the number of migrations applied.
+    # On first error: records Failed, stops, and returns Err.
+    F apply_all(&mut self) -> Result<i64, str> {
+        # Collect pending migrations into a sorted index list
+        # Sort by version (insertion sort on indices)
+        count := mut self.migrations.len()
+        sorted_indices := mut Vec.new()
+        i := mut 0
+        L i < count {
+            sorted_indices.push(i)
+            i = i + 1
+        }
+
+        # Insertion sort the index list by migration version
+        i = 1
+        L i < sorted_indices.len() {
+            j := mut i
+            L j > 0 {
+                idx_j := mut sorted_indices[j]
+                idx_prev := mut sorted_indices[j - 1]
+                tmp_j := mut self.migrations[idx_j]
+                tmp_prev := mut self.migrations[idx_prev]
+                I tmp_j.version < tmp_prev.version {
+                    sorted_indices[j] = idx_prev
+                    sorted_indices[j - 1] = idx_j
+                    j = j - 1
+                } E {
+                    j = 0  # break
+                }
+            }
+            i = i + 1
+        }
+
+        applied_count := mut 0 as i64
+        si := mut 0
+        L si < sorted_indices.len() {
+            idx := mut sorted_indices[si]
+            tmp := mut self.migrations[idx]
+            ver := mut tmp.version
+            mname := mut tmp.name.clone()
+            up := mut tmp.up_sql.clone()
+
+            I !self.tracker.is_applied(ver) {
+                # Execute the up_sql (simulation: we validate it is non-empty)
+                I up == "" {
+                    self.tracker.record_failed(ver, &mname)
+                    R Err("Migration {ver} '{mname}' has empty up_sql")
+                }
+
+                # Record as applied
+                self.tracker.record_applied(ver, &mname)
+                applied_count = applied_count + 1
+            }
+            si = si + 1
+        }
+
+        Ok(applied_count)
+    }
+
+    # Apply a single migration identified by version.
+    # Returns true if the migration was applied, false if it was already applied.
+    # Returns Err if the migration is not found or fails.
+    F apply_one(&mut self, version: i64) -> Result<bool, str> {
+        found_idx := mut -1 as i64
+        i := mut 0
+        L i < self.migrations.len() {
+            tmp := mut self.migrations[i]
+            I tmp.version == version {
+                found_idx = i as i64
+            }
+            i = i + 1
+        }
+
+        I found_idx < 0 {
+            R Err("Migration version {version} not found")
+        }
+
+        I self.tracker.is_applied(version) {
+            R Ok(false)
+        }
+
+        tmp := mut self.migrations[found_idx as i64]
+        mname := mut tmp.name.clone()
+        up := mut tmp.up_sql.clone()
+
+        I up == "" {
+            self.tracker.record_failed(version, &mname)
+            R Err("Migration {version} '{mname}' has empty up_sql")
+        }
+
+        self.tracker.record_applied(version, &mname)
+        Ok(true)
+    }
+
+    # Rollback the most recently applied migration.
+    # Returns true if a migration was rolled back, false if nothing is applied.
+    F rollback_last(&mut self) -> Result<bool, str> {
+        max_ver := mut self.tracker.max_applied_version()
+        I max_ver < 0 {
+            R Ok(false)
+        }
+
+        # Find the migration with this version
+        found_idx := mut -1 as i64
+        i := mut 0
+        L i < self.migrations.len() {
+            tmp := mut self.migrations[i]
+            I tmp.version == max_ver {
+                found_idx = i as i64
+            }
+            i = i + 1
+        }
+
+        I found_idx < 0 {
+            R Err("Applied version {max_ver} not found in registered migrations")
+        }
+
+        tmp := mut self.migrations[found_idx as i64]
+        mname := mut tmp.name.clone()
+        down := mut tmp.down_sql.clone()
+
+        I down == "" {
+            R Err("Migration {max_ver} '{mname}' has empty down_sql — cannot rollback")
+        }
+
+        # Execute rollback (simulation) and remove from tracker
+        self.tracker.remove_record(max_ver)
+        Ok(true)
+    }
+
+    # Rollback all migrations down to (but not including) the given target version.
+    # Returns the number of migrations rolled back.
+    F rollback_to(&mut self, version: i64) -> Result<i64, str> {
+        rolled_back := mut 0 as i64
+        L {
+            max_ver := mut self.tracker.max_applied_version()
+            I max_ver < 0 || max_ver <= version {
+                # Nothing more to roll back
+                R Ok(rolled_back)
+            }
+
+            # Find the migration
+            found_idx := mut -1 as i64
+            i := mut 0
+            L i < self.migrations.len() {
+                tmp := mut self.migrations[i]
+                I tmp.version == max_ver {
+                    found_idx = i as i64
+                }
+                i = i + 1
+            }
+
+            I found_idx < 0 {
+                R Err("Applied version {max_ver} not found in registered migrations")
+            }
+
+            tmp := mut self.migrations[found_idx as i64]
+            mname := mut tmp.name.clone()
+            down := mut tmp.down_sql.clone()
+
+            I down == "" {
+                R Err("Migration {max_ver} '{mname}' has empty down_sql — cannot rollback")
+            }
+
+            self.tracker.remove_record(max_ver)
+            rolled_back = rolled_back + 1
+        }
+    }
+
+    # Return the status of all registered migrations.
+    F status(&self) -> Vec<MigrationRecord> {
+        result := mut Vec.new()
+        i := mut 0
+        L i < self.migrations.len() {
+            tmp := mut self.migrations[i]
+            ver := mut tmp.version
+            mname := mut tmp.name.clone()
+
+            I self.tracker.is_applied(ver) {
+                rec := mut MigrationRecord.new_applied(ver, &mname, 0)
+                result.push(rec)
+            } E {
+                # Check if Failed
+                is_failed := mut false
+                j := mut 0
+                L j < self.tracker.applied_versions.len() {
+                    trec := mut self.tracker.applied_versions[j]
+                    M trec.status {
+                        MigrationStatus.Failed => {
+                            I trec.version == ver {
+                                is_failed = true
+                            }
+                        },
+                        _ => {},
+                    }
+                    j = j + 1
+                }
+
+                I is_failed {
+                    rec := mut MigrationRecord.new_failed(ver, &mname, 0)
+                    result.push(rec)
+                } E {
+                    rec := mut MigrationRecord {
+                        version: ver,
+                        name: mname,
+                        applied_at: 0,
+                        status: MigrationStatus.Pending,
+                    }
+                    result.push(rec)
+                }
+            }
+            i = i + 1
+        }
+        result
+    }
+}

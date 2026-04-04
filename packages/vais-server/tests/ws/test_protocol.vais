@@ -1,0 +1,476 @@
+# test_protocol.vais — Unit tests for WsEnvelope, WsRpcRegistry, and StreamWriter
+
+U ws/protocol
+U ws/rpc
+U ws/stream_writer
+U ws/server
+
+# ============================================================================
+# WsEnvelope tests
+# ============================================================================
+
+F test_envelope_request_factory() -> i64 {
+    env := WsEnvelope.request("id-1", "chat.send", "{\"text\":\"hello\"}")
+    I env.id != "id-1" {
+        println("FAIL test_envelope_request_factory: expected id='id-1', got '{env.id}'")
+        R 1
+    }
+    I env.msg_type != "request" {
+        println("FAIL test_envelope_request_factory: expected msg_type='request', got '{env.msg_type}'")
+        R 1
+    }
+    I env.method != "chat.send" {
+        println("FAIL test_envelope_request_factory: expected method='chat.send', got '{env.method}'")
+        R 1
+    }
+    I env.error != "" {
+        println("FAIL test_envelope_request_factory: error should be empty for request")
+        R 1
+    }
+    println("PASS test_envelope_request_factory")
+    0
+}
+
+F test_envelope_response_factory() -> i64 {
+    env := WsEnvelope.response("id-2", "chat.send", "{\"ok\":true}")
+    I env.msg_type != "response" {
+        println("FAIL test_envelope_response_factory: expected msg_type='response'")
+        R 1
+    }
+    I env.error != "" {
+        println("FAIL test_envelope_response_factory: error should be empty for successful response")
+        R 1
+    }
+    println("PASS test_envelope_response_factory")
+    0
+}
+
+F test_envelope_event_factory() -> i64 {
+    env := WsEnvelope.event("ev-1", "user.joined", "{\"user\":\"alice\"}")
+    I env.msg_type != "event" {
+        println("FAIL test_envelope_event_factory: expected msg_type='event'")
+        R 1
+    }
+    I !env.is_event() {
+        println("FAIL test_envelope_event_factory: is_event() should return true")
+        R 1
+    }
+    println("PASS test_envelope_event_factory")
+    0
+}
+
+F test_envelope_error_response_factory() -> i64 {
+    env := WsEnvelope.error_response("id-3", "chat.send", "method not found")
+    I env.msg_type != "response" {
+        println("FAIL test_envelope_error_response_factory: expected msg_type='response'")
+        R 1
+    }
+    I env.error != "method not found" {
+        println("FAIL test_envelope_error_response_factory: unexpected error: {env.error}")
+        R 1
+    }
+    I !env.has_error() {
+        println("FAIL test_envelope_error_response_factory: has_error() should return true")
+        R 1
+    }
+    println("PASS test_envelope_error_response_factory")
+    0
+}
+
+F test_envelope_json_round_trip() -> i64 {
+    original := WsEnvelope.request("round-1", "ping", "pong-payload")
+    json := original.to_json()
+
+    I json == "" {
+        println("FAIL test_envelope_json_round_trip: to_json returned empty string")
+        R 1
+    }
+
+    result := WsEnvelope.from_json(json)
+    M result {
+        Err(e) => {
+            println("FAIL test_envelope_json_round_trip: from_json error: {e}")
+            R 1
+        },
+        Ok(decoded) => {
+            I decoded.id != original.id {
+                println("FAIL test_envelope_json_round_trip: id mismatch: got '{decoded.id}'")
+                R 1
+            }
+            I decoded.msg_type != original.msg_type {
+                println("FAIL test_envelope_json_round_trip: msg_type mismatch: got '{decoded.msg_type}'")
+                R 1
+            }
+            I decoded.method != original.method {
+                println("FAIL test_envelope_json_round_trip: method mismatch: got '{decoded.method}'")
+                R 1
+            }
+            I decoded.payload != original.payload {
+                println("FAIL test_envelope_json_round_trip: payload mismatch: got '{decoded.payload}'")
+                R 1
+            }
+            I decoded.error != original.error {
+                println("FAIL test_envelope_json_round_trip: error mismatch: got '{decoded.error}'")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_envelope_json_round_trip")
+    0
+}
+
+F test_envelope_from_json_missing_id() -> i64 {
+    # JSON without the required "id" field
+    bad_json := "{\"msg_type\":\"request\",\"method\":\"foo\",\"payload\":\"\",\"error\":\"\"}"
+    result := WsEnvelope.from_json(bad_json)
+    M result {
+        Ok(_) => {
+            println("FAIL test_envelope_from_json_missing_id: expected Err, got Ok")
+            R 1
+        },
+        Err(e) => {
+            I e == "" {
+                println("FAIL test_envelope_from_json_missing_id: error message should not be empty")
+                R 1
+            }
+        },
+    }
+    println("PASS test_envelope_from_json_missing_id")
+    0
+}
+
+F test_envelope_predicates() -> i64 {
+    req    := WsEnvelope.request("a", "m", "p")
+    resp   := WsEnvelope.response("b", "m", "p")
+    ev     := WsEnvelope.event("c", "m", "p")
+    stream := WsEnvelope.new("d", "stream", "s", "chunk", "")
+
+    I !req.is_request()    { println("FAIL test_envelope_predicates: is_request") R 1 }
+    I req.is_response()    { println("FAIL test_envelope_predicates: req.is_response should be false") R 1 }
+    I !resp.is_response()  { println("FAIL test_envelope_predicates: is_response") R 1 }
+    I !ev.is_event()       { println("FAIL test_envelope_predicates: is_event") R 1 }
+    I !stream.is_stream()  { println("FAIL test_envelope_predicates: is_stream") R 1 }
+
+    println("PASS test_envelope_predicates")
+    0
+}
+
+F test_envelope_to_json_contains_fields() -> i64 {
+    env  := WsEnvelope.response("abc", "my.method", "data-payload")
+    json := env.to_json()
+
+    # The JSON must contain the field names and values
+    I json_find_pattern(json, "\"id\"") < 0 {
+        println("FAIL test_envelope_to_json_contains_fields: 'id' field missing in JSON")
+        R 1
+    }
+    I json_find_pattern(json, "\"msg_type\"") < 0 {
+        println("FAIL test_envelope_to_json_contains_fields: 'msg_type' field missing in JSON")
+        R 1
+    }
+    I json_find_pattern(json, "my.method") < 0 {
+        println("FAIL test_envelope_to_json_contains_fields: method value missing in JSON")
+        R 1
+    }
+    I json_find_pattern(json, "data-payload") < 0 {
+        println("FAIL test_envelope_to_json_contains_fields: payload value missing in JSON")
+        R 1
+    }
+    println("PASS test_envelope_to_json_contains_fields: {json}")
+    0
+}
+
+# ============================================================================
+# WsRpcRegistry tests
+# ============================================================================
+
+F test_rpc_register_and_has_method() -> i64 {
+    registry := mut WsRpcRegistry.new()
+    registry.register("chat.send", 101)
+    registry.register("user.list", 202)
+
+    I !registry.has_method("chat.send") {
+        println("FAIL test_rpc_register_and_has_method: chat.send not found")
+        R 1
+    }
+    I !registry.has_method("user.list") {
+        println("FAIL test_rpc_register_and_has_method: user.list not found")
+        R 1
+    }
+    I registry.has_method("unknown.method") {
+        println("FAIL test_rpc_register_and_has_method: unknown.method should not be found")
+        R 1
+    }
+    println("PASS test_rpc_register_and_has_method")
+    0
+}
+
+F test_rpc_dispatch_known_method() -> i64 {
+    registry := mut WsRpcRegistry.new()
+    registry.register("chat.send", 42)
+
+    env    := WsEnvelope.request("r1", "chat.send", "hello")
+    result := registry.dispatch(env)
+
+    I result != 42 {
+        println("FAIL test_rpc_dispatch_known_method: expected handler_id=42, got {result}")
+        R 1
+    }
+    println("PASS test_rpc_dispatch_known_method")
+    0
+}
+
+F test_rpc_dispatch_unknown_method() -> i64 {
+    registry := mut WsRpcRegistry.new()
+    registry.register("chat.send", 42)
+
+    env    := WsEnvelope.request("r2", "no.such.method", "")
+    result := registry.dispatch(env)
+
+    I result != -1 {
+        println("FAIL test_rpc_dispatch_unknown_method: expected -1, got {result}")
+        R 1
+    }
+    println("PASS test_rpc_dispatch_unknown_method")
+    0
+}
+
+F test_rpc_register_replaces_existing() -> i64 {
+    registry := mut WsRpcRegistry.new()
+    registry.register("chat.send", 10)
+    registry.register("chat.send", 20)  # Should replace
+
+    I registry.handler_count() != 1 {
+        println("FAIL test_rpc_register_replaces_existing: expected 1 handler, got {registry.handler_count()}")
+        R 1
+    }
+
+    env    := WsEnvelope.request("r3", "chat.send", "")
+    result := registry.dispatch(env)
+    I result != 20 {
+        println("FAIL test_rpc_register_replaces_existing: expected handler_id=20, got {result}")
+        R 1
+    }
+
+    println("PASS test_rpc_register_replaces_existing")
+    0
+}
+
+F test_rpc_handler_count() -> i64 {
+    registry := mut WsRpcRegistry.new()
+
+    I registry.handler_count() != 0 {
+        println("FAIL test_rpc_handler_count: expected 0, got {registry.handler_count()}")
+        R 1
+    }
+
+    registry.register("a", 1)
+    registry.register("b", 2)
+    registry.register("c", 3)
+
+    I registry.handler_count() != 3 {
+        println("FAIL test_rpc_handler_count: expected 3, got {registry.handler_count()}")
+        R 1
+    }
+
+    println("PASS test_rpc_handler_count")
+    0
+}
+
+F test_rpc_find_handler_id() -> i64 {
+    registry := mut WsRpcRegistry.new()
+    registry.register("x.method", 999)
+
+    found := registry.find_handler_id("x.method")
+    I found != 999 {
+        println("FAIL test_rpc_find_handler_id: expected 999, got {found}")
+        R 1
+    }
+
+    missing := registry.find_handler_id("y.method")
+    I missing != -1 {
+        println("FAIL test_rpc_find_handler_id: expected -1 for missing method, got {missing}")
+        R 1
+    }
+
+    println("PASS test_rpc_find_handler_id")
+    0
+}
+
+# ============================================================================
+# StreamWriter tests
+# ============================================================================
+
+F test_stream_writer_initial_state() -> i64 {
+    writer := StreamWriter.new(1, "stream-abc")
+
+    I writer.conn_id != 1 {
+        println("FAIL test_stream_writer_initial_state: expected conn_id=1, got {writer.conn_id}")
+        R 1
+    }
+    I writer.stream_id != "stream-abc" {
+        println("FAIL test_stream_writer_initial_state: unexpected stream_id: {writer.stream_id}")
+        R 1
+    }
+    I writer.chunk_count != 0 {
+        println("FAIL test_stream_writer_initial_state: expected chunk_count=0, got {writer.chunk_count}")
+        R 1
+    }
+    I writer.has_data() {
+        println("FAIL test_stream_writer_initial_state: has_data() should be false initially")
+        R 1
+    }
+    println("PASS test_stream_writer_initial_state")
+    0
+}
+
+F test_stream_writer_chunk_counting() -> i64 {
+    writer := mut StreamWriter.new(2, "stream-xyz")
+    conn   := WsConnection.new(2, "127.0.0.1")
+
+    M writer.write(conn, "chunk-0") {
+        Err(e) => {
+            println("FAIL test_stream_writer_chunk_counting: write#0 error: {e.message}")
+            R 1
+        },
+        Ok(_) => {},
+    }
+    I writer.chunk_count != 1 {
+        println("FAIL test_stream_writer_chunk_counting: expected chunk_count=1, got {writer.chunk_count}")
+        R 1
+    }
+
+    M writer.write(conn, "chunk-1") {
+        Err(e) => {
+            println("FAIL test_stream_writer_chunk_counting: write#1 error: {e.message}")
+            R 1
+        },
+        Ok(_) => {},
+    }
+    I writer.chunk_count != 2 {
+        println("FAIL test_stream_writer_chunk_counting: expected chunk_count=2, got {writer.chunk_count}")
+        R 1
+    }
+
+    I !writer.has_data() {
+        println("FAIL test_stream_writer_chunk_counting: has_data() should be true after writes")
+        R 1
+    }
+    I writer.chunks_written() != 2 {
+        println("FAIL test_stream_writer_chunk_counting: chunks_written() should be 2")
+        R 1
+    }
+
+    println("PASS test_stream_writer_chunk_counting")
+    0
+}
+
+F test_stream_writer_flush_does_not_increment_count() -> i64 {
+    writer := mut StreamWriter.new(3, "stream-flush")
+    conn   := WsConnection.new(3, "127.0.0.1")
+
+    M writer.write(conn, "data") {
+        Err(e) => {
+            println("FAIL test_stream_writer_flush_does_not_increment_count: write error: {e.message}")
+            R 1
+        },
+        Ok(_) => {},
+    }
+
+    before_count := writer.chunk_count
+
+    M writer.flush(conn) {
+        Err(e) => {
+            println("FAIL test_stream_writer_flush_does_not_increment_count: flush error: {e.message}")
+            R 1
+        },
+        Ok(_) => {},
+    }
+
+    I writer.chunk_count != before_count {
+        println("FAIL test_stream_writer_flush_does_not_increment_count: flush should not change chunk_count")
+        R 1
+    }
+
+    println("PASS test_stream_writer_flush_does_not_increment_count")
+    0
+}
+
+F test_stream_writer_close_sends_stream_end() -> i64 {
+    writer := StreamWriter.new(4, "stream-close")
+    conn   := WsConnection.new(4, "127.0.0.1")
+
+    M writer.close(conn) {
+        Err(e) => {
+            println("FAIL test_stream_writer_close_sends_stream_end: close error: {e.message}")
+            R 1
+        },
+        Ok(_) => {},
+    }
+
+    println("PASS test_stream_writer_close_sends_stream_end")
+    0
+}
+
+F test_stream_writer_write_on_closed_connection_fails() -> i64 {
+    writer := mut StreamWriter.new(5, "stream-err")
+    conn   := mut WsConnection.new(5, "127.0.0.1")
+    conn.state = ConnectionState.Closed
+
+    M writer.write(conn, "payload") {
+        Ok(_) => {
+            println("FAIL test_stream_writer_write_on_closed_connection_fails: expected Err, got Ok")
+            R 1
+        },
+        Err(e) => {
+            I e.status != 400 {
+                println("FAIL test_stream_writer_write_on_closed_connection_fails: expected status=400, got {e.status}")
+                R 1
+            }
+        },
+    }
+
+    println("PASS test_stream_writer_write_on_closed_connection_fails")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    failures := mut 0
+
+    # WsEnvelope tests
+    failures += test_envelope_request_factory()
+    failures += test_envelope_response_factory()
+    failures += test_envelope_event_factory()
+    failures += test_envelope_error_response_factory()
+    failures += test_envelope_json_round_trip()
+    failures += test_envelope_from_json_missing_id()
+    failures += test_envelope_predicates()
+    failures += test_envelope_to_json_contains_fields()
+
+    # WsRpcRegistry tests
+    failures += test_rpc_register_and_has_method()
+    failures += test_rpc_dispatch_known_method()
+    failures += test_rpc_dispatch_unknown_method()
+    failures += test_rpc_register_replaces_existing()
+    failures += test_rpc_handler_count()
+    failures += test_rpc_find_handler_id()
+
+    # StreamWriter tests
+    failures += test_stream_writer_initial_state()
+    failures += test_stream_writer_chunk_counting()
+    failures += test_stream_writer_flush_does_not_increment_count()
+    failures += test_stream_writer_close_sends_stream_end()
+    failures += test_stream_writer_write_on_closed_connection_fails()
+
+    I failures > 0 {
+        println("FAILED: {failures} test(s) failed")
+        R 1
+    }
+    println("ALL TESTS PASSED (test_protocol)")
+    0
+}

@@ -1,0 +1,321 @@
+# test_logger.vais — Unit tests for structured JSON logging
+# Covers: JsonLogEntry.to_json(), generate_request_id() uniqueness, LogFormat enum.
+
+U util/log_json
+U middleware/logger
+U core/context
+
+# ============================================================================
+# JsonLogEntry.to_json() — verify output is well-formed JSON with correct fields
+# ============================================================================
+
+F test_json_log_entry_to_json_basic() -> i64 {
+    entry := JsonLogEntry.new("1712188800000", "INFO", "GET", "/health", 200, 12, "req-00000001")
+    result := entry.to_json()
+
+    # Must start with '{' and end with '}'
+    first_char := str_char_at(result, 0)
+    rlen       := str_len(result)
+    last_char  := str_char_at(result, rlen - 1)
+
+    I first_char != "{" {
+        println("FAIL test_json_log_entry_to_json_basic: expected leading '{'")
+        R 1
+    }
+    I last_char != "}" {
+        println("FAIL test_json_log_entry_to_json_basic: expected trailing '}'")
+        R 1
+    }
+    println("PASS test_json_log_entry_to_json_basic")
+    0
+}
+
+F test_json_log_entry_contains_ts() -> i64 {
+    entry  := JsonLogEntry.new("1712188800000", "INFO", "GET", "/", 200, 5, "req-00000002")
+    result := entry.to_json()
+    I !str_contains(result, "\"ts\":\"1712188800000\"") {
+        println("FAIL test_json_log_entry_contains_ts: ts field missing or wrong")
+        R 1
+    }
+    println("PASS test_json_log_entry_contains_ts")
+    0
+}
+
+F test_json_log_entry_contains_level() -> i64 {
+    entry  := JsonLogEntry.new("0", "DEBUG", "POST", "/echo", 201, 3, "req-00000003")
+    result := entry.to_json()
+    I !str_contains(result, "\"level\":\"DEBUG\"") {
+        println("FAIL test_json_log_entry_contains_level: level field missing or wrong")
+        R 1
+    }
+    println("PASS test_json_log_entry_contains_level")
+    0
+}
+
+F test_json_log_entry_contains_method_and_path() -> i64 {
+    entry  := JsonLogEntry.new("0", "INFO", "DELETE", "/users/7", 204, 8, "req-00000004")
+    result := entry.to_json()
+    I !str_contains(result, "\"method\":\"DELETE\"") {
+        println("FAIL test_json_log_entry_contains_method_and_path: method field wrong")
+        R 1
+    }
+    I !str_contains(result, "\"path\":\"/users/7\"") {
+        println("FAIL test_json_log_entry_contains_method_and_path: path field wrong")
+        R 1
+    }
+    println("PASS test_json_log_entry_contains_method_and_path")
+    0
+}
+
+F test_json_log_entry_status_numeric() -> i64 {
+    entry  := JsonLogEntry.new("0", "INFO", "GET", "/", 404, 2, "req-00000005")
+    result := entry.to_json()
+    # status must appear without quotes: "status":404
+    I !str_contains(result, "\"status\":404") {
+        println("FAIL test_json_log_entry_status_numeric: status should be a bare number")
+        R 1
+    }
+    println("PASS test_json_log_entry_status_numeric")
+    0
+}
+
+F test_json_log_entry_latency_numeric() -> i64 {
+    entry  := JsonLogEntry.new("0", "INFO", "GET", "/", 200, 137, "req-00000006")
+    result := entry.to_json()
+    I !str_contains(result, "\"latency_ms\":137") {
+        println("FAIL test_json_log_entry_latency_numeric: latency_ms should be a bare number")
+        R 1
+    }
+    println("PASS test_json_log_entry_latency_numeric")
+    0
+}
+
+F test_json_log_entry_contains_request_id() -> i64 {
+    entry  := JsonLogEntry.new("0", "INFO", "GET", "/ping", 200, 1, "req-00000007")
+    result := entry.to_json()
+    I !str_contains(result, "\"request_id\":\"req-00000007\"") {
+        println("FAIL test_json_log_entry_contains_request_id: request_id field missing or wrong")
+        R 1
+    }
+    println("PASS test_json_log_entry_contains_request_id")
+    0
+}
+
+# Escaping: a path containing a double-quote should be escaped in output.
+F test_json_log_entry_escapes_quotes() -> i64 {
+    entry  := JsonLogEntry.new("0", "INFO", "GET", "/a\"b", 200, 1, "req-00000008")
+    result := entry.to_json()
+    I !str_contains(result, "\\\"") {
+        println("FAIL test_json_log_entry_escapes_quotes: expected escaped quote in JSON output")
+        R 1
+    }
+    println("PASS test_json_log_entry_escapes_quotes")
+    0
+}
+
+# ============================================================================
+# generate_request_id() — verify uniqueness across successive calls
+# ============================================================================
+
+F test_generate_request_id_format() -> i64 {
+    id := generate_request_id()
+    I !str_contains(id, "req-") {
+        println("FAIL test_generate_request_id_format: expected 'req-' prefix, got: {id}")
+        R 1
+    }
+    println("PASS test_generate_request_id_format")
+    0
+}
+
+F test_generate_request_id_uniqueness() -> i64 {
+    id1 := generate_request_id()
+    id2 := generate_request_id()
+    id3 := generate_request_id()
+
+    I id1 == id2 {
+        println("FAIL test_generate_request_id_uniqueness: id1 == id2 ({id1})")
+        R 1
+    }
+    I id2 == id3 {
+        println("FAIL test_generate_request_id_uniqueness: id2 == id3 ({id2})")
+        R 1
+    }
+    I id1 == id3 {
+        println("FAIL test_generate_request_id_uniqueness: id1 == id3 ({id1})")
+        R 1
+    }
+    println("PASS test_generate_request_id_uniqueness")
+    0
+}
+
+F test_generate_request_id_length() -> i64 {
+    id  := generate_request_id()
+    # "req-" (4) + 8 digits = 12 characters minimum
+    len := str_len(id)
+    I len < 12 {
+        println("FAIL test_generate_request_id_length: expected >= 12 chars, got {len}: {id}")
+        R 1
+    }
+    println("PASS test_generate_request_id_length")
+    0
+}
+
+# ============================================================================
+# LogFormat enum — verify variants are distinct and constructors exist
+# ============================================================================
+
+F test_log_format_text_variant() -> i64 {
+    fmt := LogFormat.Text
+    M fmt {
+        LogFormat.Text => {
+            println("PASS test_log_format_text_variant")
+            R 0
+        },
+        LogFormat.Json => {
+            println("FAIL test_log_format_text_variant: matched Json, expected Text")
+            R 1
+        },
+    }
+}
+
+F test_log_format_json_variant() -> i64 {
+    fmt := LogFormat.Json
+    M fmt {
+        LogFormat.Json => {
+            println("PASS test_log_format_json_variant")
+            R 0
+        },
+        LogFormat.Text => {
+            println("FAIL test_log_format_json_variant: matched Text, expected Json")
+            R 1
+        },
+    }
+}
+
+F test_log_format_distinct() -> i64 {
+    text_fmt := LogFormat.Text
+    json_fmt := LogFormat.Json
+
+    text_is_text := M text_fmt { LogFormat.Text => true, LogFormat.Json => false, }
+    json_is_json := M json_fmt { LogFormat.Json => true, LogFormat.Text => false, }
+
+    I !text_is_text {
+        println("FAIL test_log_format_distinct: Text variant did not match Text")
+        R 1
+    }
+    I !json_is_json {
+        println("FAIL test_log_format_distinct: Json variant did not match Json")
+        R 1
+    }
+    println("PASS test_log_format_distinct")
+    0
+}
+
+# ============================================================================
+# LoggerMiddleware.json() — verify it creates a Json-format logger
+# ============================================================================
+
+F test_logger_middleware_json_constructor() -> i64 {
+    lm := LoggerMiddleware.json()
+    M lm.config.format {
+        LogFormat.Json => {
+            println("PASS test_logger_middleware_json_constructor")
+            R 0
+        },
+        LogFormat.Text => {
+            println("FAIL test_logger_middleware_json_constructor: expected Json format")
+            R 1
+        },
+    }
+}
+
+# LoggerMiddleware.default() must still use Text format (backwards compat).
+F test_logger_middleware_default_is_text() -> i64 {
+    lm := LoggerMiddleware.default()
+    M lm.config.format {
+        LogFormat.Text => {
+            println("PASS test_logger_middleware_default_is_text")
+            R 0
+        },
+        LogFormat.Json => {
+            println("FAIL test_logger_middleware_default_is_text: expected Text format")
+            R 1
+        },
+    }
+}
+
+# ============================================================================
+# Context.request_id — verify it is generated (non-empty) on construction
+# ============================================================================
+
+F test_context_has_request_id() -> i64 {
+    ctx := Context.new("GET", "/test")
+    I ctx.request_id == "" {
+        println("FAIL test_context_has_request_id: request_id must not be empty")
+        R 1
+    }
+    println("PASS test_context_has_request_id")
+    0
+}
+
+F test_context_request_ids_unique() -> i64 {
+    ctx1 := Context.new("GET", "/a")
+    ctx2 := Context.new("POST", "/b")
+    I ctx1.request_id == ctx2.request_id {
+        println("FAIL test_context_request_ids_unique: two contexts share request_id ({ctx1.request_id})")
+        R 1
+    }
+    println("PASS test_context_request_ids_unique")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    failures := mut 0
+
+    # JsonLogEntry.to_json()
+    failures += test_json_log_entry_to_json_basic()
+    failures += test_json_log_entry_contains_ts()
+    failures += test_json_log_entry_contains_level()
+    failures += test_json_log_entry_contains_method_and_path()
+    failures += test_json_log_entry_status_numeric()
+    failures += test_json_log_entry_latency_numeric()
+    failures += test_json_log_entry_contains_request_id()
+    failures += test_json_log_entry_escapes_quotes()
+
+    # generate_request_id()
+    failures += test_generate_request_id_format()
+    failures += test_generate_request_id_uniqueness()
+    failures += test_generate_request_id_length()
+
+    # LogFormat enum
+    failures += test_log_format_text_variant()
+    failures += test_log_format_json_variant()
+    failures += test_log_format_distinct()
+
+    # LoggerMiddleware constructors
+    failures += test_logger_middleware_json_constructor()
+    failures += test_logger_middleware_default_is_text()
+
+    # Context.request_id
+    failures += test_context_has_request_id()
+    failures += test_context_request_ids_unique()
+
+    I failures > 0 {
+        println("FAILED: {failures} test(s) failed")
+        R 1
+    }
+    println("ALL TESTS PASSED (test_logger)")
+    0
+}
+
+# ============================================================================
+# External runtime stubs needed by helpers called transitively
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_char_at(s: str, i: i64) -> str
+X F str_contains(s: str, sub: str) -> bool

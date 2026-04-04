@@ -1,0 +1,107 @@
+# Migration — Core migration data structures
+# Represents a single schema migration with up/down SQL
+# and a tracking record for applied migrations
+#
+# Design:
+#   - Migration: defines version, name, up_sql (apply), down_sql (rollback)
+#   - MigrationRecord: tracks the applied state of a migration
+#   - MigrationStatus: Pending | Applied | Failed
+
+# ============================================================================
+# MigrationStatus Enum
+# ============================================================================
+
+E MigrationStatus {
+    Pending,
+    Applied,
+    Failed,
+}
+
+X MigrationStatus {
+    # Convert status to string representation for storage
+    F as_str(&self) -> str {
+        M self {
+            MigrationStatus.Pending => "PENDING",
+            MigrationStatus.Applied => "APPLIED",
+            MigrationStatus.Failed  => "FAILED",
+        }
+    }
+
+    # Parse status from string
+    F from_str(s: &str) -> MigrationStatus {
+        I s == "APPLIED" {
+            MigrationStatus.Applied
+        } E I s == "FAILED" {
+            MigrationStatus.Failed
+        } E {
+            MigrationStatus.Pending
+        }
+    }
+}
+
+# ============================================================================
+# Migration Struct
+# ============================================================================
+
+# A single database migration, identified by a monotonically increasing version
+S Migration {
+    version: i64,
+    name: str,
+    up_sql: str,
+    down_sql: str,
+    timestamp: i64,
+}
+
+X Migration {
+    # Create a new Migration.
+    # timestamp is set to 0 by default; callers can set it via the field after construction.
+    F new(version: i64, name: &str, up_sql: &str, down_sql: &str) -> Migration {
+        Migration {
+            version,
+            name: name.to_string(),
+            up_sql: up_sql.to_string(),
+            down_sql: down_sql.to_string(),
+            timestamp: 0,
+        }
+    }
+}
+
+# ============================================================================
+# MigrationRecord Struct
+# ============================================================================
+
+# A record of an applied (or failed) migration, stored in the tracking table
+S MigrationRecord {
+    version: i64,
+    name: str,
+    applied_at: i64,
+    status: MigrationStatus,
+}
+
+X MigrationRecord {
+    # Create an Applied record
+    F new_applied(version: i64, name: &str, applied_at: i64) -> MigrationRecord {
+        MigrationRecord {
+            version,
+            name: name.to_string(),
+            applied_at,
+            status: MigrationStatus.Applied,
+        }
+    }
+
+    # Create a Failed record
+    F new_failed(version: i64, name: &str, applied_at: i64) -> MigrationRecord {
+        MigrationRecord {
+            version,
+            name: name.to_string(),
+            applied_at,
+            status: MigrationStatus.Failed,
+        }
+    }
+
+    # Generate the INSERT SQL for this record into the tracking table
+    F to_insert_sql(&self) -> str {
+        status_str := mut self.status.as_str()
+        "INSERT INTO _vaisdb_migrations (version, name, applied_at, status) VALUES ({self.version}, '{self.name}', {self.applied_at}, '{status_str}')"
+    }
+}

@@ -1,0 +1,526 @@
+# test_graphql.vais — Unit tests for GraphQL engine
+# Covers: schema building, query parsing, introspection, resolver dispatch,
+# argument extraction, mutation execution, and error handling.
+
+U api/graphql
+U api/graphql_execute
+
+# ============================================================================
+# Helpers — build a minimal test schema
+# ============================================================================
+
+F make_test_schema() -> GqlSchema {
+    schema := mut GqlSchema.new()
+
+    # Query field: user(id: ...)  resolver_id = 1
+    user_field := GqlField {
+        name:        "user",
+        field_type:  "User",
+        args:        Vec.new(),
+        resolver_id: 1,
+    }
+
+    # Query field: users  resolver_id = 2
+    users_field := GqlField {
+        name:        "users",
+        field_type:  "User",
+        args:        Vec.new(),
+        resolver_id: 2,
+    }
+
+    # Mutation field: createUser  resolver_id = 3
+    create_field := GqlField {
+        name:        "createUser",
+        field_type:  "User",
+        args:        Vec.new(),
+        resolver_id: 3,
+    }
+
+    schema.add_query(user_field)
+    schema.add_query(users_field)
+    schema.add_mutation(create_field)
+
+    # Register a User type for introspection
+    user_type := GqlType.new("User", GqlTypeKind.Object)
+    schema.add_type(user_type)
+
+    schema
+}
+
+# ============================================================================
+# Schema / parsing tests
+# ============================================================================
+
+F test_parse_empty_query() -> i64 {
+    req    := GqlRequest.new("")
+    schema := make_test_schema()
+    resp   := execute(schema, req)
+    I resp.ok != 0 {
+        println("FAIL test_parse_empty_query: expected error response")
+        R 1
+    }
+    I resp.errors.len() == 0 {
+        println("FAIL test_parse_empty_query: expected at least one error")
+        R 1
+    }
+    println("PASS test_parse_empty_query")
+    0
+}
+
+F test_parse_unknown_operation() -> i64 {
+    req    := GqlRequest.new("garbage { }")
+    schema := make_test_schema()
+    resp   := execute(schema, req)
+    I resp.ok != 0 {
+        println("FAIL test_parse_unknown_operation: expected error response")
+        R 1
+    }
+    println("PASS test_parse_unknown_operation")
+    0
+}
+
+F test_parse_query_keyword() -> i64 {
+    op := parse_operation("query { user { id } }")
+    I op.op_type != "query" {
+        println("FAIL test_parse_query_keyword: expected op_type='query', got '{op.op_type}'")
+        R 1
+    }
+    I op.field_name != "user" {
+        println("FAIL test_parse_query_keyword: expected field_name='user', got '{op.field_name}'")
+        R 1
+    }
+    I op.is_introspection != 0 {
+        println("FAIL test_parse_query_keyword: expected is_introspection=0")
+        R 1
+    }
+    println("PASS test_parse_query_keyword")
+    0
+}
+
+F test_parse_shorthand_query() -> i64 {
+    op := parse_operation("{ users { id name } }")
+    I op.op_type != "query" {
+        println("FAIL test_parse_shorthand_query: expected op_type='query', got '{op.op_type}'")
+        R 1
+    }
+    I op.field_name != "users" {
+        println("FAIL test_parse_shorthand_query: expected field_name='users', got '{op.field_name}'")
+        R 1
+    }
+    println("PASS test_parse_shorthand_query")
+    0
+}
+
+F test_parse_mutation_keyword() -> i64 {
+    op := parse_operation("mutation { createUser(name: \"Alice\") { id } }")
+    I op.op_type != "mutation" {
+        println("FAIL test_parse_mutation_keyword: expected op_type='mutation', got '{op.op_type}'")
+        R 1
+    }
+    I op.field_name != "createUser" {
+        println("FAIL test_parse_mutation_keyword: expected field_name='createUser', got '{op.field_name}'")
+        R 1
+    }
+    println("PASS test_parse_mutation_keyword")
+    0
+}
+
+# ============================================================================
+# Introspection tests
+# ============================================================================
+
+F test_introspection_schema() -> i64 {
+    schema := make_test_schema()
+    req    := GqlRequest.new("{ __schema { types { name } } }")
+    resp   := execute(schema, req)
+    I resp.ok != 1 {
+        println("FAIL test_introspection_schema: expected ok=1")
+        R 1
+    }
+    I resp.data == "null" {
+        println("FAIL test_introspection_schema: data should not be null")
+        R 1
+    }
+    println("PASS test_introspection_schema")
+    0
+}
+
+F test_introspection_type_found() -> i64 {
+    schema    := make_test_schema()
+    variables := "{\"name\": \"User\"}"
+    req       := GqlRequest.new("{ __type { name } }").with_variables(variables)
+    resp      := execute(schema, req)
+    I resp.ok != 1 {
+        println("FAIL test_introspection_type_found: expected ok=1")
+        R 1
+    }
+    println("PASS test_introspection_type_found")
+    0
+}
+
+F test_introspection_type_not_found() -> i64 {
+    schema    := make_test_schema()
+    variables := "{\"name\": \"NonExistent\"}"
+    req       := GqlRequest.new("{ __type { name } }").with_variables(variables)
+    resp      := execute(schema, req)
+    # __type for unknown type returns null data, but still ok=1
+    I resp.ok != 1 {
+        println("FAIL test_introspection_type_not_found: expected ok=1")
+        R 1
+    }
+    println("PASS test_introspection_type_not_found")
+    0
+}
+
+F test_introspection_unknown_field() -> i64 {
+    schema := make_test_schema()
+    req    := GqlRequest.new("{ __fields }")
+    resp   := execute(schema, req)
+    I resp.ok != 0 {
+        println("FAIL test_introspection_unknown_field: expected error for unknown introspection field")
+        R 1
+    }
+    println("PASS test_introspection_unknown_field")
+    0
+}
+
+# ============================================================================
+# Resolver dispatch — unknown field
+# ============================================================================
+
+F test_unknown_query_field() -> i64 {
+    schema := make_test_schema()
+    req    := GqlRequest.new("{ nonExistent { id } }")
+    resp   := execute(schema, req)
+    I resp.ok != 0 {
+        println("FAIL test_unknown_query_field: expected error for unknown field")
+        R 1
+    }
+    I resp.errors.len() == 0 {
+        println("FAIL test_unknown_query_field: expected at least one error")
+        R 1
+    }
+    println("PASS test_unknown_query_field")
+    0
+}
+
+F test_unknown_mutation_field() -> i64 {
+    schema := make_test_schema()
+    req    := GqlRequest.new("mutation { deleteUser { id } }")
+    resp   := execute(schema, req)
+    I resp.ok != 0 {
+        println("FAIL test_unknown_mutation_field: expected error for unknown mutation field")
+        R 1
+    }
+    println("PASS test_unknown_mutation_field")
+    0
+}
+
+# ============================================================================
+# find_resolver_id tests
+# ============================================================================
+
+F test_find_resolver_id_found() -> i64 {
+    schema := make_test_schema()
+    rid    := find_resolver_id(schema.queries, "user")
+    I rid != 1 {
+        println("FAIL test_find_resolver_id_found: expected resolver_id=1, got {rid}")
+        R 1
+    }
+    println("PASS test_find_resolver_id_found")
+    0
+}
+
+F test_find_resolver_id_second() -> i64 {
+    schema := make_test_schema()
+    rid    := find_resolver_id(schema.queries, "users")
+    I rid != 2 {
+        println("FAIL test_find_resolver_id_second: expected resolver_id=2, got {rid}")
+        R 1
+    }
+    println("PASS test_find_resolver_id_second")
+    0
+}
+
+F test_find_resolver_id_mutation() -> i64 {
+    schema := make_test_schema()
+    rid    := find_resolver_id(schema.mutations, "createUser")
+    I rid != 3 {
+        println("FAIL test_find_resolver_id_mutation: expected resolver_id=3, got {rid}")
+        R 1
+    }
+    println("PASS test_find_resolver_id_mutation")
+    0
+}
+
+F test_find_resolver_id_missing() -> i64 {
+    schema := make_test_schema()
+    rid    := find_resolver_id(schema.queries, "ghost")
+    I rid != 0 - 1 {
+        println("FAIL test_find_resolver_id_missing: expected -1 for unknown field, got {rid}")
+        R 1
+    }
+    println("PASS test_find_resolver_id_missing")
+    0
+}
+
+# ============================================================================
+# Argument extraction tests (GqlExecutor / extract_arguments)
+# ============================================================================
+
+F test_extract_args_present() -> i64 {
+    query := "query { user(id: 42) { name } }"
+    op    := GqlOperation.new("query", "user", query, "")
+    args  := extract_arguments(query, op)
+    I args != "id: 42" {
+        println("FAIL test_extract_args_present: expected 'id: 42', got '{args}'")
+        R 1
+    }
+    println("PASS test_extract_args_present")
+    0
+}
+
+F test_extract_args_none() -> i64 {
+    query := "{ users { id name } }"
+    op    := GqlOperation.new("query", "users", query, "")
+    args  := extract_arguments(query, op)
+    I args != "" {
+        println("FAIL test_extract_args_none: expected '', got '{args}'")
+        R 1
+    }
+    println("PASS test_extract_args_none")
+    0
+}
+
+F test_extract_args_mutation() -> i64 {
+    query := "mutation { createUser(name: \"Bob\", role: \"admin\") { id } }"
+    op    := GqlOperation.new("mutation", "createUser", query, "")
+    args  := extract_arguments(query, op)
+    I args != "name: \"Bob\", role: \"admin\"" {
+        println("FAIL test_extract_args_mutation: unexpected args '{args}'")
+        R 1
+    }
+    println("PASS test_extract_args_mutation")
+    0
+}
+
+# ============================================================================
+# GqlResponse helpers
+# ============================================================================
+
+F test_gql_response_success_json() -> i64 {
+    resp := GqlResponse.success("{\"id\": 1}")
+    json := resp.to_json()
+    I json != "{\"data\": {\"id\": 1}}" {
+        println("FAIL test_gql_response_success_json: got '{json}'")
+        R 1
+    }
+    println("PASS test_gql_response_success_json")
+    0
+}
+
+F test_gql_response_error_json() -> i64 {
+    resp := GqlResponse.error("Something went wrong")
+    json := resp.to_json()
+    I resp.ok != 0 {
+        println("FAIL test_gql_response_error_json: expected ok=0")
+        R 1
+    }
+    I resp.errors.len() != 1 {
+        println("FAIL test_gql_response_error_json: expected 1 error")
+        R 1
+    }
+    println("PASS test_gql_response_error_json")
+    0
+}
+
+F test_gql_error_to_json() -> i64 {
+    err  := GqlError.new("field not found")
+    json := err.to_json()
+    I json != "{\"message\": \"field not found\", \"locations\": []}" {
+        println("FAIL test_gql_error_to_json: got '{json}'")
+        R 1
+    }
+    println("PASS test_gql_error_to_json")
+    0
+}
+
+# ============================================================================
+# GqlSchema builder
+# ============================================================================
+
+F test_schema_add_type() -> i64 {
+    schema := mut GqlSchema.new()
+    t      := GqlType.new("Post", GqlTypeKind.Object)
+    schema.add_type(t)
+    I schema.types.len() != 1 {
+        println("FAIL test_schema_add_type: expected 1 type, got {schema.types.len()}")
+        R 1
+    }
+    println("PASS test_schema_add_type")
+    0
+}
+
+F test_schema_add_query_and_mutation() -> i64 {
+    schema := make_test_schema()
+    I schema.queries.len() != 2 {
+        println("FAIL test_schema_add_query_and_mutation: expected 2 queries, got {schema.queries.len()}")
+        R 1
+    }
+    I schema.mutations.len() != 1 {
+        println("FAIL test_schema_add_query_and_mutation: expected 1 mutation, got {schema.mutations.len()}")
+        R 1
+    }
+    println("PASS test_schema_add_query_and_mutation")
+    0
+}
+
+# ============================================================================
+# GqlExecutor unit tests
+# ============================================================================
+
+F test_executor_unknown_query_field() -> i64 {
+    schema    := make_test_schema()
+    operation := GqlOperation.new("query", "ghost", "{ ghost }", "")
+    executor  := GqlExecutor.new()
+    resp      := executor.execute_query(schema, operation)
+    I resp.ok != 0 {
+        println("FAIL test_executor_unknown_query_field: expected error response")
+        R 1
+    }
+    println("PASS test_executor_unknown_query_field")
+    0
+}
+
+F test_executor_unknown_mutation_field() -> i64 {
+    schema    := make_test_schema()
+    operation := GqlOperation.new("mutation", "deleteUser", "mutation { deleteUser }", "")
+    executor  := GqlExecutor.new()
+    resp      := executor.execute_mutation(schema, operation)
+    I resp.ok != 0 {
+        println("FAIL test_executor_unknown_mutation_field: expected error response")
+        R 1
+    }
+    println("PASS test_executor_unknown_mutation_field")
+    0
+}
+
+# ============================================================================
+# extract_type_name_from_variables tests
+# ============================================================================
+
+F test_extract_type_name_found() -> i64 {
+    name := extract_type_name_from_variables("{\"name\": \"User\"}")
+    I name != "User" {
+        println("FAIL test_extract_type_name_found: expected 'User', got '{name}'")
+        R 1
+    }
+    println("PASS test_extract_type_name_found")
+    0
+}
+
+F test_extract_type_name_empty_variables() -> i64 {
+    name := extract_type_name_from_variables("")
+    I name != "Query" {
+        println("FAIL test_extract_type_name_empty_variables: expected 'Query', got '{name}'")
+        R 1
+    }
+    println("PASS test_extract_type_name_empty_variables")
+    0
+}
+
+F test_extract_type_name_missing_key() -> i64 {
+    name := extract_type_name_from_variables("{\"foo\": \"bar\"}")
+    I name != "Query" {
+        println("FAIL test_extract_type_name_missing_key: expected 'Query', got '{name}'")
+        R 1
+    }
+    println("PASS test_extract_type_name_missing_key")
+    0
+}
+
+# ============================================================================
+# GqlRequest builder
+# ============================================================================
+
+F test_gql_request_builder() -> i64 {
+    req := GqlRequest.new("{ users }").with_variables("{\"limit\": 10}").with_operation("ListUsers")
+    I req.query != "{ users }" {
+        println("FAIL test_gql_request_builder: unexpected query '{req.query}'")
+        R 1
+    }
+    I req.variables != "{\"limit\": 10}" {
+        println("FAIL test_gql_request_builder: unexpected variables '{req.variables}'")
+        R 1
+    }
+    I req.operation_name != "ListUsers" {
+        println("FAIL test_gql_request_builder: unexpected operation_name '{req.operation_name}'")
+        R 1
+    }
+    println("PASS test_gql_request_builder")
+    0
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+F main() -> i64 {
+    failures := mut 0
+
+    # Parsing
+    failures += test_parse_empty_query()
+    failures += test_parse_unknown_operation()
+    failures += test_parse_query_keyword()
+    failures += test_parse_shorthand_query()
+    failures += test_parse_mutation_keyword()
+
+    # Introspection
+    failures += test_introspection_schema()
+    failures += test_introspection_type_found()
+    failures += test_introspection_type_not_found()
+    failures += test_introspection_unknown_field()
+
+    # Resolver dispatch (unknown field paths)
+    failures += test_unknown_query_field()
+    failures += test_unknown_mutation_field()
+
+    # find_resolver_id
+    failures += test_find_resolver_id_found()
+    failures += test_find_resolver_id_second()
+    failures += test_find_resolver_id_mutation()
+    failures += test_find_resolver_id_missing()
+
+    # Argument extraction
+    failures += test_extract_args_present()
+    failures += test_extract_args_none()
+    failures += test_extract_args_mutation()
+
+    # GqlResponse helpers
+    failures += test_gql_response_success_json()
+    failures += test_gql_response_error_json()
+    failures += test_gql_error_to_json()
+
+    # Schema builder
+    failures += test_schema_add_type()
+    failures += test_schema_add_query_and_mutation()
+
+    # GqlExecutor unit
+    failures += test_executor_unknown_query_field()
+    failures += test_executor_unknown_mutation_field()
+
+    # extract_type_name_from_variables
+    failures += test_extract_type_name_found()
+    failures += test_extract_type_name_empty_variables()
+    failures += test_extract_type_name_missing_key()
+
+    # GqlRequest builder
+    failures += test_gql_request_builder()
+
+    I failures > 0 {
+        println("FAILED: {failures} test(s) failed")
+        R 1
+    }
+    println("ALL TESTS PASSED (test_graphql)")
+    0
+}
