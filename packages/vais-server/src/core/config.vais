@@ -1,34 +1,21 @@
 # vais-server Server Configuration
-# Runtime settings with defaults and validation
-
-U core/error
-U util/yaml
-
-# ============================================================================
-# Allowed environment values
-# ============================================================================
-
-E EnvMode {
-    Dev,
-    Prod,
-}
+# Runtime settings with defaults
 
 # ============================================================================
 # ServerConfig — all tunable server parameters
 # ============================================================================
 
 S ServerConfig {
-    port: u16,               # Listening port. Default: 8080
-    host: str,               # Bind address. Default: "0.0.0.0"
-    env: str,                # "dev" or "prod". Default: "dev"
-    max_connections: u32,    # Concurrent connection limit. Default: 1000
-    read_timeout_ms: u32,    # Per-request read deadline in ms. Default: 5000
-    write_timeout_ms: u32,   # Per-request write deadline in ms. Default: 5000
-    log_level: str,          # "debug" | "info" | "warn" | "error". Default: "info"
+    port: u16,
+    host: str,
+    env: str,
+    max_connections: u32,
+    read_timeout_ms: u32,
+    write_timeout_ms: u32,
+    log_level: str,
 }
 
 X ServerConfig {
-    # Returns a sensible out-of-the-box configuration
     F default() -> ServerConfig {
         ServerConfig {
             port: 8080,
@@ -41,211 +28,11 @@ X ServerConfig {
         }
     }
 
-    # Validates all fields; returns Err with the first violation found
-    F validate(self) -> Result<(), VaisServerError> {
-        I self.port == 0 {
-            R Err(VaisServerError.bad_request("port must be greater than 0"))
-        }
-
-        I self.max_connections == 0 {
-            R Err(VaisServerError.bad_request("max_connections must be greater than 0"))
-        }
-
-        I self.read_timeout_ms == 0 {
-            R Err(VaisServerError.bad_request("read_timeout_ms must be greater than 0"))
-        }
-
-        I self.write_timeout_ms == 0 {
-            R Err(VaisServerError.bad_request("write_timeout_ms must be greater than 0"))
-        }
-
-        # Validate env string
-        valid_env := self.env == "dev" || self.env == "prod"
-        I !valid_env {
-            R Err(VaisServerError.bad_request("env must be \"dev\" or \"prod\""))
-        }
-
-        # Validate log_level string
-        valid_level := self.log_level == "debug" || self.log_level == "info" || self.log_level == "warn" || self.log_level == "error"
-        I !valid_level {
-            R Err(VaisServerError.bad_request("log_level must be one of: debug, info, warn, error"))
-        }
-
-        Ok(())
-    }
-
-    # Returns true when running in production mode
     F is_prod(self) -> bool {
         self.env == "prod"
     }
 
-    # Returns the full bind address string, e.g. "0.0.0.0:8080"
     F addr(self) -> str {
         "{self.host}:{self.port}"
     }
-
-    # -------------------------------------------------------------------------
-    # YAML file loading
-    # -------------------------------------------------------------------------
-
-    # Load ServerConfig from a YAML file.
-    #
-    # Expected YAML format:
-    #   server:
-    #     port: 8080
-    #     host: 0.0.0.0
-    #     env: dev
-    #     max_connections: 1000
-    #     read_timeout_ms: 5000
-    #     write_timeout_ms: 5000
-    #     log_level: info
-    #
-    # Missing keys fall back to ServerConfig.default() values.
-    F load_from_file(path: str) -> Result<ServerConfig, str> {
-        raw := yaml_read_file(path)
-        M parse_yaml(raw) {
-            Err(e) => { R Err("config: failed to parse YAML file '" + path + "': " + e) },
-            Ok(root) => {
-                # Navigate into the "server" block; if absent, use an empty map
-                server_node := M root.yaml_get_nested("server") {
-                    Ok(n)  => { n },
-                    Err(_) => { YamlNode.make_map() },
-                }
-
-                defaults := ServerConfig.default()
-
-                port := M server_node.yaml_get_int("port") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.port },
-                }
-
-                host := M server_node.yaml_get_str("host") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.host },
-                }
-
-                env := M server_node.yaml_get_str("env") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.env },
-                }
-
-                max_connections := M server_node.yaml_get_int("max_connections") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.max_connections },
-                }
-
-                read_timeout_ms := M server_node.yaml_get_int("read_timeout_ms") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.read_timeout_ms },
-                }
-
-                write_timeout_ms := M server_node.yaml_get_int("write_timeout_ms") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.write_timeout_ms },
-                }
-
-                log_level := M server_node.yaml_get_str("log_level") {
-                    Ok(v)  => { v },
-                    Err(_) => { defaults.log_level },
-                }
-
-                Ok(ServerConfig {
-                    port:             port,
-                    host:             host,
-                    env:              env,
-                    max_connections:  max_connections,
-                    read_timeout_ms:  read_timeout_ms,
-                    write_timeout_ms: write_timeout_ms,
-                    log_level:        log_level,
-                })
-            },
-        }
-    }
-
-    # Load ServerConfig from a YAML file and then overlay environment variables.
-    #
-    # Environment variables that are checked (and their corresponding fields):
-    #   SERVER_PORT            → port
-    #   SERVER_HOST            → host
-    #   SERVER_ENV             → env
-    #   SERVER_MAX_CONNECTIONS → max_connections
-    #   SERVER_READ_TIMEOUT_MS → read_timeout_ms
-    #   SERVER_WRITE_TIMEOUT   → write_timeout_ms
-    #   SERVER_LOG_LEVEL       → log_level
-    #
-    # A variable that is set to the empty string is treated as "not provided"
-    # and the file (or default) value is kept.
-    F load_with_env_override(path: str) -> Result<ServerConfig, str> {
-        base := M ServerConfig.load_from_file(path) {
-            Ok(c)  => { c },
-            Err(e) => { R Err(e) },
-        }
-
-        port_env := env_get("SERVER_PORT")
-        port := I str_len(port_env) > 0 {
-            str_to_i64(port_env)
-        } E {
-            base.port
-        }
-
-        host_env := env_get("SERVER_HOST")
-        host := I str_len(host_env) > 0 {
-            host_env
-        } E {
-            base.host
-        }
-
-        env_val_raw := env_get("SERVER_ENV")
-        env_val := I str_len(env_val_raw) > 0 {
-            env_val_raw
-        } E {
-            base.env
-        }
-
-        max_conn_env := env_get("SERVER_MAX_CONNECTIONS")
-        max_connections := I str_len(max_conn_env) > 0 {
-            str_to_i64(max_conn_env)
-        } E {
-            base.max_connections
-        }
-
-        read_timeout_env := env_get("SERVER_READ_TIMEOUT_MS")
-        read_timeout_ms := I str_len(read_timeout_env) > 0 {
-            str_to_i64(read_timeout_env)
-        } E {
-            base.read_timeout_ms
-        }
-
-        write_timeout_env := env_get("SERVER_WRITE_TIMEOUT_MS")
-        write_timeout_ms := I str_len(write_timeout_env) > 0 {
-            str_to_i64(write_timeout_env)
-        } E {
-            base.write_timeout_ms
-        }
-
-        log_level_env := env_get("SERVER_LOG_LEVEL")
-        log_level := I str_len(log_level_env) > 0 {
-            log_level_env
-        } E {
-            base.log_level
-        }
-
-        Ok(ServerConfig {
-            port:             port,
-            host:             host,
-            env:              env_val,
-            max_connections:  max_connections,
-            read_timeout_ms:  read_timeout_ms,
-            write_timeout_ms: write_timeout_ms,
-            log_level:        log_level,
-        })
-    }
 }
-
-# ============================================================================
-# External runtime stubs (forwarded from util/yaml when linking)
-# ============================================================================
-
-X F str_len(s: str) -> i64
-X F str_to_i64(s: str) -> i64
-X F env_get(key: str) -> str

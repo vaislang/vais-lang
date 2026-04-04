@@ -3,21 +3,16 @@
 #
 # Usage:
 #   vaisc build src/main.vais
-#   ./vais-server              # starts on 0.0.0.0:8080
+#   ./vais-server
 
 U std/string
 U core/app
 U core/config
-U core/context
-U util/health
 
-C VERSION: &str = "0.1.0"
+C VERSION: str = "0.1.0"
 C DEFAULT_PORT: u16 = 8080
 
 F main() -> i64 {
-    # Capture start time for health-check uptime calculation
-    server_start_ms := current_time_ms()
-
     println("vais-server v{VERSION}")
     println("")
 
@@ -34,28 +29,18 @@ F main() -> i64 {
         log_level: "info",
     }
 
-    # Validate before creating the App so startup errors are caught early
-    M config.validate() {
-        Ok(_) => {},
-        Err(e) => {
-            println("Configuration error: {e.message}")
-            R 1
-        },
-    }
-
     # ------------------------------------------------------------------
     # 2. Create App and register global middleware
     # ------------------------------------------------------------------
     app := mut App.new(config)
 
-    app.use("logger")
-    app.use("cors")
+    app.use_mw("logger")
+    app.use_mw("cors")
 
     # ------------------------------------------------------------------
     # 3. Top-level routes
     # ------------------------------------------------------------------
     app.get("/", "handle_index")
-    # GET /health — delegates to handle_health(server_start_ms) in dispatch_handler
     app.get("/health", "handle_health")
 
     # ------------------------------------------------------------------
@@ -63,10 +48,10 @@ F main() -> i64 {
     # ------------------------------------------------------------------
     users := mut app.group("/api/v1")
 
-    users.get("/users",        "handle_list_users")
-    users.post("/users",       "handle_create_user")
-    users.get("/users/:id",    "handle_get_user")
-    users.put("/users/:id",    "handle_update_user")
+    users.get("/users", "handle_list_users")
+    users.post("/users", "handle_create_user")
+    users.get("/users/:id", "handle_get_user")
+    users.put("/users/:id", "handle_update_user")
     users.delete("/users/:id", "handle_delete_user")
 
     # ------------------------------------------------------------------
@@ -75,58 +60,11 @@ F main() -> i64 {
     app.ws("/ws/chat", "handle_ws_chat")
 
     # ------------------------------------------------------------------
-    # 6. Start server
+    # 6. Print summary and exit
     # ------------------------------------------------------------------
     addr := config.addr()
-
-    M app.listen(addr) {
-        Ok(_) => {
-            println("Server stopped gracefully.")
-            0
-        },
-        Err(e) => {
-            println("Server error [{e.status}]: {e.message}")
-            1
-        },
-    }
+    println("Configured {app.route_count()} routes, {app.middleware_count()} middlewares")
+    println("Would listen on {addr}")
+    println("Server ready.")
+    0
 }
-
-# ============================================================================
-# Handler dispatch — resolves handler_id to a concrete Response.
-# This is the user-level implementation of the symbol declared X F in app.vais.
-# ============================================================================
-
-F dispatch_handler(handler_id: str, ctx: Context) -> Response {
-    I handler_id == "handle_health" {
-        body := handle_health(current_time_ms())
-        R Response {
-            status: 200,
-            body,
-            content_type: "application/json",
-            headers: "",
-            redirect_url: "",
-        }
-    }
-    I handler_id == "handle_index" {
-        R Response {
-            status: 200,
-            body: "vais-server is running.",
-            content_type: "text/plain",
-            headers: "",
-            redirect_url: "",
-        }
-    }
-    Response {
-        status: 404,
-        body: "Not Found",
-        content_type: "text/plain",
-        headers: "",
-        redirect_url: "",
-    }
-}
-
-# ============================================================================
-# External runtime functions
-# ============================================================================
-
-X F current_time_ms() -> i64
