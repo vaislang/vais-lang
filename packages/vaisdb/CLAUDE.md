@@ -62,9 +62,12 @@ See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
 Current phase: Test Compilation — Phase 158 strict type coercion 대응 중. 221 TC 에러 (6개 테스트). See ROADMAP.md "현재 작업 (2026-03-29 #4)" for details.
 
 ## Compiler Setup
-- **Working compiler**: `/Users/sswoo/study/projects/vais/target/debug/vaisc` (Mar 24, pointer auto-deref 포함)
+- **Working compiler**: `~/.cargo/bin/vaisc` (canonical install path; override with `VAISC` env var)
+  - ⚠️ `/opt/homebrew/bin/vaisc` (v1.0.0, 2026-03-11)는 multi-line import 미지원 — 사용 금지
+  - `~/.cargo/bin/vaisc` 또는 `/Users/sswoo/study/projects/vais/target/debug/vaisc` 사용
 - **std**: `/tmp/vais-lib/std` → symlink to `/Users/sswoo/study/projects/vais/std`
-- **Build command**: `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" VAIS_SINGLE_MODULE=1 VAIS_TC_NONFATAL=1 vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
+  - 심링크 없으면: `mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/std /tmp/vais-lib/std`
+- **Build command**: `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" VAIS_SINGLE_MODULE=1 VAIS_TC_NONFATAL=1 ~/.cargo/bin/vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
 
 ## Known Compiler Issues (2026-03-29)
 - **Phase 158 strict type coercion**: implicit bool↔i64, int↔float, f32↔f64, str↔i64 금지 — 명시적 `as` 캐스트 필수

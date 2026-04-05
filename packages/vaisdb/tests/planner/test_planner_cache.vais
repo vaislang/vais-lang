@@ -1,0 +1,406 @@
+# Phase 11 — Hybrid Query Planner Unit Tests: Cache & Statistics
+# Tests: PlanCacheKey, PlanCacheEntry, PlanCacheStats, PlanCache,
+#         ExplainOptions, StatisticsConfig, TableColumnStats, AnalyzeResult
+
+U std/test.{describe, it, assert_eq, assert_eq_str, assert_ne, assert_true, assert_false};
+U std/vec.Vec;
+
+U planner/cache.{
+    PlanCacheKey, PlanCacheEntry, PlanCacheStats, PlanCache,
+    DEFAULT_MAX_ENTRIES, normalize_query,
+};
+U planner/explain.{
+    ExplainFormat, ExplainOptions,
+    format_hybrid_cost, explain_plan,
+};
+U planner/statistics.{
+    TableColumnStats, StatisticsConfig, AnalyzeResult,
+    DEFAULT_SAMPLE_SIZE, DEFAULT_HISTOGRAM_BUCKETS, MIN_ROWS_FOR_SAMPLING,
+    pseudo_random, compare_values, build_histogram, reservoir_sample,
+};
+U sql/types.{SqlValue};
+U storage/hash.{fnv1a_hash};
+
+# ==========================================================================
+# Planner — PlanCacheKey
+# ==========================================================================
+
+describe("PlanCacheKey", |t| {
+    it("new creates key with hash from SQL string", || {
+        key := mut PlanCacheKey.new("SELECT * FROM users WHERE id = $1");
+        assert_ne(key.hash, 0u64);
+        assert_eq_str(key.normalized_sql, "SELECT * FROM users WHERE id = $1");
+    });
+
+    it("same SQL produces same hash", || {
+        key1 := mut PlanCacheKey.new("SELECT * FROM t");
+        key2 := mut PlanCacheKey.new("SELECT * FROM t");
+        assert_true(key1.eq(&key2) as i64);
+    });
+
+    it("different SQL produces different hash", || {
+        key1 := mut PlanCacheKey.new("SELECT * FROM t");
+        key2 := mut PlanCacheKey.new("SELECT * FROM u");
+        assert_false(key1.eq(&key2) as i64);
+    });
+
+    it("from_hash creates lookup key", || {
+        key := mut PlanCacheKey.from_hash(12345);
+        assert_eq(key.hash, 12345u64);
+        assert_eq_str(key.normalized_sql, "");
+    });
+});
+
+# ==========================================================================
+# Planner — PlanCacheStats
+# ==========================================================================
+
+describe("PlanCacheStats", |t| {
+    it("new creates zero stats", || {
+        stats := mut PlanCacheStats.new();
+        assert_eq(stats.hits, 0u64);
+        assert_eq(stats.misses, 0u64);
+        assert_eq(stats.evictions, 0u64);
+        assert_eq(stats.entries, 0u64);
+    });
+
+    it("hit_rate returns 0 when no queries", || {
+        stats := mut PlanCacheStats.new();
+        assert_eq(stats.hit_rate(), 0.0);
+    });
+
+    it("hit_rate computes correctly", || {
+        stats := mut PlanCacheStats.new();
+        stats.hits = 75;
+        stats.misses = 25;
+        # 75 / 100 = 0.75
+        rate := mut stats.hit_rate();
+        assert_true((rate > 0.749 && rate < 0.751) as i64);
+    });
+
+    it("hit_rate is 1.0 for all hits", || {
+        stats := mut PlanCacheStats.new();
+        stats.hits = 100;
+        stats.misses = 0;
+        rate := mut stats.hit_rate();
+        assert_true((rate > 0.999 && rate < 1.001) as i64);
+    });
+});
+
+# ==========================================================================
+# Planner — PlanCache
+# ==========================================================================
+
+describe("PlanCache", |t| {
+    it("new creates empty cache with default capacity", || {
+        cache := mut PlanCache.new();
+        assert_eq(cache.len(), 0u64);
+        assert_true(cache.is_empty() as i64);
+        assert_eq(cache.capacity(), DEFAULT_MAX_ENTRIES);
+    });
+
+    it("with_capacity sets custom max entries", || {
+        cache := mut PlanCache.with_capacity(64);
+        assert_eq(cache.capacity(), 64u64);
+    });
+
+    it("invalidate_all clears the cache", || {
+        cache := mut PlanCache.new();
+        # Insert something (need a HybridPlanNode, but we can test invalidate_all
+        # on empty cache at minimum)
+        cache.invalidate_all();
+        assert_true(cache.is_empty() as i64);
+    });
+});
+
+# ==========================================================================
+# Planner — Query Normalization
+# ==========================================================================
+
+describe("normalize_query", |t| {
+    it("replaces integer literals with parameters", || {
+        result := mut normalize_query(&"SELECT * FROM t WHERE id = 42");
+        # Numbers get replaced with $N
+        assert_true(result.contains("$") as i64);
+        assert_false(result.contains("42") as i64);
+    });
+
+    it("replaces string literals with parameters", || {
+        result := mut normalize_query(&"SELECT * FROM t WHERE name = 'alice'");
+        assert_true(result.contains("$") as i64);
+        assert_false(result.contains("alice") as i64);
+    });
+
+    it("preserves keywords and identifiers", || {
+        result := mut normalize_query(&"SELECT * FROM users WHERE active = true");
+        assert_true(result.contains("SELECT") as i64);
+        assert_true(result.contains("FROM") as i64);
+        assert_true(result.contains("users") as i64);
+        assert_true(result.contains("WHERE") as i64);
+    });
+
+    it("produces same output for same query structure", || {
+        r1 := mut normalize_query(&"SELECT * FROM t WHERE id = 1");
+        r2 := mut normalize_query(&"SELECT * FROM t WHERE id = 2");
+        # Both replace the number with $1, so should match
+        assert_eq(r1, r2);
+    });
+});
+
+# ==========================================================================
+# Planner — ExplainOptions
+# ==========================================================================
+
+describe("ExplainOptions", |t| {
+    it("default creates non-analyze non-verbose text format", || {
+        opts := mut ExplainOptions.default();
+        assert_false(opts.analyze as i64);
+        assert_false(opts.verbose as i64);
+        M opts.format {
+            ExplainFormat.Text => assert_true(1),
+            ExplainFormat.Json => assert_true(0),
+        }
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: TableColumnStats
+# ==========================================================================
+
+describe("TableColumnStats", |t| {
+    it("new creates empty stats", || {
+        stats := mut TableColumnStats.new("users", "age");
+        assert_eq_str(stats.table_name, "users");
+        assert_eq_str(stats.column_name, "age");
+        assert_eq(stats.n_distinct, 0u64);
+        assert_eq(stats.null_fraction, 0.0);
+        assert_eq(stats.histogram.len(), 0u64);
+        assert_true(stats.min_value.is_none() as i64);
+        assert_true(stats.max_value.is_none() as i64);
+        assert_eq(stats.avg_width, 0u32);
+    });
+
+    it("estimate_equality_selectivity returns 0.1 when n_distinct=0", || {
+        stats := mut TableColumnStats.new("t", "c");
+        sel := mut stats.estimate_equality_selectivity();
+        assert_true((sel > 0.099 && sel < 0.101) as i64);
+    });
+
+    it("estimate_equality_selectivity returns 1/n_distinct", || {
+        stats := mut TableColumnStats.new("t", "c");
+        stats.n_distinct = 100;
+        # 1/100 = 0.01
+        sel := mut stats.estimate_equality_selectivity();
+        assert_true((sel > 0.009 && sel < 0.011) as i64);
+    });
+
+    it("estimate_range_selectivity returns 0.3 when no histogram", || {
+        stats := mut TableColumnStats.new("t", "c");
+        val := mut SqlValue.IntVal { v: 50 };
+        sel := mut stats.estimate_range_selectivity(&val);
+        assert_true((sel > 0.29 && sel < 0.31) as i64);
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: StatisticsConfig
+# ==========================================================================
+
+describe("StatisticsConfig", |t| {
+    it("default uses standard values", || {
+        config := mut StatisticsConfig.default();
+        assert_eq(config.sample_size, DEFAULT_SAMPLE_SIZE);
+        assert_eq(config.histogram_buckets, DEFAULT_HISTOGRAM_BUCKETS);
+        assert_false(config.force_full_scan as i64);
+    });
+
+    it("builder pattern customizes values", || {
+        config := mut StatisticsConfig.default();
+        config = config.with_sample_size(5000);
+        assert_eq(config.sample_size, 5000u64);
+
+        config = config.with_histogram_buckets(50);
+        assert_eq(config.histogram_buckets, 50u64);
+
+        config = config.with_force_full_scan();
+        assert_true(config.force_full_scan as i64);
+    });
+
+    it("constants have expected values", || {
+        assert_eq(DEFAULT_SAMPLE_SIZE, 1000u64);
+        assert_eq(DEFAULT_HISTOGRAM_BUCKETS, 100u64);
+        assert_eq(MIN_ROWS_FOR_SAMPLING, 5000u64);
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: pseudo_random
+# ==========================================================================
+
+describe("pseudo_random", |t| {
+    it("produces non-zero output", || {
+        val := mut pseudo_random(42, 0);
+        assert_ne(val, 0u64);
+    });
+
+    it("produces different output for different indices", || {
+        v1 := mut pseudo_random(42, 0);
+        v2 := mut pseudo_random(42, 1);
+        v3 := mut pseudo_random(42, 2);
+        assert_ne(v1, v2);
+        assert_ne(v2, v3);
+    });
+
+    it("produces different output for different seeds", || {
+        v1 := mut pseudo_random(1, 0);
+        v2 := mut pseudo_random(2, 0);
+        assert_ne(v1, v2);
+    });
+
+    it("is deterministic", || {
+        v1 := mut pseudo_random(42, 100);
+        v2 := mut pseudo_random(42, 100);
+        assert_eq(v1, v2);
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: compare_values
+# ==========================================================================
+
+describe("compare_values", |t| {
+    it("compares equal integers", || {
+        a := mut SqlValue.IntVal { v: 42 };
+        b := mut SqlValue.IntVal { v: 42 };
+        result := mut compare_values(&a, &b);
+        assert_true(result.is_ok() as i64);
+        assert_eq(result!, 0);
+    });
+
+    it("compares less-than integers", || {
+        a := mut SqlValue.IntVal { v: 10 };
+        b := mut SqlValue.IntVal { v: 20 };
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, -1);
+    });
+
+    it("compares greater-than integers", || {
+        a := mut SqlValue.IntVal { v: 20 };
+        b := mut SqlValue.IntVal { v: 10 };
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, 1);
+    });
+
+    it("compares floats", || {
+        a := mut SqlValue.FloatVal { v: 1.5 };
+        b := mut SqlValue.FloatVal { v: 2.5 };
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, -1);
+    });
+
+    it("compares strings", || {
+        a := mut SqlValue.StringVal { v: "apple" };
+        b := mut SqlValue.StringVal { v: "banana" };
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, -1);
+    });
+
+    it("NULL sorts first", || {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.IntVal { v: 42 };
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, -1);
+    });
+
+    it("value sorts after NULL", || {
+        a := mut SqlValue.IntVal { v: 42 };
+        b := mut SqlValue.Null;
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, 1);
+    });
+
+    it("NULL equals NULL", || {
+        a := mut SqlValue.Null;
+        b := mut SqlValue.Null;
+        result := mut compare_values(&a, &b);
+        assert_eq(result!, 0);
+    });
+
+    it("errors on incompatible types", || {
+        a := mut SqlValue.IntVal { v: 42 };
+        b := mut SqlValue.StringVal { v: "hello" };
+        result := mut compare_values(&a, &b);
+        assert_true(result.is_err() as i64);
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: build_histogram
+# ==========================================================================
+
+describe("build_histogram", |t| {
+    it("returns empty for empty input", || {
+        sample: Vec<SqlValue> := mut Vec.new();
+        hist := mut build_histogram(&sample, 10);
+        assert_eq(hist.len(), 0u64);
+    });
+
+    it("returns empty for zero buckets", || {
+        sample := mut Vec.new();
+        sample.push(SqlValue.IntVal { v: 1 });
+        sample.push(SqlValue.IntVal { v: 2 });
+        hist := mut build_histogram(&sample, 0);
+        assert_eq(hist.len(), 0u64);
+    });
+});
+
+# ==========================================================================
+# Planner — Statistics: reservoir_sample
+# ==========================================================================
+
+describe("reservoir_sample", |t| {
+    it("returns empty for empty input", || {
+        rows: Vec<SqlValue> := mut Vec.new();
+        sample := mut reservoir_sample(&rows, 10, 42);
+        assert_eq(sample.len(), 0u64);
+    });
+
+    it("returns empty for zero sample size", || {
+        rows := mut Vec.new();
+        rows.push(SqlValue.IntVal { v: 1 });
+        sample := mut reservoir_sample(&rows, 0, 42);
+        assert_eq(sample.len(), 0u64);
+    });
+
+    it("returns all rows when sample_size >= input size", || {
+        rows := mut Vec.new();
+        rows.push(SqlValue.IntVal { v: 1 });
+        rows.push(SqlValue.IntVal { v: 2 });
+        rows.push(SqlValue.IntVal { v: 3 });
+        sample := mut reservoir_sample(&rows, 10, 42);
+        assert_eq(sample.len(), 3u64);
+    });
+});
+
+# ==========================================================================
+# Cross-module: FNV-1a hash consistency
+# ==========================================================================
+
+describe("FNV-1a hash for RAG", |t| {
+    it("produces non-zero hash", || {
+        h := mut fnv1a_hash(&"document content");
+        assert_ne(h, 0u64);
+    });
+
+    it("different inputs produce different hashes", || {
+        h1 := mut fnv1a_hash(&"document A");
+        h2 := mut fnv1a_hash(&"document B");
+        assert_ne(h1, h2);
+    });
+
+    it("same input is deterministic", || {
+        h1 := mut fnv1a_hash(&"test content");
+        h2 := mut fnv1a_hash(&"test content");
+        assert_eq(h1, h2);
+    });
+});

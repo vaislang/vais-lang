@@ -1,0 +1,499 @@
+# Phase 11 — Hybrid Query Planner Unit Tests: Types
+# Tests: HybridCost, EngineType, FusionMethod, EngineBreakdown,
+#         VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+#         HybridPlanNode, QueryProfile, HybridExecStats,
+#         RAG constants
+
+U std/test.{describe, it, assert_eq, assert_eq_str, assert_ne, assert_true, assert_false};
+U std/vec.Vec;
+
+U planner/types.{
+    HybridCost, EngineType, FusionMethod, EngineBreakdown,
+    VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
+    FullTextSearchMode, HybridPlanNode, QueryProfile, HybridExecStats,
+    DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
+    ERR_CODE_HYBRID_PLAN_FAILED, ERR_CODE_HYBRID_COST_FAILED,
+    ERR_CODE_HYBRID_ENGINE_MISMATCH, ERR_CODE_HYBRID_UNSUPPORTED_COMBO,
+    ERR_CODE_HYBRID_SCORE_FUSION_INVALID,
+};
+U rag/types.{
+    RAG_FORMAT_VERSION, FILE_ID_RAG, FILE_NAME_RAG,
+    CHUNK_STRATEGY_FIXED_SIZE, CHUNK_STRATEGY_SENTENCE, CHUNK_STRATEGY_PARAGRAPH,
+    DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK_SIZE, DEFAULT_MAX_CHUNK_SIZE, DEFAULT_OVERLAP_TOKENS,
+    MEMORY_TYPE_EPISODIC, MEMORY_TYPE_SEMANTIC, MEMORY_TYPE_PROCEDURAL, MEMORY_TYPE_WORKING,
+    DEFAULT_TTL_EPISODIC, DEFAULT_TTL_SEMANTIC, DEFAULT_TTL_PROCEDURAL, DEFAULT_TTL_WORKING,
+    DEFAULT_VECTOR_WEIGHT, DEFAULT_FULLTEXT_WEIGHT, DEFAULT_GRAPH_WEIGHT, ENGINE_TAG_RAG,
+    PAGE_TYPE_RAG_CHUNK, PAGE_TYPE_RAG_DOC_META, PAGE_TYPE_RAG_EMBED_META, PAGE_TYPE_RAG_MEMORY,
+    EDGE_TYPE_NEXT_CHUNK, EDGE_TYPE_SAME_SECTION, EDGE_TYPE_SAME_DOCUMENT,
+    EDGE_TYPE_CONTAINS, EDGE_TYPE_REFERENCES, EDGE_TYPE_SUPERSEDES, EDGE_TYPE_RELATED_TO,
+    EDGE_TYPE_TEMPORAL_NEXT, EDGE_TYPE_SESSION_CONTEXT,
+    LABEL_DOCUMENT, LABEL_SECTION, LABEL_PARAGRAPH, LABEL_CHUNK, LABEL_MEMORY, LABEL_SESSION,
+    DISTANCE_COSINE, DISTANCE_L2, DISTANCE_DOT_PRODUCT, MAX_CHUNK_EDGES, MAX_HIERARCHY_DEPTH,
+};
+
+# ==========================================================================
+# Planner — EngineType
+# ==========================================================================
+
+describe("EngineType", |t| {
+    it("name returns correct string for each variant", || {
+        sql_name := mut EngineType.Sql.name();
+        vec_name := mut EngineType.Vector.name();
+        graph_name := mut EngineType.Graph.name();
+        ft_name := mut EngineType.FullText.name();
+        hybrid_name := mut EngineType.Hybrid.name();
+        assert_eq_str(sql_name, "sql");
+        assert_eq_str(vec_name, "vector");
+        assert_eq_str(graph_name, "graph");
+        assert_eq_str(ft_name, "fulltext");
+        assert_eq_str(hybrid_name, "hybrid");
+    });
+});
+
+# ==========================================================================
+# Planner — HybridCost
+# ==========================================================================
+
+describe("HybridCost", |t| {
+    it("new creates zero-cost instance", || {
+        cost := mut HybridCost.new();
+        assert_eq(cost.total_io_cost, 0.0);
+        assert_eq(cost.total_cpu_cost, 0.0);
+        assert_eq(cost.total_memory_bytes, 0u64);
+        assert_eq(cost.row_estimate, 0u64);
+        assert_eq(cost.sql_io_cost, 0.0);
+        assert_eq(cost.sql_cpu_cost, 0.0);
+        assert_eq(cost.vector_io_cost, 0.0);
+        assert_eq(cost.vector_cpu_cost, 0.0);
+        assert_eq(cost.graph_io_cost, 0.0);
+        assert_eq(cost.graph_cpu_cost, 0.0);
+        assert_eq(cost.fulltext_io_cost, 0.0);
+        assert_eq(cost.fulltext_cpu_cost, 0.0);
+        assert_eq(cost.vector_dimension, 0u32);
+        assert_eq(cost.vector_ef_search, 0u32);
+        assert_eq(cost.graph_avg_degree, 0.0);
+        assert_eq(cost.graph_max_depth, 0u32);
+        assert_eq(cost.fulltext_posting_length, 0u64);
+    });
+
+    it("total returns weighted sum of IO and CPU", || {
+        cost := mut HybridCost.new();
+        cost.total_io_cost = 10.0;
+        cost.total_cpu_cost = 50.0;
+        # total = IO * 1.0 + CPU * 0.1 = 10.0 + 5.0 = 15.0
+        total := mut cost.total();
+        assert_true((total > 14.99 && total < 15.01) as i64);
+    });
+
+    it("total returns zero for zero-cost", || {
+        cost := mut HybridCost.new();
+        assert_eq(cost.total(), 0.0);
+    });
+
+    it("add combines two costs correctly", || {
+        a := mut HybridCost.new();
+        a.total_io_cost = 10.0;
+        a.total_cpu_cost = 20.0;
+        a.total_memory_bytes = 1024;
+        a.row_estimate = 100;
+        a.sql_io_cost = 5.0;
+        a.sql_cpu_cost = 10.0;
+        a.vector_io_cost = 5.0;
+        a.vector_cpu_cost = 10.0;
+        a.vector_dimension = 128;
+        a.vector_ef_search = 64;
+
+        b := mut HybridCost.new();
+        b.total_io_cost = 3.0;
+        b.total_cpu_cost = 4.0;
+        b.total_memory_bytes = 512;
+        b.row_estimate = 50;
+        b.graph_io_cost = 3.0;
+        b.graph_cpu_cost = 4.0;
+        b.graph_avg_degree = 5.0;
+        b.graph_max_depth = 3;
+
+        sum := mut a.add(&b);
+        assert_eq(sum.total_io_cost, 13.0);
+        assert_eq(sum.total_cpu_cost, 24.0);
+        assert_eq(sum.total_memory_bytes, 1536u64);
+        # row_estimate keeps first operand's value
+        assert_eq(sum.row_estimate, 100u64);
+        assert_eq(sum.sql_io_cost, 5.0);
+        assert_eq(sum.sql_cpu_cost, 10.0);
+        assert_eq(sum.vector_io_cost, 5.0);
+        assert_eq(sum.vector_cpu_cost, 10.0);
+        assert_eq(sum.graph_io_cost, 3.0);
+        assert_eq(sum.graph_cpu_cost, 4.0);
+        # Keeps first non-zero for engine-specific metrics
+        assert_eq(sum.vector_dimension, 128u32);
+        assert_eq(sum.vector_ef_search, 64u32);
+        assert_true((sum.graph_avg_degree > 4.99 && sum.graph_avg_degree < 5.01) as i64);
+        assert_eq(sum.graph_max_depth, 3u32);
+    });
+
+    it("add preserves second operand engine metrics when first is zero", || {
+        a := mut HybridCost.new();
+        b := mut HybridCost.new();
+        b.vector_dimension = 768;
+        b.vector_ef_search = 200;
+        b.graph_avg_degree = 10.0;
+        b.graph_max_depth = 5;
+        b.fulltext_posting_length = 42;
+
+        sum := mut a.add(&b);
+        assert_eq(sum.vector_dimension, 768u32);
+        assert_eq(sum.vector_ef_search, 200u32);
+        assert_true((sum.graph_avg_degree > 9.99 && sum.graph_avg_degree < 10.01) as i64);
+        assert_eq(sum.graph_max_depth, 5u32);
+        assert_eq(sum.fulltext_posting_length, 42u64);
+    });
+
+    it("engine_breakdown returns empty for zero cost", || {
+        cost := mut HybridCost.new();
+        breakdown := mut cost.engine_breakdown();
+        assert_eq(breakdown.len(), 0u64);
+    });
+
+    it("engine_breakdown returns correct percentages for multi-engine", || {
+        cost := mut HybridCost.new();
+        # SQL: IO=10, CPU=0 => weighted=10.0
+        cost.total_io_cost = 20.0;
+        cost.total_cpu_cost = 100.0;
+        cost.sql_io_cost = 10.0;
+        cost.sql_cpu_cost = 0.0;
+        cost.vector_io_cost = 10.0;
+        cost.vector_cpu_cost = 100.0;
+        # total = 20*1.0 + 100*0.1 = 30.0
+        # SQL weighted = 10*1.0 + 0*0.1 = 10.0 => 33.3%
+        # Vector weighted = 10*1.0 + 100*0.1 = 20.0 => 66.7%
+
+        breakdown := mut cost.engine_breakdown();
+        assert_eq(breakdown.len(), 2u64);
+        # Sorted descending by percentage, Vector should be first
+    });
+
+    it("engine_breakdown includes only non-zero engines", || {
+        cost := mut HybridCost.new();
+        cost.total_io_cost = 5.0;
+        cost.total_cpu_cost = 0.0;
+        cost.fulltext_io_cost = 5.0;
+        cost.fulltext_cpu_cost = 0.0;
+
+        breakdown := mut cost.engine_breakdown();
+        assert_eq(breakdown.len(), 1u64);
+    });
+});
+
+# ==========================================================================
+# Planner — FusionMethod
+# ==========================================================================
+
+describe("FusionMethod", |t| {
+    it("default_weighted creates equal 50/50 weights", || {
+        method := mut FusionMethod.default_weighted();
+        M method {
+            FusionMethod.WeightedSum { weight_a, weight_b } => {
+                assert_true((weight_a > 0.49 && weight_a < 0.51) as i64);
+                assert_true((weight_b > 0.49 && weight_b < 0.51) as i64);
+            },
+            _ => assert_true(0),
+        }
+    });
+
+    it("default_rrf uses k=60", || {
+        method := mut FusionMethod.default_rrf();
+        M method {
+            FusionMethod.ReciprocalRankFusion { k } => {
+                assert_eq(k, 60u32);
+            },
+            _ => assert_true(0),
+        }
+    });
+});
+
+# ==========================================================================
+# Planner — GraphTraverseNodeParams defaults
+# ==========================================================================
+
+describe("GraphTraverseNodeParams", |t| {
+    it("direction constants are distinct", || {
+        assert_eq(DIRECTION_OUTGOING, 0u8);
+        assert_eq(DIRECTION_INCOMING, 1u8);
+        assert_eq(DIRECTION_BOTH, 2u8);
+        assert_ne(DIRECTION_OUTGOING, DIRECTION_INCOMING);
+        assert_ne(DIRECTION_INCOMING, DIRECTION_BOTH);
+    });
+});
+
+# ==========================================================================
+# Planner — FullTextSearchMode
+# ==========================================================================
+
+describe("FullTextSearchMode", |t| {
+    it("variants are distinct", || {
+        # Verify we can construct each variant
+        simple := mut FullTextSearchMode.Simple;
+        phrase := mut FullTextSearchMode.Phrase { slop: 2 };
+        boolean := mut FullTextSearchMode.Boolean;
+        # Verify phrase slop
+        M phrase {
+            FullTextSearchMode.Phrase { slop } => assert_eq(slop, 2u32),
+            _ => assert_true(0),
+        }
+    });
+});
+
+# ==========================================================================
+# Planner — QueryProfile
+# ==========================================================================
+
+describe("QueryProfile", |t| {
+    it("new creates empty profile", || {
+        profile := mut QueryProfile.new();
+        assert_false(profile.uses_sql as i64);
+        assert_false(profile.uses_vector as i64);
+        assert_false(profile.uses_graph as i64);
+        assert_false(profile.uses_fulltext as i64);
+        assert_eq(profile.vector_calls.len(), 0u64);
+        assert_eq(profile.graph_calls.len(), 0u64);
+        assert_eq(profile.fulltext_calls.len(), 0u64);
+        assert_eq(profile.sql_tables.len(), 0u64);
+    });
+
+    it("engine_count returns zero for empty profile", || {
+        profile := mut QueryProfile.new();
+        assert_eq(profile.engine_count(), 0u32);
+    });
+
+    it("engine_count counts active engines", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        assert_eq(profile.engine_count(), 2u32);
+    });
+
+    it("engine_count counts all four engines", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        profile.uses_graph = true;
+        profile.uses_fulltext = true;
+        assert_eq(profile.engine_count(), 4u32);
+    });
+
+    it("is_single_engine true for SQL only", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        assert_true(profile.is_single_engine() as i64);
+    });
+
+    it("is_single_engine false for multi-engine", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        assert_false(profile.is_single_engine() as i64);
+    });
+
+    it("is_pure_sql for SQL-only query", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        assert_true(profile.is_pure_sql() as i64);
+    });
+
+    it("is_pure_sql false when vector used", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_vector = true;
+        assert_false(profile.is_pure_sql() as i64);
+    });
+
+    it("is_pure_sql false when graph used", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_graph = true;
+        assert_false(profile.is_pure_sql() as i64);
+    });
+
+    it("needs_score_fusion requires vector + fulltext", || {
+        profile := mut QueryProfile.new();
+        profile.uses_vector = true;
+        profile.uses_fulltext = true;
+        assert_true(profile.needs_score_fusion() as i64);
+    });
+
+    it("needs_score_fusion false for vector only", || {
+        profile := mut QueryProfile.new();
+        profile.uses_vector = true;
+        assert_false(profile.needs_score_fusion() as i64);
+    });
+
+    it("needs_score_fusion false for graph + sql (non-scoring engines)", || {
+        profile := mut QueryProfile.new();
+        profile.uses_sql = true;
+        profile.uses_graph = true;
+        assert_false(profile.needs_score_fusion() as i64);
+    });
+});
+
+# ==========================================================================
+# Planner — HybridExecStats
+# ==========================================================================
+
+describe("HybridExecStats", |t| {
+    it("new creates zero stats", || {
+        stats := mut HybridExecStats.new(EngineType.Sql);
+        assert_eq(stats.rows_produced, 0u64);
+        assert_eq(stats.rows_scanned, 0u64);
+        assert_eq(stats.pages_read, 0u64);
+        assert_eq(stats.elapsed_us, 0u64);
+        assert_eq(stats.memory_bytes, 0u64);
+        assert_eq(stats.children.len(), 0u64);
+    });
+
+    it("total_elapsed_us returns own time for leaf", || {
+        stats := mut HybridExecStats.new(EngineType.Vector);
+        stats.elapsed_us = 1000;
+        assert_eq(stats.total_elapsed_us(), 1000u64);
+    });
+
+    it("total_elapsed_us sums children", || {
+        parent := mut HybridExecStats.new(EngineType.Hybrid);
+        parent.elapsed_us = 100;
+
+        child1 := mut HybridExecStats.new(EngineType.Vector);
+        child1.elapsed_us = 500;
+
+        child2 := mut HybridExecStats.new(EngineType.FullText);
+        child2.elapsed_us = 300;
+
+        parent.children.push(child1);
+        parent.children.push(child2);
+
+        # 100 + 500 + 300 = 900
+        assert_eq(parent.total_elapsed_us(), 900u64);
+    });
+
+    it("total_elapsed_us sums nested children", || {
+        root := mut HybridExecStats.new(EngineType.Hybrid);
+        root.elapsed_us = 10;
+
+        mid := mut HybridExecStats.new(EngineType.Sql);
+        mid.elapsed_us = 20;
+
+        leaf := mut HybridExecStats.new(EngineType.Graph);
+        leaf.elapsed_us = 30;
+
+        mid.children.push(leaf);
+        root.children.push(mid);
+
+        # 10 + (20 + 30) = 60
+        assert_eq(root.total_elapsed_us(), 60u64);
+    });
+});
+
+# ==========================================================================
+# Planner — Error Codes
+# ==========================================================================
+
+describe("Planner error codes", |t| {
+    it("error codes have correct format", || {
+        assert_eq_str(ERR_CODE_HYBRID_PLAN_FAILED, "VAIS-0008001");
+        assert_eq_str(ERR_CODE_HYBRID_COST_FAILED, "VAIS-0008002");
+        assert_eq_str(ERR_CODE_HYBRID_ENGINE_MISMATCH, "VAIS-0008003");
+        assert_eq_str(ERR_CODE_HYBRID_UNSUPPORTED_COMBO, "VAIS-0008004");
+        assert_eq_str(ERR_CODE_HYBRID_SCORE_FUSION_INVALID, "VAIS-0008005");
+    });
+});
+
+# ==========================================================================
+# RAG — Constants
+# ==========================================================================
+describe("RAG constants", |t| {
+    it("format version is 1", || {
+        assert_eq(RAG_FORMAT_VERSION, 1u8);
+    });
+
+    it("file ID for RAG is 5", || {
+        assert_eq(FILE_ID_RAG, 5u8);
+    });
+
+    it("file name is rag.vdb", || {
+        assert_eq_str(FILE_NAME_RAG, "rag.vdb");
+    });
+
+    it("chunk strategies are distinct", || {
+        assert_eq(CHUNK_STRATEGY_FIXED_SIZE, 0u8);
+        assert_eq(CHUNK_STRATEGY_SENTENCE, 1u8);
+        assert_eq(CHUNK_STRATEGY_PARAGRAPH, 2u8);
+    });
+
+    it("default chunk parameters have correct values", || {
+        assert_eq(DEFAULT_CHUNK_SIZE, 512u32);
+        assert_eq(DEFAULT_MIN_CHUNK_SIZE, 64u32);
+        assert_eq(DEFAULT_MAX_CHUNK_SIZE, 1024u32);
+        assert_eq(DEFAULT_OVERLAP_TOKENS, 50u32);
+    });
+
+    it("memory types are distinct", || {
+        assert_eq(MEMORY_TYPE_EPISODIC, 0u8);
+        assert_eq(MEMORY_TYPE_SEMANTIC, 1u8);
+        assert_eq(MEMORY_TYPE_PROCEDURAL, 2u8);
+        assert_eq(MEMORY_TYPE_WORKING, 3u8);
+    });
+
+    it("default TTLs have correct values", || {
+        assert_eq(DEFAULT_TTL_EPISODIC, 7776000u64);     # 90 days
+        assert_eq(DEFAULT_TTL_SEMANTIC, 0u64);            # no expiry
+        assert_eq(DEFAULT_TTL_PROCEDURAL, 0u64);          # no expiry
+        assert_eq(DEFAULT_TTL_WORKING, 86400u64);         # 1 day
+    });
+
+    it("score fusion weights sum to 1.0", || {
+        total := mut DEFAULT_VECTOR_WEIGHT + DEFAULT_FULLTEXT_WEIGHT + DEFAULT_GRAPH_WEIGHT;
+        assert_true((total > 0.99 && total < 1.01) as i64);
+    });
+
+    it("page types are in 0x60 range", || {
+        assert_eq(PAGE_TYPE_RAG_CHUNK, 0x60u8);
+        assert_eq(PAGE_TYPE_RAG_DOC_META, 0x61u8);
+        assert_eq(PAGE_TYPE_RAG_EMBED_META, 0x62u8);
+        assert_eq(PAGE_TYPE_RAG_MEMORY, 0x63u8);
+    });
+
+    it("engine tag for RAG is 0x05", || {
+        assert_eq(ENGINE_TAG_RAG, 0x05u8);
+    });
+
+    it("distance metric constants", || {
+        assert_eq(DISTANCE_COSINE, 0u8);
+        assert_eq(DISTANCE_L2, 1u8);
+        assert_eq(DISTANCE_DOT_PRODUCT, 2u8);
+    });
+
+    it("graph limits", || {
+        assert_eq(MAX_CHUNK_EDGES, 64u32);
+        assert_eq(MAX_HIERARCHY_DEPTH, 8u32);
+    });
+
+    it("edge type constants are non-empty", || {
+        assert_eq_str(EDGE_TYPE_NEXT_CHUNK, "NEXT_CHUNK");
+        assert_eq_str(EDGE_TYPE_SAME_SECTION, "SAME_SECTION");
+        assert_eq_str(EDGE_TYPE_SAME_DOCUMENT, "SAME_DOCUMENT");
+        assert_eq_str(EDGE_TYPE_CONTAINS, "CONTAINS");
+        assert_eq_str(EDGE_TYPE_REFERENCES, "REFERENCES");
+        assert_eq_str(EDGE_TYPE_SUPERSEDES, "SUPERSEDES");
+        assert_eq_str(EDGE_TYPE_RELATED_TO, "RELATED_TO");
+        assert_eq_str(EDGE_TYPE_TEMPORAL_NEXT, "TEMPORAL_NEXT");
+        assert_eq_str(EDGE_TYPE_SESSION_CONTEXT, "SESSION_CONTEXT");
+    });
+
+    it("label constants are non-empty", || {
+        assert_eq_str(LABEL_DOCUMENT, "DOCUMENT");
+        assert_eq_str(LABEL_SECTION, "SECTION");
+        assert_eq_str(LABEL_PARAGRAPH, "PARAGRAPH");
+        assert_eq_str(LABEL_CHUNK, "CHUNK");
+        assert_eq_str(LABEL_MEMORY, "MEMORY");
+        assert_eq_str(LABEL_SESSION, "SESSION");
+    });
+});

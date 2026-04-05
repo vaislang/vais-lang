@@ -1,0 +1,488 @@
+# Phase 11 — Hybrid Query Planner Unit Tests: RAG Engine
+# Tests: RagConfig, RagMeta, ChunkInfo, DocumentInfo, RagSearchResult,
+#         RagFusionConfig, ScoredChunk, ChunkMeta, DocumentMeta,
+#         MemorySearchParams
+
+U std/test.{describe, it, assert_eq, assert_eq_str, assert_ne, assert_true, assert_false};
+U std/bytes.{ByteBuffer};
+U std/vec.Vec;
+U std/string.Str;
+U std/option.{Option, Some, None};
+
+U rag/types.{
+    RagConfig, RagMeta, ChunkInfo, DocumentInfo,
+    RagSearchResult, RagFusionConfig, ScoredChunk,
+    ChunkMeta, DocumentMeta,
+    RAG_FORMAT_VERSION, CHUNK_STRATEGY_SENTENCE, CHUNK_STRATEGY_PARAGRAPH,
+    DEFAULT_CHUNK_SIZE, DEFAULT_MIN_CHUNK_SIZE, DEFAULT_MAX_CHUNK_SIZE,
+    DEFAULT_OVERLAP_TOKENS, ENGINE_TAG_RAG,
+    MEMORY_TYPE_SEMANTIC,
+};
+U rag/memory/search.{MemorySearchParams};
+
+# ==========================================================================
+# RAG — RagConfig
+# ==========================================================================
+
+describe("RagConfig", |t| {
+    it("default creates config with standard values", || {
+        config := mut RagConfig.default(4096);
+        assert_eq(config.chunk_strategy, CHUNK_STRATEGY_SENTENCE);
+        assert_eq(config.target_chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq(config.min_chunk_size, DEFAULT_MIN_CHUNK_SIZE);
+        assert_eq(config.max_chunk_size, DEFAULT_MAX_CHUNK_SIZE);
+        assert_eq(config.overlap_tokens, DEFAULT_OVERLAP_TOKENS);
+        assert_true((config.vector_weight > 0.39 && config.vector_weight < 0.41) as i64);
+        assert_true((config.fulltext_weight > 0.29 && config.fulltext_weight < 0.31) as i64);
+        assert_true((config.graph_weight > 0.29 && config.graph_weight < 0.31) as i64);
+        assert_false(config.enable_auto_embed as i64);
+        assert_true(config.enable_auto_chunk as i64);
+        assert_true(config.enable_hierarchy as i64);
+        assert_eq(config.page_size, 4096u32);
+    });
+
+    it("serialization round-trip preserves all fields", || {
+        config := mut RagConfig.default(8192);
+        config.chunk_strategy = CHUNK_STRATEGY_PARAGRAPH;
+        config.target_chunk_size = 256;
+        config.min_chunk_size = 32;
+        config.max_chunk_size = 2048;
+        config.overlap_tokens = 100;
+        config.vector_weight = 0.6;
+        config.fulltext_weight = 0.2;
+        config.graph_weight = 0.2;
+        config.enable_auto_embed = true;
+        config.enable_auto_chunk = false;
+        config.enable_hierarchy = false;
+
+        buf := mut ByteBuffer.with_capacity(64);
+        config.serialize(&buf);
+        buf.rewind();
+        restored := mut RagConfig.deserialize(&buf, 8192)!;
+
+        assert_eq(restored.chunk_strategy, CHUNK_STRATEGY_PARAGRAPH);
+        assert_eq(restored.target_chunk_size, 256u32);
+        assert_eq(restored.min_chunk_size, 32u32);
+        assert_eq(restored.max_chunk_size, 2048u32);
+        assert_eq(restored.overlap_tokens, 100u32);
+        assert_true((restored.vector_weight > 0.59 && restored.vector_weight < 0.61) as i64);
+        assert_true((restored.fulltext_weight > 0.19 && restored.fulltext_weight < 0.21) as i64);
+        assert_true((restored.graph_weight > 0.19 && restored.graph_weight < 0.21) as i64);
+        assert_true(restored.enable_auto_embed as i64);
+        assert_false(restored.enable_auto_chunk as i64);
+        assert_false(restored.enable_hierarchy as i64);
+        assert_eq(restored.page_size, 8192u32);
+    });
+
+    it("serialization preserves boolean flags correctly", || {
+        # Test each flag independently
+        config1 := mut RagConfig.default(4096);
+        config1.enable_auto_embed = true;
+        config1.enable_auto_chunk = false;
+        config1.enable_hierarchy = false;
+
+        buf1 := mut ByteBuffer.with_capacity(64);
+        config1.serialize(&buf1);
+        buf1.rewind();
+        r1 := mut RagConfig.deserialize(&buf1, 4096)!;
+        assert_true(r1.enable_auto_embed as i64);
+        assert_false(r1.enable_auto_chunk as i64);
+        assert_false(r1.enable_hierarchy as i64);
+
+        # Test with only hierarchy
+        config2 := mut RagConfig.default(4096);
+        config2.enable_auto_embed = false;
+        config2.enable_auto_chunk = false;
+        config2.enable_hierarchy = true;
+
+        buf2 := mut ByteBuffer.with_capacity(64);
+        config2.serialize(&buf2);
+        buf2.rewind();
+        r2 := mut RagConfig.deserialize(&buf2, 4096)!;
+        assert_false(r2.enable_auto_embed as i64);
+        assert_false(r2.enable_auto_chunk as i64);
+        assert_true(r2.enable_hierarchy as i64);
+    });
+});
+
+# ==========================================================================
+# RAG — RagMeta
+# ==========================================================================
+
+describe("RagMeta", |t| {
+    it("new creates initial metadata", || {
+        meta := mut RagMeta.new(4096);
+        assert_eq(meta.format_version, RAG_FORMAT_VERSION);
+        assert_eq(meta.doc_count, 0u64);
+        assert_eq(meta.chunk_count, 0u64);
+        assert_eq(meta.memory_count, 0u64);
+        assert_eq(meta.session_count, 0u64);
+        assert_eq(meta.next_doc_id, 1u64);
+        assert_eq(meta.next_chunk_id, 1u64);
+        assert_eq(meta.next_memory_id, 1u64);
+        assert_eq(meta.next_session_id, 1u64);
+        assert_eq(meta.active_model_id, 0u32);
+    });
+
+    it("alloc_doc_id increments and returns unique IDs", || {
+        meta := mut RagMeta.new(4096);
+        assert_eq(meta.alloc_doc_id(), 1u64);
+        assert_eq(meta.alloc_doc_id(), 2u64);
+        assert_eq(meta.alloc_doc_id(), 3u64);
+        assert_eq(meta.next_doc_id, 4u64);
+    });
+
+    it("alloc_chunk_id increments and returns unique IDs", || {
+        meta := mut RagMeta.new(4096);
+        assert_eq(meta.alloc_chunk_id(), 1u64);
+        assert_eq(meta.alloc_chunk_id(), 2u64);
+        assert_eq(meta.next_chunk_id, 3u64);
+    });
+
+    it("alloc_memory_id increments and returns unique IDs", || {
+        meta := mut RagMeta.new(4096);
+        assert_eq(meta.alloc_memory_id(), 1u64);
+        assert_eq(meta.alloc_memory_id(), 2u64);
+        assert_eq(meta.next_memory_id, 3u64);
+    });
+
+    it("alloc_session_id increments and returns unique IDs", || {
+        meta := mut RagMeta.new(4096);
+        assert_eq(meta.alloc_session_id(), 1u64);
+        assert_eq(meta.alloc_session_id(), 2u64);
+        assert_eq(meta.next_session_id, 3u64);
+    });
+
+    it("ID allocators are independent", || {
+        meta := mut RagMeta.new(4096);
+        meta.alloc_doc_id();     # -> 1
+        meta.alloc_doc_id();     # -> 2
+        meta.alloc_chunk_id();   # -> 1
+        meta.alloc_memory_id();  # -> 1
+        meta.alloc_session_id(); # -> 1
+
+        assert_eq(meta.next_doc_id, 3u64);
+        assert_eq(meta.next_chunk_id, 2u64);
+        assert_eq(meta.next_memory_id, 2u64);
+        assert_eq(meta.next_session_id, 2u64);
+    });
+
+    it("serialization round-trip preserves all fields", || {
+        meta := mut RagMeta.new(4096);
+        meta.doc_count = 10;
+        meta.chunk_count = 50;
+        meta.memory_count = 5;
+        meta.session_count = 3;
+        meta.next_doc_id = 11;
+        meta.next_chunk_id = 51;
+        meta.next_memory_id = 6;
+        meta.next_session_id = 4;
+        meta.active_model_id = 2;
+
+        buf := mut ByteBuffer.with_capacity(256);
+        meta.serialize(&buf);
+        buf.rewind();
+        restored := mut RagMeta.deserialize(&buf, 4096)!;
+
+        assert_eq(restored.format_version, RAG_FORMAT_VERSION);
+        assert_eq(restored.doc_count, 10u64);
+        assert_eq(restored.chunk_count, 50u64);
+        assert_eq(restored.memory_count, 5u64);
+        assert_eq(restored.session_count, 3u64);
+        assert_eq(restored.next_doc_id, 11u64);
+        assert_eq(restored.next_chunk_id, 51u64);
+        assert_eq(restored.next_memory_id, 6u64);
+        assert_eq(restored.next_session_id, 4u64);
+        assert_eq(restored.active_model_id, 2u32);
+    });
+});
+
+# ==========================================================================
+# RAG — ChunkInfo
+# ==========================================================================
+
+describe("ChunkInfo", |t| {
+    it("serialize_meta produces 40 bytes", || {
+        chunk := mut ChunkInfo {
+            chunk_id: 42,
+            parent_doc_id: 10,
+            position_in_doc: 3,
+            chunk_text: "hello world",
+            chunk_type: CHUNK_STRATEGY_SENTENCE,
+            token_count: 15,
+            overlap_start: 100,
+            overlap_end: 120,
+            created_at: 1700000000,
+        };
+
+        buf := mut ByteBuffer.with_capacity(48);
+        chunk.serialize_meta(&buf);
+        assert_eq(buf.position(), 40u64);
+    });
+
+    it("serialization round-trip preserves fields (except text)", || {
+        chunk := mut ChunkInfo {
+            chunk_id: 99,
+            parent_doc_id: 7,
+            position_in_doc: 5,
+            chunk_text: "some text content",
+            chunk_type: CHUNK_STRATEGY_PARAGRAPH,
+            token_count: 25,
+            overlap_start: 200,
+            overlap_end: 250,
+            created_at: 1700001234,
+        };
+
+        buf := mut ByteBuffer.with_capacity(48);
+        chunk.serialize_meta(&buf);
+        buf.rewind();
+        restored := mut ChunkInfo.deserialize_meta(&buf)!;
+
+        assert_eq(restored.chunk_id, 99u64);
+        assert_eq(restored.parent_doc_id, 7u64);
+        assert_eq(restored.position_in_doc, 5u32);
+        assert_eq(restored.chunk_type, CHUNK_STRATEGY_PARAGRAPH);
+        assert_eq(restored.token_count, 25u32);
+        assert_eq(restored.overlap_start, 200u32);
+        assert_eq(restored.overlap_end, 250u32);
+        assert_eq(restored.created_at, 1700001234i64);
+        # chunk_text is not serialized in meta; deserialized as empty
+        assert_eq_str(restored.chunk_text, "");
+    });
+});
+
+# ==========================================================================
+# RAG — DocumentInfo
+# ==========================================================================
+
+describe("DocumentInfo", |t| {
+    it("serialize_meta produces 56 bytes", || {
+        doc := mut DocumentInfo {
+            doc_id: 1,
+            title: "Test Doc",
+            source_uri: "file:///test.txt",
+            content_hash: 12345678,
+            chunk_count: 5,
+            total_tokens: 500,
+            embedding_model_id: 1,
+            ttl_seconds: 86400,
+            created_at: 1700000000,
+            updated_at: 1700000100,
+        };
+
+        buf := mut ByteBuffer.with_capacity(64);
+        doc.serialize_meta(&buf);
+        assert_eq(buf.position(), 56u64);
+    });
+
+    it("serialization round-trip preserves fixed fields", || {
+        doc := mut DocumentInfo {
+            doc_id: 42,
+            title: "My Document",
+            source_uri: "https://example.com/doc",
+            content_hash: 98765432,
+            chunk_count: 10,
+            total_tokens: 1000,
+            embedding_model_id: 3,
+            ttl_seconds: 0,
+            created_at: 1700000000,
+            updated_at: 1700005000,
+        };
+
+        buf := mut ByteBuffer.with_capacity(64);
+        doc.serialize_meta(&buf);
+        buf.rewind();
+        restored := mut DocumentInfo.deserialize_meta(&buf)!;
+
+        assert_eq(restored.doc_id, 42u64);
+        assert_eq(restored.content_hash, 98765432u64);
+        assert_eq(restored.chunk_count, 10u32);
+        assert_eq(restored.total_tokens, 1000u32);
+        assert_eq(restored.embedding_model_id, 3u32);
+        assert_eq(restored.ttl_seconds, 0u64);
+        assert_eq(restored.created_at, 1700000000i64);
+        assert_eq(restored.updated_at, 1700005000i64);
+        # Variable fields not serialized
+        assert_eq_str(restored.title, "");
+        assert_eq_str(restored.source_uri, "");
+    });
+});
+
+# ==========================================================================
+# RAG — RagSearchResult
+# ==========================================================================
+
+describe("RagSearchResult", |t| {
+    it("new creates result with defaults", || {
+        result := mut RagSearchResult.new(1, 10, 0.85, "relevant text");
+        assert_eq(result.source_id, 1u64);
+        assert_eq(result.chunk_id, 10u64);
+        assert_eq(result.parent_doc_id, 0u64);
+        assert_true((result.score > 0.84 && result.score < 0.86) as i64);
+        assert_eq(result.source_engine, ENGINE_TAG_RAG);
+        assert_eq_str(result.source_text, "relevant text");
+        assert_eq_str(result.context_before, "");
+        assert_eq_str(result.context_after, "");
+    });
+
+    it("with_context sets surrounding context", || {
+        result := mut RagSearchResult.new(1, 10, 0.85, "chunk");
+        result = result.with_context("before text", "after text");
+        assert_eq_str(result.context_before, "before text");
+        assert_eq_str(result.context_after, "after text");
+    });
+
+    it("with_parent sets parent doc ID", || {
+        result := mut RagSearchResult.new(1, 10, 0.85, "chunk");
+        result = result.with_parent(42);
+        assert_eq(result.parent_doc_id, 42u64);
+    });
+});
+
+# ==========================================================================
+# RAG — RagFusionConfig
+# ==========================================================================
+
+describe("RagFusionConfig", |t| {
+    it("default creates standard fusion config", || {
+        config := mut RagFusionConfig.default();
+        assert_true((config.vector_weight > 0.39 && config.vector_weight < 0.41) as i64);
+        assert_true((config.fulltext_weight > 0.29 && config.fulltext_weight < 0.31) as i64);
+        assert_true((config.graph_weight > 0.29 && config.graph_weight < 0.31) as i64);
+        assert_true((config.memory_weight > 0.19 && config.memory_weight < 0.21) as i64);
+        assert_eq(config.fusion_method, 0u8);  # WeightedSum
+        assert_eq(config.rrf_k, 60u32);
+        assert_eq(config.top_k, 10u32);
+        assert_eq(config.max_context_tokens, 2048u32);
+    });
+
+    it("validate succeeds for default config", || {
+        config := mut RagFusionConfig.default();
+        assert_true(config.validate().is_ok() as i64);
+    });
+
+    it("validate fails when all weights are zero", || {
+        config := mut RagFusionConfig.default();
+        config.vector_weight = 0.0;
+        config.fulltext_weight = 0.0;
+        config.graph_weight = 0.0;
+        assert_true(config.validate().is_err() as i64);
+    });
+
+    it("validate fails when top_k is zero", || {
+        config := mut RagFusionConfig.default();
+        config.top_k = 0;
+        assert_true(config.validate().is_err() as i64);
+    });
+
+    it("validate succeeds with custom non-zero weights", || {
+        config := mut RagFusionConfig.default();
+        config.vector_weight = 1.0;
+        config.fulltext_weight = 0.0;
+        config.graph_weight = 0.0;
+        assert_true(config.validate().is_ok() as i64);
+    });
+});
+
+# ==========================================================================
+# RAG — ScoredChunk
+# ==========================================================================
+
+describe("ScoredChunk", |t| {
+    it("new creates scored chunk", || {
+        sc := mut ScoredChunk.new(10, 5, 0.95, ENGINE_TAG_RAG);
+        assert_eq(sc.chunk_id, 10u64);
+        assert_eq(sc.doc_id, 5u64);
+        assert_true((sc.score > 0.94 && sc.score < 0.96) as i64);
+        assert_eq(sc.source_engine, ENGINE_TAG_RAG);
+    });
+});
+
+# ==========================================================================
+# RAG — ChunkMeta (MVCC)
+# ==========================================================================
+
+describe("ChunkMeta", |t| {
+    it("new creates MVCC metadata", || {
+        cm := mut ChunkMeta.new(42, 100);
+        assert_eq(cm.chunk_id, 42u64);
+        assert_eq(cm.txn_id_create, 100u64);
+        assert_eq(cm.txn_id_expire, 0u64);
+        assert_eq(cm.cmd_id_create, 0u32);
+        assert_eq(cm.cmd_id_expire, 0u32);
+    });
+
+    it("clone produces independent copy", || {
+        cm := mut ChunkMeta.new(42, 100);
+        cm.txn_id_expire = 200;
+        cm.cmd_id_create = 5;
+        cm.cmd_id_expire = 10;
+
+        copy := mut cm.clone();
+        assert_eq(copy.chunk_id, 42u64);
+        assert_eq(copy.txn_id_create, 100u64);
+        assert_eq(copy.txn_id_expire, 200u64);
+        assert_eq(copy.cmd_id_create, 5u32);
+        assert_eq(copy.cmd_id_expire, 10u32);
+    });
+});
+
+# ==========================================================================
+# RAG — DocumentMeta (MVCC)
+# ==========================================================================
+
+describe("DocumentMeta", |t| {
+    it("new creates MVCC metadata", || {
+        dm := mut DocumentMeta.new(7, 500);
+        assert_eq(dm.doc_id, 7u64);
+        assert_eq(dm.txn_id_create, 500u64);
+        assert_eq(dm.txn_id_expire, 0u64);
+        assert_eq(dm.cmd_id_create, 0u32);
+        assert_eq(dm.cmd_id_expire, 0u32);
+    });
+
+    it("clone produces independent copy", || {
+        dm := mut DocumentMeta.new(7, 500);
+        dm.txn_id_expire = 600;
+        dm.cmd_id_create = 1;
+        dm.cmd_id_expire = 2;
+
+        copy := mut dm.clone();
+        assert_eq(copy.doc_id, 7u64);
+        assert_eq(copy.txn_id_create, 500u64);
+        assert_eq(copy.txn_id_expire, 600u64);
+        assert_eq(copy.cmd_id_create, 1u32);
+        assert_eq(copy.cmd_id_expire, 2u32);
+    });
+});
+
+# ==========================================================================
+# RAG — MemorySearchParams
+# ==========================================================================
+
+describe("MemorySearchParams", |t| {
+    it("default creates params with standard values", || {
+        params := mut MemorySearchParams.default("hello world", 10);
+        assert_eq_str(params.query_text, "hello world");
+        assert_eq(params.top_k, 10u32);
+        assert_true(params.memory_type_filter.is_none() as i64);
+        assert_true(params.session_id_filter.is_none() as i64);
+        assert_eq(params.min_importance, 0.0);
+        assert_false(params.include_expired as i64);
+        assert_true((params.recency_boost > 0.29 && params.recency_boost < 0.31) as i64);
+        assert_true((params.importance_weight > 0.39 && params.importance_weight < 0.41) as i64);
+        assert_true((params.similarity_weight > 0.59 && params.similarity_weight < 0.61) as i64);
+    });
+
+    it("with_type_filter sets memory type", || {
+        params := mut MemorySearchParams.default("query", 5);
+        params = params.with_type_filter(MEMORY_TYPE_SEMANTIC);
+        assert_true(params.memory_type_filter.is_some() as i64);
+    });
+
+    it("with_session_filter sets session ID", || {
+        params := mut MemorySearchParams.default("query", 5);
+        params = params.with_session_filter(42);
+        assert_true(params.session_id_filter.is_some() as i64);
+    });
+});
