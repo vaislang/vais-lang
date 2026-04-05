@@ -59,7 +59,7 @@ src/
 ## Roadmap Reference
 
 See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
-Current phase: Test Compilation — Phase 158 strict type coercion 대응 중. 221 TC 에러 (6개 테스트). See ROADMAP.md "현재 작업 (2026-03-29 #4)" for details.
+Current phase: Phase 184 unambiguous keywords 마이그레이션 완료 (2026-04-05). vaisdb 9개 테스트 중 8개 codegen 0 errors, test_fulltext 1건(StringMap cross-module) 잔여.
 
 ## Compiler Setup
 - **Working compiler**: `~/.cargo/bin/vaisc` (canonical install path; override with `VAISC` env var)
@@ -69,32 +69,25 @@ Current phase: Test Compilation — Phase 158 strict type coercion 대응 중. 2
   - 심링크 없으면: `mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/std /tmp/vais-lib/std`
 - **Build command**: `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" VAIS_SINGLE_MODULE=1 VAIS_TC_NONFATAL=1 ~/.cargo/bin/vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
 
-## Known Compiler Issues (2026-03-29)
+## Known Compiler Issues (2026-04-05)
 - **Phase 158 strict type coercion**: implicit bool↔i64, int↔float, f32↔f64, str↔i64 금지 — 명시적 `as` 캐스트 필수
   - `true` → i64: `true as i64`
   - `x == y` → i64: `(x == y) as i64`
   - `42` → f64: `42 as f64` 또는 `42.0`
-  - `3.14` → i64: `3.14 as i64`
   - integer widening (i8→i64 등)은 여전히 implicit 허용
-  - 문자열 보간 `"{var}"`는 정상 작동 (TC에서 어떤 타입이든 허용)
-  - match arm에서 void 함수 호출 (예: `buf.write_f64_le(x)`)은 Unit 타입으로 추론됨 (컴파일러 수정 완료)
-  - `x & 1 == 1` 같은 bitwise AND 후 비교는 `(x & 1) == 1`로 괄호 필요 (C/Rust와 동일 우선순위)
-- `!` operator returns `bool` (not bitwise NOT) — use `0xFF ^ val` for bitwise NOT
-- Vec<struct> generic erasure: elements stored as i64 in codegen
-- `R vec_variable` inside `I {}` block returns pointer, not value — use if-else instead of early return
-- `L EnumName = ... | ...` enum syntax: TC accepts but parser rejects → use `E EnumName { ... }` brace syntax
-- `str.as_bytes()`: not a valid method on str — use `s[i]` indexing + `__strlen(s)` for length
-- `str.push_str()`: not a valid method on str — use `s = s + "..."` string concatenation
-- `&[u8]` ↔ `*u8`: slice and pointer types not interchangeable in TC
-- Vec<struct> field access via indexing: `v[i].field` fails — use `tmp := mut v[i]; tmp.field`
-- Result Err() codegen: VaisError struct를 i64로 저장 (clang 에러 원인)
+  - 문자열 보간 `"{var}"`는 정상 작동
+  - `x & 1 == 1`은 `(x & 1) == 1`로 괄호 필요 (우선순위)
+- **Phase 184 unambiguous keywords**: 권장 — EN(enum), EL(else), LF(for-each), LW(while). 기존 E/L/W는 하위 호환.
+- `!` operator returns `bool` — bitwise NOT은 `0xFF ^ val`
+- Vec<struct> field access: `v[i].field` 실패 → `tmp := mut v[i]; tmp.field`
+- `str.as_bytes()` / `str.push_str()`: 미지원 — `s[i]` 인덱싱 / `s = s + "..."` 사용
+- `&[u8]` ↔ `*u8`: 호환 불가
+- StringMap cross-module declare 누락 (test_fulltext 1건)
 
-## Resolved Compiler Issues (2026-03-24)
-- ✅ Pointer auto-deref: `*Mutex<T>.lock()` now works (calls.rs + collections.rs fix)
-- ✅ Tuple→struct: no native tuple support — use named structs (DecodedTid, LsnAllocation, etc.)
-- ✅ Move semantics: &T/&mut T parameters exempted from move checking
-- ✅ Enum struct variant TC: expansion.rs enum_name preservation
-- ✅ bool→i64, int↔float, str↔i64 implicit coercion
+## Resolved Compiler Issues
+- ✅ (2026-04-05, Phase 11) Option<Struct>/Result<T,Struct> erasure — heap-alloc + pointer in i64 slot path
+- ✅ (2026-04-05, Phase 10) Vec<&[u8]> slice + Vec<struct> field access generic resolution
+- ✅ (2026-03-24) Pointer auto-deref, Tuple→struct, Move semantics, Enum struct variant TC
 
 ## VAIS Ecosystem
 

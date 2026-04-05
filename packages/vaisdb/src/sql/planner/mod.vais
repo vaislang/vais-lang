@@ -105,7 +105,7 @@ X CostEstimate {
 # ============================================================================
 
 # Physical plan node representing a single operator in the execution plan
-E PlanNode =
+EN PlanNode =
     # Table scan: sequential scan of all pages
     SeqScan { table: Str, alias: Option<Str>, filter: Option<Expr> } |
 
@@ -209,7 +209,7 @@ X TableStats {
     F from_table_info(info: &TableInfo) -> TableStats {
         # Use row_count_estimate from TableInfo
         row_count := mut info.row_count_estimate;
-        page_count := mut I row_count == 0 { 1 } E { (row_count / 50) as u32 };  # Assume ~50 rows per page
+        page_count := mut I row_count == 0 { 1 } EL { (row_count / 50) as u32 };  # Assume ~50 rows per page
         avg_row_size := mut 200;  # Default estimate: 200 bytes per row
 
         TableStats {
@@ -263,7 +263,7 @@ F estimate_selectivity(expr: &Expr) -> f64 {
         Expr.IsNull { expr, negated } => {
             I *negated {
                 1.0 - SELECTIVITY_IS_NULL
-            } E {
+            } EL {
                 SELECTIVITY_IS_NULL
             }
         },
@@ -272,7 +272,7 @@ F estimate_selectivity(expr: &Expr) -> f64 {
         Expr.Between { negated, .. } => {
             I *negated {
                 1.0 - SELECTIVITY_RANGE
-            } E {
+            } EL {
                 SELECTIVITY_RANGE
             }
         },
@@ -280,15 +280,15 @@ F estimate_selectivity(expr: &Expr) -> f64 {
         # IN list
         Expr.InList { list, negated, .. } => {
             sel := mut SELECTIVITY_EQUALITY * (list.len() as f64);
-            sel := mut I sel > 1.0 { 1.0 } E { sel };
-            I *negated { 1.0 - sel } E { sel }
+            sel := mut I sel > 1.0 { 1.0 } EL { sel };
+            I *negated { 1.0 - sel } EL { sel }
         },
 
         # LIKE
         Expr.Like { negated, .. } => {
             I *negated {
                 1.0 - SELECTIVITY_LIKE
-            } E {
+            } EL {
                 SELECTIVITY_LIKE
             }
         },
@@ -328,21 +328,21 @@ F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, 
     # Step 3: Apply GROUP BY and aggregates
     grouped_plan := mut I query.group_by.len() > 0 || has_aggregates(&query.select_list) {
         plan_aggregation(filtered_plan, &query.group_by, &query.select_list, &query.having, catalog)?
-    } E {
+    } EL {
         filtered_plan
     };
 
     # Step 4: Apply DISTINCT
     distinct_plan := mut I query.distinct {
         PlanNode.Distinct { input: Box.new(grouped_plan) }
-    } E {
+    } EL {
         grouped_plan
     };
 
     # Step 5: Apply ORDER BY
     sorted_plan := mut I query.order_by.len() > 0 {
         plan_order_by(distinct_plan, &query.order_by)?
-    } E {
+    } EL {
         distinct_plan
     };
 
@@ -378,7 +378,7 @@ F plan_from_clause(table_refs: &[TableRef], catalog: &CatalogManager) -> Result<
     plan := mut plan_table_ref(&table_refs[0], catalog)?;
 
     # Process remaining tables as implicit cross joins or explicit joins
-    L i: 1..table_refs.len() {
+    LF i: 1..table_refs.len() {
         right_plan := mut plan_table_ref(&table_refs[i], catalog)?;
 
         # Implicit cross join (comma-separated tables in FROM clause)
@@ -476,14 +476,14 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
             # USING (a, b) → ON left.a = right.a AND left.b = right.b
             I columns.len() == 0 {
                 None
-            } E {
+            } EL {
                 # Extract table names for left and right sides to qualify columns
                 left_table := mut extract_table_name(&join.left);
                 right_table := mut extract_table_name(&join.right);
 
                 # Build conjunction of equality conditions
                 on_expr: Option<Expr> := mut None;
-                L col: columns {
+                LF col: columns {
                     eq := mut Expr.BinaryOp {
                         left: Box.new(Expr.ColumnRef { table: left_table.clone(), column: col.clone() }),
                         op: BinOp.Eq,
@@ -543,7 +543,7 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
                 left_keys,
                 right_keys,
             })
-        } E {
+        } EL {
             # Swap sides
             Ok(PlanNode.HashJoin {
                 build: Box.new(right_plan),
@@ -553,7 +553,7 @@ F plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Vai
                 right_keys: left_keys,
             })
         }
-    } E {
+    } EL {
         # Nested loop join
         Ok(PlanNode.NestedLoopJoin {
             left: Box.new(left_plan),
@@ -607,12 +607,12 @@ F extract_equi_join_keys(expr: &Expr) -> (bool, Vec<u64>, Vec<u64>) {
 
                         # Offset right-side keys
                         i: u64 := mut 0;
-                        L i < r_lk.len() {
+                        LW i < r_lk.len() {
                             left_keys.push(r_lk[i] + offset);
                             i += 1;
                         }
                         i = 0;
-                        L i < r_rk.len() {
+                        LW i < r_rk.len() {
                             right_keys.push(r_rk[i] + offset);
                             i += 1;
                         }
@@ -685,7 +685,7 @@ F plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Res
 # residual_filter is the part of the predicate that cannot be satisfied by the index
 F select_index(table: &Str, indexes: &[&IndexInfo], predicate: &Expr) -> Option<(Str, KeyRange, Option<Expr>)> {
     # For each index, check if the predicate can use it
-    L idx: indexes {
+    LF idx: indexes {
         # Check if predicate references the indexed columns
         M check_index_usable(idx, predicate) {
             Some((key_range, residual)) => {
@@ -755,7 +755,7 @@ F plan_aggregation(
 ) -> Result<PlanNode, VaisError> {
     # Extract aggregate specs from SELECT list
     aggregates := mut Vec.new();
-    L item: select_list {
+    LF item: select_list {
         M item {
             SelectItem.Expr { expr, alias } => {
                 M extract_aggregate(expr) {
@@ -800,7 +800,7 @@ F extract_aggregate(expr: &Expr) -> Option<AggregateSpec> {
 
 # Check if SELECT list has any aggregate functions
 F has_aggregates(select_list: &[SelectItem]) -> bool {
-    L item: select_list {
+    LF item: select_list {
         M item {
             SelectItem.Expr { expr, .. } => {
                 M extract_aggregate(expr) {
@@ -859,7 +859,7 @@ F plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> Re
             limit: limit_val,
             offset: offset_val,
         })
-    } E {
+    } EL {
         Ok(input)
     }
 }
@@ -885,7 +885,7 @@ F extract_constant_int(expr: &Expr) -> Option<i64> {
 F plan_projection(input: PlanNode, select_list: &[SelectItem]) -> Result<PlanNode, VaisError> {
     # Convert SELECT items to ProjectColumn specs
     columns := mut Vec.new();
-    L item: select_list {
+    LF item: select_list {
         M item {
             SelectItem.AllColumns => {
                 # SELECT * — pass through all columns
@@ -915,7 +915,7 @@ F plan_projection(input: PlanNode, select_list: &[SelectItem]) -> Result<PlanNod
             input: Box.new(input),
             columns,
         })
-    } E {
+    } EL {
         Ok(input)
     }
 }
@@ -1070,7 +1070,7 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
             row_estimate := mut I group_by.len() > 0 {
                 # Estimate distinct groups as sqrt(N) (heuristic)
                 ((input_cost.row_estimate as f64).sqrt()) as u64
-            } E {
+            } EL {
                 # No GROUP BY → single aggregate row
                 1
             };
@@ -1087,7 +1087,7 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
                 Some(off) => {
                     I row_estimate > *off {
                         row_estimate = row_estimate - *off;
-                    } E {
+                    } EL {
                         row_estimate = 0;
                     }
                 },

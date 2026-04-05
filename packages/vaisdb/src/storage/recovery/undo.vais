@@ -48,7 +48,7 @@ F recovery_undo(
     # Process in reverse LSN order to maximize efficiency
     active_txns := mut Vec.with_capacity(0);  # (txn_id, last_lsn)
 
-    L (txn_id, entry): &analysis.txn_table {
+    LW (txn_id, entry): &analysis.txn_table {
         M entry.state {
             Active => {
                 active_txns.push((*txn_id, entry.last_lsn))
@@ -68,13 +68,13 @@ F recovery_undo(
     # In practice, we'd re-read from WAL segments, but we track undo progress per txn
     undo_progress := mut HashMap.with_capacity(16);  # txn_id -> next_lsn_to_undo
 
-    L &(txn_id, last_lsn): &active_txns {
+    LW &(txn_id, last_lsn): &active_txns {
         # Check if there's a CLR-based undo_next_lsn
         start_lsn := mut M analysis.txn_table.get(&txn_id) {
             Some(entry) => {
                 I entry.undo_next_lsn != NULL_LSN {
                     entry.undo_next_lsn
-                } E {
+                } EL {
                     entry.last_lsn
                 }
             },
@@ -84,7 +84,7 @@ F recovery_undo(
     }
 
     # Process each active transaction
-    L &(txn_id, _): &active_txns {
+    LW &(txn_id, _): &active_txns {
         M undo_progress.get(&txn_id) {
             Some(&current_lsn) => {
                 count := mut undo_single_transaction(
@@ -121,7 +121,7 @@ F undo_single_transaction(
     records_undone := mut 0
     current_lsn := mut start_lsn
 
-    L current_lsn != NULL_LSN {
+    LW current_lsn != NULL_LSN {
         # Read the WAL record at current_lsn
         wal_record := mut read_record_at_lsn(wal_dir, current_lsn)?;
         header := mut wal_record.header
@@ -132,7 +132,7 @@ F undo_single_transaction(
             buf := mut ByteBuffer.wrap_readonly(&payload)
             clr := mut ClrPayload.deserialize(&buf)?;
             current_lsn = clr.undo_next_lsn
-        } E {
+        } EL {
             # Determine the next LSN to undo (prev_lsn of current record)
             next_undo_lsn := mut header.prev_lsn
 
@@ -162,7 +162,7 @@ F read_record_at_lsn(
         Some((header, payload)) => {
             I header.lsn == lsn {
                 Ok(WalRecord { header, payload })
-            } E {
+            } EL {
                 Err(err_internal("WAL record at expected LSN not found"))
             }
         },
@@ -256,10 +256,10 @@ F extract_page_info(payload: &[u8]) -> ExtractedPageInfo {
         pid_result := mut read_i32_le_checked(buf)
         I fid_result.is_ok() && pid_result.is_ok() {
             ExtractedPageInfo { file_id: fid_result.unwrap(), page_id: pid_result.unwrap() }
-        } E {
+        } EL {
             ExtractedPageInfo { file_id: 0, page_id: 0 }
         }
-    } E {
+    } EL {
         ExtractedPageInfo { file_id: 0, page_id: 0 }
     }
 }
@@ -282,7 +282,7 @@ F undo_tuple_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 
     # Flush modified heap page back to frame
     flushed := mut heap.flush()
-    L i: 0..flushed.len() {
+    LF i: 0..flushed.len() {
         page_data[i] = flushed[i]
     }
 
@@ -309,7 +309,7 @@ F undo_tuple_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
     heap.update_mvcc(p.slot, &old_tuple.mvcc)?;
 
     flushed := mut heap.flush()
-    L i: 0..flushed.len() {
+    LF i: 0..flushed.len() {
         page_data[i] = flushed[i]
     }
 
@@ -344,7 +344,7 @@ F undo_tuple_update(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
     }
 
     flushed := mut heap.flush()
-    L i: 0..flushed.len() {
+    LF i: 0..flushed.len() {
         page_data[i] = flushed[i]
     }
 
@@ -431,10 +431,10 @@ F undo_btree_merge(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErro
     # Copy key directory entries from main to sibling
     key_dir_start := mut 48;  # PAGE_HEADER_SIZE
     entry_size := mut 8
-    L i: 0..move_count {
+    LF i: 0..move_count {
         src_off := mut key_dir_start + ((keep_count + i) as u32) * entry_size
         dst_off := mut key_dir_start + (i as u32) * entry_size
-        L j: 0..entry_size {
+        LF j: 0..entry_size {
             sib_data[(dst_off + j) as u64] = main_data[(src_off + j) as u64]
         }
     }
@@ -460,7 +460,7 @@ F undo_btree_page_insert_key(page_data: &mut [u8], key: &[u8], value: &[u8]) -> 
     entry_size := mut 8
 
     insert_pos := mut item_count as u32
-    L i: 0..item_count {
+    LF i: 0..item_count {
         entry_off := mut key_dir_start + (i as u32) * entry_size
         existing_key_off := mut read_u32_le(page_data, entry_off)
         existing_key_len := mut read_u32_le(page_data, entry_off + 4)
@@ -472,18 +472,18 @@ F undo_btree_page_insert_key(page_data: &mut [u8], key: &[u8], value: &[u8]) -> 
 
     data_offset := mut header.free_space_offset as u32
     total_kv_len := mut key.len() as u32 + value.len() as u32
-    L i: 0..key.len() {
+    LF i: 0..key.len() {
         page_data[data_offset as u64 + i] = key[i]
     }
-    L i: 0..value.len() {
+    LF i: 0..value.len() {
         page_data[(data_offset + key.len() as u32) as u64 + i] = value[i]
     }
 
     i := mut item_count as u32
-    L i > insert_pos {
+    LW i > insert_pos {
         src_off := mut key_dir_start + (i - 1) * entry_size
         dst_off := mut key_dir_start + i * entry_size
-        L j: 0..entry_size {
+        LF j: 0..entry_size {
             page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64]
         }
         i -= 1
@@ -506,7 +506,7 @@ F undo_btree_page_delete_key(page_data: &mut [u8], key: &[u8]) -> Result<(), Vai
     entry_size := mut 8
 
     found_pos := mut -1
-    L i: 0..item_count {
+    LF i: 0..item_count {
         entry_off := mut key_dir_start + (i as u32) * entry_size
         existing_key_off := mut read_u32_le(page_data, entry_off)
         existing_key_len := mut read_u32_le(page_data, entry_off + 4)
@@ -518,10 +518,10 @@ F undo_btree_page_delete_key(page_data: &mut [u8], key: &[u8]) -> Result<(), Vai
 
     I found_pos >= 0 {
         pos := mut found_pos as u32
-        L i: pos..(item_count as u32 - 1) {
+        LF i: pos..(item_count as u32 - 1) {
             src_off := mut key_dir_start + (i + 1) * entry_size
             dst_off := mut key_dir_start + i * entry_size
-            L j: 0..entry_size {
+            LF j: 0..entry_size {
                 page_data[(dst_off + j) as u64] = page_data[(src_off + j) as u64]
             }
         }
@@ -542,10 +542,10 @@ F undo_btree_page_redo_merge(
     target_count := mut target_header.item_count
     sib_count := mut sib_header.item_count
 
-    L i: 0..sib_count {
+    LF i: 0..sib_count {
         src_off := mut key_dir_start + (i as u32) * entry_size
         dst_off := mut key_dir_start + ((target_count + i) as u32) * entry_size
-        L j: 0..entry_size {
+        LF j: 0..entry_size {
             target_page[(dst_off + j) as u64] = sibling_page[(src_off + j) as u64]
         }
     }

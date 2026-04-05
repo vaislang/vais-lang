@@ -1,7 +1,14 @@
 # VaisDB Codegen Error Catalog
 > 2026-03-24 — codegen 타입 불일치 근본 원인 분석
+> 2026-04-05 update — Phase 11 (Option/Result struct erasure 근본 수정) + Phase 184 (unambiguous keywords) 마이그레이션 후 대부분 해결
 
-## 현재 상태
+## 현재 상태 (2026-04-05)
+- **9/9 테스트 중 8개 codegen 0 errors**: test_btree, test_wal, test_buffer_pool, test_graph, test_vector, test_cross_engine, test_transaction, test_planner
+- **잔여 1건**: test_fulltext (C001 Undefined variable `V` — StringMap cross-module generic param)
+- **핵심 개선**: Phase 184 키워드 마이그레이션(E/L→EN/EL/LF/LW)으로 test_transaction 1→0, test_planner 47→0
+- ir_fix.py post-processing은 더 이상 필요 없음 (근본 codegen 수정됨)
+
+## 구 이력 (2026-03-24)
 - 9/9 IR 생성 ✅
 - ir_fix.py 패턴 기반 수정: 500-6300 fixes/test
 - clang 에러: 각 테스트 1개 잔여
