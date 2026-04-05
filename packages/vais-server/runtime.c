@@ -6,12 +6,14 @@
 
 // str_len(s: str) -> i64
 // The compiler extracts the i8* pointer and passes it directly
+__attribute__((weak))
 long long str_len(const char* s) {
     if (!s) return 0;
     return (long long)strlen(s);
 }
 
 // sleep_ms(ms: i64)
+__attribute__((weak))
 void sleep_ms(long long ms) {
     usleep((unsigned int)(ms * 1000));
 }

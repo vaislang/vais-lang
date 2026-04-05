@@ -4,11 +4,11 @@
 
 set -e
 
-VAISC="${HOME}/.cargo/bin/vaisc"
-STD_PATH="/Users/sswoo/study/projects/vais/std"
+VAISC="${VAISC:-${HOME}/.cargo/bin/vaisc}"
 SRC_DIR="$(dirname "$0")/src"
 ROOT_DIR="$(dirname "$0")"
-DEP_PATH="${SRC_DIR}"
+STD_PATH="${VAIS_STD_PATH:-/Users/sswoo/study/projects/vais/std}"
+DEP_PATH="${VAIS_DEP_PATHS:-${SRC_DIR}}"
 
 echo "=== vais-server build ==="
 
