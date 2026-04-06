@@ -302,6 +302,14 @@ F estimate_selectivity(expr: &Expr) -> f64 {
 # Plan Building — Top-Level Entry Point
 # ============================================================================
 
+# Helper: plan a set operation arm with typed set_op parameter
+# Extracted to a typed function boundary to avoid Option<SetOperation> generic erasure
+# when accessing set_op.right (Box<SelectQuery>) inside a match arm.
+F plan_set_op_arm(left_plan: PlanNode, set_op: &SetOperation, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
+    right_plan := mut build_plan(&set_op.right, catalog)?;
+    plan_set_operation(left_plan, right_plan, set_op)
+}
+
 # Build an optimized execution plan from a SELECT query
 # Returns a PlanNode representing the root of the execution plan
 F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, VaisError> {
@@ -355,8 +363,7 @@ F build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode, 
     # Step 8: Apply set operations (UNION, INTERSECT, EXCEPT)
     final_plan := mut M &query.set_op {
         Some(set_op) => {
-            right_plan := mut build_plan(&set_op.right, catalog)?;
-            plan_set_operation(projected_plan, right_plan, set_op)?
+            plan_set_op_arm(projected_plan, set_op, catalog)?
         },
         None => projected_plan,
     };
@@ -778,21 +785,47 @@ F plan_aggregation(
     })
 }
 
+# Check if a str is a known aggregate function name (case-insensitive).
+# The `str` primitive does not expose `.to_uppercase()` in the per-module
+# codegen path, so we normalise by direct comparison against both the
+# upper- and lower-case literal forms and return the canonical upper-case
+# name wrapped as a `Str`.
+F aggregate_canonical_name(name: str) -> Option<Str> {
+    I name == "COUNT" || name == "count" {
+        R Some(Str.from("COUNT"));
+    }
+    I name == "SUM" || name == "sum" {
+        R Some(Str.from("SUM"));
+    }
+    I name == "AVG" || name == "avg" {
+        R Some(Str.from("AVG"));
+    }
+    I name == "MIN" || name == "min" {
+        R Some(Str.from("MIN"));
+    }
+    I name == "MAX" || name == "max" {
+        R Some(Str.from("MAX"));
+    }
+    None
+}
+
 # Extract aggregate function from expression
 F extract_aggregate(expr: &Expr) -> Option<AggregateSpec> {
     M expr {
         Expr.FunctionCall { name, args, distinct } => {
-            upper := mut name.to_uppercase();
-            I upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" || upper == "MAX" {
-                I args.len() > 0 {
-                    R Some(AggregateSpec {
-                        func_name: upper,
-                        arg_expr: args[0].clone(),
-                        is_distinct: *distinct,
-                    });
-                }
+            M aggregate_canonical_name(*name) {
+                Some(canonical) => {
+                    I args.len() > 0 {
+                        R Some(AggregateSpec {
+                            func_name: canonical,
+                            arg_expr: args[0].clone(),
+                            is_distinct: *distinct,
+                        });
+                    }
+                    None
+                },
+                None => None,
             }
-            None
         },
         _ => None,
     }
@@ -1144,7 +1177,12 @@ F estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstimat
 
 # Format a plan node as a human-readable string for EXPLAIN output
 F format_plan(node: &PlanNode, indent: u64) -> Str {
-    prefix := mut "  ".repeat(indent);
+    # `str.repeat()` is not supported in the per-module codegen path; build the
+    # indentation prefix manually instead.
+    prefix := mut Str.new();
+    LF _i: 0..indent {
+        prefix.push_str("  ");
+    }
 
     M node {
         PlanNode.SeqScan { table, alias, filter } => {
