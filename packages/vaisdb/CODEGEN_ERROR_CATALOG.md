@@ -2,11 +2,15 @@
 > 2026-03-24 — codegen 타입 불일치 근본 원인 분석
 > 2026-04-05 update — Phase 11 (Option/Result struct erasure 근본 수정) + Phase 184 (unambiguous keywords) 마이그레이션 후 대부분 해결
 
-## 현재 상태 (2026-04-05)
-- **9/9 테스트 중 8개 codegen 0 errors**: test_btree, test_wal, test_buffer_pool, test_graph, test_vector, test_cross_engine, test_transaction, test_planner
-- **잔여 1건**: test_fulltext (C001 Undefined variable `V` — StringMap cross-module generic param)
+## 현재 상태 (2026-04-07)
+- **9/9 테스트 모두 codegen 0 errors**: test_btree, test_wal, test_buffer_pool, test_graph, test_vector, test_cross_engine, test_transaction, test_planner, test_fulltext
+- **StringMap cross-module 해결**: multi-module 빌드(VAIS_SINGLE_MODULE=1 없이)로 0 errors. 구 SINGLE_MODULE 모드는 deprecated → 사용 금지
+- **test_planner 순환 참조**: 실제 순환 import 없음. multi-module 빌드로 0 errors 확인
 - **핵심 개선**: Phase 184 키워드 마이그레이션(E/L→EN/EL/LF/LW)으로 test_transaction 1→0, test_planner 47→0
 - ir_fix.py post-processing은 더 이상 필요 없음 (근본 codegen 수정됨)
+
+## 구 상태 (2026-04-05)
+- 9/9 테스트 중 8개 codegen 0 errors, 잔여 1건: test_fulltext (SINGLE_MODULE 모드에서만 발생하는 C001 Undefined variable `V`)
 
 ## 구 이력 (2026-03-24)
 - 9/9 IR 생성 ✅
@@ -84,13 +88,13 @@
 3. ptr→{ ptr, i64 } 패턴 해결 (call arg에서 slice 매개변수)
 4. 각 테스트 link + run 시도
 
-## 검증 명령
+## 검증 명령 (strict 모드 — SINGLE_MODULE, VAIS_TC_NONFATAL 사용 금지)
 ```bash
-# 전체 파이프라인
-for test in test_graph test_vector test_btree test_buffer_pool test_wal test_fulltext test_transaction test_planner test_types; do
-  VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" VAIS_SINGLE_MODULE=1 VAIS_TC_NONFATAL=1 \
-    /Users/sswoo/study/projects/vais/target/debug/vaisc build tests/*/${test}.vais --emit-ir -o /tmp/${test}.ll --force-rebuild 2>/dev/null
-  python3 ir_fix.py /tmp/${test}.ll /tmp/${test}_fixed.ll 2>/dev/null
-  clang -c -x ir /tmp/${test}_fixed.ll -o /tmp/${test}.o -w 2>&1 | head -1
+# 전체 파이프라인 (strict 빌드)
+cd /Users/sswoo/study/projects/vais-lang/packages/vaisdb
+mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/std /tmp/vais-lib/std
+for test in test_graph test_vector test_btree test_buffer_pool test_wal test_fulltext test_transaction test_planner; do
+  VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" \
+    ~/.cargo/bin/vaisc build tests/*/${test}.vais --emit-ir -o /tmp/${test}.ll --force-rebuild 2>&1 | grep "^error\["
 done
 ```

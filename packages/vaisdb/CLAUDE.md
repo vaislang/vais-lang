@@ -59,7 +59,7 @@ src/
 ## Roadmap Reference
 
 See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
-Current phase: Phase 184 unambiguous keywords 마이그레이션 완료 (2026-04-05). vaisdb 9개 테스트 중 8개 codegen 0 errors, test_fulltext 1건(StringMap cross-module) 잔여.
+Current phase: Phase 184+ (2026-04-07). vaisdb 9/9 테스트 모두 codegen 0 errors (strict multi-module 빌드).
 
 ## Compiler Setup
 - **Working compiler**: `~/.cargo/bin/vaisc` (canonical install path; override with `VAISC` env var)
@@ -67,9 +67,11 @@ Current phase: Phase 184 unambiguous keywords 마이그레이션 완료 (2026-04
   - `~/.cargo/bin/vaisc` 또는 `/Users/sswoo/study/projects/vais/target/debug/vaisc` 사용
 - **std**: `/tmp/vais-lib/std` → symlink to `/Users/sswoo/study/projects/vais/std`
   - 심링크 없으면: `mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/std /tmp/vais-lib/std`
-- **Build command**: `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" VAIS_SINGLE_MODULE=1 VAIS_TC_NONFATAL=1 ~/.cargo/bin/vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
+- **Strict build command** (검증용): `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" ~/.cargo/bin/vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
+  - ⚠️ `VAIS_SINGLE_MODULE=1` deprecated — 사용 금지 (StringMap cross-module 에러 유발)
+  - ⚠️ `VAIS_TC_NONFATAL=1` 검증 시 사용 금지 (TC 에러를 경고로 강등하여 거짓 성공 보고 초래)
 
-## Known Compiler Issues (2026-04-05)
+## Known Compiler Issues (2026-04-07)
 - **Phase 158 strict type coercion**: implicit bool↔i64, int↔float, f32↔f64, str↔i64 금지 — 명시적 `as` 캐스트 필수
   - `true` → i64: `true as i64`
   - `x == y` → i64: `(x == y) as i64`
@@ -82,9 +84,9 @@ Current phase: Phase 184 unambiguous keywords 마이그레이션 완료 (2026-04
 - Vec<struct> field access: `v[i].field` 실패 → `tmp := mut v[i]; tmp.field`
 - `str.as_bytes()` / `str.push_str()`: 미지원 — `s[i]` 인덱싱 / `s = s + "..."` 사용
 - `&[u8]` ↔ `*u8`: 호환 불가
-- StringMap cross-module declare 누락 (test_fulltext 1건)
 
 ## Resolved Compiler Issues
+- ✅ (2026-04-07) StringMap cross-module generic param — multi-module 빌드로 해결 (SINGLE_MODULE deprecated)
 - ✅ (2026-04-05, Phase 11) Option<Struct>/Result<T,Struct> erasure — heap-alloc + pointer in i64 slot path
 - ✅ (2026-04-05, Phase 10) Vec<&[u8]> slice + Vec<struct> field access generic resolution
 - ✅ (2026-03-24) Pointer auto-deref, Tuple→struct, Move semantics, Enum struct variant TC
