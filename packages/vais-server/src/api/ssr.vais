@@ -1,0 +1,193 @@
+# SSR API Endpoints
+# Implements POST /api/render, POST /api/hydrate, and GET /api/health.
+# These endpoints form the HTTP contract consumed by vais-web's ssr-client.ts.
+
+U std/string
+U src/http/request
+U src/http/response
+U src/api/rest
+
+# ============================================================================
+# Request / Response shapes
+# ============================================================================
+
+# Parsed body for POST /api/render
+S RenderRequest {
+    route: str,   # URL path, e.g. "/blog/hello"
+    props: str,   # JSON-encoded props object
+}
+
+# Parsed body for POST /api/hydrate
+S HydrateRequest {
+    route: str,   # URL path rendered server-side
+    props: str,   # JSON-encoded props used during SSR
+}
+
+# ============================================================================
+# JSON field extraction helpers
+# ============================================================================
+
+# Extract the value of a top-level string field from a flat JSON object.
+# Returns "" when the field is absent or the value is not a quoted string.
+# Only handles simple {"key":"value",...} objects — sufficient for our wire
+# protocol which never nests the route/props fields.
+F json_get_str(json: str, key: str) -> str {
+    needle := "\"" + key + "\":"
+    start  := str_find(json, needle)
+    I start == -1 { R "" }
+
+    val_start := start + str_len(needle)
+    val_start = skip_whitespace(json, val_start)
+
+    # Expect a quoted string value
+    I str_char_at(json, val_start) != 34 { R "" }   # 34 = '"'
+
+    # Walk until the closing '"', honouring '\' escapes
+    end := mut (val_start + 1)
+    LW 1 == 1 {
+        c := str_char_at(json, end)
+        I c == 0  { R "" }        # unterminated string
+        I c == 92 { end += 2 }    # 92 = '\' — skip escaped char
+        EL I c == 34 {            # closing '"'
+            R str_slice(json, val_start + 1, end)
+        }
+        EL { end += 1 }
+    }
+    ""
+}
+
+# Skip ASCII whitespace (space=32, tab=9, CR=13, LF=10) from position i.
+F skip_whitespace(s: str, i: i64) -> i64 {
+    c := str_char_at(s, i)
+    I c == 32 || c == 9 || c == 13 || c == 10 {
+        skip_whitespace(s, i + 1)
+    } EL {
+        i
+    }
+}
+
+# ============================================================================
+# Parse helpers
+# ============================================================================
+
+F parse_render_request(body: str) -> RenderRequest {
+    route := json_get_str(body, "route")
+    props := json_get_str(body, "props")
+    RenderRequest { route: route, props: props }
+}
+
+F parse_hydrate_request(body: str) -> HydrateRequest {
+    route := json_get_str(body, "route")
+    props := json_get_str(body, "props")
+    HydrateRequest { route: route, props: props }
+}
+
+# ============================================================================
+# SSR rendering logic
+# ============================================================================
+
+# Perform server-side rendering for the given route and props.
+# Returns (html, head, status_code) as a tuple encoded in the response body.
+#
+# In a production implementation this would invoke the JS SSR service via an
+# internal HTTP call.  Here we produce a well-formed HTML shell so that the
+# wire contract is exercised end-to-end without requiring the JS runtime.
+F do_render(route: str, props: str) -> Response {
+    I route == "" {
+        R json_error("Missing required field: route", 400)
+    }
+
+    # Build minimal rendered HTML
+    html := "<div id=\"app\" data-route=\"" + route + "\"></div>"
+    head := "<title>vais | " + route + "</title>"
+    status_val := 200
+
+    html_escaped := escape_json_str(html)
+    head_escaped := escape_json_str(head)
+    status_str   := i64_to_str(status_val)
+
+    body := "{\"html\": \"" + html_escaped + "\""
+          + ", \"head\": \"" + head_escaped + "\""
+          + ", \"status\": " + status_str + "}"
+
+    json_response(body, 200)
+}
+
+# ============================================================================
+# Hydration logic
+# ============================================================================
+
+F do_hydrate(route: str, props: str) -> Response {
+    I route == "" {
+        R json_error("Missing required field: route", 400)
+    }
+
+    props_val := I props == "" { "{}" } EL { props }
+
+    props_escaped := escape_json_str(props_val)
+    route_escaped := escape_json_str(route)
+
+    body := "{\"data\": \"" + props_escaped + "\""
+          + ", \"route\": \"" + route_escaped + "\"}"
+
+    json_response(body, 200)
+}
+
+# ============================================================================
+# Route handlers
+# ============================================================================
+
+# POST /api/render
+# Request body: { "route": str, "props": str (JSON) }
+# Response:     { "html": str, "head": str, "status": i64 }
+F handle_ssr_render(req: Request) -> Response {
+    req_data := parse_render_request(req.body)
+    do_render(req_data.route, req_data.props)
+}
+
+# POST /api/hydrate
+# Request body: { "route": str, "props": str (JSON) }
+# Response:     { "data": str, "route": str }
+F handle_ssr_hydrate(req: Request) -> Response {
+    req_data := parse_hydrate_request(req.body)
+    do_hydrate(req_data.route, req_data.props)
+}
+
+# GET /api/health
+# Response: { "status": "ok", "version": str }
+F handle_health(req: Request) -> Response {
+    body := "{\"status\": \"ok\", \"version\": \"0.1.0\"}"
+    json_response(body, 200)
+}
+
+# ============================================================================
+# String escaping helper
+# ============================================================================
+
+# Escape a string for safe embedding inside a JSON quoted value.
+# Handles backslash and double-quote characters.
+F escape_json_str(s: str) -> str {
+    escape_json_str_rec(s, "", 0)
+}
+
+F escape_json_str_rec(s: str, acc: str, i: i64) -> str {
+    c := str_char_at(s, i)
+    I c == 0  { R acc }
+    I c == 92 { escape_json_str_rec(s, acc + "\\\\", i + 1) }   # backslash
+    I c == 34 { escape_json_str_rec(s, acc + "\\\"", i + 1) }   # double-quote
+    EL {
+        ch := str_from_char(c)
+        escape_json_str_rec(s, acc + ch, i + 1)
+    }
+}
+
+# ============================================================================
+# External helpers
+# ============================================================================
+
+X F str_len(s: str) -> i64
+X F str_char_at(s: str, i: i64) -> i64
+X F str_slice(s: str, start: i64, end: i64) -> str
+X F str_find(s: str, needle: str) -> i64
+X F str_from_char(c: i64) -> str
+X F i64_to_str(n: i64) -> str
