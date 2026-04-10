@@ -7,7 +7,7 @@ set -e
 VAISC="${VAISC:-${HOME}/.cargo/bin/vaisc}"
 SRC_DIR="$(dirname "$0")/src"
 ROOT_DIR="$(dirname "$0")"
-STD_PATH="${VAIS_STD_PATH:-/Users/sswoo/study/projects/vais/std}"
+STD_PATH="${VAIS_STD_PATH:-/Users/sswoo/study/projects/vais/compiler/std}"
 DEP_PATH="${VAIS_DEP_PATHS:-${SRC_DIR}}"
 
 echo "=== vais-server build ==="
