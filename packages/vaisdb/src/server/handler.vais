@@ -72,9 +72,11 @@ X QueryHandler {
         responses := mut Vec.with_capacity(0);
 
         # Update connection state to InQuery
-        pool.with_connection(self.conn_id, |conn| {
-            conn.set_state(InQuery)
-        })??;
+        guard := mut pool.connections.lock()
+        M guard.get_mut(&self.conn_id) {
+            Some(conn) => { conn.set_state(InQuery)?; },
+            None => {},
+        }
 
         # FUTURE(integration): Route to SQL execution pipeline
         # parse_sql -> HybridPlanner.execute_query / Executor.execute_dml / DDL / txn mgmt
@@ -84,18 +86,22 @@ X QueryHandler {
         responses.push(serialize_command_complete(&tag));
 
         # Return to Ready state
-        pool.with_connection(self.conn_id, |conn| {
-            conn.set_state(Ready)
-        })??;
+        guard2 := mut pool.connections.lock()
+        M guard2.get_mut(&self.conn_id) {
+            Some(conn) => { conn.set_state(Ready)?; },
+            None => {},
+        }
 
         # Send ReadyForQuery
-        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
-            M conn.get_txn_state() {
+        guard3 := mut pool.connections.lock()
+        txn_state := mut M guard3.get(&self.conn_id) {
+            Some(conn) => M conn.get_txn_state() {
                 Idle => Idle,
                 InBlock => InBlock,
                 Failed => Failed,
-            }
-        })?;
+            },
+            None => Idle,
+        };
         responses.push(serialize_ready(&txn_state));
 
         Ok(responses)
@@ -166,18 +172,22 @@ X QueryHandler {
     # Handle Sync: mark end of extended query sequence
     F handle_sync(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
         # Clear all portals
-        pool.with_connection(self.conn_id, |conn| {
-            conn.clear_portals();
-        })?;
+        guard4 := mut pool.connections.lock()
+        M guard4.get_mut(&self.conn_id) {
+            Some(conn) => { conn.clear_portals(); },
+            None => {},
+        }
 
         # Send ReadyForQuery
-        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
-            M conn.get_txn_state() {
+        guard5 := mut pool.connections.lock()
+        txn_state := mut M guard5.get(&self.conn_id) {
+            Some(conn) => M conn.get_txn_state() {
                 Idle => Idle,
                 InBlock => InBlock,
                 Failed => Failed,
-            }
-        })?;
+            },
+            None => Idle,
+        };
 
         responses := mut Vec.with_capacity(0);
         responses.push(serialize_ready(&txn_state));
