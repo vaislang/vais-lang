@@ -226,7 +226,7 @@ F recovery_analysis(
     checkpoint_lsn: u64,
 ) -> Result<AnalysisResult, VaisError> {
     txn_table := mut HashMap.with_capacity(16)
-    dirty_pages := mut Vec.with_capacity(0)
+    dirty_pages: Vec<DirtyPageEntry> := mut Vec.with_capacity(0)
     redo_start_lsn := mut checkpoint_lsn
 
     iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), checkpoint_lsn)?;
@@ -329,6 +329,20 @@ F recovery_analysis(
     })
 }
 
+# Check if a page is already in the dirty page list
+F is_page_tracked(dirty_pages: &mut Vec<DirtyPageEntry>, file_id: u8, page_id: u32) -> bool {
+    result := mut false
+    idx := mut 0
+    LW idx < dirty_pages.len() {
+        dp: DirtyPageEntry := dirty_pages[idx]
+        I dp.file_id == file_id && dp.page_id == page_id {
+            result = true
+        }
+        idx += 1
+    }
+    result
+}
+
 # Track dirty pages from a WAL record
 F track_dirty_page(header: &WalRecordHeader, payload: &[u8], dirty_pages: &mut Vec<DirtyPageEntry>) {
     # Extract file_id and page_id from common record types
@@ -339,14 +353,7 @@ F track_dirty_page(header: &WalRecordHeader, payload: &[u8], dirty_pages: &mut V
                 M read_i32_le_checked(buf) {
                     Ok(page_id) => {
                         # Check if already tracked
-                        found := mut false
-                        dpi := mut 0
-                        LW dpi < dirty_pages.len() {
-                            I !found && dirty_pages[dpi].file_id == file_id && dirty_pages[dpi].page_id == page_id {
-                                found = true
-                            }
-                            dpi += 1
-                        }
+                        found := is_page_tracked(dirty_pages, file_id, page_id as u32)
                         I !found {
                             dirty_pages.push(DirtyPageEntry {
                                 file_id,
