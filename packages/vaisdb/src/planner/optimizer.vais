@@ -97,7 +97,8 @@ F push_predicates_down(plan: HybridPlanNode) -> Result<HybridPlanNode, VaisError
         # Filter on top of a VectorScan → push into pre/post filter
         HybridPlanNode.HybridFilter { input, predicate, cost } => {
             M *input {
-                HybridPlanNode.VectorScan { params, alias, cost: scan_cost } => {
+                HybridPlanNode.VectorScan { params, alias, cost } => {
+                    scan_cost := cost;
                     sel := mut estimate_selectivity(&predicate);
                     new_params := mut params;
 
@@ -116,7 +117,8 @@ F push_predicates_down(plan: HybridPlanNode) -> Result<HybridPlanNode, VaisError
                     })
                 },
 
-                HybridPlanNode.GraphTraverse { params, alias, cost: scan_cost } => {
+                HybridPlanNode.GraphTraverse { params, alias, cost } => {
+                    scan_cost := cost;
                     # Push filter into graph traversal's filter field
                     new_params := mut params;
                     new_params.filter = Some(merge_predicates(new_params.filter, predicate));
@@ -128,7 +130,8 @@ F push_predicates_down(plan: HybridPlanNode) -> Result<HybridPlanNode, VaisError
                     })
                 },
 
-                HybridPlanNode.FullTextScan { params, alias, cost: scan_cost } => {
+                HybridPlanNode.FullTextScan { params, alias, cost } => {
+                    scan_cost := cost;
                     # Push filter into full-text scan's filter field
                     new_params := mut params;
                     new_params.filter = Some(merge_predicates(new_params.filter, predicate));
@@ -481,11 +484,9 @@ F recalculate_costs(
             child := mut recalculate_costs(*input, stats)?;
             child_cost := mut child.get_cost().clone();
             sel := mut estimate_selectivity(&predicate);
-            cost := mut HybridCost {
-                row_estimate: (child_cost.row_estimate as f64 * sel) as u64,
-                total_cpu_cost: child_cost.total_cpu_cost + child_cost.row_estimate as f64 * 0.01,
-                ..child_cost
-            };
+            cost := mut child_cost.clone();
+            cost.row_estimate = (child_cost.row_estimate as f64 * sel) as u64;
+            cost.total_cpu_cost = child_cost.total_cpu_cost + child_cost.row_estimate as f64 * 0.01;
             Ok(HybridPlanNode.HybridFilter { input: Box.new(child), predicate, cost })
         },
 
@@ -603,7 +604,9 @@ F build_initial_plan(
     # Multiple engines: combine with score fusion (for ranking queries)
     # or cross-engine join (for relational queries)
     combined := mut engine_nodes.remove(0);
-    LF node: engine_nodes.drain(..) {
+    en_idx := mut 0u64
+    LW en_idx < engine_nodes.len() {
+        node := engine_nodes[en_idx].clone()
         # Default: score fusion for hybrid search, join for relational
         left_cost := mut combined.get_cost().clone();
         right_cost := mut node.get_cost().clone();
@@ -627,6 +630,7 @@ F build_initial_plan(
                 cost: join_cost,
             };
         }
+        en_idx = en_idx + 1
     }
 
     Ok(combined)
