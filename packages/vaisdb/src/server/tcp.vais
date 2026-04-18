@@ -109,7 +109,7 @@ X TcpServer {
         }
         running := mut true
         LW running {
-            n := stream.read(&mut buf, 4096)
+            n := stream.read(buf.as_ptr(), 4096)
             I n <= 0 {
                 running = false
             } EL {
@@ -118,7 +118,7 @@ X TcpServer {
                         r := mut 0
                         LW r < responses.len() {
                             resp := responses[r].clone()
-                            stream.write(&resp, resp.len() as i64)
+                            stream.write(resp.as_ptr(), resp.len() as i64)
                             r += 1
                         }
                     },
@@ -225,12 +225,16 @@ X TcpServer {
         }
 
         # Update connection with user info
-        self.pool.with_connection(conn_id, |conn| {
-            conn.user = user.clone()
-            conn.database = database.clone()
-            conn.application_name = app_name
-            conn.set_state(Authenticating)
-        })??;
+        guard := mut self.pool.connections.lock()
+        M guard.get_mut(&conn_id) {
+            Some(conn) => {
+                conn.user = user.clone()
+                conn.database = database.clone()
+                conn.application_name = app_name
+                conn.set_state(Authenticating)?;
+            },
+            None => {},
+        }
 
         # Send auth request
         responses := mut Vec.with_capacity(0)
@@ -249,9 +253,11 @@ X TcpServer {
         responses := mut Vec.with_capacity(0)
 
         # Get user from connection
-        user := mut self.pool.with_connection_ref(conn_id, |conn| {
-            conn.get_user().clone()
-        })?;
+        guard2 := mut self.pool.connections.lock()
+        user := mut M guard2.get(&conn_id) {
+            Some(conn) => conn.get_user().clone(),
+            None => "".to_string(),
+        };
 
         # Authenticate
         auth_result := mut self.auth.authenticate(
@@ -261,9 +267,11 @@ X TcpServer {
         )?;
 
         # Auth succeeded — transition to Ready
-        self.pool.with_connection(conn_id, |conn| {
-            conn.set_state(Ready)
-        })??;
+        guard3 := mut self.pool.connections.lock()
+        M guard3.get_mut(&conn_id) {
+            Some(conn) => { conn.set_state(Ready)?; },
+            None => {},
+        }
 
         responses.push(serialize_auth_ok())
         responses.push(serialize_ready(&Idle))
