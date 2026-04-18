@@ -3,17 +3,26 @@
  * query utilities plus lifecycle helpers.
  */
 
+import { $$mount, $$destroy } from "@vaisx/runtime";
 import type { ComponentInstance } from "@vaisx/runtime";
 import { getByText, getByTestId, getByRole, queryByText, queryByTestId, queryByRole, findByText, findByTestId, findByRole } from "./queries.js";
 
-/** A VaisX component factory — takes optional props and returns a ComponentInstance */
-export type ComponentFactory = (props?: Record<string, unknown>) => ComponentInstance;
+/**
+ * A VaisX component factory — matches the shape emitted by `vaisx-compiler`:
+ * `export default function MyComponent($$target) { ... }`.
+ *
+ * The component takes the target DOM element it should mount into and returns
+ * an optional ComponentInstance (with `$$update` / `$$destroy` hooks).
+ *
+ * Props are NOT passed to the top-level component — VaisX's runtime calls
+ * `$$mount(target, componentFn)` without props. If your test needs to pass
+ * props, wrap the factory in a closure: `render((target) => MyComp(target, myProps))`.
+ */
+export type ComponentFactory = (target: HTMLElement) => ComponentInstance;
 
 export interface RenderOptions {
   /** Provide your own container element. Defaults to a freshly created <div>. */
   container?: HTMLElement;
-  /** Props to pass to the component factory. */
-  props?: Record<string, unknown>;
 }
 
 export interface RenderResult {
@@ -50,33 +59,38 @@ const mountedInstances: Map<HTMLElement, ComponentInstance> = new Map();
  *
  * @example
  * ```ts
- * const { getByText, unmount } = render(MyComponent, { props: { name: 'World' } });
- * expect(getByText('Hello, World!')).toBeTruthy();
+ * import Counter from './Counter.vaisx';
+ * const { getByText, unmount } = render(Counter);
+ * expect(getByText('0')).toBeTruthy();
  * unmount();
+ * ```
+ *
+ * @example With props (closure):
+ * ```ts
+ * const { getByText } = render((target) => Greeting(target, { name: 'World' }));
+ * expect(getByText('Hello, World!')).toBeTruthy();
  * ```
  */
 export function render(
   componentFactory: ComponentFactory,
   options: RenderOptions = {},
 ): RenderResult {
-  const { props = {}, container = document.createElement("div") } = options;
+  const { container = document.createElement("div") } = options;
 
   // Attach container to body so queries that depend on layout or focusability work.
   if (!container.parentNode) {
     document.body.appendChild(container);
   }
 
-  // Mount the component.
-  const instance = componentFactory(props);
-  instance.mount(container);
+  // Mount the component via the runtime's $$mount helper.
+  // It invokes componentFactory(container) and returns the ComponentInstance.
+  const instance = $$mount(container, componentFactory);
 
   mountedContainers.add(container);
   mountedInstances.set(container, instance);
 
   function unmount(): void {
-    if (instance.destroy) {
-      instance.destroy();
-    }
+    $$destroy(instance);
     if (container.parentNode) {
       container.parentNode.removeChild(container);
     }
@@ -120,8 +134,8 @@ export function render(
 export function cleanup(): void {
   for (const container of mountedContainers) {
     const instance = mountedInstances.get(container);
-    if (instance?.destroy) {
-      instance.destroy();
+    if (instance) {
+      $$destroy(instance);
     }
     if (container.parentNode) {
       container.parentNode.removeChild(container);

@@ -81,8 +81,11 @@ describe("createFallbackManager", () => {
     const manager = createFallbackManager({ retries: 1, retryDelay: 1 });
     const loader = makeFailingLoader("boom");
     const p = manager.loadWithFallback(loader);
+    // Attach rejection handler *before* running timers to prevent
+    // an unhandled-rejection event during the async settling window.
+    const assertion = expect(p).rejects.toThrow("boom");
     await vi.runAllTimersAsync();
-    await expect(p).rejects.toThrow("boom");
+    await assertion;
   });
 
   it("5. calls onError on each failed attempt", async () => {

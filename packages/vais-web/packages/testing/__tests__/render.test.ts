@@ -4,45 +4,49 @@ import type { ComponentFactory } from "../src/render.js";
 
 // ---------------------------------------------------------------------------
 // Minimal component factory helpers used across tests
+//
+// VaisX components have the signature `(target: HTMLElement) => ComponentInstance`.
+// The function mounts its DOM into the target directly and returns an instance
+// with optional `$$destroy` / `$$update` hooks.
 // ---------------------------------------------------------------------------
 
 /** Creates a simple component that appends a <p> with textContent. */
 function makeTextComponent(text: string): ComponentFactory {
-  return (_props) => ({
-    mount(target: HTMLElement) {
-      const p = document.createElement("p");
-      p.textContent = text;
-      target.appendChild(p);
-    },
-    destroy() {
-      // no-op for simple component
-    },
-  });
+  return (target: HTMLElement) => {
+    const p = document.createElement("p");
+    p.textContent = text;
+    target.appendChild(p);
+    return {
+      $$destroy() {
+        // no-op for simple component
+      },
+    };
+  };
 }
 
-/** Creates a component that uses provided props. */
-function makePropsComponent(): ComponentFactory {
-  return (props) => ({
-    mount(target: HTMLElement) {
-      const el = document.createElement("div");
-      el.textContent = String(props?.["label"] ?? "default");
-      el.setAttribute("data-testid", "props-el");
-      target.appendChild(el);
-    },
-    destroy() {},
-  });
+/**
+ * Creates a component that renders a `label` prop.
+ * Since VaisX top-level components don't take props directly, callers pass
+ * props by wrapping the factory in a closure before handing it to render().
+ */
+function makePropsComponent(label: string | undefined): ComponentFactory {
+  return (target: HTMLElement) => {
+    const el = document.createElement("div");
+    el.textContent = String(label ?? "default");
+    el.setAttribute("data-testid", "props-el");
+    target.appendChild(el);
+    return { $$destroy() {} };
+  };
 }
 
-/** Component that tracks destroy calls. */
+/** Component that tracks $$destroy calls. */
 function makeTrackableComponent(onDestroy: () => void): ComponentFactory {
-  return (_props) => ({
-    mount(target: HTMLElement) {
-      const div = document.createElement("div");
-      div.textContent = "trackable";
-      target.appendChild(div);
-    },
-    destroy: onDestroy,
-  });
+  return (target: HTMLElement) => {
+    const div = document.createElement("div");
+    div.textContent = "trackable";
+    target.appendChild(div);
+    return { $$destroy: onDestroy };
+  };
 }
 
 afterEach(() => cleanup());
@@ -70,17 +74,17 @@ describe("render()", () => {
     expect(container.querySelector("p")?.textContent).toBe("custom");
   });
 
-  it("passes props to the component factory", () => {
-    const { getByTestId } = render(makePropsComponent(), { props: { label: "my-label" } });
+  it("supports passing props via a closure wrapper", () => {
+    const { getByTestId } = render(makePropsComponent("my-label"));
     expect(getByTestId("props-el").textContent).toBe("my-label");
   });
 
-  it("uses 'default' label when no props are passed", () => {
-    const { getByTestId } = render(makePropsComponent());
+  it("uses 'default' label when the closure omits props", () => {
+    const { getByTestId } = render(makePropsComponent(undefined));
     expect(getByTestId("props-el").textContent).toBe("default");
   });
 
-  it("unmount() calls destroy() on the component instance", () => {
+  it("unmount() calls $$destroy on the component instance", () => {
     const spy = vi.fn();
     const { unmount } = render(makeTrackableComponent(spy));
     expect(spy).not.toHaveBeenCalled();
@@ -123,7 +127,7 @@ describe("cleanup()", () => {
     expect(() => cleanup()).not.toThrow();
   });
 
-  it("calls destroy() on all tracked component instances", () => {
+  it("calls $$destroy on all tracked component instances", () => {
     const spy1 = vi.fn();
     const spy2 = vi.fn();
     render(makeTrackableComponent(spy1));

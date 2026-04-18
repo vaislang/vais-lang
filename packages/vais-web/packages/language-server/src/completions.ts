@@ -11,15 +11,13 @@
  */
 
 import {
-  CompletionItem,
   CompletionItemKind,
-  CompletionList,
   MarkupKind,
   VAISX_DIRECTIVES,
   BUILTIN_COMPONENTS,
   VAISX_APIS,
 } from './lsp-types.js';
-import type { Position } from './lsp-types.js';
+import type { CompletionItem, CompletionList, Position } from './lsp-types.js';
 import {
   parseVaisxFile,
   extractComponents,
