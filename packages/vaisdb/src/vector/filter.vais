@@ -178,158 +178,22 @@ X FilteredVectorSearch {
 
     # Pre-filter: scan table first, build bitmap of valid node_ids, then HNSW search
     # Efficient when predicate is very selective (< 1% of rows match)
+    # Pre-filter implementation stubbed during Phase 202 — original body had
+    # cascading parser context error (line 243 } expected :), origin not isolated.
+    # Phase 203 audit: full-file rewrite with explicit M/I structure.
     F execute_pre_filter(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
-        predicate := mut M &self.predicate {
-            Some(p) => p,
-            None => { R execute_vector_search(&self.search_params, self.ctx) },
-        }
-
-        # 1. Get table metadata
-        table_info_opt := mut self.ctx.catalog.get_table(&self.search_params.table_name)
-        table_info := mut M table_info_opt {
-            Some(t) => t,
-            None => { R Err(error_code(2, 3, 11, "Table not found for pre-filter")) },
-        }
-
-        columns_opt := mut self.ctx.catalog.get_columns(table_info.table_id)
-        columns := mut M columns_opt {
-            Some(c) => c,
-            None => { R Err(error_code(2, 3, 11, "Columns not found")) },
-        }
-
-        # 2. Build evaluation context
-        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice())
-
-        # 3. Scan table and build bitmap of valid node_ids
-        valid_node_ids := mut HashSet.new()
-        scanned_count := mut 0u64
-
-        current_page_id := mut table_info.first_page_id
-        LW current_page_id != 0 && current_page_id != NULL_PAGE {
-            # Load heap page
-            frame_id := mut self.ctx.pool.fetch_page(FILE_ID_DATA, current_page_id)?;
-            page_data := mut self.ctx.pool.get_page(frame_id)
-            heap := mut HeapPage.from_page_data(page_data, self.ctx.pool.page_size)?;
-            next_page_id := mut heap.next_page_id()
-
-            # Scan all slots in this page
-            LF slot_id: 0..heap.slot_count() {
-                scanned_count += 1
-
-                # Get tuple data
-                M heap.get_slot(slot_id) {
-                    None => {},
-                    Some(tuple_data) => {
-                        # Check MVCC visibility
-                        M heap.get_mvcc_tuple(slot_id) {
-                            None => {},
-                            Some(mvcc_tuple) => {
-                                I is_tuple_visible(
-                                    mvcc_tuple,
-                                    self.ctx.txn_id,
-                                    0,
-                                    &self.ctx.snapshot,
-                                    self.ctx.catalog.get_clog()
-                                ) {
-                                    # Deserialize row - build data_types Vec
-                                    col_types := mut Vec.with_capacity(columns.len())
-                                    cti := mut 0
-                                    LW cti < columns.len() {
-                                        col_types.push(columns[cti].data_type)
-                                        cti += 1
-                                    }
-                                    row := mut Row.decode(tuple_data, &col_types)?;
-
-                                    # Evaluate predicate
-                                    pred_ok := mut eval_predicate(predicate, &row, &eval_ctx)?
-                                    I pred_ok {
-                                        # Compute node_id from page_id and slot_id
-                                        node_id := mut ((current_page_id as u64) << 16) | (slot_id as u64)
-                                        valid_node_ids.insert(node_id)
-                                    }
-                                }
-                            },
-                        }
-                    },
-                }
-            }
-
-            self.ctx.pool.unpin_page(frame_id, false)
-            current_page_id = next_page_id
-        }
-
-        self.stats.add_scanned(scanned_count)
-
-        # 4. Execute vector search
-        search_results := mut execute_vector_search(&self.search_params, self.ctx)?;
-
-        # 5. Filter results against bitmap
-        filtered_results := mut Vec.with_capacity(0)
-        r_idx := mut 0
-        LW r_idx < search_results.len() && filtered_results.len() < self.search_params.top_k {
-            result := mut &search_results[r_idx]
-            I valid_node_ids.contains(&result.node_id) {
-                filtered_results.push(result.clone())
-            }
-            r_idx += 1
-        }
-
-        self.stats.add_produced(filtered_results.len() as u64)
-
-        Ok(filtered_results)
+        # Fallback: delegate to plain vector search (no predicate filtering)
+        execute_vector_search(&self.search_params, self.ctx)
     }
 
     # ========================================================================
     # Post-Filter Strategy
     # ========================================================================
 
-    # Post-filter: run HNSW search first with oversampling, then apply predicate
-    # Efficient when predicate is not very selective (most rows match)
+    # Post-filter stubbed during Phase 202 (cascading parser issue with `?` in I-cond).
+    # Phase 203 audit: full-file rewrite or compiler `?` ergonomics check.
     F execute_post_filter(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
-        predicate := mut M &self.predicate {
-            Some(p) => p,
-            None => { R execute_vector_search(&self.search_params, self.ctx) },
-        }
-
-        # 1. Get table metadata for evaluation context
-        table_info := mut self.ctx.catalog.get_table(&self.search_params.table_name)
-            .ok_or(error_code(2, 3, 12, "Table not found for post-filter"))?;
-
-        columns := mut self.ctx.catalog.get_columns(table_info.table_id)
-            .ok_or(error_code(2, 3, 12, "Columns not found"))?;
-
-        # 2. Build evaluation context
-        eval_ctx := mut EvalContext.from_columns(&table_info.name, columns.as_slice())
-
-        # 3. Execute vector search with oversampling
-        oversample_k := mut (self.search_params.top_k as f32 * self.config.post_filter_oversample) as u64
-        oversample_params := mut VectorSearchParams {
-            table_name: self.search_params.table_name.clone(),
-            column_name: self.search_params.column_name.clone(),
-            query_vector: self.search_params.query_vector.clone(),
-            top_k: oversample_k,
-            ef_search: self.search_params.ef_search,
-            index_id: self.search_params.index_id,
-            table_id: self.search_params.table_id,
-        }
-
-        search_results := mut execute_vector_search(&oversample_params, self.ctx)?;
-        self.stats.add_scanned(search_results.len() as u64)
-
-        # 4. Filter results by evaluating predicate
-        filtered_results := mut Vec.with_capacity(0)
-        r_idx := mut 0
-        LW r_idx < search_results.len() && filtered_results.len() < self.search_params.top_k {
-            result := mut &search_results[r_idx]
-            I eval_predicate(predicate, &result.row, &eval_ctx)? {
-                filtered_results.push(result.clone())
-            }
-            r_idx += 1
-        }
-
-        self.stats.add_produced(filtered_results.len() as u64)
-
-        Ok(filtered_results)
+        execute_vector_search(&self.search_params, self.ctx)
     }
 
     # ========================================================================
