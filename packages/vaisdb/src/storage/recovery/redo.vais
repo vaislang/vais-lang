@@ -82,11 +82,17 @@ S WalRecordIterator {
 X WalRecordIterator {
     # Create iterator starting from a specific LSN
     F from_lsn(wal_dir: str, start_lsn: u64) -> Result<WalRecordIterator, VaisError> {
-        segment := mut I start_lsn == NULL_LSN { 1u32 } EL { lsn_segment(start_lsn) }
-        offset := mut I start_lsn == NULL_LSN { WAL_SEGMENT_HEADER_SIZE } EL { lsn_offset(start_lsn) }
+        segment := mut 1u32
+        I start_lsn != NULL_LSN {
+            segment = lsn_segment(start_lsn)
+        }
+        offset := mut WAL_SEGMENT_HEADER_SIZE
+        I start_lsn != NULL_LSN {
+            offset = lsn_offset(start_lsn)
+        }
 
         iter := mut WalRecordIterator {
-            wal_dir,
+            wal_dir: wal_dir,
             current_segment: segment,
             current_offset: offset,
             segment_file: None,
@@ -103,8 +109,13 @@ X WalRecordIterator {
         L {
             # Ensure we have a segment file open
             I self.segment_file.is_none() {
-                I !self.try_open_next_segment()? {
-                    R Ok(None);  # No more segments
+                opened_res := mut self.try_open_next_segment()
+                opened := mut M opened_res {
+                    Ok(b) => b,
+                    Err(e) => { R Err(e) },
+                }
+                I !opened {
+                    R Ok(None)
                 }
             }
 
@@ -399,14 +410,25 @@ F recovery_redo(
                     # Extract file_id and page_id from payload
                     I payload.len() >= 5 {
                         buf := mut ByteBuffer.wrap_readonly(&payload)
-                        M (read_u8_checked(buf), read_i32_le_checked(buf)) {
-                            (Ok(file_id), Ok(page_id)) => {
-                                I needs_redo(pool, file_id, page_id, header.lsn)? {
-                                    redo_record(pool, &header, &payload)?;
-                                    records_redone += 1
+                        fid_res := mut read_u8_checked(buf)
+                        pid_res := mut read_i32_le_checked(buf)
+                        M fid_res {
+                            Ok(file_id) => {
+                                M pid_res {
+                                    Ok(page_id) => {
+                                        nr := mut needs_redo(pool, file_id, page_id, header.lsn)
+                                        M nr {
+                                            Ok(true) => {
+                                                redo_record(pool, &header, &payload)?;
+                                                records_redone += 1
+                                            },
+                                            _ => {},
+                                        }
+                                    },
+                                    Err(_) => {},
                                 }
                             },
-                            _ => {},
+                            Err(_) => {},
                         }
                     }
                 }
