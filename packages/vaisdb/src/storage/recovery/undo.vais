@@ -49,23 +49,40 @@ F recovery_undo(
     # Process in reverse LSN order to maximize efficiency
     active_txns := mut Vec.with_capacity(0);  # (txn_id, last_lsn)
 
-    LF item: &analysis.txn_table {
-        txn_id := item.0
-        entry := item.1
-        M entry.state {
-            Active => {
-                active_txns.push((*txn_id, entry.last_lsn))
+    keys := mut analysis.txn_table.keys()
+    ki: i64 := mut 0
+    LW ki < keys.len() as i64 {
+        txn_id := keys[ki]
+        M analysis.txn_table.get(&txn_id) {
+            Some(entry) => {
+                M entry.state {
+                    Active => {
+                        active_txns.push((txn_id, entry.last_lsn))
+                    },
+                    _ => {},
+                }
             },
-            _ => {},
+            None => {},
         }
+        ki = ki + 1
     }
 
     I active_txns.len() == 0 {
         R Ok(UndoResult { txns_undone: 0, records_undone: 0 })
     }
 
-    # Sort by last_lsn descending (process most recent first)
-    active_txns.sort_by(|a, b| lsn_compare(b.1, a.1))
+    # Sort by last_lsn descending (process most recent first — inline insertion sort)
+    si: i64 := mut 1
+    LW si < active_txns.len() as i64 {
+        sj: i64 := mut si
+        LW sj > 0 && active_txns[sj].1 > active_txns[sj - 1].1 {
+            tmp_txn := active_txns[sj]
+            active_txns[sj] = active_txns[sj - 1]
+            active_txns[sj - 1] = tmp_txn
+            sj = sj - 1
+        }
+        si = si + 1
+    }
 
     # Build a map of LSN -> WalRecordHeader+payload for quick lookup
     # In practice, we'd re-read from WAL segments, but we track undo progress per txn
@@ -169,9 +186,9 @@ F read_record_at_lsn(
 ) -> Result<WalRecord, VaisError> {
     iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), lsn)?;
     __mv1 := iter.next()?; M __mv1 {
-        Some((header, payload)) => {
-            I header.lsn == lsn {
-                Ok(WalRecord { header, payload })
+        Some(record) => {
+            I record.header.lsn == lsn {
+                Ok(record)
             } EL {
                 Err(err_internal("WAL record at expected LSN not found"))
             }
