@@ -85,7 +85,7 @@ F err_hnsw_invalid_layer(layer: u8, max_layer: u8) -> VaisError {
 }
 
 # HNSW Configuration (immutable after creation)
-# Size: 2 + 2 + 4 + 4 + 8 + 1 = 21 bytes
+# Size: 2 + 2 + 4 + 4 + 8 + 1 + 4 + 1 + 1 = 25 bytes
 S HnswConfig {
     m: u16,                    # Max neighbors per layer (default 16)
     m_max_0: u16,              # Max neighbors at layer 0 (default 32)
@@ -93,6 +93,10 @@ S HnswConfig {
     ef_search: u32,            # Search beam width (default 50)
     max_elements: u64,         # Maximum capacity
     distance_metric: u8,       # 0=Cosine, 1=L2, 2=DotProduct
+    # Phase 6.27b extensions (required by vaisdb/src/vector/mod.vais)
+    dim: u32,                  # Vector dimension
+    metric: u8,                # Alias for distance_metric (back-compat)
+    quantization_strategy: u8, # 0=None, 1=Scalar, 2=PQ
 }
 
 X HnswConfig {
@@ -105,6 +109,9 @@ X HnswConfig {
             ef_search: DEFAULT_EF_SEARCH,
             max_elements,
             distance_metric: DISTANCE_COSINE,
+            dim: 0,
+            metric: DISTANCE_COSINE,
+            quantization_strategy: 0,
         }
     }
 
@@ -141,6 +148,9 @@ X HnswConfig {
             ef_search,
             max_elements,
             distance_metric,
+            dim: 0,
+            metric: distance_metric,
+            quantization_strategy: 0,
         })
     }
 
@@ -161,13 +171,22 @@ X HnswConfig {
 
     # Deserialize from ByteBuffer (21 bytes)
     F deserialize(buf: &ByteBuffer) -> Result<HnswConfig, VaisError> {
+        m := mut read_u16_le_checked(buf)?;
+        m_max_0 := mut read_u16_le_checked(buf)?;
+        ef_construction := mut read_i32_le_checked(buf)?;
+        ef_search := mut read_i32_le_checked(buf)?;
+        max_elements := mut read_i64_le_checked(buf)?;
+        distance_metric := mut read_u8_checked(buf)?;
         Ok(HnswConfig {
-            m: read_u16_le_checked(buf)?,
-            m_max_0: read_u16_le_checked(buf)?,
-            ef_construction: read_i32_le_checked(buf)?,
-            ef_search: read_i32_le_checked(buf)?,
-            max_elements: read_i64_le_checked(buf)?,
-            distance_metric: read_u8_checked(buf)?,
+            m,
+            m_max_0,
+            ef_construction,
+            ef_search,
+            max_elements,
+            distance_metric,
+            dim: 0,
+            metric: distance_metric,
+            quantization_strategy: 0,
         })
     }
 
@@ -193,12 +212,14 @@ S HnswMeta {
     total_deleted: u64,        # Soft-deleted nodes (pending GC)
     config: HnswConfig,        # Immutable configuration
     index_id: u32,             # Catalog index ID
+    dim: u32,                  # Phase 6.27b: Vector dimension (back-compat accessor)
 }
 
 X HnswMeta {
     # Create new metadata for empty index
     F new(config: HnswConfig, index_id: u32) -> HnswMeta {
         config_value := mut config.clone()
+        dim_val := mut config_value.dim
         HnswMeta {
             format_version: HNSW_FORMAT_VERSION,
             entry_point: INVALID_NODE_ID,
@@ -207,6 +228,7 @@ X HnswMeta {
             total_deleted: 0,
             config: config_value,
             index_id,
+            dim: dim_val,
         }
     }
 
@@ -247,14 +269,22 @@ X HnswMeta {
             R Err(err_hnsw_meta_corrupt(header.page_id))
         }
 
+        entry_point := mut read_i64_le_checked(buf)?;
+        max_layer := mut read_u8_checked(buf)?;
+        total_nodes := mut read_i64_le_checked(buf)?;
+        total_deleted := mut read_i64_le_checked(buf)?;
+        config := mut HnswConfig.deserialize(&buf)?;
+        index_id := mut read_i32_le_checked(buf)?;
+        dim_val := mut config.dim
         Ok(HnswMeta {
             format_version,
-            entry_point: read_i64_le_checked(buf)?,
-            max_layer: read_u8_checked(buf)?,
-            total_nodes: read_i64_le_checked(buf)?,
-            total_deleted: read_i64_le_checked(buf)?,
-            config: HnswConfig.deserialize(&buf)?,
-            index_id: read_i32_le_checked(buf)?,
+            entry_point,
+            max_layer,
+            total_nodes,
+            total_deleted,
+            config,
+            index_id,
+            dim: dim_val,
         })
     }
 
