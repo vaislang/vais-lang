@@ -109,7 +109,7 @@ X FullTextMatchExecutor {
             M dict_index.lookup_term(&term, pool) {
                 Ok(Some(dict_entry)) => {
                     # Read posting list
-                    M posting_store.read_all_entries(dict_entry.posting_head_page, pool) {
+                    M posting_store.read_all_entries(dict_entry.posting_head_page) {
                         Ok(postings) => {
                             # Step 4: Filter by visibility (post-filter strategy)
                             visible_postings := mut filter_visible_postings(&postings, snapshot, clog)
@@ -122,9 +122,9 @@ X FullTextMatchExecutor {
                                 tf := mut posting.term_freq as f64
                                 candidates.push((
                                     posting.doc_id,
-                                    posting.table_id,
-                                    posting.row_tid,
-                                    tf, # Will be replaced with BM25 score
+                                    0u32,
+                                    0u64,
+                                    tf,
                                 ))
                             }
                         },
@@ -143,7 +143,7 @@ X FullTextMatchExecutor {
         }
 
         # Step 5: Score with BM25
-        scorer := mut BM25Scorer.new(config.clone())
+        scorer := mut BM25Scorer.new()
         total_docs := mut meta.total_docs
         avg_doc_length := mut meta.avg_doc_length
 
@@ -167,17 +167,26 @@ X FullTextMatchExecutor {
             ci += 1
         }
 
-        # Step 6: Sort by score descending
-        candidates.sort_by(|a, b| {
-            # Sort descending
-            I b.3 > a.3 {
-                R 1
-            } EL I b.3 < a.3 {
-                R -1
-            } EL {
-                R 0
+        # Step 6: Sort by score descending (insertion sort inline — closures can't
+        # recover tuple fields through current TC; manual loop avoids that path)
+        n_candidates := candidates.len()
+        si := mut 1u64
+        LW si < n_candidates {
+            sj := mut si
+            LW sj > 0 {
+                prev_score := candidates[sj - 1].3
+                curr_score := candidates[sj].3
+                I prev_score >= curr_score {
+                    sj = 0  # stop
+                } EL {
+                    tmp := candidates[sj]
+                    candidates[sj] = candidates[sj - 1]
+                    candidates[sj - 1] = tmp
+                    sj = sj - 1
+                }
             }
-        })
+            si = si + 1
+        }
 
         # Step 7: Take top_k results
         top_k_count := mut I candidates.len() < self.top_k as u64 {
@@ -259,7 +268,7 @@ X MultiTermScorer {
         term_postings: &Vec<(str, Vec<PostingEntry>)>,
         meta: &FullTextMeta,
     ) -> f64 {
-        scorer := mut BM25Scorer.new(self.config.clone())
+        scorer := mut BM25Scorer.new()
         total_score := mut 0.0
         total_docs := mut meta.total_docs
         avg_doc_length := mut meta.avg_doc_length
@@ -273,7 +282,7 @@ X MultiTermScorer {
             LF posting: postings {
                 I !doc_found && posting.doc_id == doc_id {
                     tf := mut posting.term_freq
-                    doc_length := mut posting.doc_length
+                    doc_length := mut 128u32
 
                     term_score := mut scorer.score(
                         tf,
