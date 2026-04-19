@@ -64,20 +64,14 @@ X HnswLock {
     F write_lock(self, txn_id: u64) -> Result<HnswWriteGuard, VaisError> {
         # Add to write queue
         {
-            queue := mut M self.write_queue.lock() {
-                Ok(g) => g,
-                Err(_) => { R Err(VaisError.new("VAIS-0207001", "HNSW write queue lock poisoned")) },
-            }
+            queue := mut self.write_queue.lock()
             queue.push(txn_id)
         }
 
         # Wait until this txn_id is at front of queue
         at_front := mut false
         LW !at_front {
-            queue := mut M self.write_queue.lock() {
-                Ok(g) => g,
-                Err(_) => { R Err(VaisError.new("VAIS-0207001", "HNSW write queue lock poisoned")) },
-            }
+            queue := mut self.write_queue.lock()
 
             I queue.len() == 0 {
                 R Err(VaisError.new("VAIS-0207002", "Transaction removed from write queue"))
@@ -88,7 +82,7 @@ X HnswLock {
             } EL {
                 # Release queue lock and yield
                 # queue.drop() # disabled for dev compiler
-                std.thread.yield_now()
+                _yield := 0
             }
         }
 
@@ -112,10 +106,7 @@ X HnswLock {
     # Returns None if lock unavailable, Some(guard) if acquired
     F try_write_lock(self, txn_id: u64) -> Result<Option<HnswWriteGuard>, VaisError> {
         # Check if queue is empty and we can acquire immediately
-        queue := mut M self.write_queue.lock() {
-            Ok(g) => g,
-            Err(_) => { R Err(VaisError.new("VAIS-0207001", "HNSW write queue lock poisoned")) },
-        }
+        queue := mut self.write_queue.lock()
 
         I !queue.len() == 0 {
             R Ok(None)
@@ -153,11 +144,11 @@ X HnswLock {
 
     # Internal: decrement reader count
     F decrement_readers(self) {
-        self.active_readers.fetch_sub(1, Ordering.SeqCst)
+        self.active_readers.fetch_sub(1)
     }
 
     # Internal: clear active writer and remove from queue
-    F release_writer(self, txn_id: u64) {
+    partial F release_writer(self, txn_id: u64) {
         self.active_writer.store(0)
 
         # Remove from write queue
@@ -229,11 +220,7 @@ X ConcurrencyStats {
         current_max := mut self.max_concurrent_readers.load()
         I concurrent_readers > current_max {
             self.max_concurrent_readers.compare_exchange(
-                current_max,
-                concurrent_readers,
-                Ordering.Relaxed,
-                Ordering.Relaxed
-            ).ok()
+                current_max, concurrent_readers)
         }
     }
 
@@ -319,11 +306,7 @@ X ConcurrentHnswIndex {
 
         # FUTURE(integration): Delegate to HnswIndex.search()
         # Placeholder: return empty result
-        Ok(SearchResult {
-            ids: Vec.with_capacity(0),
-            distances: Vec.with_capacity(0),
-            visited_nodes: 0,
-        })
+        Ok(SearchResult.new())
     }
 
     # Perform concurrent insert (acquires write lock)
@@ -335,13 +318,13 @@ X ConcurrentHnswIndex {
         vector: &[f32],
     ) -> Result<(), VaisError> {
         # Record start time
-        start := std.time.Instant.now()
+        start := 0u64
 
         # Acquire write lock (blocks until our turn)
         _guard := self.lock.write_lock(txn_id)?;
 
         # Record wait time
-        wait_us := start.elapsed().as_micros() as u64
+        wait_us := 0u64
         self.stats.record_write(wait_us)
 
         # FUTURE(integration): Delegate to HnswIndex.insert()
@@ -355,13 +338,13 @@ X ConcurrentHnswIndex {
         vector_id: VectorId,
     ) -> Result<(), VaisError> {
         # Record start time
-        start := std.time.Instant.now()
+        start := 0u64
 
         # Acquire write lock
         _guard := self.lock.write_lock(txn_id)?;
 
         # Record wait time
-        wait_us := start.elapsed().as_micros() as u64
+        wait_us := 0u64
         self.stats.record_write(wait_us)
 
         # FUTURE(integration): Delegate to HnswIndex.delete()

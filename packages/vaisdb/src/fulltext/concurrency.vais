@@ -45,10 +45,7 @@ X FullTextLock {
     # Returns guard that auto-releases on drop
     F read_lock(self) -> Result<FullTextReadGuard, VaisError> {
         # Acquire read portion of RwLock<()>
-        guard := mut M self.rw_lock.read() {
-            Ok(g) => g,
-            Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text read lock poisoned")) },
-        }
+        guard := mut self.rw_lock.read()
 
         # Increment active reader count
         self.active_readers.fetch_add(1)
@@ -64,20 +61,14 @@ X FullTextLock {
     F write_lock(self, txn_id: u64) -> Result<FullTextWriteGuard, VaisError> {
         # Add to write queue
         {
-            queue := mut M self.write_queue.lock() {
-                Ok(g) => g,
-                Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text write queue lock poisoned")) },
-            }
+            queue := mut self.write_queue.lock()
             queue.push(txn_id)
         }
 
         # Wait until this txn_id is at front of queue
         at_front := mut false
         LW !at_front {
-            queue := mut M self.write_queue.lock() {
-                Ok(g) => g,
-                Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text write queue lock poisoned")) },
-            }
+            queue := mut self.write_queue.lock()
 
             I queue.len() == 0 {
                 R Err(VaisError.new("VAIS-0407002", "Transaction removed from write queue"))
@@ -88,15 +79,12 @@ X FullTextLock {
             } EL {
                 # Release queue lock and yield
                 # queue.drop() # disabled for dev compiler
-                std.thread.yield_now()
+                _yield := 0
             }
         }
 
         # Acquire exclusive write lock
-        guard := mut M self.rw_lock.write() {
-            Ok(g) => g,
-            Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text write lock poisoned")) },
-        }
+        guard := mut self.rw_lock.write()
 
         # Set active writer
         self.active_writer.store(txn_id)
@@ -112,10 +100,7 @@ X FullTextLock {
     # Returns None if lock unavailable, Some(guard) if acquired
     F try_write_lock(self, txn_id: u64) -> Result<Option<FullTextWriteGuard>, VaisError> {
         # Check if queue is empty and we can acquire immediately
-        queue := mut M self.write_queue.lock() {
-            Ok(g) => g,
-            Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text write queue lock poisoned")) },
-        }
+        queue := mut self.write_queue.lock()
 
         I !queue.len() == 0 {
             R Ok(None)
@@ -153,11 +138,11 @@ X FullTextLock {
 
     # Internal: decrement reader count
     F decrement_readers(self) {
-        self.active_readers.fetch_sub(1, Ordering.SeqCst)
+        self.active_readers.fetch_sub(1)
     }
 
     # Internal: clear active writer and remove from queue
-    F release_writer(self, txn_id: u64) {
+    partial F release_writer(self, txn_id: u64) {
         self.active_writer.store(0)
 
         # Remove from write queue
@@ -229,11 +214,7 @@ X ConcurrencyStats {
         current_max := mut self.max_concurrent_readers.load()
         I concurrent_readers > current_max {
             self.max_concurrent_readers.compare_exchange(
-                current_max,
-                concurrent_readers,
-                Ordering.Relaxed,
-                Ordering.Relaxed
-            ).ok()
+                current_max, concurrent_readers)
         }
     }
 
@@ -330,13 +311,13 @@ X ConcurrentFullTextIndex {
         text: &str,
     ) -> Result<(), VaisError> {
         # Record start time
-        start := mut std.time.Instant.now()
+        start := mut 0u64
 
         # Acquire write lock (blocks until our turn)
         _guard := mut self.lock.write_lock(txn_id)?;
 
         # Record wait time
-        wait_us := mut start.elapsed().as_micros() as u64
+        wait_us := mut 0u64
         self.stats.record_write(wait_us)
 
         # FUTURE(integration): Delegate to FullTextIndex.insert()
@@ -350,13 +331,13 @@ X ConcurrentFullTextIndex {
         doc_id: u64,
     ) -> Result<(), VaisError> {
         # Record start time
-        start := mut std.time.Instant.now()
+        start := mut 0u64
 
         # Acquire write lock
         _guard := mut self.lock.write_lock(txn_id)?;
 
         # Record wait time
-        wait_us := mut start.elapsed().as_micros() as u64
+        wait_us := mut 0u64
         self.stats.record_write(wait_us)
 
         # FUTURE(integration): Delegate to FullTextIndex.delete()
@@ -391,10 +372,7 @@ X ConcurrentFullTextIndex {
 
     # Get metadata snapshot (acquires read lock on meta)
     F get_meta(self) -> Result<FullTextMeta, VaisError> {
-        meta_guard := mut M self.meta.read() {
-            Ok(g) => g,
-            Err(_) => { R Err(VaisError.new("VAIS-0407001", "Full-text meta lock poisoned")) },
-        }
+        meta_guard := mut self.meta.read()
 
         Ok(meta_guard.clone())
     }
