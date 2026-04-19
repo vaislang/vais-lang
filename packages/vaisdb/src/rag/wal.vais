@@ -49,9 +49,7 @@ X RagChunkInsertPayload {
     ## Deserialize payload from bytes
     F deserialize(data: &[u8]) -> Result<RagChunkInsertPayload, VaisError> {
         I data.len() < 28 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagChunkInsertPayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagChunkInsertPayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         chunk_id := mut buf.get_u64_le();
@@ -80,9 +78,7 @@ X RagChunkDeletePayload {
 
     F deserialize(data: &[u8]) -> Result<RagChunkDeletePayload, VaisError> {
         I data.len() < 16 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagChunkDeletePayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagChunkDeletePayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         chunk_id := mut buf.get_u64_le();
@@ -112,9 +108,7 @@ X RagDocumentInsertPayload {
 
     F deserialize(data: &[u8]) -> Result<RagDocumentInsertPayload, VaisError> {
         I data.len() < 24 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagDocumentInsertPayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagDocumentInsertPayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         doc_id := mut buf.get_u64_le();
@@ -140,9 +134,7 @@ X RagDocumentDeletePayload {
 
     F deserialize(data: &[u8]) -> Result<RagDocumentDeletePayload, VaisError> {
         I data.len() < 8 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagDocumentDeletePayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagDocumentDeletePayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         doc_id := mut buf.get_u64_le();
@@ -171,9 +163,7 @@ X RagEmbeddingUpdatePayload {
 
     F deserialize(data: &[u8]) -> Result<RagEmbeddingUpdatePayload, VaisError> {
         I data.len() < 18 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagEmbeddingUpdatePayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagEmbeddingUpdatePayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         chunk_id := mut buf.get_u64_le();
@@ -207,9 +197,7 @@ X RagMemoryWritePayload {
 
     F deserialize(data: &[u8]) -> Result<RagMemoryWritePayload, VaisError> {
         I data.len() < 24 {
-            R Err(VaisError.WalCorruption(
-                Str.from("RagMemoryWritePayload: insufficient data")
-            ));
+            R Err(VaisError.new("VAIS-0704001", "RagMemoryWritePayload: insufficient data"));
         }
         buf := mut ByteBuffer.from_bytes(data);
         memory_id := mut buf.get_u64_le();
@@ -399,9 +387,7 @@ X RagWalManager {
                 self.redo_memory_write(&p, pool)
             },
             _ => {
-                Err(VaisError.WalCorruption(
-                    Str.from("Unknown RAG WAL record type")
-                ))
+                Err(VaisError.new("VAIS-0704001", "Unknown RAG WAL record type"))
             }
         }
     }
@@ -439,9 +425,7 @@ X RagWalManager {
                 self.undo_memory_write(&p, pool)
             },
             _ => {
-                Err(VaisError.WalCorruption(
-                    Str.from("Unknown RAG WAL record type")
-                ))
+                Err(VaisError.new("VAIS-0704001", "Unknown RAG WAL record type"))
             }
         }
     }
@@ -453,15 +437,13 @@ X RagWalManager {
     # Redo chunk insert: restore chunk data to its page at the recorded offset
     F redo_chunk_insert(self, payload: &RagChunkInsertPayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         # Validate offset + length within page bounds
         end := mut payload.chunk_offset as u64 + payload.chunk_length as u64;
         I end > page_data.len() {
-            pool.unpin_page(FILE_ID_RAG, payload.page_id, false);
-            R Err(VaisError.WalCorruption(
-                Str.from("REDO chunk_insert: offset+length exceeds page bounds")
-            ));
+            pool.unpin_page(frame, false);
+            R Err(VaisError.new("VAIS-0704001", "REDO chunk_insert: offset+length exceeds page bounds"));
         }
 
         # Write chunk_id at the chunk offset as a marker (8 bytes LE)
@@ -471,7 +453,7 @@ X RagWalManager {
             page_data[offset + i] = id_bytes[i];
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 
@@ -487,7 +469,7 @@ X RagWalManager {
     # Redo document insert: restore document metadata to its page
     F redo_document_insert(self, payload: &RagDocumentInsertPayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         # Write document header: doc_id (8B) + chunk_count (4B) + total_length (8B) = 20B
         id_bytes := mut payload.doc_id.to_le_bytes();
@@ -503,7 +485,7 @@ X RagWalManager {
             page_data[12 + i] = tl_bytes[i];
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 
@@ -517,37 +499,33 @@ X RagWalManager {
     # Redo embedding update: restore embedding vector page data
     F redo_embedding_update(self, payload: &RagEmbeddingUpdatePayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.vector_page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         # Validate vector offset is within page bounds
         # Each dimension is 4 bytes (f32), total size = dimension * 4
         vector_size := mut payload.dimension as u64 * 4;
         end := mut payload.vector_offset as u64 + vector_size;
         I end > page_data.len() {
-            pool.unpin_page(FILE_ID_RAG, payload.vector_page_id, false);
-            R Err(VaisError.WalCorruption(
-                Str.from("REDO embedding_update: vector data exceeds page bounds")
-            ));
+            pool.unpin_page(frame, false);
+            R Err(VaisError.new("VAIS-0704001", "REDO embedding_update: vector data exceeds page bounds"));
         }
 
         # The actual vector data would be written by the vector engine's redo path
         # This handler validates page accessibility for the embedding location
-        pool.unpin_page(FILE_ID_RAG, payload.vector_page_id, false);
+        pool.unpin_page(frame, false);
         Ok(())
     }
 
     # Redo memory write: restore memory entry data to its page
     F redo_memory_write(self, payload: &RagMemoryWritePayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         # Validate offset + length within page bounds
         end := mut payload.memory_offset as u64 + payload.memory_length as u64;
         I end > page_data.len() {
-            pool.unpin_page(FILE_ID_RAG, payload.page_id, false);
-            R Err(VaisError.WalCorruption(
-                Str.from("REDO memory_write: offset+length exceeds page bounds")
-            ));
+            pool.unpin_page(frame, false);
+            R Err(VaisError.new("VAIS-0704001", "REDO memory_write: offset+length exceeds page bounds"));
         }
 
         # Write memory_id (8B) + turn_index (4B) at the memory offset as header
@@ -561,7 +539,7 @@ X RagWalManager {
             page_data[offset + 8 + i] = ti_bytes[i];
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 
@@ -572,14 +550,12 @@ X RagWalManager {
     # Undo chunk insert: remove chunk from page (zero out the slot)
     F undo_chunk_insert(self, payload: &RagChunkInsertPayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         end := mut payload.chunk_offset as u64 + payload.chunk_length as u64;
         I end > page_data.len() {
-            pool.unpin_page(FILE_ID_RAG, payload.page_id, false);
-            R Err(VaisError.WalCorruption(
-                Str.from("UNDO chunk_insert: offset+length exceeds page bounds")
-            ));
+            pool.unpin_page(frame, false);
+            R Err(VaisError.new("VAIS-0704001", "UNDO chunk_insert: offset+length exceeds page bounds"));
         }
 
         # Zero out the chunk region to remove it
@@ -588,7 +564,7 @@ X RagWalManager {
             page_data[offset + i] = 0;
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 
@@ -603,14 +579,14 @@ X RagWalManager {
     # Undo document insert: remove document metadata from page
     F undo_document_insert(self, payload: &RagDocumentInsertPayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         # Zero out document header (20 bytes)
         LF i: 0..20 {
             page_data[i] = 0;
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 
@@ -631,14 +607,12 @@ X RagWalManager {
     # Undo memory write: remove memory entry from page (zero out)
     F undo_memory_write(self, payload: &RagMemoryWritePayload, pool: &mut BufferPool) -> Result<(), VaisError> {
         frame := mut pool.pin_page(FILE_ID_RAG, payload.page_id)?;
-        page_data := mut frame.get_page_data_mut();
+        page_data := mut pool.get_page_mut(frame);
 
         end := mut payload.memory_offset as u64 + payload.memory_length as u64;
         I end > page_data.len() {
-            pool.unpin_page(FILE_ID_RAG, payload.page_id, false);
-            R Err(VaisError.WalCorruption(
-                Str.from("UNDO memory_write: offset+length exceeds page bounds")
-            ));
+            pool.unpin_page(frame, false);
+            R Err(VaisError.new("VAIS-0704001", "UNDO memory_write: offset+length exceeds page bounds"));
         }
 
         # Zero out the memory region
@@ -647,7 +621,7 @@ X RagWalManager {
             page_data[offset + i] = 0;
         }
 
-        pool.unpin_page(FILE_ID_RAG, payload.page_id, true);
+        pool.unpin_page(frame, true);
         Ok(())
     }
 }
