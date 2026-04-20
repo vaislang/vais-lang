@@ -63,7 +63,7 @@ X VectorSearchExecutor {
     # Open: resolve index, execute MVCC-filtered search, materialize results
     F open(mut self) -> Result<(), VaisError> {
         # 1. Resolve table and column from catalog
-        table_meta := self.ctx.catalog.get_table(&self.params.table_name).ok_or(error_code(2, 3, 7, "Table not found for VECTOR_SEARCH"))?;
+        table_meta := self.ctx.catalog.get_table(&self.params.table_name).ok_or(VaisError.new("VAIS-0203007", "Table not found for VECTOR_SEARCH"))?;
 
         self.params.table_id = table_meta.table_id
 
@@ -85,7 +85,7 @@ X VectorSearchExecutor {
                             index_meta := self.ctx.catalog.get_vector_index(
                                 self.params.table_id,
                                 col.column_id
-                            ).ok_or(error_code(2, 3, 7, "No HNSW index found for column"))?;
+                            ).ok_or(VaisError.new("VAIS-0203007", "No HNSW index found for column"))?;
                             vector_index_id = index_meta.index_id
                         }
                     },
@@ -96,17 +96,17 @@ X VectorSearchExecutor {
         }
 
         I !column_found {
-            R Err(error_code(2, 3, 7, "VECTOR column not found"))
+            R Err(VaisError.new("VAIS-0203007", "VECTOR column not found"))
         }
 
         self.params.index_id = vector_index_id
 
         # 3. Load HNSW metadata and verify dimension
         index_meta := self.ctx.catalog.get_hnsw_metadata(vector_index_id)
-            .ok_or(error_code(2, 3, 7, "HNSW metadata not found"))?;
+            .ok_or(VaisError.new("VAIS-0203007", "HNSW metadata not found"))?;
 
         I self.params.query_vector.len() != index_meta.dimension as u64 {
-            R Err(error_code(2, 3, 8, "Query vector dimension mismatch"))
+            R Err(VaisError.new("VAIS-0203008", "Query vector dimension mismatch"))
         }
 
         # 4. Create distance computer from index config
@@ -134,7 +134,7 @@ X VectorSearchExecutor {
             &distance_computer,
             &self.ctx.snapshot,
             self.ctx.catalog.get_clog(),
-        ).map_err(|e| error_code(2, 3, 9, "MVCC search failed"))?;
+        ).map_err(|e| VaisError.new("VAIS-0203009", "MVCC search failed"))?;
 
         self.stats.add_scanned(search_result.total_candidates)
 
@@ -166,7 +166,7 @@ X VectorSearchExecutor {
     # Next: return next result row as ExecutorRow
     F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         M &self.results {
-            None => Err(error_code(2, 3, 9, "VectorSearchExecutor not opened")),
+            None => Err(VaisError.new("VAIS-0203009", "VectorSearchExecutor not opened")),
             Some(results) => {
                 I self.cursor >= results.len() {
                     R Ok(None)
@@ -212,7 +212,7 @@ X VectorSearchExecutor {
 
         # Get table file_id from catalog
         table_meta := self.ctx.catalog.get_table_by_id(self.params.table_id)
-            .ok_or(error_code(2, 3, 9, "Table metadata not found"))?;
+            .ok_or(VaisError.new("VAIS-0203009", "Table metadata not found"))?;
 
         file_id := table_meta.file_id
 
@@ -223,14 +223,14 @@ X VectorSearchExecutor {
         # Parse heap page and extract slot
         heap_page := HeapPage.from_bytes(page_guard.data())?;
         tuple_data := heap_page.get_slot(slot_id)
-            .ok_or(error_code(2, 3, 9, "Slot not found in heap page"))?;
+            .ok_or(VaisError.new("VAIS-0203009", "Slot not found in heap page"))?;
 
         # Deserialize row
         row := Row.deserialize(tuple_data, &table_meta.columns)?;
 
         # Check MVCC visibility
         mvcc_tuple := heap_page.get_mvcc_tuple(slot_id)
-            .ok_or(error_code(2, 3, 9, "MVCC tuple not found"))?;
+            .ok_or(VaisError.new("VAIS-0203009", "MVCC tuple not found"))?;
 
         I !is_visible(
             mvcc_tuple,
@@ -239,7 +239,7 @@ X VectorSearchExecutor {
             &self.ctx.snapshot,
             self.ctx.catalog.get_clog()
         ) {
-            R Err(error_code(2, 3, 9, "Row not visible to snapshot"))
+            R Err(VaisError.new("VAIS-0203009", "Row not visible to snapshot"))
         }
 
         Ok(row)
@@ -255,7 +255,7 @@ F parse_vector_search_args(
     ctx: &ExecContext
 ) -> Result<VectorSearchParams, VaisError> {
     I args.len() < 3 || args.len() > 4 {
-        R Err(error_code(2, 3, 7, "VECTOR_SEARCH requires 3 or 4 arguments"))
+        R Err(VaisError.new("VAIS-0203007", "VECTOR_SEARCH requires 3 or 4 arguments"))
     }
 
     # Argument 1: table.column reference
@@ -263,7 +263,7 @@ F parse_vector_search_args(
         ColumnRef { table, column } => {
             (table.clone(), column.clone())
         },
-        _ => { R Err(error_code(2, 3, 7, "First arg must be column reference")) }
+        _ => { R Err(VaisError.new("VAIS-0203007", "First arg must be column reference")) }
     }
 
     # Argument 2: query vector (ARRAY[...] or vector literal)
@@ -279,25 +279,25 @@ F parse_vector_search_args(
                     Literal { value: SqlValue.IntVal { v } } => {
                         vec.push(*v as f32)
                     },
-                    _ => { R Err(error_code(2, 3, 7, "Array elements must be numeric")) }
+                    _ => { R Err(VaisError.new("VAIS-0203007", "Array elements must be numeric")) }
                 }
                 ei += 1
             }
             vec
         },
         Literal { value: SqlValue.VectorVal { v } } => v.clone(),
-        _ => { R Err(error_code(2, 3, 7, "Second arg must be vector")) }
+        _ => { R Err(VaisError.new("VAIS-0203007", "Second arg must be vector")) }
     }
 
     # Argument 3: top_k
     top_k := M &args[2] {
         Literal { value: SqlValue.IntVal { v } } => {
             I *v <= 0 {
-                R Err(error_code(2, 3, 7, "top_k must be positive"))
+                R Err(VaisError.new("VAIS-0203007", "top_k must be positive"))
             }
             *v as u64
         },
-        _ => { R Err(error_code(2, 3, 7, "Third arg must be integer")) }
+        _ => { R Err(VaisError.new("VAIS-0203007", "Third arg must be integer")) }
     }
 
     # Argument 4: ef_search (optional)
@@ -305,11 +305,11 @@ F parse_vector_search_args(
         M &args[3] {
             Literal { value: SqlValue.IntVal { v } } => {
                 I *v <= 0 {
-                    R Err(error_code(2, 3, 7, "ef_search must be positive"))
+                    R Err(VaisError.new("VAIS-0203007", "ef_search must be positive"))
                 }
                 Some(*v as u32)
             },
-            _ => { R Err(error_code(2, 3, 7, "Fourth arg must be integer")) }
+            _ => { R Err(VaisError.new("VAIS-0203007", "Fourth arg must be integer")) }
         }
     } EL {
         None
@@ -396,10 +396,10 @@ X VectorSearchBuilder {
 
     F build(self) -> Result<VectorSearchParams, VaisError> {
         Ok(VectorSearchParams {
-            table_name: self.table.ok_or(error_code(2, 3, 7, "Missing table"))?,
-            column_name: self.column.ok_or(error_code(2, 3, 7, "Missing column"))?,
-            query_vector: self.query.ok_or(error_code(2, 3, 7, "Missing query vector"))?,
-            top_k: self.k.ok_or(error_code(2, 3, 7, "Missing top_k"))?,
+            table_name: self.table.ok_or(VaisError.new("VAIS-0203007", "Missing table"))?,
+            column_name: self.column.ok_or(VaisError.new("VAIS-0203007", "Missing column"))?,
+            query_vector: self.query.ok_or(VaisError.new("VAIS-0203007", "Missing query vector"))?,
+            top_k: self.k.ok_or(VaisError.new("VAIS-0203007", "Missing top_k"))?,
             ef_search: self.ef,
             index_id: 0,
             table_id: 0,
