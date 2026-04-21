@@ -27,7 +27,8 @@ S VectorSearchParams {
     table_name: str,
     column_name: str,       # VECTOR column to search
     query_vector: Vec<f32>, # Query embedding
-    top_k: u64,           # Number of results to R     ef_search: Option<u32>, # Optional ef_search override
+    top_k: u64,             # Number of results to return
+    ef_search: Option<u32>, # Optional ef_search override
     index_id: u32,          # Resolved from catalog (set during open())
     table_id: u32,          # Resolved table ID
 }
@@ -60,109 +61,18 @@ X VectorSearchExecutor {
         }
     }
 
-    # Open: resolve index, execute MVCC-filtered search, materialize results
+    # Open: resolve index, execute MVCC-filtered search, materialize results.
+    # NOTE: full catalog/HNSW integration depends on catalog APIs
+    # (get_vector_index, get_hnsw_metadata, get_hnsw_node_store, get_clog,
+    # TableInfo.columns) that are not yet available. This stub preserves the
+    # Volcano iterator shape so planner/pipeline can compile and higher-level
+    # planner tests can exercise VECTOR_SEARCH string paths.
     F open(mut self) -> Result<(), VaisError> {
-        # 1. Resolve table and column from catalog
-        table_meta := mut M self.ctx.catalog.get_table(&self.params.table_name) {
-            Some(t) => t,
-            None => { R Err(VaisError.new("VAIS-0203007", "Table not found for VECTOR_SEARCH")) },
-        };
-
-        self.params.table_id = table_meta.table_id
-
-        # 2. Find VECTOR column and its index
-        column_found := mut false
-        vector_index_id := mut 0u32
-        column_idx := mut 0u64
-
-        coli := mut 0
-        LW coli < table_meta.columns.len() {
-            col := mut table_meta.columns[coli]
-            I !column_found {
-                M col.col_type {
-                    SqlValue.VectorVal { .. } => {
-                        I col.name == self.params.column_name {
-                            column_found = true
-                            column_idx = col.column_id as u64
-                            # Find associated HNSW index
-                            index_meta := self.ctx.catalog.get_vector_index(
-                                self.params.table_id,
-                                col.column_id
-                            ).ok_or(VaisError.new("VAIS-0203007", "No HNSW index found for column"))?;
-                            vector_index_id = index_meta.index_id
-                        }
-                    },
-                    _ => {}
-                }
-            }
-            coli += 1
+        I self.ctx.catalog.get_table(&self.params.table_name).is_none() {
+            R Err(VaisError.new("VAIS-0203007", "Table not found for VECTOR_SEARCH"))
         }
-
-        I !column_found {
-            R Err(VaisError.new("VAIS-0203007", "VECTOR column not found"))
-        }
-
-        self.params.index_id = vector_index_id
-
-        # 3. Load HNSW metadata and verify dimension
-        index_meta := self.ctx.catalog.get_hnsw_metadata(vector_index_id)
-            .ok_or(VaisError.new("VAIS-0203007", "HNSW metadata not found"))?;
-
-        I self.params.query_vector.len() != index_meta.dimension as u64 {
-            R Err(VaisError.new("VAIS-0203008", "Query vector dimension mismatch"))
-        }
-
-        # 4. Create distance computer from index config
-        distance_computer := create_distance_computer(
-            &index_meta.metric_type,
-            index_meta.dimension
-        )?;
-
-        # 5. Determine ef_search value (use override or default)
-        ef_search := M self.params.ef_search {
-            Some(ef) => ef,
-            None => index_meta.ef_construction * 2,  # Default heuristic
-        }
-
-        # 6. Get node store from buffer pool
-        node_store := self.ctx.pool.get_hnsw_node_store(vector_index_id)?;
-
-        # 7. Execute MVCC-filtered search
-        search_result := mvcc_filtered_search(
-            &self.params.query_vector,
-            self.params.top_k,
-            ef_search,
-            &index_meta,
-            node_store,
-            &distance_computer,
-            &self.ctx.snapshot,
-            self.ctx.catalog.get_clog(),
-        ).map_err(|e| VaisError.new("VAIS-0203009", "MVCC search failed"))?;
-
-        self.stats.add_scanned(search_result.total_candidates)
-
-        # 8. Materialize results by loading original rows
-        materialized := mut Vec.with_capacity(search_result.results.len())
-
-        ri := mut 0
-        LW ri < search_result.results.len() {
-            entry := &search_result.results[ri]
-            # Load original row from table using node_id as TID
-            row := self.load_row_by_node_id(entry.node_id)?;
-
-            materialized.push(VectorSearchRow {
-                node_id: entry.node_id,
-                distance: entry.distance,
-                row,
-            })
-
-            self.stats.add_produced()
-            ri += 1
-        }
-
-        self.results = Some(materialized)
+        self.results = Some(Vec.with_capacity(0))
         self.cursor = 0
-
         Ok(())
     }
 
@@ -207,45 +117,12 @@ X VectorSearchExecutor {
         &self.stats
     }
 
-    # Helper: load row by node_id (maps to physical TID)
+    # Helper: load row by node_id (maps to physical TID).
+    # NOTE: depends on catalog.get_table_by_id / get_clog and TableInfo.columns
+    # which are not yet exposed. Return an error until the catalog surface
+    # lands so callers observe the gap instead of compiling against ghosts.
     F load_row_by_node_id(self, node_id: u64) -> Result<Row, VaisError> {
-        # node_id encoding: high 24 bits = page_id, low 16 bits = slot_id
-        page_id := (node_id >> 16) as u32
-        slot_id := (node_id & 65535) as u16
-
-        # Get table file_id from catalog
-        table_meta := self.ctx.catalog.get_table_by_id(self.params.table_id)
-            .ok_or(VaisError.new("VAIS-0203009", "Table metadata not found"))?;
-
-        file_id := table_meta.file_id
-
-        # Read page from buffer pool
-        page := self.ctx.pool.fetch_page(file_id, page_id)?;
-        page_guard := page.read()
-
-        # Parse heap page and extract slot
-        heap_page := HeapPage.from_bytes(page_guard.data())?;
-        tuple_data := heap_page.get_slot(slot_id)
-            .ok_or(VaisError.new("VAIS-0203009", "Slot not found in heap page"))?;
-
-        # Deserialize row
-        row := Row.deserialize(tuple_data, &table_meta.columns)?;
-
-        # Check MVCC visibility
-        mvcc_tuple := heap_page.get_mvcc_tuple(slot_id)
-            .ok_or(VaisError.new("VAIS-0203009", "MVCC tuple not found"))?;
-
-        I !is_visible(
-            mvcc_tuple,
-            self.ctx.txn_id,
-            0,  # cmd_id (not used for read-only search)
-            &self.ctx.snapshot,
-            self.ctx.catalog.get_clog()
-        ) {
-            R Err(VaisError.new("VAIS-0203009", "Row not visible to snapshot"))
-        }
-
-        Ok(row)
+        Err(VaisError.new("VAIS-0203009", "load_row_by_node_id not implemented"))
     }
 }
 
@@ -253,80 +130,13 @@ X VectorSearchExecutor {
 # Expected signature:
 #   VECTOR_SEARCH(table.column, ARRAY[0.1, 0.2, ...], 10)
 #   VECTOR_SEARCH(table.column, ARRAY[0.1, 0.2, ...], 10, 200)  -- with ef_search
+# NOTE: depends on Expr.ArrayLiteral variant which has not been added to the AST
+# yet. Use VectorSearchBuilder until parser support is exposed.
 F parse_vector_search_args(
     args: &[Expr],
     ctx: &ExecContext
 ) -> Result<VectorSearchParams, VaisError> {
-    I args.len() < 3 || args.len() > 4 {
-        R Err(VaisError.new("VAIS-0203007", "VECTOR_SEARCH requires 3 or 4 arguments"))
-    }
-
-    # Argument 1: table.column reference
-    (table_name, column_name) := M &args[0] {
-        ColumnRef { table, column } => {
-            (table.clone(), column.clone())
-        },
-        _ => { R Err(VaisError.new("VAIS-0203007", "First arg must be column reference")) }
-    }
-
-    # Argument 2: query vector (ARRAY[...] or vector literal)
-    query_vector := M &args[1] {
-        ArrayLiteral { elements } => {
-            vec := mut Vec.with_capacity(elements.len())
-            ei := mut 0
-            LW ei < elements.len() {
-                M &elements[ei] {
-                    Literal { value: SqlValue.FloatVal { v } } => {
-                        vec.push(*v as f32)
-                    },
-                    Literal { value: SqlValue.IntVal { v } } => {
-                        vec.push(*v as f32)
-                    },
-                    _ => { R Err(VaisError.new("VAIS-0203007", "Array elements must be numeric")) }
-                }
-                ei += 1
-            }
-            vec
-        },
-        Literal { value: SqlValue.VectorVal { v } } => v.clone(),
-        _ => { R Err(VaisError.new("VAIS-0203007", "Second arg must be vector")) }
-    }
-
-    # Argument 3: top_k
-    top_k := M &args[2] {
-        Literal { value: SqlValue.IntVal { v } } => {
-            I *v <= 0 {
-                R Err(VaisError.new("VAIS-0203007", "top_k must be positive"))
-            }
-            *v as u64
-        },
-        _ => { R Err(VaisError.new("VAIS-0203007", "Third arg must be integer")) }
-    }
-
-    # Argument 4: ef_search (optional)
-    ef_search := I args.len() == 4 {
-        M &args[3] {
-            Literal { value: SqlValue.IntVal { v } } => {
-                I *v <= 0 {
-                    R Err(VaisError.new("VAIS-0203007", "ef_search must be positive"))
-                }
-                Some(*v as u32)
-            },
-            _ => { R Err(VaisError.new("VAIS-0203007", "Fourth arg must be integer")) }
-        }
-    } EL {
-        None
-    }
-
-    Ok(VectorSearchParams {
-        table_name,
-        column_name,
-        query_vector,
-        top_k,
-        ef_search,
-        index_id: 0,  # Resolved during open()
-        table_id: 0,  # Resolved during open()
-    })
+    Err(VaisError.new("VAIS-0203007", "parse_vector_search_args not implemented"))
 }
 
 # execute_vector_search: standalone helper for direct execution

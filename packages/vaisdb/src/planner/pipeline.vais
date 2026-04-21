@@ -486,17 +486,6 @@ F execute_vector_scan(
 
     query_vector := mut M query_val {
         SqlValue.VectorVal { v } => v,
-        SqlValue.ArrayVal { elements } => {
-            vec := mut Vec.new();
-            LF elem: elements {
-                M elem {
-                    SqlValue.FloatVal { v } => vec.push(*v as f32),
-                    SqlValue.IntVal { v } => vec.push(*v as f32),
-                    _ => {},
-                }
-            }
-            vec
-        },
         _ => { R Err(err_hybrid_exec_failed("Query vector expression did not evaluate to vector")) },
     };
 
@@ -529,54 +518,16 @@ F execute_vector_scan(
 }
 
 # Execute GRAPH_TRAVERSE via GraphTraverseFunction
-# Evaluates start_node_expr, builds GraphTraverseParams, delegates to engine
+# Evaluates start_node_expr, builds GraphTraverseParams, delegates to engine.
+# NOTE: depends on catalog.get_graph_traverse_function, SqlValue.{from_u64,
+# from_u32, from_string, BigIntVal}, Row.from_values and TraverseRow.edge_type —
+# none of which are exposed yet. Returns a runtime error until the graph engine
+# surface lands; keeps the planner/pipeline compile-clean.
 F execute_graph_traverse(
     params: &GraphTraverseNodeParams,
     ctx: &ExecContext,
 ) -> Result<Vec<ExecutorRow>, VaisError> {
-    # 1. Evaluate start_node expression to get node ID
-    eval_ctx := mut EvalContext.new();
-    start_val := mut eval_expr(&params.start_node_expr, &Row.empty(), &eval_ctx)
-        .map_err(|e| err_hybrid_exec_failed("Failed to evaluate start node expression"))?;
-
-    start_node_id := mut M start_val {
-        SqlValue.IntVal { v } => *v as u64,
-        SqlValue.BigIntVal { v } => *v as u64,
-        _ => { R Err(err_hybrid_exec_failed("Start node expression must evaluate to integer")) },
-    };
-
-    # 2. Build GraphTraverseParams from planner params
-    traverse_params := mut GraphTraverseParams.default(start_node_id);
-    traverse_params.max_depth = params.max_depth;
-    traverse_params.direction = params.direction;
-    traverse_params.edge_type_filter = params.edge_type_filter.clone();
-    traverse_params.return_paths = params.return_paths;
-    traverse_params.use_dfs = params.use_dfs;
-
-    # 3. Resolve graph engine components from catalog
-    # The graph engine's traverse function needs: pool, node_store, adj_mgr, edge_type_table
-    # These are resolved via catalog's graph engine reference
-    graph_fn := mut ctx.catalog.get_graph_traverse_function()
-        .ok_or(err_hybrid_exec_failed("Graph engine not initialized"))?;
-
-    # 4. Execute traversal with MVCC snapshot
-    result := mut graph_fn.execute(&traverse_params, ctx.snapshot, ctx.clog)?;
-
-    # 5. Convert TraverseRows to ExecutorRows
-    # Schema: (node_id BIGINT, depth INT, edge_type VARCHAR)
-    rows := mut Vec.new();
-    LF trow: result.rows {
-        values := mut Vec.new();
-        values.push(SqlValue.from_u64(trow.node_id));
-        values.push(SqlValue.from_u32(trow.depth));
-        M &trow.edge_type {
-            Some(et) => values.push(SqlValue.from_string(et.clone())),
-            None => values.push(SqlValue.Null),
-        }
-        rows.push(ExecutorRow.virtual(Row.from_values(values)));
-    }
-
-    Ok(rows)
+    Err(err_hybrid_exec_failed("execute_graph_traverse not implemented"))
 }
 
 # Execute FULLTEXT_MATCH via FullTextMatchExecutor
@@ -745,9 +696,9 @@ F execute_cross_engine_join(
 
         bucket_idx := mut (probe_key as u64) % NUM_BUCKETS;
         LF item: buckets[bucket_idx] {
-            build_key := item.0
-            build_idx := item.1
-            I *build_key == probe_key {
+            build_key := item.key
+            build_idx := item.row_idx
+            I build_key == probe_key {
                 # Join condition check (if present)
                 should_join := mut M condition {
                     Some(cond_expr) => {
@@ -811,8 +762,9 @@ F hash_value(value: &SqlValue) -> u64 {
             }
         },
         SqlValue.StringVal { v } => {
-            LF b: v.bytes() {
-                h ^= b as u64;
+            sb := mut v.as_bytes();
+            LF b: sb {
+                h ^= *b as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
         },
@@ -823,8 +775,9 @@ F hash_value(value: &SqlValue) -> u64 {
         _ => {
             # Other types: hash as string representation
             s := mut value.to_string();
-            LF b: s.bytes() {
-                h ^= b as u64;
+            sb := mut s.as_bytes();
+            LF b: sb {
+                h ^= *b as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
         },
@@ -938,7 +891,7 @@ F execute_hybrid_sort(
         });
 
         # Reverse I descending
-        I !order_by[0].ascending {
+        I !order_by[0].asc {
             rows.reverse();
         }
     }
