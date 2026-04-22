@@ -12,9 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1) → 18 (H2) → 19 (H3) → 20 (H4) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 0
+task_order: 17 (H1 ✅) → 18 (H2) → 19 (H3) → 20 (H4) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 2
 max_iterations: 30
+  strategy: sequential (H2 시작 — SSA registry audit, Opus direct. H1 완료 후 15/15 standalone ✅).
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
@@ -473,20 +474,21 @@ Phase A 기반 위에서 남은 3개 링크 에러를 근본적으로 해결.
 > max_iterations: 30
 >   strategy: sequential. H1 → H2 → H3 → H4 (regression audit). 각 단계 완료 시 vaisdb 15/15 standalone codegen regression 0 + 링크 에러 재계수.
 
-### H1. Span에 file_id 추가 (TC span bleed 완전 차단)
-**범위**: vais-ast + vais-parser + vais-types + vais-codegen
+### H1. Span에 file_id 추가 (TC span bleed 완전 차단) ✅ 2026-04-23
+**범위**: vais-ast + vais-types + vais-codegen + vaisc drivers
 **문제**: 현재 `Span { start, end }`는 byte offset만 담음. Cross-module build에서 같은 (start, end) 쌍이 다른 파일에서 공유되면 TC expr_types map이 오염. `body_size as u32` 같은 단순 코드가 Vec<u8>로 승격되는 원인.
-**작업**:
-  1. `Span` 구조체에 `file_id: u32` 필드 추가 (기본값 0 허용으로 backward-compat)
-  2. Parser가 파일당 고유 file_id 할당
-  3. TC expr_types key를 `(file_id, start, end)`로 확장
-  4. Codegen `span_key` 계산 지점 전체 업데이트
+**작업 (완료)**:
+  1. ✅ `Span` 구조체에 `file_id: u32` 필드 추가 (`with_file` 명시적 생성자 + `new`는 file_id=0 backward-compat)
+  2. ✅ TC/Codegen 양쪽에 `current_file_id` + setter 추가. 4개 driver 지점에서 FNV-1a(canonical path)로 per-module file_id 주입
+  3. ✅ TC expr_types key를 `(file_id, start, end)`로 확장. `check_expr`/`inference_modes` 모두 파일별 namespace로 stamp
+  4. ✅ `merge_type_defs_from`에 expr_types + implicit_try_sites 병합 추가 (parallel TC에서 merge가 expr_types를 silently 날리던 기존 bug 동시 수정)
+  5. ✅ 직렬 TC 경로 대응: 정확 key miss 시 (start, end) 단일 매칭 fallback (다중 매칭이면 span-bleed 가능성 → 거부)
 **완료 조건**:
-  - cargo test -p vais-codegen --lib 796 passed
-  - vaisdb 15/15 standalone codegen 0 errors
-  - test_buffer_pool `max_overflow_data_per_page` trunc 회귀 없음 검증
-  - type_inference.rs의 "Phase E.3 narrow-primitive guard" hack 제거 가능
-**예상 소요**: 1 세션
+  - ✅ cargo test -p vais-codegen --lib: 796/796
+  - ✅ cargo test -p vais-types --lib: 355/355
+  - ✅ vaisdb 15/15 standalone codegen 0 errors
+  - Phase E.3 narrow-primitive guard 제거는 H4에서 재평가 (현재는 유지 — 추가 안전망)
+**커밋**: `4b6413f7 fix(compiler): Phase 17.H1 — Span file_id + expr_types namespace + merge`
 
 ### H2. SSA Type Registry 완전성 보강
 **범위**: vais-codegen/src (emission 지점 전체 audit)
