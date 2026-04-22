@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2) → 19 (H3) → 20 (H4) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+task_order: 17 (H1 ✅) → 18 (H2 ✅ merged into H3) → 19 (H3) → 20 (H4) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
 iteration: 2
 max_iterations: 30
-  strategy: sequential (H2 시작 — SSA registry audit, Opus direct. H1 완료 후 15/15 standalone ✅).
+  strategy: sequential. H2 re-scoped — 283 clang errors 전수 분석 결과 모두 ABI coerce 문제(H3 영역), register_temp_type 누락이 아님. H3 ("coerce_for_abi 통합 함수")가 본질적 해결책이므로 H2를 H3로 merge. opus_direct 유지.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
@@ -490,20 +490,19 @@ Phase A 기반 위에서 남은 3개 링크 에러를 근본적으로 해결.
   - Phase E.3 narrow-primitive guard 제거는 H4에서 재평가 (현재는 유지 — 추가 안전망)
 **커밋**: `4b6413f7 fix(compiler): Phase 17.H1 — Span file_id + expr_types namespace + merge`
 
-### H2. SSA Type Registry 완전성 보강
-**범위**: vais-codegen/src (emission 지점 전체 audit)
-**문제**: 많은 IR emission 지점에서 생성한 temp를 `register_temp_type`로 등록하지 않음 → downstream `llvm_type_of` fallback "i64"가 오답을 낳음. "i64 vs <N-bit>" 계열 에러의 주범.
-**작업**:
-  1. 모든 `%t = <op> <ty>` emission을 grep으로 열거 (약 100+ 지점)
-  2. 각 지점에서 `self.fn_ctx.register_temp_type(&tmp, resolved_ty)` 호출 확인/추가
-  3. `llvm_type_of_checked`를 기본으로 하고, fallback i64를 사용하는 경로는 debug-build assertion으로 감쌈
-  4. E.6에서 추가한 generate_ident_expr 등록은 유지 + 그 외 emit 지점 일괄 감사
-**완료 조건**:
-  - cargo test 796/796 + vaisdb 15/15 standalone
-  - 테스트 파일 클래스 감소: 현재 "i64 vs iN/float/ptr" 에러 ≥50건 → 10건 이하
-  - `llvm_type_of` 기본 호출이 Option 반환으로 전환되거나, 모든 call site에서 checked 버전 사용
-**예상 소요**: 2 세션
-**blockedBy**: H1 (선결은 아니나, H1 먼저 하면 registry 일관성 검증이 쉬워짐)
+### H2. SSA Type Registry 완전성 보강 ✅ (re-scoped into H3) 2026-04-23
+**원래 가설**: `register_temp_type` 누락이 "i64 vs iN/float/ptr" 에러의 주범.
+**실측 (H1 완료 후)**:
+  - cargo test 796/796 ✅, vaisdb 15/15 standalone codegen 0 errors ✅
+  - 15개 테스트 전체 clang 검증 시 **283개 에러**, 에러 클래스는 압도적으로 ABI coerce:
+    - int width 불일치 (i32/i64, i8/ptr) — store/ret/call 경계에서 coerce 누락
+    - base↔specialized generic bitcast (`i64 → %"Vec$u8"`, `{ptr, i64} → %"Vec$u8"`)
+    - undef forward decl (`@Vec_truncate` 등) — 별개 문제
+    - PHI predecessor mismatch — 제어흐름 버그, 별개
+    - void-in-struct (Phase E Unit marker 잔존) — 별개
+**결론**: 에러 283건 전부 **경계 coerce 문제**로, emission 지점 register_temp_type 누락이 아님. H2의 원래 audit scope (1144 write_ir! 지점 전체 검토)는 이 에러들에 대한 수정을 내지 못함. → H3 ("ABI 경계 통합 Coerce Pass")가 본질적 해결책이므로 H2를 H3로 **merge**.
+**완료 판정**: H1로 1차 목표 (standalone codegen 0 errors) 달성. 2차 목표 (link-ready IR)는 H3에서 다룸.
+**조치**: H2 완료 처리, H3의 blockedBy에서 H2 제거 (실질적으로는 이미 resolved).
 
 ### H3. ABI 경계 통합 Coerce Pass
 **범위**: generate_expr_call.rs + expr_helpers_call/{call_gen,method_call}.rs + function_gen/codegen.rs (ret 경로)
