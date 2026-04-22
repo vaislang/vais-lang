@@ -394,7 +394,18 @@ Phase A 기반 위에서 남은 3개 링크 에러를 근본적으로 해결.
   scope: 근본 원인은 "local mangling 부재"가 아니라 SSA registry에 남은 이전 specialization의 `%Result*` 태그가 Ident 재사용 시 재활성화되는 것. 직접 호출 arg coercion에서 local이 i64계열이면 ptrtoint 경로 스킵하여 우회
   verify: cargo test -p vais-codegen --lib 796 passed / vaisdb 15/15 standalone codegen 0 errors / test_types_string.ll `%suffix i64 vs ptr` 링크 에러 제거 ✓
   잔존: test_types_test_types.ll:4448 str assert_eq, test_types_types.ll:1142 float phi → 별개 이슈 (B2/C1 범위 외)
-- [ ] Phase C1. Runtime Helpers 12개 구현 [blockedBy: B2/B1/B3]
+- [x] Phase B4. Generic return coerce (i64 → %T) at call site (Opus direct) ✅ 2026-04-22
+  changes: crates/vais-codegen/src/expr_helpers_call/method_call.rs (static method call이 emitted ret_type과 일치하는 ResolvedType으로 register_temp_type 호출), 부수적으로 outer if-else double-phi LUB/int→float sitofp (expr_helpers_control.rs), Vec<T>→&[T] fat-pointer call coercion (generate_expr_call.rs + method_call.rs)
+  commit: vais@1582ce9c, 35ab7230, 388c2b18
+  scope: 3개 연관 링크 에러 해결 — `%t128` float phi (outer if-else int/double LUB), `%t15 i64 vs %Vec$SqlValue` (Vec_new 반환 타입), `%encoded.48 ptr vs { ptr, i64 }` (Row.decode Vec→slice). 부수: str↔i64, int→float sitofp 호출 arg coercion
+  verify: cargo test 796/796 / vaisdb 15/15 standalone codegen 0 errors / test_types 링크 에러 3 → 2
+  잔존 (B5 신규 필요):
+    1. test_types_test_types.ll:4993 — F64 enum payload pattern binding이 `%t85 = load i64, i64* %t83` 생성 (%t83은 double 값, pointer가 아님). 재현: `M row.get(_) { SqlValue.FloatVal { v } => { v > 3.13 && v < 3.15 } ... }` 연쇄 match arm에서 두 번째 이후 arm. 추정: match arm 전환 시 이전 arm의 v binding이 leak되어 `generate_ident_expr`가 alloca i64 경로 선택
+    2. test_types_*.ll — "PHI node entries do not match predecessors!" (opaque location). 다른 파일일 가능성 (`clang -o` 에러는 순서 non-deterministic). B2에서 다루지 못한 match_gen 또는 loop의 predecessor 추적 누락
+- [ ] Phase B5. F64 enum payload pattern binding + match arm scope leak
+  scope: pattern.rs `Pattern::Variant` compound-small (field_size=8) 경로에서 F64 field 바인딩 후 다음 arm에서 v lookup이 old binding 사용. generate_pattern_bindings_typed가 SSA 바인딩 하는데도 왜 alloca 경로가 선택되는지 재현 + 수정. IR dump + eprintln 조합 필요
+  blockedBy: (없음 — 즉시 착수 가능)
+- [ ] Phase C1. Runtime Helpers 12개 구현 [blockedBy: B5]
 - [ ] Phase C2. Cross-module shallow-free emission [blockedBy: C1]
 - [ ] Phase C3. End-to-end `vaisc run` 검증 [blockedBy: C1/C2]
 >
