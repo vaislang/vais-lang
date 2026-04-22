@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅ merged into H3) → 19 (H3) → 20 (H4) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 2
+task_order: 17 (H1 ✅) → 18 (H2 ✅ merged) → 19 (H3 partial ✅ width/primitive) → 20 (H4 extended scope) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 3
 max_iterations: 30
-  strategy: sequential. H2 re-scoped — 283 clang errors 전수 분석 결과 모두 ABI coerce 문제(H3 영역), register_temp_type 누락이 아님. H3 ("coerce_for_abi 통합 함수")가 본질적 해결책이므로 H2를 H3로 merge. opus_direct 유지.
+  strategy: sequential. H3 두 가지 width coerce 수정(H3.1 범위 i64, H3.2 Try payload trunc)으로 16건 에러 제거. 나머지 에러 클래스는 원자적 버그(슬라이스 deref, enum layout, void leak)라 width coerce만으로 해결 안 됨 → H4로 이월. opus_direct 유지. ROADMAP H3 섹션에 상세 기록.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
@@ -504,14 +504,25 @@ Phase A 기반 위에서 남은 3개 링크 에러를 근본적으로 해결.
 **완료 판정**: H1로 1차 목표 (standalone codegen 0 errors) 달성. 2차 목표 (link-ready IR)는 H3에서 다룸.
 **조치**: H2 완료 처리, H3의 blockedBy에서 H2 제거 (실질적으로는 이미 resolved).
 
-### H3. ABI 경계 통합 Coerce Pass
+### H3. ABI 경계 통합 Coerce Pass (partial ✅ H3.1+H3.2 / 2026-04-23)
 **범위**: generate_expr_call.rs + expr_helpers_call/{call_gen,method_call}.rs + function_gen/codegen.rs (ret 경로)
 **문제**: arg 전달, return, match-phi 등 ABI 경계마다 **개별 coercion 로직**이 중복/누락. 결과: "aggregate value vs ptr", "Result base vs specialized" 등 재발성 에러.
-**작업**:
-  1. `coerce_for_abi(val, from_ty: ResolvedType, to_ty: ResolvedType, counter, ir) -> String` 단일 함수 도입
-     - 처리 케이스: int width, float width, int↔float, Unit skip, Str↔i64, Named 포인터/값 변환, Ref(Str)↔Str, Vec→Slice, Ok/Err enum pointer 처리, base↔specialized bitcast
-  2. 기존 coerce 로직을 모두 이 함수로 위임 (현재 ~15개 이상의 인라인 coerce 블록)
-  3. Call arg / Return / Match phi / Let binding 4개 지점에서 `coerce_for_abi` 호출로 표준화
+
+**완료 (increments)**:
+  - ✅ **H3.1** (`272fe4f0`): `generate_range_for_loop` — start/end 경계를 i64로 sext/trunc. 8건 `capacity i32→i64` 에러 제거.
+  - ✅ **H3.2** (`eee975fe`): `generate_aggregate_extractvalue` (Try `?`) — primitive payload path에서 i64 slot → try_llvm 너비로 trunc. 8건 `t3 i64→i32` 에러 제거.
+
+**남은 작업 (H4로 이월)**:
+  1. Slice deref 시 ptrtoint 오용 수정 (`%t9 i8→ptr` 9건)
+  2. Vec base↔specialized struct bitcast (`%t23 i64→%Vec$BTreeInternalEntry` 5건)
+  3. i64→ptr/struct coerce (`%t21 ptr→%FrameState` 5건)
+  4. Base `%Vec`→specialized `%Vec$T` 코어크 (기타 비슷 5+ 클래스)
+  5. Unit→void-in-struct 잔존 marker 정리 (`void type only allowed for function results` 6건)
+  6. `@Vec_truncate` 등 forward decl 누락 (7건)
+  7. PHI predecessor mismatch (5건 — 별개 제어흐름 버그)
+  8. `coerce_for_abi` 통합 함수 추상화 — 위 점진적 수정 후 패턴이 명확해지면 일괄 리팩터
+
+**사유**: 원래 H3 scope("coerce_for_abi 단일 함수 도입")는 15+ 기존 coerce 사이트를 한 번에 추상화하는 설계. 실측(283 clang errors 수동 분석) 결과 각 에러 클래스가 서로 다른 **원자적 버그**(슬라이스 deref, enum layout, void leak 등)로 **width coerce만으로는 해결 안 됨**. → pragmatic: 각 버그 독립 수정 후 공통 패턴 추출. H3는 width/primitive coerce 완성, 나머지는 H4에서 음영별 수정.
 **완료 조건**:
   - cargo test 796/796 + vaisdb 15/15 standalone
   - "aggregate vs ptr", "{ ptr, i64 } vs i64" 계열 에러 전부 소멸
