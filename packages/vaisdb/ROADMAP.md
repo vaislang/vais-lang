@@ -13,9 +13,10 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 17
+iteration: 18
 max_iterations: 30
-  last_session: iter 17 complete (2026-04-23, commit 3d4535d). iter 18 task queued. Session paused — next session should start with `generate_expr_call.rs` investigation per iter 18 task description.
+  last_session: iter 17 complete (2026-04-23, commit 3d4535d). iter 18 in progress.
+  strategy: sequential, Opus direct — per `subagent_delegation_for_compiler_tasks` memory (vais compiler codegen tasks). iter 18 goal: trace fat-pointer alloca-as-value bug in static function call path and fix at root.
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
   **iter 13 (2026-04-23)**: Vec.new() ground-truth 조사 및 iter 14 목표 구체화 (docs-only 커밋 7a5b0bb).
@@ -75,6 +76,24 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 18 (2026-04-24) — cross-module Vais fn ABI + &str/&[T] ref ABI, LANDED ✅**:
+  - Root cause: iter 17 identified `declare i64 @fnv1a_hash(i8*)` vs `call i64 @fnv1a_hash({i8*,i64})` mismatch + call-site alloca-as-value. Two orthogonal bugs stacked at the same call site.
+  - Fix 1 (`crates/vais-codegen/src/function_gen/signature.rs`): `generate_extern_decl` branches on `info.is_extern` — C-ABI `type_to_llvm_extern` only for true externs (malloc, free, …), Vais-native `type_to_llvm` for cross-module Vais fn declares. Call site already uses native ABI, now declare matches.
+  - Fix 2 (`crates/vais-codegen/src/generate_expr/ref_deref.rs`): `generate_ref_spill` early-returns the value directly for `Str | Slice | SliceMut`. These types' LLVM lowering IS the fat-pointer value; `&x` in Vais is semantic-only, so `&<str>` = `<str>` in LLVM IR. Previous spill to alloca produced `{i8*,i64}*` where call sites expected `{i8*,i64}` value.
+  - 검증 (15개 vaisdb 테스트, 3-run 평균):
+    - Baseline: ~171 link errors, ~24 ptr-vs-slice, 1/15 linked
+    - With-fix: ~159 link errors, ~20 ptr-vs-slice, 1/15 linked
+    - Net: **-12 total, -4 ptr-slice class** (modest 하지만 실제 — 기존 수정 중 가장 깔끔한 structural fix)
+    - cargo test -p vais-codegen --lib: 796/796 ✅
+    - cargo test -p vais-types --lib: 355/355 ✅
+    - Standalone codegen: 14-15/15 (flake 상한 개선 — 이전 13-14/15)
+  - 남은 에러 (iter 19+ 대상): 여전히 1/15 linked. 남은 에러 클래스들:
+    - `i64` vs `%Vec$T` / `%Result` / `%Option` (specialized struct과 erased i64 불일치)
+    - `%t3` (Str_new 같은 undefined-body builtin) 호출 후 반환 타입 불일치
+    - `i32` vs `i64` (option payload)
+    - Vec base `%Vec` ↔ specialized `%Vec$T` bitcast 누락
+  - 커밋: `c552ad85 fix(codegen): Phase 17.H4 iter 18 — cross-module Vais function ABI + &str/&[T] ref ABI`
 
   **iter 17 (2026-04-23) — path 1 tried (isolated coerced_val), REVERTED as wash**:
   - Implementation: `generate_method_call_expr` arg 루프에 `is_vec_to_slice_coercion` 분기 추가 (iter 16과 같은 위치) + **`val` 원본 유지하고 새 로컬 `coerced_val`에 fat pointer 저장**, 즉시 `arg_vals.push + continue`로 downstream 우회. ~48 lines at line ~400.
