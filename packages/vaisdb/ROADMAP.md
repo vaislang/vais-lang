@@ -12,17 +12,16 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 13 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 10
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 11
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 누적 **13 fixes + 3 stdlib** (iter 10): H4.12 slice PHI, stdlib Vec.new + sync.vais `LW...!` → `I...EL`.
+  strategy: sequential, Opus direct. H4.13 added: generate_module + generate_module_with_instantiations now mirror generate_module_subset's generic struct_defs registration.
 
-  **Ground truth**: vaisdb full-build 1/15 (test_types only). Core issue is structural:
-  - Cross-module `struct_defs` 미공유 → Vec.new specialization 미동작 (has_struct=false)
-  - Base generic emitted instead of `Vec_new$T` → 5+ tests blocked
-  - sync.vais `LW...!` mistake was an app code bug, now fixed
+  **진짜 root cause (iter 11 조사 결과)**: 단순 "cross-module struct_defs 미공유"가 아님. **Vec struct의 AST node가 아예 tracker 모듈의 `full_module.items`에 없음**. stdlib 모듈(std/vec.vais)은 TC가 `register_builtins()`로 관리하지만 parser는 사용자가 `U std/vec`를 명시하지 않으면 해당 AST를 로드 안 함. vaisdb의 tracker.vais는 `U std/vec`가 없지만 Vec를 사용 — TC는 builtin으로 OK, 하지만 codegen은 AST item이 없어 specialization 불가.
 
-  **진단 요약**: "기존 H4.x는 **per-module codegen 경계에서 Vec template 공유**가 안 되어 specialization 실패. 이 문제를 해결하려면 module_gen/subset.rs에서 full_module.items를 반복할 때 imported modules의 struct items도 struct_defs에 등록해야 함. 단일 fix로 여러 클래스 한 번에 해결 가능 — **다음 세션의 핵심 target**."
+  **다음 세션 high-leverage**: vaisc/src/imports.rs 또는 parser에서 **stdlib auto-preload** 구현 — Vec/HashMap/Option/Result를 항상 final_ast.items에 주입. 1 location change로 5+ tests 잠금 해제 예상.
+
+  **현재 상태 유지**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (개선 없음, 그러나 invariant 정리됨).
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
