@@ -13,7 +13,7 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 14
+iteration: 15
 max_iterations: 30
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
@@ -43,6 +43,26 @@ max_iterations: 30
     - 수량: Vec.new() 관련 에러 완전 소멸, 다른 클래스 에러가 표면화됨 (기대 동작: 버그 cascade)
 
   **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb 15/15 standalone codegen 0 errors ✅, full-build(링크+실행) 여전히 1/15 — 그러나 Vec.new specialization 클래스 완전 제거.
+
+  **iter 15 (2026-04-23) — iter 14 impact 정량화 + iter 16 target selection**:
+  - docs-only 커밋 (compiler unchanged). 이유: 메모리 cascade 경고 ("한 세션에 B-class fix 3개 이상 = regression risk"). iter 14가 substantial fix였고, iter 15에서 즉시 또 다른 compiler 수정 시 risk stacking.
+  - iter 14 global impact 측정 (15개 test 전체 IR across `/tmp/test_*.ll`):
+    - `call @Vec_new()` unmangled call sites: **4개** (전부 `test_cross_engine_pipeline.ll` 내부, cross_engine 테스트 전용)
+    - `call @Vec_new$T()` mangled call sites: **168개**
+    - `declare @Vec_new()` (forward decl, non-call): 422개 — 각 module 당 1개씩, call site 아님
+    - 판정: iter 14의 Vec.new specialization 전파는 전역적으로 성공. 남은 4개는 pipeline.vais의 edge case (별개 iter 대상)
+  - iter 15 baseline 재측정 (standalone codegen + link):
+    - standalone codegen: 15/15 ✅
+    - clang link: 1/15 (test_types만 통과)
+    - 14/15 fail의 top error class distribution (정규화된 에러 메시지 빈도):
+      - 24건: `ptr` vs `{ ptr, i64 }` — str/slice ABI 경계 (가장 흔함)
+      - 22건: `i64` vs `%Vec$T`(specialized struct) — Vec 기본→특수화 bitcast
+      - 20건: `i64` vs `ptr` — 포인터-슬롯 vs 정수-슬롯 불일치
+      - 16건: `{ ptr, i64 }` vs `i64` — slice-slot → i64 raw로 squash
+      - 15건: `double` vs `i64` — float payload ABI
+      - 13건: `ptr` vs `i64` — 위 3번의 역방향
+      - 그 외: `i32` vs `i64`, Vec base→specialized, Result/Option payload, etc.
+  - **iter 16 target (예정)**: 24건 슬라이스 ABI 클래스 (`ptr` vs `{ptr,i64}`) — 가장 큰 단일 클래스이자 H3.1/H3.2에서 다룬 ABI coerce 연장선. 한 fix로 ~24건 제거 예상. method_call.rs의 `did_vec_to_slice` 경로 확장 또는 새 coerce 함수 도입.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
