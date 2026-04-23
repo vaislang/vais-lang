@@ -15,8 +15,7 @@ current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
 iteration: 19
 max_iterations: 30
-  last_session: iter 19 closed as negative result (compiler unchanged). Str_new builtin path exposes vaisdb source bug (`normalized.push_byte()` on Str — immutable fat pointer). i64↔specialized-struct class is same-root (unregistered methods fall back to i64 default). Both require either (a) vaisdb source redesign (Str → proper mutable String, to_vec method registration) or (b) compiler structural fix to propagate expected-type hint into unregistered-call return inference.
-  next_iter_target: iter 20 — propagate expected-type hint to unregistered call return types at codegen time. Use iter 14's expected_type_stack infrastructure at call site when FunctionInfo is missing. Expected impact: broad — unblocks i64↔specialized class AND eliminates Str_new-class silent-bad-IR pattern. Risk: high (touches core type resolution), needs small-scoped prototype first.
+  last_session: iter 19 closed as negative result (compiler unchanged). Str_new builtin path exposes vaisdb source bug (`normalized.push_byte()` on Str — immutable fat pointer). i64↔specialized-struct class is same-root (unregistered methods fall back to i64 default). Session paused — iter 20 task queued (#4).
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
