@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 10 fixes) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 6
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 11 fixes) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 7
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 누적 **10 fixes**: H4.1 struct-lit Unit void + H4.2/3 enum match/unwrap Unit + stdlib Vec.truncate + H4.4 arg actual-type + H4.5 placeholder zext + H4.6 `&arr[i]` GEP + H4.6guard Range → slice + H4.7 `&call()` spill + H4.8 field-store load-ptr + H4.8b/c local-assign load-ptr + enum_ptr register. **282 → 185 (97건 eliminated, ~34%)**. 남은 185건: `extractvalue aggregate`(7 partial F 구조), PHI 불일치(5), slice-of-slice(5), base↔spec Vec bitcast, `ptr→i64` icmp 구조 비교 등 — GEP 결과 register_temp_type propagation + partial F wrap 재구현 등 **구조적 큰 refactor 필요 영역**. 세션 마무리 권장.
+  strategy: sequential, Opus direct. H4 누적 **11 fixes**. 이전 세션 마지막 fix: H4.10 struct field GEP register + ptrtoint icmp operands — icmp ptr, ptr 제거. **282 → 186 (96건 eliminated)**. 남은 186건: base↔specialized Vec 호출 (Vec_new 비특수화, 5), partial F wrap (7), PHI 불일치(5), specialization 반환 타입 전파(5 t5 i32→i64), 기타 구조. 다음 단계: (a) Vec 호출 site 특수화 / (b) partial F codegen 재설계 / (c) PHI 분석 — 각각 독립적이고 구조적.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
