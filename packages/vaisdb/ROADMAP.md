@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 6 fixes/많) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 5
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 10 fixes) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 6
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 누적 6 fixes: H4.1(struct-lit Unit void leak) H4.2(match-arm Unit payload) H4.3(unwrap Unit) H4.4(arg actual-type coerce) + std::Vec.truncate 추가 + H4.5(placeholder Bool→i64 zext skip). **282 → 199 (83건 eliminated, ~29%)**. 남은 199건 중 `%t9 i8→ptr` (9, slice deref), `extractvalue aggregate` (7, partial F Result wrap), PHI mismatch (5), outer match i64→i1 (5, placeholder propagation 설계 필요) — 대부분 semantic bug로 surgical width coerce 한계.
+  strategy: sequential, Opus direct. H4 누적 **10 fixes**: H4.1 struct-lit Unit void + H4.2/3 enum match/unwrap Unit + stdlib Vec.truncate + H4.4 arg actual-type + H4.5 placeholder zext + H4.6 `&arr[i]` GEP + H4.6guard Range → slice + H4.7 `&call()` spill + H4.8 field-store load-ptr + H4.8b/c local-assign load-ptr + enum_ptr register. **282 → 185 (97건 eliminated, ~34%)**. 남은 185건: `extractvalue aggregate`(7 partial F 구조), PHI 불일치(5), slice-of-slice(5), base↔spec Vec bitcast, `ptr→i64` icmp 구조 비교 등 — GEP 결과 register_temp_type propagation + partial F wrap 재구현 등 **구조적 큰 refactor 필요 영역**. 세션 마무리 권장.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
