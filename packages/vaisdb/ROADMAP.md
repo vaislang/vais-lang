@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 4/많) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 4
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 6 fixes/많) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 5
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 4가지 fix 누적 (H4.1 struct-lit Unit field void leak, H4.2 match-arm Unit payload, H4.3 unwrap_expr Unit, H4.4 method call arg actual-type coerce). 282 → 202 clang errors (80건 eliminated ~28%). 남은 ~200건 중 상위 클래스: partial function Result-wrapping (sync.vais Once_call_once), base↔specialized Vec bitcast, @Vec_truncate forward decl 누락, PHI predecessor mismatch — 각각 원자적 구조 버그.
+  strategy: sequential, Opus direct. H4 누적 6 fixes: H4.1(struct-lit Unit void leak) H4.2(match-arm Unit payload) H4.3(unwrap Unit) H4.4(arg actual-type coerce) + std::Vec.truncate 추가 + H4.5(placeholder Bool→i64 zext skip). **282 → 199 (83건 eliminated, ~29%)**. 남은 199건 중 `%t9 i8→ptr` (9, slice deref), `extractvalue aggregate` (7, partial F Result wrap), PHI mismatch (5), outer match i64→i1 (5, placeholder propagation 설계 필요) — 대부분 semantic bug로 surgical width coerce 한계.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
