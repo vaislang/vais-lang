@@ -13,9 +13,10 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 19
+iteration: 20
 max_iterations: 30
-  last_session: iter 19 closed as negative result (compiler unchanged). Str_new builtin path exposes vaisdb source bug (`normalized.push_byte()` on Str — immutable fat pointer). i64↔specialized-struct class is same-root (unregistered methods fall back to i64 default). Session paused — iter 20 task queued (#4).
+  last_session: iter 20 landed (compiler e3e7fa5f). TC expr_types fallback now fills unregistered call return types. Standalone codegen 15/15 ✅. Link error count roughly stable (~162, flake range). Linked 1/15 (new {ptr,i64}↔%Vec$u8 class exposed for iter 21+).
+  next_iter_target: iter 21 — address newly exposed coerce gaps now that call sites carry correct specialized types. Specifically `{ptr,i64}` vs `%Vec$u8` (8 sites), `i64` vs `%Vec$u8` (remaining), `ptr` vs `i64` (17 sites), `{ptr,i64}` vs `i64` (12 sites). These are likely slice/fat-pointer ↔ Vec struct coerce at assignment/arg-pass boundaries.
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
@@ -88,6 +89,24 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 20 (2026-04-24) — TC expr_types fallback for unregistered call return types, LANDED ✅**:
+  - Root cause (from iter 19): unregistered calls (`Str.new()`, `buf.to_vec()`, etc.) fell back to `i64` return type in codegen. Use sites then failed to type-match at link time.
+  - Fix (`crates/vais-codegen/src/generate_expr_call.rs` + `expr_helpers_call/method_call.rs` + callers):
+    - Added TC `expr_types[(file_id, span.start, span.end)]` lookup as last-resort fallback before `i64` default.
+    - Reuses Phase 17.H1 file_id infrastructure (span's file_id OR codegen's current_file_id) + unique-(start,end) serial-TC fallback.
+    - Threaded `call_span: Option<Span>` through `generate_method_call_expr`. Static-call path already had `call_span`.
+  - IR 개선 (test_planner_cache_cache.ll):
+    - Before: `%t3 = call i64 @Str_new()`
+    - After: `%t3 = call %Str @Str_new()` ✅
+  - 측정:
+    - cargo test -p vais-codegen --lib: 796/796 ✅
+    - cargo test -p vais-types --lib: 355/355 ✅
+    - Standalone codegen: **15/15** ✅ (iter 18의 14-15/15 flake 상한 안정화)
+    - Link 에러 총 ~162 (baseline ~158) — 노이즈 범위 내. linked 1/15 (변화 없음).
+  - 새로운 에러 클래스 노출: `{ptr,i64}` vs `%Vec$u8` (8건). 올바른 타입 전파로 drown-out된 하위 coerce 불일치가 표면화.
+  - 판정: 구조적 개선. IR이 이제 specialized 타입을 call 경계에서 올바르게 운반 → 이후 iter의 store/ret/arg coerce 수정이 실제 타입을 볼 수 있음.
+  - 커밋: `e3e7fa5f fix(codegen): Phase 17.H4 iter 20 — TC expr_types fallback for unregistered call return types`
 
   **iter 18 (2026-04-24) — cross-module Vais fn ABI + &str/&[T] ref ABI, LANDED ✅**:
   - Root cause: iter 17 identified `declare i64 @fnv1a_hash(i8*)` vs `call i64 @fnv1a_hash({i8*,i64})` mismatch + call-site alloca-as-value. Two orthogonal bugs stacked at the same call site.
