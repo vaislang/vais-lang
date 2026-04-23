@@ -12,20 +12,17 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 13 fixes + stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 9
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 13 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 10
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 **13 fixes + 2 stdlib** accumulated. Latest (iter 9): H4.12 slice helper current_block update (PHI 5건 해결), stdlib Vec.new added.
+  strategy: sequential, Opus direct. H4 누적 **13 fixes + 3 stdlib** (iter 10): H4.12 slice PHI, stdlib Vec.new + sync.vais `LW...!` → `I...EL`.
 
-  **실제 ground truth**: vaisdb full-build 1/15 (test_types만 통과). H4.12 PHI fix는 cascade를 이동시킴 — 각 fix는 독립 작업자 관점에서 진전이나 net "PASS" 증가는 안 일어남. 남은 14개 test 빌드 실패의 각 루트는:
-  - test_cross_engine: Option<&[u8]> ptr mismatch 
-  - test_planner: slice 관련
-  - test_btree: base↔specialized Vec 다중
-  - sync.vais partial F (3 tests 영향)
-  - generic 특수화 반환 타입 propagation
-  - 기타 module-level 특수 케이스
+  **Ground truth**: vaisdb full-build 1/15 (test_types only). Core issue is structural:
+  - Cross-module `struct_defs` 미공유 → Vec.new specialization 미동작 (has_struct=false)
+  - Base generic emitted instead of `Vec_new$T` → 5+ tests blocked
+  - sync.vais `LW...!` mistake was an app code bug, now fixed
 
-  남은 진전은 **structural refactor 수준**: SSA type registry across codegen, partial F codegen 재설계, 특수화 signature 전파 — 이 세션 범위 넘음. 다음 세션에 fresh context로 각 class별 집중 수정 권장.
+  **진단 요약**: "기존 H4.x는 **per-module codegen 경계에서 Vec template 공유**가 안 되어 specialization 실패. 이 문제를 해결하려면 module_gen/subset.rs에서 full_module.items를 반복할 때 imported modules의 struct items도 struct_defs에 등록해야 함. 단일 fix로 여러 클래스 한 번에 해결 가능 — **다음 세션의 핵심 target**."
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
