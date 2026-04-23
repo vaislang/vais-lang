@@ -15,8 +15,8 @@ current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
 iteration: 18
 max_iterations: 30
-  last_session: iter 17 complete (2026-04-23, commit 3d4535d). iter 18 in progress.
-  strategy: sequential, Opus direct — per `subagent_delegation_for_compiler_tasks` memory (vais compiler codegen tasks). iter 18 goal: trace fat-pointer alloca-as-value bug in static function call path and fix at root.
+  last_session: iter 18 complete (2026-04-24, compiler c552ad85 + vaisdb e18f503). Two structural fixes: generate_extern_decl is_extern branch + generate_ref_spill Str/Slice early-return. -12 total link errors, -4 ptr-vs-slice. Session paused.
+  next_iter_target: iter 19 — address remaining i64↔%Vec$T/%Result/%Option class errors, Str_new body emission, i32↔i64 Option payload, Vec base↔specialized bitcast. Expected: noticeable linked-count increase (currently 1/15)
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
   **iter 13 (2026-04-23)**: Vec.new() ground-truth 조사 및 iter 14 목표 구체화 (docs-only 커밋 7a5b0bb).
