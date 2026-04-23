@@ -13,15 +13,13 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 11
+iteration: 12
 max_iterations: 30
-  strategy: sequential, Opus direct. H4.13 added: generate_module + generate_module_with_instantiations now mirror generate_module_subset's generic struct_defs registration.
+  strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
-  **진짜 root cause (iter 11 조사 결과)**: 단순 "cross-module struct_defs 미공유"가 아님. **Vec struct의 AST node가 아예 tracker 모듈의 `full_module.items`에 없음**. stdlib 모듈(std/vec.vais)은 TC가 `register_builtins()`로 관리하지만 parser는 사용자가 `U std/vec`를 명시하지 않으면 해당 AST를 로드 안 함. vaisdb의 tracker.vais는 `U std/vec`가 없지만 Vec를 사용 — TC는 builtin으로 OK, 하지만 codegen은 AST item이 없어 specialization 불가.
+  **부분 해결**: tracker.ll now has `Vec_new$MigrationRecord` specialized correctly (was unmangled `@Vec_new()`). **일부 call site (e.g., 재귀 Vec-반환 함수 body)는 여전히 unmangled** — `expected_ret` 정보가 전달 안 되는 contexts에서. 향후 작업: method_call.rs 내 expected_ret 전파 범위 확장 + 추가 specialization paths.
 
-  **다음 세션 high-leverage**: vaisc/src/imports.rs 또는 parser에서 **stdlib auto-preload** 구현 — Vec/HashMap/Option/Result를 항상 final_ast.items에 주입. 1 location change로 5+ tests 잠금 해제 예상.
-
-  **현재 상태 유지**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (개선 없음, 그러나 invariant 정리됨).
+  **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (네트 변화 없음, 그러나 error 위치 downstream으로 이동 — 여러 unmangled Vec_new 실제로 specialize됨).
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
