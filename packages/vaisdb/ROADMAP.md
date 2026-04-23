@@ -13,23 +13,36 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 13
+iteration: 14
 max_iterations: 30
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
-  **iter 13 (2026-04-23) — 잔존 unmangled Vec_new() 정밀 ground-truth**:
-  - 대상: `tests/sql/test_migration.vais` → `src/sql/migrate/tracker.vais` → `/tmp/test_migration_tracker.ll`
-  - 3개 `Vec.new()` 사이트 중:
-    - ✅ L60 (`new_vec := mut Vec.new()`) → L283 `Vec_new$MigrationRecord` (specialized). 추론 단서: `new_vec.push(keep: MigrationRecord)` + `self.applied_versions = new_vec` (field 타입과 직접 unify)
-    - ❌ L29 (struct-literal field `applied_versions: Vec.new()`) → L227 `call i64 @Vec_new()` (unmangled). 즉시 `store %Vec$MigrationRecord %t1, %Vec$MigrationRecord* %t2`로 타입 불일치
-    - ❌ L76 (local `result := mut Vec.new()` + `result.push(tmp.version: i64)` + return `result: Vec<i64>`) → L370 `call i64 @Vec_new()` (unmangled). i64→memcpy hack으로 store
-  - 원인 조사 (기록만, 수정은 iter 14):
-    - `checker_expr/mod.rs` `check_expr`는 `expr_types[(file_id,start,end)]`에 raw ResolvedType stamp, 이후 driver가 `get_resolved_expr_types()` (vais-types/lib.rs:416)로 `apply_substitutions` 일괄 적용
-    - L29 실패 가설: `collections.rs:844 check_expr(value)`가 struct field의 expected type(`Vec<MigrationRecord>`) 힌트 없이 호출됨. `Vec.new()`가 `Vec<Var(N)>` 반환 후 L853 unify에서 `Var(N):=MigrationRecord` 바인딩은 되지만, `method_call.rs:1086 resolve_generic_call_with_hint` 호출 시점이 **check_expr 내부**이므로 unify 전 — `expected_ret`가 여전히 Var 상태. codegen이 `expr_types[span]` 조회할 때는 resolved지만, TC 내부 resolution은 stale
-    - L76 실패 가설: `result.push(tmp.version)` push가 `Var(N)`에 i64를 바인딩해야 하지만, `.push` method 조회 중 폴리모픽 인스턴스 선택 로직이 막힐 가능성. 추가 조사 필요
-  - **iter 14 목표**: `collections.rs:830 for (field_name, value) in fields` 루프에서 `expected_ty_subst`를 type-hint 스택에 push → `check_static_method_call` 내에서 hint로 pre-unify 후 `resolve_generic_call_with_hint` 호출. enum_hint_stack 패턴 재사용.
+  **iter 13 (2026-04-23)**: Vec.new() ground-truth 조사 및 iter 14 목표 구체화 (docs-only 커밋 7a5b0bb).
 
-  **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (네트 변화 없음, iter 12~13 연속 documentation 커밋 — 실제 residual fix는 iter 14에서).
+  **iter 14 (2026-04-23) — expected-type hint 인프라 도입 ✅**:
+  - 추가된 인프라:
+    - `vais-types/lib.rs`: `expected_type_stack: Vec<ResolvedType>` 필드
+    - `vais-types/lookup.rs`: `push_expected_type / pop_expected_type / current_expected_type` helpers (enum_hint_stack과 병행)
+  - TC 수정:
+    - `checker_expr/collections.rs` struct-literal field 루프: `expected_ty_subst`를 push/pop으로 감쌈
+    - `checker_expr/calls.rs` builtin Vec/HashMap/HashSet `new`/`with_capacity`: fresh type var 생성 직후 `current_expected_type()` 조회 → 일치 시 unify + `GenericInstantiation::struct_type`/`method` 등록. 이로써 다른 call site에서 `fn_instantiations` 조회해도 발견됨
+  - Codegen 수정:
+    - `expr_helpers_call/method_call.rs`: 새 변수 `skip_ab_for_expected` 도입. zero-arg + 구체적 expected generics인데 inst_list에 없는 경우 branch A+B 건너뛰고 바로 branch C로 → `resolve_generic_call_with_hint`의 "last resort: first inst" 오매칭 방지
+    - Branch C 조건에서 `I64` 예외 제거 (legacy "i64 = unresolved fallback" sentinel이었으나 새 경로에서는 유효한 concrete type)
+  - 검증 (tests/sql/test_migration 대상):
+    - tracker.vais 3개 `Vec.new()` 사이트 모두 specialize ✅ (L29/L60/L76 → `Vec_new$MigrationRecord/$MigrationRecord/$i64`)
+    - test_migration IR 전체 unmangled `@Vec_new(` 개수: 0 (이전: tracker에만 2개 + migration/runner 등에 추가 존재)
+    - mangled `@Vec_new$...` 개수: 18 (tracker 6 + runner 6 + migration 2 + test 2 + test_migration 2)
+  - Regression 체크:
+    - cargo test -p vais-codegen --lib: 796/796 ✅
+    - cargo test -p vais-types --lib: 355/355 ✅
+    - vaisdb 15/15 standalone codegen 0 errors ✅ (strict multi-module force-rebuild 기준)
+  - 남은 링크 에러 (iter 15+ 대상, 별개 버그):
+    - `%Vec`→`%Vec$T` base-to-specialized bitcast 누락 (getelementptr on opaque `%Vec`)
+    - `%Result$i64_str` type vs `ptr` 불일치 (enum payload 경로)
+    - 수량: Vec.new() 관련 에러 완전 소멸, 다른 클래스 에러가 표면화됨 (기대 동작: 버그 cascade)
+
+  **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb 15/15 standalone codegen 0 errors ✅, full-build(링크+실행) 여전히 1/15 — 그러나 Vec.new specialization 클래스 완전 제거.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
