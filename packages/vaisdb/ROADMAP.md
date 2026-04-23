@@ -13,13 +13,23 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 12
+iteration: 13
 max_iterations: 30
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
-  **부분 해결**: tracker.ll now has `Vec_new$MigrationRecord` specialized correctly (was unmangled `@Vec_new()`). **일부 call site (e.g., 재귀 Vec-반환 함수 body)는 여전히 unmangled** — `expected_ret` 정보가 전달 안 되는 contexts에서. 향후 작업: method_call.rs 내 expected_ret 전파 범위 확장 + 추가 specialization paths.
+  **iter 13 (2026-04-23) — 잔존 unmangled Vec_new() 정밀 ground-truth**:
+  - 대상: `tests/sql/test_migration.vais` → `src/sql/migrate/tracker.vais` → `/tmp/test_migration_tracker.ll`
+  - 3개 `Vec.new()` 사이트 중:
+    - ✅ L60 (`new_vec := mut Vec.new()`) → L283 `Vec_new$MigrationRecord` (specialized). 추론 단서: `new_vec.push(keep: MigrationRecord)` + `self.applied_versions = new_vec` (field 타입과 직접 unify)
+    - ❌ L29 (struct-literal field `applied_versions: Vec.new()`) → L227 `call i64 @Vec_new()` (unmangled). 즉시 `store %Vec$MigrationRecord %t1, %Vec$MigrationRecord* %t2`로 타입 불일치
+    - ❌ L76 (local `result := mut Vec.new()` + `result.push(tmp.version: i64)` + return `result: Vec<i64>`) → L370 `call i64 @Vec_new()` (unmangled). i64→memcpy hack으로 store
+  - 원인 조사 (기록만, 수정은 iter 14):
+    - `checker_expr/mod.rs` `check_expr`는 `expr_types[(file_id,start,end)]`에 raw ResolvedType stamp, 이후 driver가 `get_resolved_expr_types()` (vais-types/lib.rs:416)로 `apply_substitutions` 일괄 적용
+    - L29 실패 가설: `collections.rs:844 check_expr(value)`가 struct field의 expected type(`Vec<MigrationRecord>`) 힌트 없이 호출됨. `Vec.new()`가 `Vec<Var(N)>` 반환 후 L853 unify에서 `Var(N):=MigrationRecord` 바인딩은 되지만, `method_call.rs:1086 resolve_generic_call_with_hint` 호출 시점이 **check_expr 내부**이므로 unify 전 — `expected_ret`가 여전히 Var 상태. codegen이 `expr_types[span]` 조회할 때는 resolved지만, TC 내부 resolution은 stale
+    - L76 실패 가설: `result.push(tmp.version)` push가 `Var(N)`에 i64를 바인딩해야 하지만, `.push` method 조회 중 폴리모픽 인스턴스 선택 로직이 막힐 가능성. 추가 조사 필요
+  - **iter 14 목표**: `collections.rs:830 for (field_name, value) in fields` 루프에서 `expected_ty_subst`를 type-hint 스택에 push → `check_static_method_call` 내에서 hint로 pre-unify 후 `resolve_generic_call_with_hint` 호출. enum_hint_stack 패턴 재사용.
 
-  **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (네트 변화 없음, 그러나 error 위치 downstream으로 이동 — 여러 unmangled Vec_new 실제로 specialize됨).
+  **현재 상태**: cargo 796/796 + 355/355 ✅, vaisdb full-build 1/15 (네트 변화 없음, iter 12~13 연속 documentation 커밋 — 실제 residual fix는 iter 14에서).
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
