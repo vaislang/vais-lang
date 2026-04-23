@@ -13,7 +13,7 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 16
+iteration: 17
 max_iterations: 30
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
@@ -74,6 +74,26 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 17 (2026-04-23) — path 1 tried (isolated coerced_val), REVERTED as wash**:
+  - Implementation: `generate_method_call_expr` arg 루프에 `is_vec_to_slice_coercion` 분기 추가 (iter 16과 같은 위치) + **`val` 원본 유지하고 새 로컬 `coerced_val`에 fat pointer 저장**, 즉시 `arg_vals.push + continue`로 downstream 우회. ~48 lines at line ~400.
+  - Cargo/types tests: 796/796 + 355/355 ✅ 유지
+  - Standalone codegen: flake 복제 — test_planner/test_planner_rag는 iter 17 change 없이도 지금 baseline flake (13-14/15). 즉 iter 16에서 "regression"이라 본 신호는 실은 기존 flake (`/tmp/*.ll` 캐시 + Vec<T> generic leak)였음. 제대로 baseline 측정 시 `test_planner_rag` 20-run 50% fail rate — fix 적용 시도 20-run도 비슷.
+  - Link-error 정량 (3-run 평균, 15개 테스트):
+    - Baseline: 총 link 에러 ~168, ptr-vs-slice ~24, linked 1/15
+    - With-fix: 총 link 에러 ~182, ptr-vs-slice ~25, linked 1/15
+    - **Unique 에러 signature 비교** (line 번호 제외): baseline 11개 ↔ with-fix 11개. 2개 사라지고 2개 새로 등장 — net-zero 개선.
+  - 실제 ptr-vs-slice 에러의 발원 지점 조사 (`test_planner_cache_cache.ll:2178`):
+    - IR 발췌: `%t0 = alloca { i8*, i64 }` → `store %normalized_sql, %t0*` → `call @fnv1a_hash({ i8*, i64 } %t0)`. 문제는 **`%t0`가 alloca 주소(`ptr`)인데 function이 value(`{ i8*, i64 }`)를 기대**. `load { i8*, i64 }, %t0*` 누락.
+    - Vais source: `hash := mut fnv1a_hash(&normalized_sql)` (planner/cache.vais:31). 일반 **static function call** (`hash::fnv1a_hash`) — 즉 method call arg 루프 경로가 **아님**. → iter 17에서 손 댄 `generate_method_call_expr`는 이 에러와 무관.
+  - 판정: method call arg 루프 vec-to-slice coerce는 실제 ptr-vs-slice 에러를 거의 줄이지 못함. 에러 대부분은 static function call / field store / ret 경로에서 fat pointer alloca→value load 누락이 원인.
+  - 조치: `crates/vais-codegen/src/expr_helpers_call/method_call.rs` 변경 revert. compiler HEAD `e2604384` 유지. 시간 소비/리스크 대비 개선 = 제로.
+  - iter 18 target (재정의):
+    - `generate_expr_call.rs` (static function call) 경로에서 `{ i8*, i64 }` param에 alloca'd 값 전달 시 `load` 자동 삽입 누락 조사
+    - 또는 `call_gen.rs`에서 "pass-by-value fat param received as alloca ptr" detection + auto-load 삽입
+    - 후보 포인터: PlanCacheKey_new의 fnv1a_hash call (test_planner_cache_cache.ll:2178), 유사 패턴 `cost_model.ll:%table_name`, `dictionary.ll:%term`, `scan.ll:%t41` 등
+    - 위 포인터들은 **모두 alloca+store 후 raw alloca 주소를 function arg로 넘기는 패턴** — 공통 fix 가능성 높음
+    - Vais source 관점: `&str` argument 의 codegen 경로 (fat pointer를 ref로 저장한 뒤 value로 읽어야 함) 정비 필요
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
