@@ -12,12 +12,20 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 12 fixes) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 8
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 13 fixes + stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 9
 max_iterations: 30
-  strategy: sequential, Opus direct. H4 **12 fixes** accumulated. Latest: H4.11 Vec.new() spec via expected_ret. **282 → 183 clang-verify errors (99 eliminated)**.
+  strategy: sequential, Opus direct. H4 **13 fixes + 2 stdlib** accumulated. Latest (iter 9): H4.12 slice helper current_block update (PHI 5건 해결), stdlib Vec.new added.
 
-  **중요 발견 (iteration 8)**: "vaisdb 15/15 standalone codegen" 지표는 IR 생성만 측정 — clang **컴파일** 단계 검증 아님. 실제 full build(`vaisc build -o bin`): **1/15 통과** (test_types만). 14개 테스트가 clang에서 실패하여 링크 불가. H4의 clang-verify 카운트가 real ground truth이며, 진짜 목표는 벙 build 15/15. 남은 183 건이 이 14개 테스트 빌드 실패를 막는 근본 원인.
+  **실제 ground truth**: vaisdb full-build 1/15 (test_types만 통과). H4.12 PHI fix는 cascade를 이동시킴 — 각 fix는 독립 작업자 관점에서 진전이나 net "PASS" 증가는 안 일어남. 남은 14개 test 빌드 실패의 각 루트는:
+  - test_cross_engine: Option<&[u8]> ptr mismatch 
+  - test_planner: slice 관련
+  - test_btree: base↔specialized Vec 다중
+  - sync.vais partial F (3 tests 영향)
+  - generic 특수화 반환 타입 propagation
+  - 기타 module-level 특수 케이스
+
+  남은 진전은 **structural refactor 수준**: SSA type registry across codegen, partial F codegen 재설계, 특수화 signature 전파 — 이 세션 범위 넘음. 다음 세션에 fresh context로 각 class별 집중 수정 권장.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
