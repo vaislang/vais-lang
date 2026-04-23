@@ -13,10 +13,23 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 18
+iteration: 19
 max_iterations: 30
-  last_session: iter 18 complete (2026-04-24, compiler c552ad85 + vaisdb e18f503). Two structural fixes: generate_extern_decl is_extern branch + generate_ref_spill Str/Slice early-return. -12 total link errors, -4 ptr-vs-slice. Session paused.
-  next_iter_target: iter 19 — address remaining i64↔%Vec$T/%Result/%Option class errors, Str_new body emission, i32↔i64 Option payload, Vec base↔specialized bitcast. Expected: noticeable linked-count increase (currently 1/15)
+  last_session: iter 19 closed as negative result (compiler unchanged). Str_new builtin path exposes vaisdb source bug (`normalized.push_byte()` on Str — immutable fat pointer). i64↔specialized-struct class is same-root (unregistered methods fall back to i64 default). Both require either (a) vaisdb source redesign (Str → proper mutable String, to_vec method registration) or (b) compiler structural fix to propagate expected-type hint into unregistered-call return inference.
+  next_iter_target: iter 20 — propagate expected-type hint to unregistered call return types at codegen time. Use iter 14's expected_type_stack infrastructure at call site when FunctionInfo is missing. Expected impact: broad — unblocks i64↔specialized class AND eliminates Str_new-class silent-bad-IR pattern. Risk: high (touches core type resolution), needs small-scoped prototype first.
+
+  **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
+  - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
+    - Side effect: TC now catches `normalized.push_byte(ch)` at src/planner/cache.vais:391 (Str doesn't have push_byte). Before registration, TC let this through with "method not found" warning and codegen fell back to unknown-call IR.
+    - 측정: codegen 13-14/15 → 11/15 (test_cross_engine, test_planner, test_planner_cache, test_planner_rag 전부 fail — 모두 동일한 Str.push_byte 오류).
+    - Revert: compiler 양쪽 파일 모두 revert (`git checkout`).
+  - Attempt 2 (skipped): i64↔specialized struct class 조사.
+    - 샘플: `test_planner_cache_checkpoint.ll:2279 %t21 = call i64 @to_vec({i8*,i64} %active_txn_ids)` 이후 `store %Vec$u64 %t21, %Vec$u64* %t22` 에서 타입 불일치.
+    - 원인: `to_vec` 메서드가 registered signature 없음 → codegen이 default `i64` 반환 타입으로 emit. Str_new과 동일 클래스의 "unregistered call fallback" 버그.
+    - 미시도 이유: iter 14 `expected_type_stack`을 codegen 호출 site로 확장하는 proper fix가 필요한데, 이건 새 session의 1차 작업으로 적합 (session 3개째 스캐폴딩 상태).
+  - cargo test -p vais-codegen --lib: 796/796 ✅ (변경 없음)
+  - cargo test -p vais-types --lib: 355/355 ✅ (변경 없음)
+  - 교훈: "missing body builtins" 패턴 (Str_new, to_vec, 기타) 개별 등록은 TC 엄격성이 올라가 소스 버그 노출 → codegen 회귀. Structural fix (call-site expected-type propagation)가 올바른 경로.
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
   **iter 13 (2026-04-23)**: Vec.new() ground-truth 조사 및 iter 14 목표 구체화 (docs-only 커밋 7a5b0bb).
