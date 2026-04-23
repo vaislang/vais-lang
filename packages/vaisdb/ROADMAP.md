@@ -13,7 +13,7 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 15
+iteration: 16
 max_iterations: 30
   strategy: sequential, Opus direct. **H4.14**: stdlib generic struct auto-preload via `phase17_load_stdlib_generic_templates`. Parses vec/option/hashmap/result.vais once, attaches impl methods, injects Rc<Struct> into each per-module CodeGenerator's `generics.struct_defs` before `generate_module_subset`. Applied to both full compile (per_module.rs) and emit-IR (parallel.rs) paths via shared helper.
 
@@ -63,6 +63,17 @@ max_iterations: 30
       - 13건: `ptr` vs `i64` — 위 3번의 역방향
       - 그 외: `i32` vs `i64`, Vec base→specialized, Result/Option payload, etc.
   - **iter 16 target (예정)**: 24건 슬라이스 ABI 클래스 (`ptr` vs `{ptr,i64}`) — 가장 큰 단일 클래스이자 H3.1/H3.2에서 다룬 ABI coerce 연장선. 한 fix로 ~24건 제거 예상. method_call.rs의 `did_vec_to_slice` 경로 확장 또는 새 coerce 함수 도입.
+
+  **iter 16 (2026-04-23) — attempted vec-to-slice in method calls, REVERTED**:
+  - Attempt: `generate_method_call_expr` 내 arg 루프에 `is_vec_to_slice_coercion` 분기 추가 (static call path 미러). ~45 lines.
+  - Net effect: cargo 796/796 + 355/355 ✅ 유지, vaisdb 14/15 codegen (test_planner_rag regression) — cascade pattern 경고 정확히 실현
+  - Regression detail: `src/rag/memory/search.vais:293` `candidates.get(ri as u64).memory_type` — codegen C003 "Cannot access field 'memory_type' on type 'T'". `candidates := mut Vec.new()` 타입이 T=Var 상태로 고정돼 있고, my change가 method arg 처리 순서를 바꿔 downstream 추론 disturb한 것으로 추정. 정확한 메커니즘은 iter 17+에서 격리 조사.
+  - 교훈 (memory cascade_pattern 재확인): static 경로를 method 경로에 그대로 복사 ≠ safe. Method call 경로는 static과 달리 receiver-based 추론 chain이 있어 local val 재할당이 downstream을 변조함.
+  - 조치: `crates/vais-codegen/src/expr_helpers_call/method_call.rs` 변경 revert. compiler HEAD unchanged (`e2604384`).
+  - 다음 시도 가능 경로 (iter 17+):
+    1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
+    2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
+    3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
