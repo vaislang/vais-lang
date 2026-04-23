@@ -12,10 +12,10 @@
 
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅ merged) → 19 (H3 partial ✅ width/primitive) → 20 (H4 extended scope) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 3
+task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 4/많) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
+iteration: 4
 max_iterations: 30
-  strategy: sequential. H3 두 가지 width coerce 수정(H3.1 범위 i64, H3.2 Try payload trunc)으로 16건 에러 제거. 나머지 에러 클래스는 원자적 버그(슬라이스 deref, enum layout, void leak)라 width coerce만으로 해결 안 됨 → H4로 이월. opus_direct 유지. ROADMAP H3 섹션에 상세 기록.
+  strategy: sequential, Opus direct. H4 4가지 fix 누적 (H4.1 struct-lit Unit field void leak, H4.2 match-arm Unit payload, H4.3 unwrap_expr Unit, H4.4 method call arg actual-type coerce). 282 → 202 clang errors (80건 eliminated ~28%). 남은 ~200건 중 상위 클래스: partial function Result-wrapping (sync.vais Once_call_once), base↔specialized Vec bitcast, @Vec_truncate forward decl 누락, PHI predecessor mismatch — 각각 원자적 구조 버그.
 
 **원칙**:
 - Phase 17 (H1~H4): 컴파일러 **구조적 invariant 3개** 확립 → 같은 종류 에러 재발 구조적 차단
