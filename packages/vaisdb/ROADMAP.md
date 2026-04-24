@@ -13,10 +13,9 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 21
+iteration: 22
 max_iterations: 30
-  last_session: iter 21 landed (compiler 706645e8). Scalar-shape AST gate skips TC-inferred Named→ptrtoint for arithmetic args. −11 link errors. Standalone codegen 14-15/15. Linked 1/15.
-  next_iter_target: iter 22 — trace the other ptrtoint-emission site still affecting `malloc(len+1)` in filesystem.ll. Likely call_gen.rs / expr_helpers_data.rs. Find via debug print or IR source-line mapping. Other pending classes: `double` vs `i64` (12 sites), `i32` vs `i64` (7 sites), `%Option` vs `i64` (7 sites) — orthogonal coerce gaps.
+  last_session: iter 22 NEGATIVE — found bug site + correct-looking fix but net +13 link errors across 6-run avg. Reverted. compiler HEAD stays at iter 21 (706645e8).
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
@@ -89,6 +88,21 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 22 (2026-04-24) — AST-shape guard on `%Struct` ptrtoint branch, REVERTED (net +13 errors)**:
+  - Investigation: traced `filesystem.ll:2387 %t75 = ptrtoint %Vec$u8* %t74 to i64` (where %t74 is `add i64`).
+  - Via debug prints located emission site: `generate_expr_call.rs:692` — the `val_ty.starts_with('%') && !val_ty.ends_with('*') && val_ty != "i64"` branch.
+  - Root cause: `llvm_type_of(%t74)` returns `%Vec$u8` because SSA registry entry for %t74 says Vec$u8 (cross-module span bleed via `infer_expr_type` catch-all at `generate_expr/mod.rs:298`).
+  - Fix attempted: AST-shape gate on the `%Struct` branch (same scalar_shape matches as iter 21), skip ptrtoint when `arg_for_gen` is `Binary/Unary/literal/Cast`.
+  - Specific site verified fixed: `malloc(len+1)` IR no longer emits bogus `ptrtoint %Vec$u8* %t74`.
+  - 측정 (6-run avg): total ~162 (iter 21 baseline ~149). **Net +13 errors** — other call sites relied on the `%Struct` branch to do real pointer coerce that my scalar_shape guard now skips. The AST shape isn't a reliable enough signal at that branch.
+  - cargo test: 796/796 + 355/355 유지 (regression noise 한정).
+  - 판정: 특정 site 단일 fix 효과 < 다른 sites 회귀 비용. Revert.
+  - 조치: `git checkout HEAD -- generate_expr_call.rs`. compiler HEAD stays at `706645e8`.
+  - iter 23+ 방향:
+    - 역접근: 원인 제거 — `generate_expr/mod.rs:298` 카치-올 registration에서 Binary/Unary/Cast 모양의 Named 추론 거부 (시도했지만 %t74가 여전히 Vec로 등록되는 다른 경로 존재, 더 깊은 조사 필요)
+    - 또는 OR approach: SSA registry value type tracking을 IR emission과 sync (registry 엔트리가 emitted `add i64`와 충돌하면 registry 무효)
+    - 현재 1/15 linked 유지의 구조적 원인이 이 클래스라면 좀 더 본격적인 리팩터 필요
 
   **iter 21 (2026-04-24) — skip TC-inferred Named→ptrtoint for scalar-shape args, LANDED ✅**:
   - Root cause: iter 20 made TC expr_types authoritative. Side-effect: `infer_expr_type(arg_for_gen)` upgrades scalar expressions (e.g., `Expr::Binary` `size + 1`) to Named types via span collision. The arg-processing loop at `generate_expr_call.rs:694` then emitted invalid `ptrtoint %Vec$u8* %t to i64` on a genuine `i64` arithmetic result.
