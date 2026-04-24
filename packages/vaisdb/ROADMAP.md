@@ -13,9 +13,9 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 22
+iteration: 23
 max_iterations: 30
-  last_session: iter 22 NEGATIVE — found bug site + correct-looking fix but net +13 link errors across 6-run avg. Reverted. compiler HEAD stays at iter 21 (706645e8).
+  last_session: iter 23 NEGATIVE — registration-site scalar_shape guard (Binary/Unary) prevents Named mis-tag but downstream coerce paths depended on it. 6-run avg +9.5 errors. Reverted. compiler HEAD stays at 706645e8 (iter 21).
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
@@ -88,6 +88,16 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 23 (2026-04-24) — registration-site Binary/Unary Named skip, REVERTED (net +9.5 errors)**:
+  - Precise bug trace: added debug to `llvm_type_of_checked` → confirmed `%t74` (from `add i64`) is registered as `Vec<u8>` via catch-all `register_temp_type` at `generate_expr/mod.rs:~310`. `inferred_type = Named { name: "Vec", generics: [U8] }` from `infer_expr_type(Expr::Binary)` via cross-module span collision in TC `expr_types`.
+  - Fix attempted: AST-shape gate **at registration site** — `skip_named_register = matches!(expr.node, Binary | Unary) && matches!(inferred_type, Named)`. Skips Vec<T>/Option/Result registration for Binary/Unary shapes since their LLVM result is always scalar iN/float/bool (string concat uses `Str` variant, not Named).
+  - Specific fix verified: `filesystem.ll:malloc(len+1)` now `%t75 = call i8* @malloc(i64 %t74)` — no bogus ptrtoint.
+  - 측정 (6-run avg): ~158.5 (iter 21 baseline ~149). **Net +9.5 errors**.
+  - Codegen: 13-15/15 (no codegen regression, same flake edge).
+  - 회귀 원인 (추정): downstream coerce paths — 특히 struct/alloca 관련 — 이 `%tN` registered-as-Named 정보를 잘못이지만 **운 좋게** 맞는 coerce로 활용하던 사이트들 존재. 해당 registration을 끄면 다른 decode 경로가 fallback으로 넘어가서 다른 유형의 에러로 surface.
+  - Lesson: Binary/Unary의 Named 등록이 "항상 잘못"인 것은 semantic 수준에서 맞지만, codegen pipeline의 일부 소비자가 이 잘못된 데이터로 암묵적 가정을 해왔음. 
+  - iter 24+ 방향: registration을 끄는 대신, **ptrtoint 소비자 쪽에서 per-site**로 "SSA temp의 binary/unary 생성 여부" 확인. Or: `register_temp_type` call sites 각자가 자신의 의도를 명시하도록 리팩터. 단일 catch-all이 semantic 중첩.
 
   **iter 22 (2026-04-24) — AST-shape guard on `%Struct` ptrtoint branch, REVERTED (net +13 errors)**:
   - Investigation: traced `filesystem.ll:2387 %t75 = ptrtoint %Vec$u8* %t74 to i64` (where %t74 is `add i64`).
