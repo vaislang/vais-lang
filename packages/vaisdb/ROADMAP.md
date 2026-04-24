@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 42 Wave 3 +8 phi LANDED ✅ (Wave 3 누적 15 sites). 다음: Wave 3 bitcast + match_gen phi 또는 control_flow/pattern phi)
+mode: auto (iter 43 Wave 3 +10 sites LANDED ✅ (Wave 3 누적 25 sites). 다음: Wave 3 bitcast 또는 잔여 insertvalue)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 42
+iteration: 43
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -28,6 +28,19 @@ max_iterations: 50
   iter_40_strategy: Opus direct, Wave 2d 확장. strlen i64 (6 sites landed). i32 returning libc calls (strcmp, snprintf len) 시도했으나 cascade — i32 기록 자체가 cascade class로 확인.
   iter_41_strategy: Opus direct, Wave 3 착수. extractvalue 45 sites 중 안전한 것 (poll_ret_ty struct extract, { i8*, i64 } fat-ptr extract). Fat-ptr extract는 consumer에 따라 cascade 위험.
   iter_42_strategy: Opus direct, Wave 3 phi 착수. phi declared type이 IR에 명시돼 있어 기록 단순. stmt/if_else/expr_helpers_control 등 declared phi_llvm 변수 기반.
+  iter_43_strategy: Opus direct, Wave 3 확장. match_gen phi 1 + insertvalue batch (helpers fat-ptr + range literal + slice ref fat-ptr). insertvalue result type = base aggregate type (리터럴).
+
+  **iter 43 (2026-04-25) — Wave 3 +10 sites LANDED ✅ (2 batches, 누적 25)**:
+  - Compiler commits: `da4e3455` (match+helpers 3) + `46e9537d` (special+ref_deref 7) = **10 sites**
+  - 타입별:
+    - match_gen.rs 1 phi (dynamic phi_type)
+    - helpers.rs 2 insertvalue `{ i8*, i64 }` (slice fat-ptr construct)
+    - generate_expr/special.rs 3 insertvalue `{ i64, i64, i1 }` (range literal chain)
+    - generate_expr/ref_deref.rs 4 insertvalue `{ i8*, i64 }` (slice ref + dual function)
+  - Gate per batch: {match+helpers: -4.15 ✅, insertvalue: -3.75 ✅}. cargo 796/796 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: **200 sites** 돌파 ✅ (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 25 − 1 doublecount).
+  - Wave 3 잔여: bitcast sites (~20-40 estimated) + 다른 insertvalue (stmt 4, expr_helpers 2, stmt_visitor 3, if_else 1, expr_helpers_control 4, method_call 2, etc) + async_gen 3 + generate_expr_call 4 extract (cascade), special 3, codegen 2, string_lit 1.
+  - 다음 iter: bitcast 또는 insertvalue 추가 배치.
 
   **iter 42 (2026-04-25) — Wave 3 +8 phi LANDED ✅ (1 batch, 누적 15 sites)**:
   - Compiler commit: `5f782603` — stmt.rs 1 + if_else.rs 3 + expr_helpers_control.rs 4 = **8 phi sites**
