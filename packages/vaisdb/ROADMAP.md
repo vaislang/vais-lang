@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: stopped (awaiting user review of iter 25 design doc at /Users/sswoo/study/projects/vais/compiler/docs/refactor/llvm-ground-truth.md, Open Questions §9)
+mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 25
+iteration: 26
 max_iterations: 30
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -32,6 +32,26 @@ max_iterations: 30
     - compiler HEAD: 706645e8 (iter 21 landed) 유지, 신규 커밋 없음
   - 예상 소요: Wave 1-5 합계 4-5 세션 + 버퍼 1세션.
   - 다음 iter 방향: 사용자 리뷰 → 승인 시 Wave 1 착수 (Opus direct, primitives 15-25 site mechanical conversion + gate 검증).
+
+  **iter 26 (2026-04-24) — Wave 1a + 1b LANDED ✅ (ground-truth infrastructure + ptrtoint)**:
+  - Wave 1a (compiler commit `0aec7bd8`): infrastructure only
+    - `FunctionContext.actual_llvm_type: HashMap<String, String>` field 추가
+    - `record_emitted_type / get_emitted_type` methods 추가
+    - `init.rs` 초기화, `signature.rs` / `async_gen.rs` clear, `method_call.rs` save/restore 추가
+    - `llvm_type_of_checked` resolution 1순위에 ground-truth track 추가 (legacy ResolvedType fallback 유지)
+    - 4-run baseline: codegen {15,13,15,14}, linked 1/15, errors {182,145,180,150} avg ~164
+  - Wave 1b (compiler commit `788cffde`): 20 ptrtoint emission sites 전부 migrate
+    - generate_expr_call.rs:10, expr_helpers.rs:5, method_call.rs:1, call_gen.rs:1, string_ops.rs:1
+    - Skipped helpers.rs:_generate_alloc (dead fn, &self signature)
+    - 4-run: codegen {14,14,15,14}, linked 1/15, errors {153,150,181,154} avg ~159.5
+    - **Wave 1b delta: −4.5 errors** (ptrtoint sites 대부분 catch-all registry가 이미 i64로 등록 — 차이는 cross-module bleed 케이스에서만 발생)
+  - 채택된 defaults (design doc Open Questions §9):
+    - Q1 → 매크로 대신 개별 method call (`self.fn_ctx.record_emitted_type`) — 명시적, greppable, self borrow 이슈 site-local 판별 가능
+    - Q2 → per-function (`FunctionContext.actual_llvm_type`), SSA scope 일치
+    - Q3 → Wave 4 coverage 100% (strict) 
+    - Q4 → debug_assert! 추가는 Wave 3 이후 시점에 고려 (지금은 두 track 공존)
+  - Gate 전체 합격: cargo 796/796 ✅ + 355/355 ✅ + codegen 13-15/15 (flake band) ✅ + linked 1/15 held ✅ + 총 link 에러 -4.5
+  - 다음 iter 방향 (Wave 1c): trunc/sext/zext/icmp/fcmp sites 87개 전체. batch 5 세션 필요 — 작게 쪼개서 파일별 진행. 독립 commit + per-batch gate. 각 batch cargo + vaisdb 4-run 통과 필수.
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
