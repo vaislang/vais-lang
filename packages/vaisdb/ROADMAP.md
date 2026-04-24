@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto
+mode: stopped (awaiting user review of iter 25 design doc at /Users/sswoo/study/projects/vais/compiler/docs/refactor/llvm-ground-truth.md, Open Questions §9)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
 iteration: 25
