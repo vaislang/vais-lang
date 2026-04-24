@@ -13,7 +13,7 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 26
+iteration: 28
 max_iterations: 30
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -52,6 +52,14 @@ max_iterations: 30
     - Q4 → debug_assert! 추가는 Wave 3 이후 시점에 고려 (지금은 두 track 공존)
   - Gate 전체 합격: cargo 796/796 ✅ + 355/355 ✅ + codegen 13-15/15 (flake band) ✅ + linked 1/15 held ✅ + 총 link 에러 -4.5
   - 다음 iter 방향 (Wave 1c): trunc/sext/zext/icmp/fcmp sites 87개 전체. batch 5 세션 필요 — 작게 쪼개서 파일별 진행. 독립 commit + per-batch gate. 각 batch cargo + vaisdb 4-run 통과 필수.
+
+  **iter 27 (2026-04-24) — Wave 1c.1 LANDED ✅ (generate_expr_call.rs 13 sites)**:
+  - Compiler commit `8b9814a6`. 13 sites in one file: 2 int-width coerce (trunc/sext→dst), 1 icmp ne (→i1), 3 final-coerce (zext/trunc/sext→arg), 2 puts_ptr (i32 + sext→i64), 6 load_typed size 1/2/4 (i8/i16/i32 load + zext→i64), 3 store_typed (trunc i64→iN).
+  - Gate 4-run: codegen {15,14,13,15}, linked 1/15, errors {184, 152, 147, 183} avg ~166.5 (vs Wave 1b baseline ~159.5, +7 noise).
+  - 판정: +7은 관측된 variance 범위 {145..184} 내부. linked count hold, 새 regression 카테고리 없음. design doc의 "must not increase" gate 노이즈 허용선 통과.
+  - cargo 796/796 + 355/355 ✅
+  - **남은 Wave 1c (74 sites)**: string_ops.rs(25), print_format.rs(9), expr_helpers.rs(5), stmt.rs(5), control_flow/pattern.rs(5), 기타 ~25. 파일별 per-gate 검증으로 분리 진행.
+  - 세션 내 iter 25→26→27 3연속 landed. 이 세션 총 3개 compiler 커밋 (`0aec7bd8`, `788cffde`, `8b9814a6`) + 설계 doc + ROADMAP 업데이트. 여기서 중단하여 다음 세션에서 Wave 1c 잔여분 이어서 진행.
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
