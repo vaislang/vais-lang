@@ -10,16 +10,32 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 34 Wave 2a LANDED ✅. 다음: Wave 2a.deferred (9 sites) consumer audit 또는 Wave 2b (gep 76) 병행)
+mode: auto (iter 35 Wave 2c.1 23 sites LANDED ✅ across 5 batches. 다음: Wave 2c.1 나머지 load ptr + Wave 2b gep + Wave 2c.2 narrow load audit)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 34
+iteration: 35
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
   iter_32_strategy: Opus direct, mechanical multi-file edit (Wave 1c.5). 이유: (1) Wave 1c.1~1c.4 모두 Opus direct로 진행 (memory subagent_delegation_for_compiler_tasks), (2) record_emitted_type 인자(LLVM type string)는 emission context별로 정확해야 함 — pattern-match만으로는 sext/trunc/icmp dst-type 추출 실수 가능, (3) &self signature 빌드 에러 즉시 분기 판단 필요. Background는 가성비 떨어짐.
   iter_33_strategy: Opus direct, design-only doc (Wave 2). 이유: 기존 llvm-ground-truth.md의 톤/구조 유지, Wave 1c.5 cascade 교훈 반영, 5-Wave migration plan과 일관된 scope 서술. Delegation 시 design continuity 손실 위험.
   iter_34_strategy: Opus direct, Wave 2a 착수. 사용자가 "100% 안전·명확" 우선 원칙으로 5개 Open Questions 결정 — 전부 debt-free defaults.
+  iter_35_strategy: Opus direct, Wave 2c.1 load i64 mechanical batch migration. 파일별 batch + 8-run gate per batch. Cascade 감지 시 즉시 revert (loops.rs 6 sites revert됨, +10 에러 cascade). Wave 2b gep보다 단순 (load result는 IR string pointee type 그대로).
+
+  **iter 35 (2026-04-24) — Wave 2c.1 23 sites LANDED ✅ (5 batches)**:
+  - Compiler commits: `a55454b8` (helpers 4) + `5b1c2ff6` (call 4) + `377fe6c0` (loop+stmt 6) + `7b547aa9` (pattern 8) + `316e4861` (method_call 5) = **23 sites**
+  - 대상: `%tN = load i64, i64* X` → `record_emitted_type(&tN, "i64")`. All wide-load.
+  - 파일별:
+    - helpers.rs 4 (slice len, data field, loop_idx, elem copy)
+    - generate_expr_call.rs 4 (Vec data/len field loads × 2 paths, fn_ptr var, deref)
+    - generate_expr_loop.rs 3 (range-for counter: cond/bind/inc)
+    - stmt.rs 3 (Vec eager-drop helper: data_i/len_v/es_v)
+    - control_flow/pattern.rs 8 (enum payload raw loads — safe, excludes 2 field_val direct loads)
+    - expr_helpers_call/method_call.rs 5 (reserve/push len+cap/slice-arg)
+  - **Deferred (cascade-trigger, +10 errors avg)**: generate_expr/loops.rs 6 sites (collection for-loop idx/len/data/elem_size). Wave 2c.2 audit iter로 이월.
+  - Gate per batch 8-run: 모두 baseline ~21.75 내 (avg 14.5~21.5 범위, noise 내). cargo 796/796 + 355/355 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: 131 sites (Wave 1 99 + 2a 9 + 2c.1 23). Wave 2 잔여: ~245 sites (alloca 9 deferred + gep 76 + load remaining 110 + call 54).
+  - 다음 iter: (1) Wave 2c.1 남은 wide-load (pointer load, named-struct load) or (2) Wave 2b gep 76 sites or (3) Wave 2c.2 narrow-load audit (Q1 결정: full pre-audit 63 sites). Cascade-detection 학습: vaisdb gate 측정치 자체에 flake가 많아 +5 이하 정밀 판정 어려움, +10 이상 일관 증가 시 revert.
 
   **iter 34 (2026-04-24) — Wave 2a LANDED ✅ (9 safe alloca sites, 9 deferred)**:
   - Compiler commit `3a01c700`. 18 grepped alloca sites 전수 시도 → bisect로 9 safe / 9 cascade-trigger 분리. 설계 doc 14-count vs grep 18-count 차이는 cascade-risk 사이트 포함 여부 때문.
