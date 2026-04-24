@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 37 Wave 2b 7 sites LANDED ✅ + method_call 3 deferred. 다음: Wave 2b tuple/assign gep 또는 narrow load audit)
+mode: auto (iter 38 Wave 2b +10 sites LANDED ✅ (2b 누적 17 sites). 다음: Wave 2b 잔여 tuple/fat-pointer gep 또는 Wave 2c.2 audit)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 37
+iteration: 38
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -23,6 +23,17 @@ max_iterations: 50
   iter_35_strategy: Opus direct, Wave 2c.1 load i64 mechanical batch migration. 파일별 batch + 8-run gate per batch. Cascade 감지 시 즉시 revert (loops.rs 6 sites revert됨, +10 에러 cascade). Wave 2b gep보다 단순 (load result는 IR string pointee type 그대로).
   iter_36_strategy: Opus direct, Wave 2c.1 wide-load 나머지 batch (ptr/float/F32/Str-fat/i64 각각 batch). Named struct value load는 Wave 2a deferred와 동일 클래스 → 이월.
   iter_37_strategy: Opus direct, Wave 2b gep 착수. 안전 우선 — 단순 `[N x T]` array gep + Vec `i32 0, i32 N` field gep. Vec es/cap/len의 일부 consumer는 catch-all 의존 (method_call 3 sites revert).
+  iter_38_strategy: Opus direct, Wave 2b 확장. stmt.rs/stmt_visitor.rs Vec field gep (Wave 2a의 stmt.rs alloca deferred class와 달리 gep는 safe — consumer가 이후 load i64로 cascading), ref_deref.rs/map_lit.rs 배열 gep. 2 commits.
+
+  **iter 38 (2026-04-25) — Wave 2b +10 sites LANDED ✅ (2 batches, 2b 누적 17 sites)**:
+  - Compiler commits: `47affc65` (stmt 4: stmt_visitor 1 + stmt 3) + `93779cd7` (ref+map 6: ref_deref 3 + map_lit 3) = **10 sites**
+  - 타입별:
+    - Vec field gep `i32 0, i32 N` → "i64*" (stmt_visitor Vec init + stmt Vec eager-drop)
+    - Array elem_ptr gep `[N x T]` or generic → "T*" (ref_deref: index/slice + map_lit: keys/vals/result)
+  - Gate per batch 8-run: {stmt: 14.9, ref+map: 14.5} vs baseline ~21.75 (**consistent -7 improvement**). cargo 796/796 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: **164 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 − 1 doublecount).
+  - Wave 2b 잔여: fat-pointer/named struct field gep (`{T1, T2}` 기반, ~30+ sites). Vec consumer에 묶인 경우 cascade 위험.
+  - 다음 iter: Wave 2b 잔여 {} tuple gep 또는 Wave 2c.2 narrow audit. gate baseline이 매번 향상 중 — 점진적 invariant 강화 동작 증거.
 
   **iter 37 (2026-04-25) — Wave 2b 7 sites LANDED ✅ + 3 deferred (3 batches)**:
   - Compiler commits: `5ff2b391` (helpers 2) + `514f8e29` (expr_visitor 1) + `ef4d19fb` (pattern+special+printfmt 4) = **7 sites**
