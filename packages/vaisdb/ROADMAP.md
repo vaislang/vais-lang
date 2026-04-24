@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 43 Wave 3 +10 sites LANDED ✅ (Wave 3 누적 25 sites). 다음: Wave 3 bitcast 또는 잔여 insertvalue)
+mode: auto (iter 44 Wave 3 +6 bitcast LANDED ✅ (Wave 3 누적 31 sites). 다음: Wave 3 나머지 bitcast (struct targets) 또는 잔여 insertvalue)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 43
+iteration: 44
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -29,6 +29,17 @@ max_iterations: 50
   iter_41_strategy: Opus direct, Wave 3 착수. extractvalue 45 sites 중 안전한 것 (poll_ret_ty struct extract, { i8*, i64 } fat-ptr extract). Fat-ptr extract는 consumer에 따라 cascade 위험.
   iter_42_strategy: Opus direct, Wave 3 phi 착수. phi declared type이 IR에 명시돼 있어 기록 단순. stmt/if_else/expr_helpers_control 등 declared phi_llvm 변수 기반.
   iter_43_strategy: Opus direct, Wave 3 확장. match_gen phi 1 + insertvalue batch (helpers fat-ptr + range literal + slice ref fat-ptr). insertvalue result type = base aggregate type (리터럴).
+  iter_44_strategy: Opus direct, Wave 3 bitcast 착수. bitcast target = cast dst type (IR 명시). i8* / i64* 타겟부터 안전 — consumer가 pointer type 기대.
+
+  **iter 44 (2026-04-25) — Wave 3 +6 bitcast LANDED ✅ (2 batches, 누적 31)**:
+  - Compiler commits: `4441ea30` (4 bitcast-to-i8*) + `f2fc1970` (2 bitcast-to-i64*) = **6 sites**
+  - 패턴: `bitcast <src> to <dst_ptr_ty>` → record dst_ptr_ty (literal in IR).
+    - `to i8*`: helpers 1 (slice data) + ref_deref 2 (slice-ref × 2 functions via replace_all) + stmt_visitor 1 (Vec memcpy dst) = 4
+    - `to i64*`: helpers 2 (array-as-slice typed_ptr + Vec elem slice_ptr)
+  - Gate per batch: {bitcast-i8*: -4 ✅, bitcast-i64*: -4.15 ✅}. cargo 796/796 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: **206 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 31 − 1 doublecount).
+  - Wave 3 잔여: generate_expr_call 11 bitcast (complex consumer chain — 위험), expr_helpers_data/call_gen/stmt_visitor 일부 struct target bitcast, vtable bitcast, function_gen/codegen + generics bitcast.
+  - 다음 iter: 잔여 bitcast struct target 또는 insertvalue 다른 file (stmt 4, expr_helpers 2, if_else 1, async_gen 3, codegen 2).
 
   **iter 43 (2026-04-25) — Wave 3 +10 sites LANDED ✅ (2 batches, 누적 25)**:
   - Compiler commits: `da4e3455` (match+helpers 3) + `46e9537d` (special+ref_deref 7) = **10 sites**
