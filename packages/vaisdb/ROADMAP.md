@@ -13,10 +13,10 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 20
+iteration: 21
 max_iterations: 30
-  last_session: iter 20 landed (compiler e3e7fa5f). TC expr_types fallback now fills unregistered call return types. Standalone codegen 15/15 ✅. Link error count roughly stable (~162, flake range). Linked 1/15 (new {ptr,i64}↔%Vec$u8 class exposed for iter 21+).
-  next_iter_target: iter 21 — address newly exposed coerce gaps now that call sites carry correct specialized types. Specifically `{ptr,i64}` vs `%Vec$u8` (8 sites), `i64` vs `%Vec$u8` (remaining), `ptr` vs `i64` (17 sites), `{ptr,i64}` vs `i64` (12 sites). These are likely slice/fat-pointer ↔ Vec struct coerce at assignment/arg-pass boundaries.
+  last_session: iter 21 landed (compiler 706645e8). Scalar-shape AST gate skips TC-inferred Named→ptrtoint for arithmetic args. −11 link errors. Standalone codegen 14-15/15. Linked 1/15.
+  next_iter_target: iter 22 — trace the other ptrtoint-emission site still affecting `malloc(len+1)` in filesystem.ll. Likely call_gen.rs / expr_helpers_data.rs. Find via debug print or IR source-line mapping. Other pending classes: `double` vs `i64` (12 sites), `i32` vs `i64` (7 sites), `%Option` vs `i64` (7 sites) — orthogonal coerce gaps.
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
@@ -89,6 +89,20 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 21 (2026-04-24) — skip TC-inferred Named→ptrtoint for scalar-shape args, LANDED ✅**:
+  - Root cause: iter 20 made TC expr_types authoritative. Side-effect: `infer_expr_type(arg_for_gen)` upgrades scalar expressions (e.g., `Expr::Binary` `size + 1`) to Named types via span collision. The arg-processing loop at `generate_expr_call.rs:694` then emitted invalid `ptrtoint %Vec$u8* %t to i64` on a genuine `i64` arithmetic result.
+  - Fix (`crates/vais-codegen/src/generate_expr_call.rs`): AST-shape gate. `val_ty == "i64"` branch skips Named→ptrtoint upgrade for `Expr::Binary | Unary | Int | Float | Bool | Cast` shapes since they cannot produce struct values at LLVM level.
+  - 측정 (3-run 평균):
+    - iter 20 baseline: ~160 link errors
+    - iter 21: ~149 link errors (−11)
+    - cargo test -p vais-codegen --lib: 796/796 ✅
+    - cargo test -p vais-types --lib: 355/355 ✅
+    - Standalone codegen: 14-15/15 (flake edge, no regression)
+  - 남은 사이트 (iter 22+ 대상):
+    - `filesystem.ll:malloc(len+1)` 여전히 bad ptrtoint — 다른 코드 경로에서 emit. 추적 필요.
+    - `{ptr,i64}` vs `%Vec$u8` 8건은 vaisdb 소스 버그 (`.clone()` on slice → Vec<u8>) — 컴파일러 측 수정 불가.
+  - 커밋: `706645e8 fix(codegen): Phase 17.H4 iter 21 — skip TC-inferred Named→ptrtoint for scalar-shape args`
 
   **iter 20 (2026-04-24) — TC expr_types fallback for unregistered call return types, LANDED ✅**:
   - Root cause (from iter 19): unregistered calls (`Str.new()`, `buf.to_vec()`, etc.) fell back to `i64` return type in codegen. Use sites then failed to type-match at link time.
