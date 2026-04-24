@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 48 Wave 3 +3 async_gen insertvalue LANDED ✅ (Wave 3 누적 44). wake-up 간격 10분 단축. 다음: stmt/method_call/stmt_visitor insertvalue)
+mode: auto (iter 49 Wave 3 +4 stmt insertvalue LANDED ✅ (Wave 3 누적 48). 다음: method_call/stmt_visitor/codegen insertvalue)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 48
+iteration: 49
 max_iterations: 60
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -34,6 +34,13 @@ max_iterations: 60
   iter_46_strategy: Opus direct, Wave 3 insertvalue 잔여 배치. expr_helpers pad cast, string_lit format!-based, if_else Str zeroinit substitute — 모두 `{ i8*, i64 }` 고정.
   iter_47_strategy: Opus direct, Wave 3 expr_helpers_control insertvalue. 4 Str void substitute 패턴 — phi_llvm == "{ i8*, i64 }"일 때 zeroinit으로 사용.
   iter_48_strategy: Opus direct, Wave 3 async_gen insertvalue. poll return { i64, ret_llvm } 3 sites. 사용자 요청으로 wake-up 간격 25분→10분 단축, max_iterations 50→60 확장.
+  iter_49_strategy: Opus direct, Wave 3 stmt insertvalue. 4 async poll-ret + Str fat-ptr zinit.
+
+  **iter 49 (2026-04-25) — Wave 3 +4 stmt insertvalue LANDED ✅ (1 batch, 누적 48)**:
+  - Compiler commit: `0effcd12` — stmt.rs 4 insertvalue (async poll ret + Str zinit) = **4 sites**
+  - Gate 8-run avg **~21.9** vs baseline ~21.75 (held). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **223 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 48 − 1).
+  - 다음 iter: stmt_visitor/method_call/codegen 나머지 insertvalue.
 
   **iter 48 (2026-04-25) — Wave 3 +3 async_gen insertvalue LANDED ✅ (1 batch, 누적 44)**:
   - Compiler commit: `c3169d29` — function_gen/async_gen.rs 3 sites (%ret_0, %ret_1, %invalid_ret)
