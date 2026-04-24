@@ -13,9 +13,9 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 23
+iteration: 24
 max_iterations: 30
-  last_session: iter 23 NEGATIVE — registration-site scalar_shape guard (Binary/Unary) prevents Named mis-tag but downstream coerce paths depended on it. 6-run avg +9.5 errors. Reverted. compiler HEAD stays at 706645e8 (iter 21).
+  last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
@@ -88,6 +88,16 @@ max_iterations: 30
     1. Static 경로 그대로 복사 대신, `val = fat2` 재할당을 **로컬 변수 `coerced_val`로 분리** — 원본 `val` 유지 → downstream inference 흐트러짐 방지
     2. Vec-to-slice 대상 범위를 `Vec_push_slice_u8` 같은 명시적 slice-param 시그니처로 좁히기 (signature-directed only)
     3. TC 단계에서 이미 resolve된 arg 타입 정보를 codegen이 재사용하도록 span-indexed arg_types 주입
+
+  **iter 24 (2026-04-24) — match arm int-width phi coerce, REVERTED (1/15 → 0/15, +34 errors)**:
+  - Investigation: traced `test_planner_cache_option.ll:2202` phi i64 taking %t5 (i32 from trunc in match arm). `Option_unwrap_or$i32`: T=i32 pattern extracts payload as i32, phi expects i64 (function ABI-widened).
+  - Precise cause: `match_gen.rs:62-99` `arm_body_type` derivation picks `first_arm_ty` (=I32 via Vais-level inference) but LLVM ABI widens narrow T→i64 in function signature. Phi type reads from arm_body_type (i32) — inconsistent with phi usage sites that expect function return type i64.
+  - Fix attempted: catch-all int-width coerce at end of arm block (before `arm_terminated` check). If `llvm_type_of(body_val)` ≠ `type_to_llvm(arm_body_type)` and both are `iN`, emit sext/trunc to align.
+  - Specific site verified: `%t7 = sext i32 %t5 to i64` emitted correctly for `Option_unwrap_or$i32` arm.
+  - 측정 (6-run avg): **~183 errors (baseline 149), linked 0/15 (baseline 1/15)**. 회귀 -1 linked test + +34 errors.
+  - 회귀 원인: `arm_body_type` vs `body_val` 타입 불일치가 다른 arm 경로에서도 광범위. 내 coerce 추가가 **올바른** 경우도 있었지만 phi_type 쪽이 narrow(i32)을 유지할 때 body_val(i64)을 trunc 시도 → 데이터 손실. Match arm의 일부는 "wider body_val, narrower phi" 케이스도 있고, 반대도 있는데, catch-all은 둘 다 건드림.
+  - Lesson (iter 22/23/24 3연속 negative 교훈 통합): 이 클래스의 모든 단순 guard/coerce가 **다른 경로를 깨뜨림**. Codegen pipeline이 mis-typed SSA 값에 암묵적으로 의존하는 경로가 여러 개. 단일 iter fix 불가능.
+  - 조치: `git checkout HEAD -- match_gen.rs`. compiler HEAD `706645e8` 유지.
 
   **iter 23 (2026-04-24) — registration-site Binary/Unary Named skip, REVERTED (net +9.5 errors)**:
   - Precise bug trace: added debug to `llvm_type_of_checked` → confirmed `%t74` (from `add i64`) is registered as `Vec<u8>` via catch-all `register_temp_type` at `generate_expr/mod.rs:~310`. `inferred_type = Named { name: "Vec", generics: [U8] }` from `infer_expr_type(Expr::Binary)` via cross-module span collision in TC `expr_types`.
