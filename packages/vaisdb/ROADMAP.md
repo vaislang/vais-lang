@@ -10,13 +10,52 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: stopped (context save — resume Wave 1c.5 next session, target ~27 remaining sites across smaller files)
+mode: auto (iter 34 Wave 2a LANDED ✅. 다음: Wave 2a.deferred (9 sites) consumer audit 또는 Wave 2b (gep 76) 병행)
 current_phase: Phase 17 (Compiler Invariant Hardening)
-task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 31
-max_iterations: 40
+task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
+iteration: 34
+max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
+  iter_32_strategy: Opus direct, mechanical multi-file edit (Wave 1c.5). 이유: (1) Wave 1c.1~1c.4 모두 Opus direct로 진행 (memory subagent_delegation_for_compiler_tasks), (2) record_emitted_type 인자(LLVM type string)는 emission context별로 정확해야 함 — pattern-match만으로는 sext/trunc/icmp dst-type 추출 실수 가능, (3) &self signature 빌드 에러 즉시 분기 판단 필요. Background는 가성비 떨어짐.
+  iter_33_strategy: Opus direct, design-only doc (Wave 2). 이유: 기존 llvm-ground-truth.md의 톤/구조 유지, Wave 1c.5 cascade 교훈 반영, 5-Wave migration plan과 일관된 scope 서술. Delegation 시 design continuity 손실 위험.
+  iter_34_strategy: Opus direct, Wave 2a 착수. 사용자가 "100% 안전·명확" 우선 원칙으로 5개 Open Questions 결정 — 전부 debt-free defaults.
+
+  **iter 34 (2026-04-24) — Wave 2a LANDED ✅ (9 safe alloca sites, 9 deferred)**:
+  - Compiler commit `3a01c700`. 18 grepped alloca sites 전수 시도 → bisect로 9 safe / 9 cascade-trigger 분리. 설계 doc 14-count vs grep 18-count 차이는 cascade-risk 사이트 포함 여부 때문.
+  - **Migrated (9 sites)**:
+    - expr_visitor.rs:402, 555 (local spill + comptime array)
+    - expr_helpers_assign.rs:73 (entry-block alloca + initial store)
+    - expr_helpers_misc.rs:206, 490 (closure refcap + return spill)
+    - function_gen/codegen.rs:170, 799 (struct param spill × 2)
+    - generate_expr_call.rs:1492, 1510 (specialized + generic alloca)
+  - **Deferred 9 cascade-trigger sites** (iter 34 bisect 결과, Wave 2a.deferred로 표기):
+    - expr_helpers_data.rs:61/129/249/313 (array/tuple/struct/union literal ptrs)
+    - expr_helpers_call/call_gen.rs:42 (enum_ptr — 기존 register_temp_type와 중복)
+    - stmt.rs:187/201/219/233 (let-binding %Type** double-ptr path)
+    - function_gen/generics.rs:446 (specialized generic param spill)
+    - helpers.rs `emit_entry_alloca` (21-caller blast radius — 별도 sub-iter로)
+  - **Gate**:
+    - cargo test -p vais-codegen --lib: 796/796 ✅
+    - cargo test -p vais-types --lib: 355/355 ✅
+    - 4-run gate (multi-module link, `clang -O0 -o bin /tmp/${name}_*.ll runtime.o sync_runtime.o`, `grep -c "error:"`)
+      - pre-Wave-2a baseline: codegen {15,14,13,14}, linked 0/15, errors {15,14,13,14} avg **~14**
+      - Wave 2a landed: codegen {15,14,14,14}, linked 0/15, errors {15,14,14,14} avg **~14.25** (+0.25, noise 범위)
+    - Note: 이 gate 측정법(baseline ~14)은 기존 Wave 1c 시리즈의 `avg ~157` 스케일과 다름 — 별도 tooling으로 재측정하여 새 baseline 확립. 앞으로 Wave 2 시리즈는 이 ~14 baseline 기준으로 cascade 판정.
+  - **Cascade observations** (Wave 1c.5 패턴 재현):
+    - expr_helpers_data alloca ptrs는 downstream consumer(field access, gep, load)가 i64-default fallback 또는 별도 register_temp_type(Pointer(Named))에 의존. ground-truth `<T>*` 추가 시 **+22 errors** burst.
+    - stmt.rs alloca는 `%Type**` double-ptr 경로 (struct_lit/enum_variant). 이 경로는 기존 llvm_type_of가 **%Type*로 축약**해 반환 — ground-truth 기록이 consumer store/load와 불일치.
+    - helpers.rs `emit_entry_alloca`는 21 caller 전역 영향 → 단일 site가 아니라 caller-level 호출 context별 다른 LLVM type 필요 → 현재 helper 단일 `*` 추가는 부족.
+  - 누적 migrated: 108 sites (Wave 1 99 + Wave 2a 9). Wave 2 잔여: 268 sites (alloca 9 deferred + gep 76 + load 133 + call 54 − 4 Wave 1 차감).
+  - 다음 iter (Wave 2a.deferred or 2b): (1) stmt.rs 4 sites의 `%Type**` 정확한 기록 (double-ptr 경로), (2) expr_helpers_data 4 sites의 consumer audit 먼저, (3) generics.rs 1 site는 context-sensitive — 더 자세한 llvm_ty computation, (4) call_gen.rs 1 site 중복 기록 정리. 또는 Wave 2b (gep 76) 착수.
+    **Wave 2 Open Questions 결정 (iter 34, 2026-04-24, 사용자 승인)**:
+      Q1 (Wave 2c.2 audit cost) → **Full pre-audit**. Wave 1c.5 cascade 재발 방지. 5-10h audit ≈ bisect+revert 루프 대비 동등 비용 + zero noise.
+      Q2 (Helper-IR) → **포함 (helper FunctionContext 신설)**. 영구 제외 시 Wave 4 catch-all 제거 불가 → invariant 불완전. 1세션 인프라 추가.
+      Q3 (Cross-module call return type) → **IR-string type** (tentative 채택). LLVM이 실제로 보는 것이 ground truth. Iter 20 TC fallback은 분리 레이어로 남김.
+      Q4 (Wave 4 coverage gate) → **Strict 100%** (Wave 5 이월 안 함). 5% legacy가 남으면 catch-all 제거 불가. Deferred set(width 5 + narrow-load) Wave 4 내 해결.
+      Q5 (Macro vs explicit) → **Explicit 유지**. Grep-ability + self borrow 가시성. Wave 2c에서 boilerplate 측정 후 부분 macro 도입 escape hatch.
+    예상 소요: Wave 2a(1) + 2b(1-2) + 2c.1(1) + 2c.2 audit(1) + 2c.2 migrate(1-2) + 2d(1-2) + helper-IR infra(1) = **7-10 세션**.
+    착수 순서: Wave 2a (alloca 14 sites, risk 최저) → 2b → 2c.1 → 2c.2 audit iter → 2c.2 migrate → helper-IR infra → 2d.
 
   **iter 25 (2026-04-24) — LANDED ✅ (design-only, 코드 변경 0)**:
   - 산출물: `/Users/sswoo/study/projects/vais/compiler/docs/refactor/llvm-ground-truth.md` (신규, ~250 라인)
@@ -52,6 +91,43 @@ max_iterations: 40
     - Q4 → debug_assert! 추가는 Wave 3 이후 시점에 고려 (지금은 두 track 공존)
   - Gate 전체 합격: cargo 796/796 ✅ + 355/355 ✅ + codegen 13-15/15 (flake band) ✅ + linked 1/15 held ✅ + 총 link 에러 -4.5
   - 다음 iter 방향 (Wave 1c): trunc/sext/zext/icmp/fcmp sites 87개 전체. batch 5 세션 필요 — 작게 쪼개서 파일별 진행. 독립 commit + per-batch gate. 각 batch cargo + vaisdb 4-run 통과 필수.
+
+  **iter 33 (2026-04-24) — Wave 2 design doc LANDED ✅ (design-only, 코드 변경 0)**:
+  - 산출물: `compiler/docs/refactor/llvm-ground-truth-wave2.md` (신규, 276 라인)
+  - Compiler commit: `9fd7528b` (docs only)
+  - Site 인벤토리 (실제 grep 측정): load 133, call 54, gep 76, alloca 14 = **277 sites Wave 2 total**. 추가로 push_str-style 138 (대부분 helper IR / runtime — Wave 2 scope에서 제외).
+  - 위험-오름차순 마이그레이션 순서: 2a alloca → 2b gep → 2c.1 load(wide) → 2c.2 load(narrow, audit 필수) → 2d call.
+  - **하드 게이트**: 각 sub-wave 4-run 평균 link 에러 +5 이상 증가 시 즉시 bisect+revert (Wave 1c.5 cascade 교훈 적용 — width-coerce 5건 패턴 재발 방지).
+  - Wave 2c.2 (narrow load) 특수 프로토콜: 각 사이트 downstream consumer 분류 (safe vs cascade-trigger) 후 selective migrate.
+  - Wave 4 coverage 궤적: Wave 2 종료 시 누적 ~87% (현재 23% → 87%). Wave 3 후 ~100%.
+  - 예상 소요: Wave 2a (1) + 2b (1-2) + 2c.1 (1) + 2c.2 (1-2 audit 포함) + 2d (1-2) = **6-8 세션**.
+  - Open Questions 5건 (audit 비용, helper-IR 제외, cross-module call 결정 기준, Wave 4 coverage 게이트, macro vs explicit) — 사용자 리뷰 대기.
+  - cargo 796/796 + 355/355 ✅ (변경 없음 자동 통과).
+  - 다음 iter 방향: 사용자 Open Questions 리뷰 → 승인 시 Wave 2a (alloca 14 sites) 착수.
+
+  **iter 32 (2026-04-24) — Wave 1c.5 LANDED ✅ (19 contract/control-flow sites, 5 width-coerce reverted)**:
+  - Compiler commit `115c3f5b`. 19 sites (initial 24 attempted, 5 reverted as cascade-trigger):
+    - contracts/* (7): requires/invariants/assert/assume/auto_checks(nonnull+nonzero) icmp ne→i1, decreases icmp sge→i1
+    - control_flow/match_gen.rs (2): guard icmp ne→i1, body zext i1→i64
+    - expr_helpers_call/method_call.rs (1): vec_es needs_adjust icmp eq→i1
+    - expr_helpers_misc.rs (3): poll is_ready, try_op is_err, unwrap is_err — icmp→i1
+    - expr_helpers_data.rs (1): index sext narrow→i64
+    - generate_expr_struct.rs (1): u8 field zext→i64
+    - helpers.rs (1): for-loop bounds icmp slt→i1
+    - stmt_visitor.rs (1): poll return trunc i64→i1
+    - function_gen/async_gen.rs (1): poll body trunc i64→i1
+    - function_gen/dependent_checks.rs (1): predicate icmp ne→i1
+  - **Reverted 5 width-coerce sites** (initial attempt: +18.5 errors avg ~176 vs Wave 1c.4 ~157.5):
+    - method_call.rs L446 zext, L1380 sext (param-width coerce in call args)
+    - expr_helpers_assign.rs closure trunc/sext (compound assign width coerce)
+    - function_gen/codegen.rs L333 ret trunc i64→narrow
+    - function_gen/generics.rs L635 specialized ret trunc i64→narrow
+  - Cascade pattern (memory `phase17_iter22_23_ptrtoint_cascade` 재현): width coerces register narrow types (i8/i16/i32) but downstream consumers expect i64-default fallback. Recording the truth breaks consumers that depend on the lie.
+  - Gate 4-run (after revert): codegen {13,13,14,13}, linked 1/15, errors {147,149,183,149} avg **~157** vs Wave 1c.4 **~157.5** (**flat, within noise**).
+  - cargo 796/796 + 355/355 ✅
+  - 누적 migrated: 99 sites (1a infra + 1b 20 + 1c.1 13 + 1c.2 23 + 1c.3 9 + 1c.4 15 + 1c.5 19).
+  - Wave 1c 잔여: 5 width-coerce sites deferred (consumer audit 필요 before record_emitted_type).
+  - 다음 iter 방향: Wave 2 (load/call/getelementptr/alloca) 설계 또는 deferred 5 width-coerce sites consumer audit. Wave 4 (catch-all 제거)는 width 5건 포함 100% coverage 후.
 
   **iter 31 (2026-04-24) — Wave 1c.4 LANDED ✅ (expr_helpers/stmt/pattern 15 sites)**:
   - Compiler commit `95c23fe5`. 15 sites across 3 files:
