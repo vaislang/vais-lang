@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 45 Wave 3 +1 bitcast LANDED ✅ (data 2 cascade revert). Wave 3 누적 32. 다음: insertvalue 잔여 batch)
+mode: auto (iter 46 Wave 3 +5 insertvalue fat-ptr LANDED ✅ (Wave 3 누적 37). 다음: expr_helpers_control insertvalue or async_gen 또는 나머지)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 45
+iteration: 46
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -31,6 +31,16 @@ max_iterations: 50
   iter_43_strategy: Opus direct, Wave 3 확장. match_gen phi 1 + insertvalue batch (helpers fat-ptr + range literal + slice ref fat-ptr). insertvalue result type = base aggregate type (리터럴).
   iter_44_strategy: Opus direct, Wave 3 bitcast 착수. bitcast target = cast dst type (IR 명시). i8* / i64* 타겟부터 안전 — consumer가 pointer type 기대.
   iter_45_strategy: Opus direct, Wave 3 bitcast struct target 시도. data 클래스 cascade 재확인 (Wave 2a.deferred와 동일 class). call_gen 1 site landed.
+  iter_46_strategy: Opus direct, Wave 3 insertvalue 잔여 배치. expr_helpers pad cast, string_lit format!-based, if_else Str zeroinit substitute — 모두 `{ i8*, i64 }` 고정.
+
+  **iter 46 (2026-04-25) — Wave 3 +5 insertvalue LANDED ✅ (1 batch, 누적 37)**:
+  - Compiler commit: `71d0ab24` — expr_helpers.rs 2 + string_lit.rs 2 + if_else.rs 1 = **5 sites**
+  - 모든 insertvalue target `{ i8*, i64 }` (Str fat pointer): i8* pad cast + string literal construct + Str void substitute.
+  - string_lit의 format!-based IR에도 self.fn_ctx.record_emitted_type 호출 (write_ir! 아니어도 가능).
+  - Gate 8-run avg **~18** vs baseline ~21.75 (**-3.75 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **212 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 37 − 1).
+  - Wave 3 잔여 insertvalue: async_gen 3, codegen 2, stmt 4, expr_helpers_control 4, stmt_visitor 3, method_call 2, expr_helpers_misc 2, vtable 2.
+  - 다음 iter: expr_helpers_control insertvalue or async_gen.
 
   **iter 45 (2026-04-25) — Wave 3 +1 bitcast LANDED ✅ (1 batch, 2 cascade revert)**:
   - Compiler commit: `00605e7c` — expr_helpers_call/call_gen.rs 1 bitcast i8*→{T}* (enum payload heap-alloc) = **1 site**
