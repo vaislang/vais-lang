@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 35 Wave 2c.1 23 sites LANDED ✅ across 5 batches. 다음: Wave 2c.1 나머지 load ptr + Wave 2b gep + Wave 2c.2 narrow load audit)
+mode: auto (iter 36 Wave 2c.1 +16 sites LANDED ✅ (누적 40 sites 2c.1 완료). 다음: Wave 2b gep 76 또는 Wave 2c.2 narrow audit)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 35
+iteration: 36
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -21,6 +21,21 @@ max_iterations: 50
   iter_33_strategy: Opus direct, design-only doc (Wave 2). 이유: 기존 llvm-ground-truth.md의 톤/구조 유지, Wave 1c.5 cascade 교훈 반영, 5-Wave migration plan과 일관된 scope 서술. Delegation 시 design continuity 손실 위험.
   iter_34_strategy: Opus direct, Wave 2a 착수. 사용자가 "100% 안전·명확" 우선 원칙으로 5개 Open Questions 결정 — 전부 debt-free defaults.
   iter_35_strategy: Opus direct, Wave 2c.1 load i64 mechanical batch migration. 파일별 batch + 8-run gate per batch. Cascade 감지 시 즉시 revert (loops.rs 6 sites revert됨, +10 에러 cascade). Wave 2b gep보다 단순 (load result는 IR string pointee type 그대로).
+  iter_36_strategy: Opus direct, Wave 2c.1 wide-load 나머지 batch (ptr/float/F32/Str-fat/i64 각각 batch). Named struct value load는 Wave 2a deferred와 동일 클래스 → 이월.
+
+  **iter 36 (2026-04-25) — Wave 2c.1 +16 sites LANDED ✅ (3 batches, 누적 2c.1 40 sites)**:
+  - Compiler commits: `73be3e47` (ptr+f64 9) + `857e3482` (float+fat 6) + `a7939953` (assign 1) = **16 sites**
+  - 타입별:
+    - i8* loaded → "i8*" (stmt.rs 2 sites, scope+frame drop slot)
+    - %T* loaded → "%<T>*" (generate_expr_call.rs 1 site, struct ptr double-deref)
+    - double loaded → "double" (pattern.rs 3 F64 + generate_expr_call.rs 2 F64 = 5)
+    - float loaded → "float" (pattern.rs 3 F32 + generate_expr_call.rs 2 F32 = 5)
+    - { i8*, i64 } loaded → fat-pointer (pattern.rs 1 Str binding)
+    - i64 loaded → "i64" (expr_helpers_assign.rs 1 array-ref data slot)
+  - Gate per batch 8-run: {22.6, 21.6, 18.1} all within/below baseline ~21.75. cargo 796/796 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: 147 sites (Wave 1 99 + 2a 9 + 2c.1 40 - 1 double count = 146 이상).
+  - **Wave 2c.1 완료 판단**: 남은 wide-load 대부분은 Named struct value loads (ret 경로, 70 generic load sites의 subset) — Wave 2a deferred와 동일 클래스 (consumer audit 필요). Wave 4 구조 수정 단계로 이월.
+  - 다음 iter: Wave 2b gep 76 sites or Wave 2c.2 narrow-load audit. Wave 2c.2는 full pre-audit 63 sites (Q1 결정) — 시간 많이 필요. Wave 2b 먼저가 현실적.
 
   **iter 35 (2026-04-24) — Wave 2c.1 23 sites LANDED ✅ (5 batches)**:
   - Compiler commits: `a55454b8` (helpers 4) + `5b1c2ff6` (call 4) + `377fe6c0` (loop+stmt 6) + `7b547aa9` (pattern 8) + `316e4861` (method_call 5) = **23 sites**
