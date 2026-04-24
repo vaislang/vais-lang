@@ -10,11 +10,11 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 47 Wave 3 +4 control insertvalue LANDED ✅ (Wave 3 누적 41). 다음: async_gen 또는 stmt insertvalue)
+mode: auto (iter 48 Wave 3 +3 async_gen insertvalue LANDED ✅ (Wave 3 누적 44). wake-up 간격 10분 단축. 다음: stmt/method_call/stmt_visitor insertvalue)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 47
-max_iterations: 50
+iteration: 48
+max_iterations: 60
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
   iter_32_strategy: Opus direct, mechanical multi-file edit (Wave 1c.5). 이유: (1) Wave 1c.1~1c.4 모두 Opus direct로 진행 (memory subagent_delegation_for_compiler_tasks), (2) record_emitted_type 인자(LLVM type string)는 emission context별로 정확해야 함 — pattern-match만으로는 sext/trunc/icmp dst-type 추출 실수 가능, (3) &self signature 빌드 에러 즉시 분기 판단 필요. Background는 가성비 떨어짐.
@@ -33,6 +33,15 @@ max_iterations: 50
   iter_45_strategy: Opus direct, Wave 3 bitcast struct target 시도. data 클래스 cascade 재확인 (Wave 2a.deferred와 동일 class). call_gen 1 site landed.
   iter_46_strategy: Opus direct, Wave 3 insertvalue 잔여 배치. expr_helpers pad cast, string_lit format!-based, if_else Str zeroinit substitute — 모두 `{ i8*, i64 }` 고정.
   iter_47_strategy: Opus direct, Wave 3 expr_helpers_control insertvalue. 4 Str void substitute 패턴 — phi_llvm == "{ i8*, i64 }"일 때 zeroinit으로 사용.
+  iter_48_strategy: Opus direct, Wave 3 async_gen insertvalue. poll return { i64, ret_llvm } 3 sites. 사용자 요청으로 wake-up 간격 25분→10분 단축, max_iterations 50→60 확장.
+
+  **iter 48 (2026-04-25) — Wave 3 +3 async_gen insertvalue LANDED ✅ (1 batch, 누적 44)**:
+  - Compiler commit: `c3169d29` — function_gen/async_gen.rs 3 sites (%ret_0, %ret_1, %invalid_ret)
+  - 패턴: async poll return `{ i64, <ret_llvm> }` — record with `format!("{{ i64, {} }}", ret_llvm)`.
+  - Gate 8-run avg **~17.9** vs baseline ~21.75 (**-3.85 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **219 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 44 − 1).
+  - Wave 3 잔여 insertvalue: codegen 2, stmt 4, stmt_visitor 3, method_call 2, expr_helpers_misc 2, vtable 2.
+  - 다음 iter: stmt or method_call insertvalue.
 
   **iter 47 (2026-04-25) — Wave 3 +4 control insertvalue LANDED ✅ (1 batch, 누적 41)**:
   - Compiler commit: `ce95061a` — expr_helpers_control.rs 4 Str void substitute insertvalue
