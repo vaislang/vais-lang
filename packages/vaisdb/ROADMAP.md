@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 40 Wave 2d +6 strlen LANDED ✅ (2d 누적 11 sites). 다음: Wave 2d 잔여 (i32 strcmp/printf — cascade class) 또는 Wave 3 phi/extract)
+mode: auto (iter 41 Wave 3 7 sites LANDED ✅ (extract from poll_ret_ty + fat-ptr). 다음: Wave 3 phi 사이트 또는 bitcast/insertvalue)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 40
+iteration: 41
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -26,6 +26,18 @@ max_iterations: 50
   iter_38_strategy: Opus direct, Wave 2b 확장. stmt.rs/stmt_visitor.rs Vec field gep (Wave 2a의 stmt.rs alloca deferred class와 달리 gep는 safe — consumer가 이후 load i64로 cascading), ref_deref.rs/map_lit.rs 배열 gep. 2 commits.
   iter_39_strategy: Opus direct, Wave 2b 잔여 + Wave 2c.2 audit + Wave 2d 시작. expr_helpers_misc payload_ptr gep (cascade, 2 revert). pattern tag_val i32 narrow load (cascade, 3 revert). malloc 5 landed. Task #6 Helper-IR Wave 4로 이월하고 #9 Wave 2d unblock.
   iter_40_strategy: Opus direct, Wave 2d 확장. strlen i64 (6 sites landed). i32 returning libc calls (strcmp, snprintf len) 시도했으나 cascade — i32 기록 자체가 cascade class로 확인.
+  iter_41_strategy: Opus direct, Wave 3 착수. extractvalue 45 sites 중 안전한 것 (poll_ret_ty struct extract, { i8*, i64 } fat-ptr extract). Fat-ptr extract는 consumer에 따라 cascade 위험.
+
+  **iter 41 (2026-04-25) — Wave 3 7 sites LANDED ✅ (2 batches, 1 cascade revert)**:
+  - Compiler commits: `0ca568bb` (5 extractvalue in expr_helpers_misc) + `abb685f4` (2 in helpers.rs) = **7 sites**
+  - 타입별:
+    - async poll_ret_ty extract 0 (status) → "i64"
+    - async poll_ret_ty extract 1 (result) → inner_ret_llvm dynamic
+    - `{ i8*, i64 }` fat-ptr extract 0 → "i8*", extract 1 → "i64"
+  - Deferred cascade: generate_expr_call.rs 4 fat-ptr extract sites — +6.85 errors avg (ptrtoint chain consumer 간섭 추정). Revert.
+  - Gate per batch: {misc extract: 18 ✅, gen_expr_call+helpers 모두: 28.6 revert → helpers-only: 21.9 ✅}. cargo 796/796 ✅ per commit. linked 0/15 held.
+  - 누적 migrated: **182 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 7 − 1 doublecount).
+  - 다음 iter: Wave 3 phi sites (control_flow/if_else, match_gen, pattern, string_ops) — phi declared type은 명시적이라 기록 단순. bitcast/insertvalue도 가능.
 
   **iter 40 (2026-04-25) — Wave 2d +6 strlen LANDED ✅ (1 batch, 1 cascade revert)**:
   - Compiler commit: `bc95b0e2` — generate_expr_call.rs 4 strlen sites + string_ops.rs 2 strlen sites = **6 sites**
