@@ -13,7 +13,7 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 30
+iteration: 31
 max_iterations: 40
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -52,6 +52,15 @@ max_iterations: 40
     - Q4 → debug_assert! 추가는 Wave 3 이후 시점에 고려 (지금은 두 track 공존)
   - Gate 전체 합격: cargo 796/796 ✅ + 355/355 ✅ + codegen 13-15/15 (flake band) ✅ + linked 1/15 held ✅ + 총 link 에러 -4.5
   - 다음 iter 방향 (Wave 1c): trunc/sext/zext/icmp/fcmp sites 87개 전체. batch 5 세션 필요 — 작게 쪼개서 파일별 진행. 독립 commit + per-batch gate. 각 batch cargo + vaisdb 4-run 통과 필수.
+
+  **iter 31 (2026-04-24) — Wave 1c.4 LANDED ✅ (expr_helpers/stmt/pattern 15 sites)**:
+  - Compiler commit `95c23fe5`. 15 sites across 3 files:
+    - expr_helpers.rs (5): icmp ne args for &&/||, zext i1→i64 × 2 (&&/|| result, cmp result), icmp ne for xor i1 coerce
+    - stmt.rs (5): trunc i64→i1 poll return, icmp eq null × 2 (scope_drop + frame_drop), icmp sle/sge i64 vec-eager-drop bounds
+    - pattern.rs (5): icmp eq strcmp match, icmp sge range pattern, trunc i64→i1 × 3 Bool field bindings (enum variant paths)
+  - Gate 4-run: codegen {13,13,14,14}, linked 1/15, errors {148, 151, 153, 178} avg **~157.5** (vs Wave 1c.3 ~165.75, **−8.25 LARGEST Wave 1c gain**)
+  - cargo 796/796 + 355/355 ✅
+  - 누적 migrated: 80 sites. Wave 1c 잔여: ~27 sites across smaller files (misc).
 
   **iter 30 (2026-04-24) — Wave 1c.3 LANDED ✅ (print_format.rs 9 sites)**:
   - Compiler commit `14bc417f`. 9 sext/zext sites in expr_helpers_call/print_format.rs:
