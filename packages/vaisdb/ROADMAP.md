@@ -13,9 +13,25 @@
 mode: auto
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: 17 (H1 ✅) → 18 (H2 ✅) → 19 (H3 ✅ partial) → 20 (H4 in_progress, 14 fixes + 3 stdlib) → 21 (I1) → 22 (I2) → 23 (I3) → 24 (I4) → 25 (J1) → 26 (J2)
-iteration: 24
+iteration: 25
 max_iterations: 30
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
+  iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
+
+  **iter 25 (2026-04-24) — LANDED ✅ (design-only, 코드 변경 0)**:
+  - 산출물: `/Users/sswoo/study/projects/vais/compiler/docs/refactor/llvm-ground-truth.md` (신규, ~250 라인)
+  - 설계 요약:
+    - **문제**: `llvm_type_of`가 `temp_var_types` (ResolvedType registry) → `type_to_llvm` 프로젝션으로 동작 → SSA 값의 **실제 emitted LLVM type**이 아닌 **등록된 semantic type** 반환. 34개 consumer가 잘못된 타입으로 coerce 결정. 45개 registration site가 AST inference 기반으로 등록 → emission과 불일치.
+    - **선택된 접근**: Option B — parallel `actual_llvm_type: HashMap<String, String>` track을 emission 시점에 기록. `llvm_type_of` resolution-order 1순위로 추가, 기존 ResolvedType track은 fallback으로 유지.
+    - **거부된 대안**: Option A (IR 문자열 파싱, 복잡도 높음), Option C (signature-directed consumer only, 근본 해결 안 됨).
+    - **마이그레이션**: 5-Wave 점진적 전환. Wave 1 (primitives: ptrtoint/trunc/sext/icmp/algebraic) → Wave 2 (composite: gep/load/call/alloca) → Wave 3 (aggregate+phi) → Wave 4 (catch-all `generate_expr/mod.rs:298` 제거) → Wave 5 (consumer cleanup). Wave당 cargo 796/796 + vaisdb 15/15 standalone + linked count 비회귀 gate.
+    - **도구**: `write_ir_typed!` 매크로로 emit + record를 원자화. 각 Wave는 독립 revert 가능.
+  - 검증 gate:
+    - cargo test -p vais-codegen --lib: 796/796 ✅ (변경 없음, 코드 수정 0)
+    - cargo test -p vais-types --lib: 355/355 ✅ (변경 없음)
+    - compiler HEAD: 706645e8 (iter 21 landed) 유지, 신규 커밋 없음
+  - 예상 소요: Wave 1-5 합계 4-5 세션 + 버퍼 1세션.
+  - 다음 iter 방향: 사용자 리뷰 → 승인 시 Wave 1 착수 (Opus direct, primitives 15-25 site mechanical conversion + gate 검증).
 
   **iter 19 (2026-04-24) — NEGATIVE RESULT (no compiler change)**:
   - Attempt 1: Register `Str_new` builtin returning `Str` + emit body `define { i8*, i64 } @Str_new() { ... }` in runtime.rs.
