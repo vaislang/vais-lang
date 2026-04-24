@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 39 Wave 2c.2 audit 완료 ✅ + Wave 2d malloc 5 LANDED ✅. 다음: Wave 2d free/ 기타 call 또는 Wave 2b.deferred audit)
+mode: auto (iter 40 Wave 2d +6 strlen LANDED ✅ (2d 누적 11 sites). 다음: Wave 2d 잔여 (i32 strcmp/printf — cascade class) 또는 Wave 3 phi/extract)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 39
+iteration: 40
 max_iterations: 50
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -25,6 +25,16 @@ max_iterations: 50
   iter_37_strategy: Opus direct, Wave 2b gep 착수. 안전 우선 — 단순 `[N x T]` array gep + Vec `i32 0, i32 N` field gep. Vec es/cap/len의 일부 consumer는 catch-all 의존 (method_call 3 sites revert).
   iter_38_strategy: Opus direct, Wave 2b 확장. stmt.rs/stmt_visitor.rs Vec field gep (Wave 2a의 stmt.rs alloca deferred class와 달리 gep는 safe — consumer가 이후 load i64로 cascading), ref_deref.rs/map_lit.rs 배열 gep. 2 commits.
   iter_39_strategy: Opus direct, Wave 2b 잔여 + Wave 2c.2 audit + Wave 2d 시작. expr_helpers_misc payload_ptr gep (cascade, 2 revert). pattern tag_val i32 narrow load (cascade, 3 revert). malloc 5 landed. Task #6 Helper-IR Wave 4로 이월하고 #9 Wave 2d unblock.
+  iter_40_strategy: Opus direct, Wave 2d 확장. strlen i64 (6 sites landed). i32 returning libc calls (strcmp, snprintf len) 시도했으나 cascade — i32 기록 자체가 cascade class로 확인.
+
+  **iter 40 (2026-04-25) — Wave 2d +6 strlen LANDED ✅ (1 batch, 1 cascade revert)**:
+  - Compiler commit: `bc95b0e2` — generate_expr_call.rs 4 strlen sites + string_ops.rs 2 strlen sites = **6 sites**
+  - `call i64 @strlen(...)` → record "i64" (wide, safe)
+  - Gate 8-run avg errors **~14.4** vs baseline ~21.75 (**-7.35 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - Deferred cascade: `call i32 @snprintf(null, 0, ...)` len_i32 (print_format.rs) — +6 errors avg → revert. i32 consumer 여러 site 연계 가능성.
+  - Wave 2d 잔여 i32 calls (strcmp 5, printf 6, @puts i32): 전부 i32 return class → pattern tag_val과 같은 cascade class. Wave 4 refactor 단계로 이월 권장.
+  - 누적 migrated: **175 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 − 1 doublecount).
+  - 다음 iter: Wave 3 (phi/extract/insert) 또는 Wave 2d i64 returning non-libc calls. i32 class는 Wave 4에서 일괄 처리.
 
   **iter 39 (2026-04-25) — Wave 2c.2 audit 완료 + Wave 2d 5 malloc LANDED ✅ (1 batch, 2 revert)**:
   - Compiler commit: `ea67c681` (malloc 5 sites: helpers + generate_expr_call + print_format + call_gen + expr_helpers_misc)
