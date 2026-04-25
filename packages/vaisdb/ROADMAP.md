@@ -10,11 +10,11 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 57 Wave 2d completed (25) + Wave 4 design doc landed. 다음 iter: 사용자 review or Wave 4a 시작)
+mode: auto (iter 58 Wave 4a probe + 4 %ret. sites LANDED ✅. probe로 50+ unique misses 발견. 다음 iter: 추가 long-tail 사이트 등록)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 57
-max_iterations: 60
+iteration: 58
+max_iterations: 70
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
   iter_32_strategy: Opus direct, mechanical multi-file edit (Wave 1c.5). 이유: (1) Wave 1c.1~1c.4 모두 Opus direct로 진행 (memory subagent_delegation_for_compiler_tasks), (2) record_emitted_type 인자(LLVM type string)는 emission context별로 정확해야 함 — pattern-match만으로는 sext/trunc/icmp dst-type 추출 실수 가능, (3) &self signature 빌드 에러 즉시 분기 판단 필요. Background는 가성비 떨어짐.
@@ -43,6 +43,17 @@ max_iterations: 60
   iter_55_strategy: Opus direct, Wave 2d string_ops `__vais_str_*` helper calls (i64 ret, 3 sites).
   iter_56_strategy: Opus direct, Wave 2d misc calls. await poll_result (dynamic poll_ret_ty), SIMD reduction intrinsics (elem_ty), async state alloc.
   iter_57_strategy: Opus direct, design-only doc (Wave 4). Wave 2d task #9 completed (25 sites total). Task #11 Wave 4 design 신설+landing. 4 deferred classes (A i32, B data-chain, C &self, D helper-IR) 분석 + sub-wave 4a-e plan.
+  iter_58_strategy: Opus direct, Wave 4a 시작. probe infra (VAIS_GROUND_TRUTH_PROBE) + %ret.{N} long-tail 4 sites. max_iterations 60→70 확장.
+
+  **iter 58 (2026-04-25) — Wave 4a probe + 4 %ret. sites LANDED ✅**:
+  - Compiler commits:
+    - `342b776c` — VAIS_GROUND_TRUTH_PROBE env-gated diagnostic (`llvm_type_of` fallback emits `[ground-truth-miss] %tN` to stderr)
+    - `4e9f000b` — function_gen/codegen.rs 4 `%ret.{counter}` named-struct return load sites (replace_all)
+  - Probe 측정 결과 (test_btree.vais 1개 테스트): **156 raw misses, ~50 unique SSA names**. 약 67-80% coverage 추정. Wave 4 design 예측 정확.
+  - %ret. long-tail 발견 → 4 sites 즉시 register.
+  - Gate 8-run avg **~14.1** vs baseline ~21.75 (**-7.65 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **256 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 25 + 3 62 + 4a 4 − 1).
+  - 다음 iter: probe로 다른 테스트 누락 사이트 측정, 점진적 등록.
 
   **iter 57 (2026-04-25) — Wave 2d completed + Wave 4 design LANDED ✅ (design only, code 0)**:
   - Task #9 Wave 2d completed (25 sites total). Task #7 (duplicate Wave 2d, blocked) deleted. Task #11 Wave 4 design completed.
