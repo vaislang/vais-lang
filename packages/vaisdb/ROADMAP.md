@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 62 Wave 4a coerce_int_width signature 시도 → +7 cascade revert. 다른 stdlib path 식별 (__load_i32 등). 코드 변경 0.)
+mode: stopped (iter 63 Wave 4a partial completed (Task #12). 점진 path 한계 도달. 사용자 결정 필요: (a) Wave 4 sub-wave 4a-e 본격 시작 (catch-all 제거 + Class A/B/C 동시), (b) 다른 영역 작업으로 전환, (c) 현재 상태 유지하고 종료. memory 업데이트 완료.)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 62
+iteration: 63
 max_iterations: 70
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -48,6 +48,24 @@ max_iterations: 70
   iter_60_strategy: Opus direct, Wave 4a probe analysis. Top miss 함수 식별 (PageHeader_deserialize 15, BTree*_from_page_data 7-8). 패턴 — `sext i32 ... to i64` result가 record_emitted_type 누락. 분석 노트만, 코드 변경 0.
   iter_61_strategy: Opus direct, Wave 4a 추적 emit path. expr_helpers.rs binop sext widening + as-cast trunc/sext result.
   iter_62_strategy: Opus direct, Wave 4a coerce_int_width 시도. signature `&self → &mut self` + record_emitted_type. cascade +7 revert. stdlib unknown call (`__load_i32`) miss path 발견.
+  iter_63_strategy: Opus direct, Wave 4a partial completed + memory consolidation. Task #12 closed. memory `phase17_wave2_3_4a_progress.md` 신설. mode → stopped (사용자 결정 대기).
+
+  **iter 63 (2026-04-25) — Wave 4a partial completed + memory landed**:
+  - Task #12 (Wave 4a) marked completed: probe infra + 6 safe sites (Wave 4a.partial).
+  - Memory file: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase17_wave2_3_4a_progress.md` (Wave 2/3/4a 누적 258 sites + cascade trigger classes + Wave 4 catch-all 전제).
+  - MEMORY.md 인덱스에 추가 (12 entries).
+  - 누적 migrated: **258 sites** (iter 58-61 Wave 4a로 +6).
+  - **Wave 2/3/4a 종합**:
+    - Wave 1: 99 sites (primitives)
+    - Wave 2a alloca: 9 (9 deferred), 2b gep: 17 (5+ deferred), 2c.1 load wide: 40, 2c.2 narrow: 0 신규, 2d call: 25
+    - Wave 3 phi/extract/insert/bitcast: 62
+    - Wave 4a probe + safe: 6
+    - 잔여 deferred: ~30+ sites across cascade-trigger classes (모두 Wave 4 단계).
+  - **사용자 결정 필요**:
+    - (a) Wave 4 본격 시작 — catch-all 제거 + Class A (i32) + B (data-chain) + C (&self) + D (helper-IR) 동시 진행. Risk: 큰 refactor, 여러 cascade likely.
+    - (b) 다른 vaisdb 영역 (예: 테스트 link 100% 도달 위한 ad-hoc fix)
+    - (c) 현재 상태 유지하고 추후 재개 — Wave 4는 더 큰 refactor design 필요.
+  - mode: stopped 설정.
 
   **iter 62 (2026-04-25) — Wave 4a NEGATIVE — coerce_int_width signature change reverted**:
   - 시도: `types/coercion.rs::coerce_int_width(&self → &mut self)` + `record_emitted_type(&tmp, target_ty)`
