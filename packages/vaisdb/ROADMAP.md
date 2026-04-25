@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 53 Wave 3 completed (62 sites) + Wave 2d +3 i64 call LANDED ✅ (2d 누적 14). 다음: Wave 2d call extension)
+mode: auto (iter 54 Wave 2d +4 user fn/memcpy/indirect call LANDED ✅ (2d 누적 18). 다음: Wave 2d ABI 잔여 또는 Wave 4 준비)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 53
+iteration: 54
 max_iterations: 60
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -39,6 +39,19 @@ max_iterations: 60
   iter_51_strategy: Opus direct, Wave 3 잔여 fat-ptr insertvalue. method_call Vec→slice, expr_helpers_misc closure heap-buf, codegen ret zinit.
   iter_52_strategy: Opus direct, Wave 3 generate_expr_call insertvalue. Vec→slice fat-ptr (call-arg conversion) + trait object 구성 (`{ i8*, i8* }`).
   iter_53_strategy: Opus direct, Wave 3 completed (62 sites total) → Wave 2d 다시. user fn calls (closure) + drop_fn calls.
+  iter_54_strategy: Opus direct, Wave 2d call extension. indirect-call, memcpy, user fn (variadic + regular).
+
+  **iter 54 (2026-04-25) — Wave 2d +4 call sites LANDED ✅ (1 batch, 누적 18)**:
+  - Compiler commit: `fb40dc9a` — generate_expr_call.rs 4 sites (indirect/memcpy/variadic/regular user fn)
+  - 패턴별:
+    - indirect call via fn_ptr → "i64" (L1108)
+    - memcpy → "i8*" (L1158)
+    - variadic user fn call → dynamic `ret_ty` (L1366)
+    - regular user fn call → dynamic `ret_ty` (L1378)
+  - Deferred: L1321 i32 variadic (cascade class).
+  - Gate 8-run avg **~17.75** vs baseline ~21.75 (**-4 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **244 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 18 + 3 62 − 1).
+  - 다음 iter: Wave 2d ABI calls (sched_yield, free, etc) 또는 Wave 4 준비.
 
   **iter 53 (2026-04-25) — Wave 3 완료 + Wave 2d +3 i64 call LANDED ✅ (1 batch)**:
   - Task #10 (Wave 3) completed — 62 sites (phi 8 + extract 7 + bitcast 6 + insertvalue 41).
