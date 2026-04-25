@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 56 Wave 2d +4 misc call LANDED ✅ (2d 누적 25). 다음: Wave 2d 정리 및 Wave 4 준비)
+mode: auto (iter 57 Wave 2d completed (25) + Wave 4 design doc landed. 다음 iter: 사용자 review or Wave 4a 시작)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 56
+iteration: 57
 max_iterations: 60
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -42,6 +42,21 @@ max_iterations: 60
   iter_54_strategy: Opus direct, Wave 2d call extension. indirect-call, memcpy, user fn (variadic + regular).
   iter_55_strategy: Opus direct, Wave 2d string_ops `__vais_str_*` helper calls (i64 ret, 3 sites).
   iter_56_strategy: Opus direct, Wave 2d misc calls. await poll_result (dynamic poll_ret_ty), SIMD reduction intrinsics (elem_ty), async state alloc.
+  iter_57_strategy: Opus direct, design-only doc (Wave 4). Wave 2d task #9 completed (25 sites total). Task #11 Wave 4 design 신설+landing. 4 deferred classes (A i32, B data-chain, C &self, D helper-IR) 분석 + sub-wave 4a-e plan.
+
+  **iter 57 (2026-04-25) — Wave 2d completed + Wave 4 design LANDED ✅ (design only, code 0)**:
+  - Task #9 Wave 2d completed (25 sites total). Task #7 (duplicate Wave 2d, blocked) deleted. Task #11 Wave 4 design completed.
+  - Compiler commit: `baec4e5f` — `docs/refactor/llvm-ground-truth-wave4.md` (193 lines)
+  - 설계 요약:
+    - **Goal**: `generate_expr/mod.rs:298` catch-all `default → "i64"` 제거 (sub-wave 4a).
+    - **Pre-conditions**: Class A (i32 cascade 8) + B (data-chain 6) + C (&self 7) deferred 사이트 해결 필요.
+    - **Sub-waves**: 4a 1-line catch-all change → 4b i32 retry → 4c data-chain retry → 4d &self signature → 4e helper-IR FunctionContext (Q2 strict 100%).
+    - **Coverage metric**: panic-driven (debug_assert!) 1순위, 측정 pass 옵션.
+    - **Risk**: 4a `debug_assert!` panic-driven coverage hunt 필요. 첫 run에서 long-tail 미등록 SSA 표면화 예상. Wave 1c 수준의 iteration 작업.
+  - cargo 796/796 + 355/355 ✅ (변경 없음). vaisdb gate 영향 없음.
+  - 누적 migrated: **252 sites** (변동 없음, design-only).
+  - **사용자 review checkpoint**: Wave 4 5개 Open Questions (Wave 2와 동일 패턴). 다음 iter는 사용자 review 후 결정.
+  - 다음 iter: 사용자 Wave 4 review → 승인 시 Wave 4a 시작 또는 4d (`&self` audit) 먼저.
 
   **iter 56 (2026-04-25) — Wave 2d +4 misc calls LANDED ✅ (1 batch, 누적 25)**:
   - Compiler commit: `f3da3db6` — expr_helpers_misc.rs 3 + async_gen.rs 1 = **4 sites**
