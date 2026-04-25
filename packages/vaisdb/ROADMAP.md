@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 64 Master Roadmap landed → Phase α.1 시작. test_page_manager link errors 4→3 (-1: freelist null literal phi default fix). 다음: 3 errors 추가 fix.)
+mode: stopped (iter 65 Phase α.1 진행 중 layer-by-layer 노출 패턴 확인. compiler 4 fixes + vaisdb 4 source fixes. 매 fix가 다음 layer 표면화. 사용자 결정 필요: (a) Phase α.1 강행 (multi-session, deep compiler work 필요), (b) Phase 0 도입 — 컴파일러 selfhost 검증 먼저, (c) ROADMAP 재조정.)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 64
+iteration: 65
 max_iterations: 100
 phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
@@ -51,6 +51,35 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   iter_62_strategy: Opus direct, Wave 4a coerce_int_width 시도. signature `&self → &mut self` + record_emitted_type. cascade +7 revert. stdlib unknown call (`__load_i32`) miss path 발견.
   iter_63_strategy: Opus direct, Wave 4a partial completed + memory consolidation. Task #12 closed. memory `phase17_wave2_3_4a_progress.md` 신설. mode → stopped (사용자 결정 대기).
   iter_64_strategy: Opus direct, **방향 전환**. 사용자 "사람들이 믿고 쓸 수 있어야"에 응답하여 Master Roadmap 신설 (`docs/MASTER_ROADMAP.md`). Phase α/β/γ/δ/ε trust-building. Wave 4 보류, "0/14 → 1/14 → 5/14 → 14/14 + production hardening" 단계. iter 64 Phase α.1 시작 — test_page_manager link errors 4→3.
+  iter_65_strategy: Opus direct, Phase α.1 강행. 결과: layer-by-layer 노출 패턴 확인.
+
+  **iter 65 (2026-04-25) — Phase α.1 진행 보고: layer 노출 패턴**:
+  - Compiler fixes (4 commits):
+    - `7c3aed52` match default arm null literal type detection
+    - `72616dc2` Vec[i] = struct value loads pointer-to-struct
+    - `039df2f7` 4-byte Named struct store (Vec_index_set)
+    - `32d1ed83` match Variant pattern uses specialized enum name (e.g., Result$Tuple_VaisError)
+  - vaisdb source fixes (3 commits):
+    - `d834a49` test source `as u32` casts + heap.flush slice + as_bytes signature + write_to_page_vec helper
+    - `71fa28c` heap iter_live Tuple decode 임시 skip (deep compiler gap)
+  - Layer 노출 패턴 (test_page_manager errors 진행):
+    1. freelist phi null → fixed
+    2. heap dead_slot store → fixed (broader assign heuristic)
+    3. vec __value_ptr 4-byte struct → fixed
+    4. test_page_manager phi i64 with i32 → source `as u32` workaround
+    5. heap flush Vec→slice → source helper
+    6. heap as_bytes signature → fixed
+    7. heap match `%Unknown` enum → fixed
+    8. heap match `%Tuple` payload → source skip
+    9. heap `@to_vec` undefined → 다음 layer
+  - **각 fix가 다음 hidden bug 표면화**. test_page_manager 단일 테스트도 multi-session 작업이 명백.
+  - cargo 796/796 ✅ throughout.
+  - **솔직한 진단**: 컴파일러 자체의 안정성이 부족. ad-hoc fix 패턴은 trust-building에 부적합 — 진짜 수정은 컴파일러 차원의 systematic work 필요. Master Roadmap이 "post-Phase 17 cleanup"을 의미했지만 **실제로는 vais 컴파일러가 still in-development** 상태.
+  - 사용자 결정 필요:
+    - (a) Phase α.1 강행 (multi-session 인내, layer-by-layer)
+    - (b) **Phase 0 신설 — 컴파일러 selfhost / hello world 검증 먼저** (vais 컴파일러 안정성 baseline 확보)
+    - (c) ROADMAP 재조정 (vaisdb는 vais 컴파일러 v1.0 이후로 이월, 그 전엔 선언적 기능 정의에만 집중)
+  - mode: stopped (사용자 결정 대기)
 
   **iter 64 (2026-04-25) — Master Roadmap landed + Phase α.1 첫 fix LANDED ✅**:
   - 신규 산출물: `docs/MASTER_ROADMAP.md` (~270 lines, vaisdb 종합 로드맵)
