@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 51 Wave 3 +6 method+misc+codegen insertvalue LANDED ✅ (Wave 3 누적 57). 다음: 잔여 사이트 마무리 또는 Wave 4 준비)
+mode: auto (iter 52 Wave 3 +5 generate_expr_call insertvalue LANDED ✅ (Wave 3 누적 62). 다음: Wave 3 잔여 마무리 또는 Wave 4 준비)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 51
+iteration: 52
 max_iterations: 60
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -37,6 +37,15 @@ max_iterations: 60
   iter_49_strategy: Opus direct, Wave 3 stmt insertvalue. 4 async poll-ret + Str fat-ptr zinit.
   iter_50_strategy: Opus direct, Wave 3 stmt_visitor insertvalue. 3 async poll patterns (stmt.rs와 mirror).
   iter_51_strategy: Opus direct, Wave 3 잔여 fat-ptr insertvalue. method_call Vec→slice, expr_helpers_misc closure heap-buf, codegen ret zinit.
+  iter_52_strategy: Opus direct, Wave 3 generate_expr_call insertvalue. Vec→slice fat-ptr (call-arg conversion) + trait object 구성 (`{ i8*, i8* }`).
+
+  **iter 52 (2026-04-25) — Wave 3 +5 expr_call insertvalue LANDED ✅ (1 batch, 누적 62)**:
+  - Compiler commit: `f2f6c522` — generate_expr_call.rs 5 insertvalue
+  - 타입별: `{ i8*, i64 }` Vec→slice 2, `{ i8*, i8* }` trait obj 2, `i8*` vtable_cast 1
+  - Gate 8-run avg **~17.9** vs baseline ~21.75 (**-3.85 improved**). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **237 sites** (Wave 1 99 + 2a 9 + 2c.1 40 + 2b 17 + 2d 11 + 3 62 − 1).
+  - Wave 3 잔여 insertvalue: emit.rs 2 (raw push_str helper IR — Wave 4 helper-IR scope), vtable.rs 2 (`&self`).
+  - 다음 iter: Wave 3 마무리 정리 (사실상 끝났음 — 잔여 사이트는 모두 Wave 4 helper-IR 또는 &self 클래스). Wave 4 준비 또는 Wave 2.deferred 클래스 재시도.
 
   **iter 51 (2026-04-25) — Wave 3 +6 fat-ptr insertvalue LANDED ✅ (1 batch, 누적 57)**:
   - Compiler commit: `5e344d18` — method_call 2 + expr_helpers_misc 2 + codegen 2 = **6 sites**
