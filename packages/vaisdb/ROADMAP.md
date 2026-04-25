@@ -4,13 +4,19 @@
 > **Version**: 0.1.0 (Implementation Phase)
 > **Goal**: Vector + Graph + Relational + Full-Text search in a single DB, optimized for RAG
 > **Language**: Pure Vais (with C FFI for system calls)
-> **Last Updated**: 2026-04-23 (Phase 17 시작 — Compiler Invariant Hardening)
+> **Last Updated**: 2026-04-26 (Phase 0 v1.0 ✅ 완료 — vaisdb 재개 진입점)
 
 ---
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: PAUSED (iter 66, post-vais-v1.0). vaisdb 작업은 vais 컴파일러 Phase 0 v1.0 완료 후 재개. 진단: vais 언어 자체가 alpha 단계로 vaisdb 같은 대규모 dogfooding 코드 빌드에 부족. 작업 우선순위: compiler/docs/PHASE_0_LANGUAGE_STABILIZATION.md 참조.
+mode: RESUMING (iter 67). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+
+**다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
+
+상세 인계: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase0_complete_vaisdb_resume.md` 참조 — 4건 site별 진단, 빌드 명령, 우선순위, lang regression 정책 기록됨.
+
+mode: PAUSED 시절 진단 보존: vais 언어 자체가 alpha 단계로 vaisdb 같은 대규모 dogfooding 코드 빌드에 부족 (현재는 lang 자체 부족 ✅ 해소, 잔여는 codegen ground-truth tracking).
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
 iteration: 65
