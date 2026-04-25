@@ -10,11 +10,12 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: stopped (iter 63 Wave 4a partial completed (Task #12). 점진 path 한계 도달. 사용자 결정 필요: (a) Wave 4 sub-wave 4a-e 본격 시작 (catch-all 제거 + Class A/B/C 동시), (b) 다른 영역 작업으로 전환, (c) 현재 상태 유지하고 종료. memory 업데이트 완료.)
+mode: auto (iter 64 Master Roadmap landed → Phase α.1 시작. test_page_manager link errors 4→3 (-1: freelist null literal phi default fix). 다음: 3 errors 추가 fix.)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 63
-max_iterations: 70
+iteration: 64
+max_iterations: 100
+phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
   iter_32_strategy: Opus direct, mechanical multi-file edit (Wave 1c.5). 이유: (1) Wave 1c.1~1c.4 모두 Opus direct로 진행 (memory subagent_delegation_for_compiler_tasks), (2) record_emitted_type 인자(LLVM type string)는 emission context별로 정확해야 함 — pattern-match만으로는 sext/trunc/icmp dst-type 추출 실수 가능, (3) &self signature 빌드 에러 즉시 분기 판단 필요. Background는 가성비 떨어짐.
@@ -49,6 +50,24 @@ max_iterations: 70
   iter_61_strategy: Opus direct, Wave 4a 추적 emit path. expr_helpers.rs binop sext widening + as-cast trunc/sext result.
   iter_62_strategy: Opus direct, Wave 4a coerce_int_width 시도. signature `&self → &mut self` + record_emitted_type. cascade +7 revert. stdlib unknown call (`__load_i32`) miss path 발견.
   iter_63_strategy: Opus direct, Wave 4a partial completed + memory consolidation. Task #12 closed. memory `phase17_wave2_3_4a_progress.md` 신설. mode → stopped (사용자 결정 대기).
+  iter_64_strategy: Opus direct, **방향 전환**. 사용자 "사람들이 믿고 쓸 수 있어야"에 응답하여 Master Roadmap 신설 (`docs/MASTER_ROADMAP.md`). Phase α/β/γ/δ/ε trust-building. Wave 4 보류, "0/14 → 1/14 → 5/14 → 14/14 + production hardening" 단계. iter 64 Phase α.1 시작 — test_page_manager link errors 4→3.
+
+  **iter 64 (2026-04-25) — Master Roadmap landed + Phase α.1 첫 fix LANDED ✅**:
+  - 신규 산출물: `docs/MASTER_ROADMAP.md` (~270 lines, vaisdb 종합 로드맵)
+    - 5 Phases: α (1 test pass) → β (5 tests + CLI demo) → γ (persistence + crash recovery) → δ (vector + RAG) → ε (production hardening)
+    - 6 Trust principles (runs → does what it says → survives surprises → honest → reproducible → scales → external user)
+    - 6 Process rules (demo-driven, README honesty, no phase skip, etc)
+    - Anti-goals 6 (features-before-tests, hide failures, marketing-before-β)
+  - **Phase α.1 첫 fix (compiler)**: `match_gen.rs` default arm null literal로 phi result type narrow integer phi인데 incoming "null" emit하던 버그 수정
+    - `phi_llvm_actual` detection (actual_llvm_type / temp_var_types) 추가
+    - resolved type LLVM rendering이 pointer일 때만 "null", 아니면 "0" 사용
+  - test_page_manager 진행: link errors **4 → 3** (freelist null fixed). cargo 796/796 ✅.
+  - 잔여 3 errors:
+    - `heap.ll:1273` ptr vs %HeapPageSlot value
+    - `test_page_manager.ll:828` phi i64 with i32 incoming  
+    - `vec.ll:913` %__value_ptr ptr vs i32 store
+  - max_iterations 70→100 확장 (Phase α/β를 위한 여유).
+  - 다음 iter: heap.ll dead_slot fix.
 
   **iter 63 (2026-04-25) — Wave 4a partial completed + memory landed**:
   - Task #12 (Wave 4a) marked completed: probe infra + 6 safe sites (Wave 4a.partial).
