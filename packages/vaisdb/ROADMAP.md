@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 59 Wave 4a void special-case + probe ctx LANDED ✅. 다음 iter: %tN long-tail 사이트 등록)
+mode: auto (iter 60 Wave 4a probe analysis. void 후 misses: PageHeader_deserialize 15 (Try op), BTree_*_from_page_data 7-8 each. 등록 site 식별 위해 IR 직접 검토 필요)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 59
+iteration: 60
 max_iterations: 70
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -45,6 +45,16 @@ max_iterations: 70
   iter_57_strategy: Opus direct, design-only doc (Wave 4). Wave 2d task #9 completed (25 sites total). Task #11 Wave 4 design 신설+landing. 4 deferred classes (A i32, B data-chain, C &self, D helper-IR) 분석 + sub-wave 4a-e plan.
   iter_58_strategy: Opus direct, Wave 4a 시작. probe infra (VAIS_GROUND_TRUTH_PROBE) + %ret.{N} long-tail 4 sites. max_iterations 60→70 확장.
   iter_59_strategy: Opus direct, Wave 4a void special-case + probe context. void miss는 가장 빈번한 false-positive (semantic miss-not-real-miss).
+  iter_60_strategy: Opus direct, Wave 4a probe analysis. Top miss 함수 식별 (PageHeader_deserialize 15, BTree*_from_page_data 7-8). 패턴 — `sext i32 ... to i64` result가 record_emitted_type 누락. 분석 노트만, 코드 변경 0.
+
+  **iter 60 (2026-04-25) — Wave 4a probe analysis (no code change)**:
+  - Probe data:
+    - test_btree.vais: Top 5 misses by function — PageHeader_deserialize (15), BTreeInternalNode_from_page_data (8), BTreeLeafNode_from_page_data (7), compress_keys_with_restarts (5), CompressedKey_deserialize (3)
+    - test_types.vais: 단일 테스트는 대부분 covered (5-10 misses), like_match_internal에 cluster
+  - Pattern 분석: `%t7 = sext i32 %checksum to i64` 같은 sext-to-i64 result가 record 누락. Wave 1 ptrtoint 처리는 됐지만 `byte_at()` / deserialize 경로의 sext는 별도 emit path.
+  - 식별된 emit path 후보 (TBD): byte_extract helpers in expr_helpers_call/print_format.rs (Wave 1c.3에서 이미 9개 처리)와 다른 곳. 추가 grep 분석으로 정확한 emit site 찾기 필요.
+  - Gate 영향 없음 (코드 변경 0). 누적 migrated **256 sites** 유지.
+  - 다음 iter: byte_at deserialize 경로의 sext emit site 추적 + 등록.
 
   **iter 59 (2026-04-25) — Wave 4a void special-case + probe ctx LANDED ✅**:
   - Compiler commit: `f6d102c1` — `types/coercion.rs` `llvm_type_of`:
