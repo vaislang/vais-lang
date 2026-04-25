@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 60 Wave 4a probe analysis. void 후 misses: PageHeader_deserialize 15 (Try op), BTree_*_from_page_data 7-8 each. 등록 site 식별 위해 IR 직접 검토 필요)
+mode: auto (iter 61 Wave 4a +2 cast/widen LANDED ✅. probe miss 156→97 (-37%). 다음 iter: 추가 long-tail 추적)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 60
+iteration: 61
 max_iterations: 70
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -46,6 +46,16 @@ max_iterations: 70
   iter_58_strategy: Opus direct, Wave 4a 시작. probe infra (VAIS_GROUND_TRUTH_PROBE) + %ret.{N} long-tail 4 sites. max_iterations 60→70 확장.
   iter_59_strategy: Opus direct, Wave 4a void special-case + probe context. void miss는 가장 빈번한 false-positive (semantic miss-not-real-miss).
   iter_60_strategy: Opus direct, Wave 4a probe analysis. Top miss 함수 식별 (PageHeader_deserialize 15, BTree*_from_page_data 7-8). 패턴 — `sext i32 ... to i64` result가 record_emitted_type 누락. 분석 노트만, 코드 변경 0.
+  iter_61_strategy: Opus direct, Wave 4a 추적 emit path. expr_helpers.rs binop sext widening + as-cast trunc/sext result.
+
+  **iter 61 (2026-04-25) — Wave 4a +2 cast/widen sites LANDED ✅ (probe miss 156→97 -37%)**:
+  - Compiler commit: `5a11bcf0` — expr_helpers.rs 2 sites
+    - L138 binop sext widening: `widened = sext i{rbits} ... to i64` → record "i64"
+    - L686 `as`-cast width coercion: trunc/sext result → record llvm_type dynamic
+  - Probe (test_btree): 156 raw misses → 97 (-37% reduction). void + cast 두 개 큰 source 처리.
+  - Gate 8-run avg **~21.75** vs baseline ~21.75 (exactly held). cargo 796/796 ✅. linked 0/15 held.
+  - 누적 migrated: **258 sites** (iter 58 4 + 60 0 + 61 2 = +6 since Wave 4a start).
+  - 다음 iter: 잔여 97 miss source 추적 (PageHeader_deserialize 등 deserialize 경로).
 
   **iter 60 (2026-04-25) — Wave 4a probe analysis (no code change)**:
   - Probe data:
