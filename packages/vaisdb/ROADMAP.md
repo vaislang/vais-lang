@@ -10,10 +10,10 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 61 Wave 4a +2 cast/widen LANDED ✅. probe miss 156→97 (-37%). 다음 iter: 추가 long-tail 추적)
+mode: auto (iter 62 Wave 4a coerce_int_width signature 시도 → +7 cascade revert. 다른 stdlib path 식별 (__load_i32 등). 코드 변경 0.)
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
-iteration: 61
+iteration: 62
 max_iterations: 70
   last_session: iter 24 NEGATIVE — i32↔i64 class investigation found exact bug (match arm body_val vs phi_type width mismatch at `Option_unwrap_or$i32`), applied catch-all int-width coerce in arm block. Specific fix verified but broke link completely (1/15 → 0/15, +34 errors). Reverted. compiler HEAD stays at 706645e8.
   iter_25_strategy: Opus direct, design-only. 3 연속 negative 이후 memory escalation 정책에 따라 단일-사이트 fix 금지. llvm_type_of ground-truth 리팩터 설계 문서 작성. 사용자 승인: "리팩터 설계 문서 작성 (Recommended)".
@@ -47,6 +47,18 @@ max_iterations: 70
   iter_59_strategy: Opus direct, Wave 4a void special-case + probe context. void miss는 가장 빈번한 false-positive (semantic miss-not-real-miss).
   iter_60_strategy: Opus direct, Wave 4a probe analysis. Top miss 함수 식별 (PageHeader_deserialize 15, BTree*_from_page_data 7-8). 패턴 — `sext i32 ... to i64` result가 record_emitted_type 누락. 분석 노트만, 코드 변경 0.
   iter_61_strategy: Opus direct, Wave 4a 추적 emit path. expr_helpers.rs binop sext widening + as-cast trunc/sext result.
+  iter_62_strategy: Opus direct, Wave 4a coerce_int_width 시도. signature `&self → &mut self` + record_emitted_type. cascade +7 revert. stdlib unknown call (`__load_i32`) miss path 발견.
+
+  **iter 62 (2026-04-25) — Wave 4a NEGATIVE — coerce_int_width signature change reverted**:
+  - 시도: `types/coercion.rs::coerce_int_width(&self → &mut self)` + `record_emitted_type(&tmp, target_ty)`
+  - 결과: cargo 796/796 ✅ but Gate 8-run avg **~28.75** vs baseline ~21.75 (**+7 cascade**)
+  - Revert. Wave 4a coerce path는 catch-all 의존성 강함 — Wave 4b/4c (catch-all 제거 후) 단계가 적합.
+  - **다른 식별된 miss path**:
+    - `__load_i32` 같은 stdlib unknown call — call return record가 user fn에만 적용됨, stdlib helper는 별도 path
+    - `read_vec_u32`/`read_vec_u64` body 내 `%t6 = call i64 @__load_i32(...)` 사이트 누락
+  - Gate 영향 없음 (revert). 누적 migrated **258 sites** 유지.
+  - **결론**: Wave 4a 코드 변경은 **점진적 등록 path만 안전**, coercion/struct 같은 cross-site interaction은 cascade. Wave 4 design doc Class A/B/C 중 C(`&self`)는 단순 signature 변경으로 안 됨 — 더 정교한 separation 필요.
+  - 다음 iter: 다른 안전한 path 찾기 또는 Wave 4 strategy 재설계.
 
   **iter 61 (2026-04-25) — Wave 4a +2 cast/widen sites LANDED ✅ (probe miss 156→97 -37%)**:
   - Compiler commit: `5a11bcf0` — expr_helpers.rs 2 sites
