@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: stopped (iter 65 Phase α.1 진행 중 layer-by-layer 노출 패턴 확인. compiler 4 fixes + vaisdb 4 source fixes. 매 fix가 다음 layer 표면화. 사용자 결정 필요: (a) Phase α.1 강행 (multi-session, deep compiler work 필요), (b) Phase 0 도입 — 컴파일러 selfhost 검증 먼저, (c) ROADMAP 재조정.)
+mode: PAUSED (iter 66, post-vais-v1.0). vaisdb 작업은 vais 컴파일러 Phase 0 v1.0 완료 후 재개. 진단: vais 언어 자체가 alpha 단계로 vaisdb 같은 대규모 dogfooding 코드 빌드에 부족. 작업 우선순위: compiler/docs/PHASE_0_LANGUAGE_STABILIZATION.md 참조.
 current_phase: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
 iteration: 65
