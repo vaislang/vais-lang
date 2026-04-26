@@ -26,17 +26,23 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
-### iter 80 strategy + 결과 (2026-04-26, P1.0a Draft 완료)
-- task: P1.0a — ADR 0002 Draft 작성 (P1.0 split, 0a Draft / 0b Accepted 전환)
-- strategy: Opus direct (design intent 고도)
-- 위험: 0 (doc-only)
-- 산출: compiler/docs/adr/0002-codegen-invariants.md (210 lines, 11KB)
-  - 4 클래스 invariant: ret (LANDED partial) / index-store (P1.1 대기) / call-arg (P1.4 대기) / var-to-llvm (NEW)
-  - R1+R2+R3 충족 매트릭스 (iter 80 baseline 표)
-  - 단계적 도입 plan (P1.0~P1.4, ~6주 multi-session)
-  - CLAUDE 규칙 8/11 연결, ADR 0001 의존
-  - Status: Draft → 다음 iter 사용자 승인 (P1.0b)
-- 다음 iter (81+): P1.0b — 사용자 review + Accepted 전환 + (옵션) ADR 0003 (integer-constant 클래스)
+### iter 80 strategy + 결과 (2026-04-26, P1.0a + P1.0b 모두 LANDED)
+- task: P1.0 (split 0a Draft + 0b Accepted) — ADR 0002 codegen invariant 4 클래스 + AI multi-session protocol
+- strategy: Opus direct (design intent 고도, "AI single-session에서 multi-session 전환을 안전하게 만드는 spec" 사용자 결정)
+- 위험: 0 (doc-only) → 다만 Self-Audit Checklist + Rollback Trigger 채택으로 P1.1+ 위험 임계값 명문화됨
+- 산출: compiler/docs/adr/0002-codegen-invariants.md (210 → 341 lines)
+  - **결정 절** (4 클래스 invariant): ret / index-store / call-arg / var-to-llvm
+    - 각 클래스 R3 audit이 **기계 검증 가능한 grep + iter 80 baseline 카운트**로 명시
+    - Class 1: 152 ret emit / Class 2: 160 GEP + 164 store / Class 3: 86 call + 334 register_temp_type / Class 4: 7 fallback + 53 Var/Unknown match
+  - **AI Multi-Session Protocol 절 (NEW)**:
+    - Self-Audit Checklist 9 항목 (R1+R2+R3 + verify-cargo/integrity/vaisdb + recon)
+    - AI Failure Mode Anti-Patterns 9건 (A1~A9, 모두 commit/iter trace)
+    - Iter Entry Point Spec yaml block (다음 iter 견고성)
+    - Rollback Trigger T1~T5 (T5 = Self-Audit NO 안전망)
+  - 단계적 도입 plan (P1.0~P1.4, ~6주)
+  - CLAUDE 규칙 8 강화: ADR 0002 4 클래스 분류 + Self-Audit LANDED 게이트
+  - Status: Accepted (사용자 명시 승인 "너 제안대로 계속 가줘")
+- 다음 iter (81+): Pillar 1 본격 시작 후보 — P1.1 (index test ≥10 case, iter 83) 또는 P1.2 (TC Var unify, iter 84~88, 위험 8/10) 또는 P4.2 (memory 정합성 검증)
 
 ### iter 76~79 세션 종료 (2026-04-26)
 - 사용자 결정: 4 iter 누적 + Pillar 2 wave 1 LANDED → 세션 종료. 다음 세션 iter 80+ 진입
@@ -268,11 +274,12 @@ exit_audit:
 ### Pillar 1.0 — invariant 명세 (iter 80~82, 1주, 위험 0)
 - [x] P1.0a. ADR 0002 Draft 작성 ✅ 2026-04-26 (iter 80, Opus direct)
   changes: compiler/docs/adr/0002-codegen-invariants.md (210 lines) — 4 클래스 명세 (ret/index-store/call-arg/var-to-llvm), R1+R2+R3 충족 매트릭스, 단계적 도입 plan (P1.0→P1.4 ~6주), CLAUDE 규칙 8/11 연결. Status: Draft
-- [ ] P1.0b. ADR 0002 사용자 승인 + Accepted 전환 [iter 81+ 대기]
-  - 사용자 review → 피드백 반영 → Status Draft→Accepted
-  - (옵션) ADR 0003 신설 (integer-constant / undefined fn 클래스, iter 78 baseline에서 발견)
-  - CLAUDE.md 규칙 8 강화 (4 클래스 분류 의무 명시)
-- [ ] P1.0. codegen 4 클래스 invariant 문서화 [legacy entry — P1.0a/0b로 split]
+- [x] P1.0b. ADR 0002 Accepted + AI multi-session protocol 흡수 ✅ 2026-04-26 (iter 80, Opus direct, 사용자 명시 승인)
+  changes:
+    - compiler/docs/adr/0002-codegen-invariants.md 210 → 341 lines. 5 강화 흡수: (1) 각 클래스 R3 grep+baseline (Class1=152 ret / Class2=160 GEP+164 store / Class3=86 call+334 register / Class4=7 fallback+53 match) (2) Self-Audit Checklist 9 항목 (3) AI Failure Mode Anti-Patterns 9건 (A1~A9, 모두 commit/iter trace) (4) Iter Entry Point Spec yaml block (5) Rollback Trigger T1~T5 (T5 = Self-Audit NO 안전망)
+    - compiler/CLAUDE.md 규칙 8: ADR 0002 4 클래스 분류 + Self-Audit Checklist LANDED 게이트 명시
+    - Status: Draft → Accepted (사용자 명시 승인 "너 제안대로 계속 가줘")
+- [x] P1.0. codegen 4 클래스 invariant 문서화 ✅ 2026-04-26 (iter 80, P1.0a + P1.0b 모두 LANDED)
   - 위치: `compiler/docs/adr/0002-codegen-invariants.md` (신규)
   - 4 클래스:
     1. ret elem-ty: 이미 ADR 0001 §1 R1 (iter 74 LANDED)
