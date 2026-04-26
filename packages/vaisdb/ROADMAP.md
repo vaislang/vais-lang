@@ -26,6 +26,33 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 94~98 세션 종료 (2026-04-26, 자동진행 4 iter / 4 task LANDED, P1.3 3/4 진행)
+- 사용자 결정: "이어서 진행해줘" → mode=auto 자동진행
+- 종료 사유: iteration cap 99/100 (1 iter 여유) + Path 3 (compound assign) cascade 위험 7-8/10 multi-session 의무
+- 본 세션 commits (총 6 = compiler 4 + lang 4):
+  - compiler: `fa61c444` (iter 95 ADR 적용 범위) / `d837ecfb` (iter 97 P1.3 helper+Path 1) / `8629da3d` (iter 98 P1.3 Path 2)
+  - lang: `bb4cccf` `27a6d03` `45dae1f` `781ce59` (iter 95~98 ROADMAP)
+- LANDED task (4개):
+  - **iter 95**: ADR 0001 적용 범위 절 추가 (P4.1 백로그 1번, doc-only)
+  - **iter 96**: P1.3 recon 1/4 (4 path 정확 위치 + helper 시그니처 명문화)
+  - **iter 97**: P1.3 helper 신설 + Path 1 migration 2/4
+  - **iter 98**: P1.3 Path 2 migration 3/4
+- 신설: `crates/vais-codegen/src/index_access.rs` (210 LOC, 7 unit tests)
+- 다음 세션 entry 권고:
+  - **A. P1.3 Path 3 (compound assign) migration** (위험 7-8/10) — iter 74 stash@{0} 영역, cascade 위험 multi-session
+    - stash@{0} `phaseO_compound_assign_fix` 적용 + 검증
+    - vaisdb -3 regression 패턴 회피 의무
+  - **B. P1.3 Path 4 (inkwell) migration** (위험 5/10) — backend 차이, Path 3 후 진행
+  - **C. P1.4 Type-Tagged IR Builder 도입** (위험 9/10) — Pillar 1 최종 단계
+- 다음 세션 prerequisite (ADR 0002 Iter Entry Spec):
+  - cargo test --workspace --exclude bindings ≥ 12422 (iter 90 baseline)
+  - cargo test -p vais-codegen ≥ 1776 (iter 97 baseline)
+  - vaisdb-regression --all ≤ 8 (iter 92 baseline)
+  - 단독 vaisdb tests (test_btree=2, test_wal=1, test_buffer_pool=1, test_graph=1, test_migration=3)
+  - vais-server-regression --all = 2
+  - vais-web-regression cargo test = 271/0
+- ROADMAP `mode: auto`, iteration: 99, max_iterations: 100 — **재진입 시 max_iterations 갱신 필수** (iter 100 도달 시 사용자 escalation)
+
 ### iter 88~93 세션 종료 (2026-04-26, 자동진행 6 iter / P1.2 multi-session 완료)
 - 사용자 결정: "이어서 진행해줘" 후속 → mode=auto 자동진행
 - 종료 사유: P1.3 (위험 9/10, codegen indexing 4-path 통합) Pillar 1 본격 진입은 multi-session 의무 (위험 회피 원칙 4)
