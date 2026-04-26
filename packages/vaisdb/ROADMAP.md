@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 106
+iteration: 107
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,33 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 107 LANDED (2026-04-27, P1.4 첫 production migration — stmt_visitor.rs:708)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (P1.4 multi-session, 위험 5/10 — 단일 사이트, byte-for-byte IR 동일성 보장)
+- 산출물:
+  - `compiler/crates/vais-codegen/src/stmt_visitor.rs:708` 마이그레이션:
+    - 기존: `format!("%ret.cast.{}", counter)` + `*counter += 1` + `write_ir!(ir, "  {} = bitcast ... to {}*", ...)` (ADR 0002 Class 1 omission: register_emitted_type 누락)
+    - 신규: `TypedEmitter::new(&mut ir, &mut self.fn_ctx, counter).emit_bitcast_with_prefix("ret.cast.", LlvmType::from(...), &val, LlvmType::from(format!("{}*", llvm_ty)))`
+    - **byte-for-byte IR 동일** (counter prefix 보존 + format 동일)
+    - **추가 효과**: cast SSA에 `record_emitted_type` 자동 호출 (이전 누락 → 자동화)
+  - `emit_typed.rs`: dead_code allow 주석 갱신 (iter 107 첫 production caller 기록)
+- 검증:
+  - cargo test -p vais-codegen --lib: **823 passed / 0 failed** (iter 106 baseline 유지)
+  - cargo build --release: 30s OK
+  - **check-integrity: vaisdb 222/261** — iter 105/106 baseline 220~221 대비 **+2** (clean baseline 220 + 2)
+- 🎯 **Phase Ω P1.4 첫 production impact 후보 (iter 107)**:
+  - vaisdb 220/261 → 222/261 (+2)
+  - **가설**: cast result에 `record_emitted_type` 자동 호출이 추가되어 downstream consumer가 i64 fallback 대신 정확한 LLVM 타입 획득 → 1~2 .vais 파일 빌드 성공 전환
+  - **검증 필요 (iter 108)**: 같은 빌드 2~3회 재측정으로 flaky vs improvement 구분
+  - 만약 222 안정적이면 P1.2 (test_graph 2→1) 이후 P1.4 첫 production impact
+- iter 107 산출물:
+  - compiler 1 commit `3d597f81`: stmt_visitor.rs migration + emit_typed.rs allow comment 갱신 (+24/-15 = 9 LOC 실 코드)
+  - lang 1 commit: 본 ROADMAP iter 107 LANDED
+- 다음 iter 108 entry:
+  - **A. iter 107 production impact 검증** — vaisdb 222 안정성 측정 (build 2~3회 + 220/221/222 분포 기록). 위험 1/10.
+  - **B. stmt_visitor.rs:723 load 마이그레이션** — emit_load_with_prefix("ret.", ...) 후속. 위험 4/10.
+  - **C. R2 차단 테스트 추가** (ADR 0002 의무) — `record_emitted_type` 누락 시 fail. ret_invariant_test.rs 신규 또는 기존 보강.
 
 ### iter 106 LANDED (2026-04-27, P1.4 emit_bitcast/load/store + TypeRegistrar bridge)
 - 사용자 결정: "이어서 진행해줘" (iter 105 직후, mode=auto 유지)
