@@ -15,14 +15,16 @@ iteration: 74
 max_iterations: 100
 current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invariant 1개 사이트 적용 (2026-04-26)
 
-**iter 74 완료 산출물 (6 compiler commits + 1 vaisdb commit)**:
+**iter 74 완료 산출물 (7 compiler commits + 2 vaisdb commits)**:
 - compiler `c683bd42` — docs(policy): Phase Ω Pillar 3+2 (CLAUDE 규칙 8~12 + ADR 0001 + vaisdb regression CI)
 - compiler `7cfc5caf` — fix(codegen): Mini Pillar 1 coerce_ret_value 단일 coerce point
 - compiler `1b99766c` — test(codegen): ret_invariant_test 5개 (ADR R2 차단 테스트)
 - compiler `c0d5bd31` — refactor(codegen): expr-body ret → coerce_ret_value
 - compiler `628674ec` — refactor(codegen): stmt.rs ret → coerce_ret_value + case 4/5 gating
 - compiler `2ab0a421` — refactor(codegen): Block path else-fallback ret → coerce_ret_value
+- compiler `041685e6` — fix(codegen): structural call-arg Vec*→fat-ptr guard (옵션 B 부분)
 - vais-lang `b490e0d` — docs(vaisdb): iter 74 entry
+- vais-lang `a090f7c` — docs(vaisdb): iter 74 Phase Ω session complete
 
 **vaisdb Task #6 RESOLVED ✅** (node.ll:1736)
 - ret 클래스 invariant 4 사이트 적용 (~85% vaisdb 사용자 코드 ret)
@@ -31,9 +33,11 @@ current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invaria
 - regression baseline: 2 errors → 2 errors (1 resolved, 1 newly exposed call-arg class)
 
 **잔여 (다음 세션 대상)**:
-- node.ll:1848 — call-arg coercion 클래스 (옵션 B, recon 완료 — Vec→slice deref coercion 부재)
-- key.ll:1128 — Task #7, slice indexing emit (별도 클래스)
+- node.ll:1848 — **진짜 근본 식별**: expr_helpers_data.rs Vec<Vec<u8>> indexing path가 element를 i64로 erase. 옵션 B method_call guard만으로 해결 불가. expr_helpers_data.rs Vec indexing path (line 571-677) 수정 필요.
+- key.ll:1128 — Task #7, slice indexing emit (같은 클래스: indexing path elem_type)
 - Block path C/D/F branches — 각자 다른 invariant 분석 필요
+
+**중요 발견**: node.ll:1848과 key.ll:1128은 **같은 클래스** — 둘 다 Vec/slice indexing path의 element type erasure 문제. 다음 세션은 이 indexing path 한 곳 수정으로 두 errors 동시 해결 가능성.
 
 **상세 인계**:
 - `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_mini_pillar1_first_iter_2026-04-26.md`
