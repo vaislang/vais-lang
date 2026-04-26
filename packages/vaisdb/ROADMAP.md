@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 77
+iteration: 78
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,21 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 78 strategy + 결과 (2026-04-26, P2.2b 완료)
+- task: P2.2b — vaisdb wave 1 standalone build + baseline 측정
+- 본 세션 scope: 전반부만 (build 5회 + clang error 카운트 + 클래스 분류). script/workflow는 P2.2c/P2.2d로 분리
+- strategy: Opus direct (mechanical 5-step build, feedback_delegation memory 따름)
+- 산출:
+  - 5 build all 0 errors at vaisc level (TC pass), but **link 단계에서 32 clang errors**
+  - test_wal: 1 error (call-arg slice coerce miss, node.ll:1848과 동일 클래스 fire)
+  - test_buffer_pool: 1 error (ptr vs i64)
+  - test_migration: 3 errors (GEP unsized × 2 + Result ptr coerce × 1)
+  - test_planner_types: **25 errors** (transitive dependency 폭증, 9 클래스)
+  - test_graph: 2 errors (i64 vs ptr + slice vs ptr)
+- **검증 의문 결론**: iter 77 recon false-negative 확정 — research-haiku의 "0 generic struct + 0 cascade signal" 분류는 import만 봤기 때문. transitive dependency가 cascade 위험의 진짜 원천. 다음 wave 분류는 standalone build 1회 cross-check 의무화
+- **wave 1 재정의**: 4-test (test_wal/buffer_pool/graph/migration, 합계 7 errors), test_planner_types는 wave 2 defer
+- 다음 iter (79): P2.2c (script 확장) + P2.2d (workflow 갱신)
 
 ### iter 76+77 세션 종료 (2026-04-26)
 - 사용자 결정: multi-session 의무 (위험 회피 원칙 4) 준수 → 세션 종료
@@ -170,8 +185,27 @@ exit_audit:
   - 산출: CI가 진짜 차단력 있는지 검증
   - 완료 기준: 의도적 regression 추가 시 CI fail, fix 시 CI pass
 
-### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 77~78, 2일, 위험 2/10)
-- [ ] P2.2. test_btree 외 vaisdb 테스트 추가 등록 [iter 77 recon 완료, iter 78 wiring 대기]
+### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 77~78~79, 2~3일, 위험 2/10)
+- [x] P2.2a. wave 1 recon (iter 77, 2026-04-26) ✅ — 5 후보 선정 완료 (commit 72df1cf)
+- [ ] P2.2b. wave 1 standalone build + baseline 측정 [iter 78 진행 중, build 완료]
+  - **baseline (iter 78, 2026-04-26 실측)** — recon "0 generic struct" 분류 false-negative 확정
+    | # | test | LOC | IR files | clang errors | 주요 클래스 |
+    |---|------|----:|---:|---:|---|
+    | 1 | tests/storage/test_wal.vais | 219 | 19 | 1 | call-arg slice coerce miss (test_wal.ll:787) |
+    | 2 | tests/storage/test_buffer_pool.vais | 223 | 10 | 1 | ptr vs i64 (frame.ll:759) |
+    | 3 | tests/sql/test_migration.vais | 332 | 5 | 3 | GEP unsized × 2 + Result ptr coerce × 1 |
+    | 4 | tests/planner/test_planner_types.vais | 499 | 57 | 25 | slice coerce × 9 + ptr↔i64 × 4 + integer-constant × 5 + undefined @to_vec × 1 + i32↔i64 × 3 + 기타 × 3 |
+    | 5 | tests/graph/test_graph.vais | 558 | 15 | 2 | i64 vs ptr + slice vs ptr |
+    | **합계** | | | **106** | **32** | |
+  - **검증 의문 결론**: iter 77 recon이 "0 generic struct + 0 cascade signal" 분류했지만 실제 빌드는 32 errors. test_planner_types 25 errors가 가장 큰 false-negative — recon이 import만 보고 transitive dependency 측정 못 함. **권고**: 다음 wave 분류는 standalone build 1회로 cross-check 의무화
+  - **wave 1 분류 재정의** (build 결과 기반, baseline 정렬):
+    - **wave 1-clean (cascade-low 검증된 1~3 error 그룹)**: test_wal (1), test_buffer_pool (1), test_graph (2) — 합계 4 errors, 4 클래스
+    - **wave 1-medium (3 errors)**: test_migration (GEP unsized 클래스 신규)
+    - **wave 1-defer (25 errors, transitive 폭증)**: test_planner_types — wave 2로 미루는 것이 안전
+- [ ] P2.2c. compiler/scripts/vaisdb-regression.sh 확장 [iter 79 대기]
+  - 4 후보 (test_wal/buffer_pool/graph/migration)만 등록, planner_types는 wave 2로 defer
+  - per-test KNOWN_FAILURE_COUNT (각 1/1/2/3) 또는 합산 baseline (7) 결정 필요
+- [ ] P2.2d. compiler/.github/workflows/vaisdb-regression.yml `--all` 구현 [iter 79 대기]
   - **recon 결과 (iter 77, 2026-04-26, research-haiku)**: 14 후보 중 cascade-low 5개 선정
     | # | file | LOC | rationale |
     |---|------|----:|---|
