@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 103
+iteration: 104
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,44 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 104 진행 중 (2026-04-26, P1.4 Stage A recon-only)
+- 사용자 결정: "전체 자동 진행" (mode=auto)
+- strategy: P1.4 위험 9/10 + multi-session 의무 → Opus direct + recon-only iter (0 LOC 변경, git revert 단위 = 본 ROADMAP 항목)
+- opus_direct: design-impl inseparable — Type-Tagged IR Builder API 설계는 763 사이트 분류 정확성에 의존 (skill-config criteria)
+- 정확한 산발 사이트 카운트 (현 시점 실측, memory historical 값 정정):
+  - **register_temp_type**: 46건 (memory 329건 — 7.1배 historical 과대, P1.3 helper로 일부 흡수 가능성)
+  - **record_emitted_type**: 289건 (별 트랙, P1.4 흡수 대상 진짜 핫스팟)
+  - **if-coerce 분기 (`if X_ty != Y_ty` 패턴)**: 5건 (memory 165건 — 33배 historical 과대, P1.3 P1.2 LANDED 후 잔존)
+    - generate_expr_call.rs:745 (call ret val_ty == "i64")
+    - generate_expr_call.rs:813, 834 (call arg val_ty != arg_ty)
+    - stmt_visitor.rs:708 (assign LHS base_ptr_ty != expected_ptr_ty)
+    - stmt_visitor.rs:746 (assign RHS val_llvm_ty != llvm_ty)
+  - **coerce_* 함수 호출**: 16건 (P1.3 helper 흡수 후 결과)
+  - **bitcast IR emit (text)**: 78건 (memory 77 거의 일치)
+  - **sext/zext/trunc IR emit (text)**: 101건
+  - **inttoptr/ptrtoint IR emit (text)**: 211건 (generate_expr_call.rs:49 + function_gen/runtime.rs:41 = 90건/43%, spawn/builtin pointer-as-i64 컨벤션)
+  - **insertvalue IR emit**: 57건 (memory 53 근접)
+  - **call IR emit (text)**: 106건 (P1.4 typed `emit_call` 진짜 흡수 대상)
+  - **load**: 196건, **store**: 150건, **GEP**: 188건
+- 백엔드 분리 발견:
+  - text codegen src LOC: 51,994 (P1.4 흡수 대상)
+  - inkwell codegen src LOC: 13,593 (별도 추상, write_ir!=0건, 별 sub-track 필요)
+- recon 결론:
+  1. memory의 "763 산발 사이트" 추정은 **historical 합산값** — 현재는 P1.2/P1.3로 일부 자동 흡수됨
+  2. P1.4의 진짜 흡수 대상 (현 baseline 기준):
+     - **A. 5건 if-coerce 분기 + 16건 coerce_* 호출** = 21건 (Class 1+3 ret/call-arg coerce)
+     - **B. 289건 record_emitted_type 호출** = LLVM ground-truth 트랙 (자동화로 흡수)
+     - **C. 78건 bitcast + 101건 sext/zext/trunc + 211건 inttoptr/ptrtoint = 390건 type cast IR emit** (typed wrapper로 분류)
+     - **D. 106건 call IR emit + 57건 insertvalue + 188건 GEP + 196건 load + 150건 store = 697건 IR emit** (typed builder API 대체)
+  3. 슬라이싱 전략 (multi-session, iter 105~):
+     - **iter 105 (위험 5/10)**: typed wrapper API 설계 + emit.rs 신규 module 신설 (0 사이트 마이그레이션, API 정의만)
+     - **iter 106~108 (위험 5/10 each)**: 5건 if-coerce 분기 + 16건 coerce_* 호출 마이그레이션 (Class 1/3 차단 테스트 4건과 호환 검증)
+     - **iter 109~115 (위험 7/10 each)**: 290건 record_emitted_type 자동화 (typed wrapper 도입 시 자동 호출)
+     - **iter 116~125 (위험 9/10 each)**: 697건 IR emit 마이그레이션 (5~7 사이트/iter, R2 차단 테스트 추가 의무)
+     - 추정 총 iter: 20~25 (147 iter 여유 충분)
+- iter 104 산출물: ROADMAP recon log only (compiler 0 commits, lang 1 commit 본 ROADMAP)
+- 다음 iter 105 entry: typed wrapper API 설계 — `emit_call(ret: TypedTemp, fn: &str, args: &[(LlvmType, Value)]) -> TypedTemp` 시그니처 확정 + emit.rs neue module skeleton
 
 ### iter 99~103 세션 종료 (2026-04-26, 자동진행 5 iter / 🎉 Path 3 stash 안전 통합 + 4 R2 tests enable)
 - 사용자 결정: max_iterations 100→150 갱신 + "이어서 진행해줘 잘"
