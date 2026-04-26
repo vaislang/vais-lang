@@ -26,6 +26,33 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 88~93 세션 종료 (2026-04-26, 자동진행 6 iter / P1.2 multi-session 완료)
+- 사용자 결정: "이어서 진행해줘" 후속 → mode=auto 자동진행
+- 종료 사유: P1.3 (위험 9/10, codegen indexing 4-path 통합) Pillar 1 본격 진입은 multi-session 의무 (위험 회피 원칙 4)
+- 본 세션 commits (총 6 = compiler 4 + lang 6):
+  - compiler: `7fcdd285` (iter 90 Vec.push) / `27f6b260` (iter 91 HashMap.insert R3) / `2359906d` (iter 92 baseline)
+  - lang: `3524849` `fe0891f` `9bdd055` `f0ffdce` `2952f3a` (iter 89~93 ROADMAP)
+- LANDED task (1개 multi-session, 5 iter):
+  - **iter 89**: P1.2 recon 1/5 (root cause 정확 식별: builtin dispatch 미흐름)
+  - **iter 90**: P1.2 first fix 2/5 (Vec.push, vaisc check OK / clang link / run exit 0)
+  - **iter 91**: P1.2 R3 audit fix 3/5 (HashMap.insert update_var_type)
+  - **iter 92**: P1.2 baseline IMPROVEMENT 4/5 (test_graph 2 → 1, 첫 production impact)
+  - **iter 93**: P1.2 task 종료 5/5 (cargo test 11856/17 confirmed)
+- **첫 Phase Ω production impact 측정 성공**:
+  - vaisdb-regression --all 합계 9 → 8 (test_graph 1 site 해소)
+  - WAVE1_BASELINES 갱신: (2 1 1 2 3) → (2 1 1 1 3)
+- 다음 세션 entry 권고:
+  - **A. P1.3 codegen indexing 4-path 통합** (iter 89~93 estimated, 위험 9/10, multi-session) — Pillar 1.3 본격 진입
+  - **B. BTreeMap/IndexMap/StrHashMap audit** (위험 1/10, mechanical) — P1.2 R3 잔여
+  - **C. vais-server-regression PR 트리거** (위험 1/10) — Pillar 2.1 P2.1 잔여
+- 다음 세션 prerequisite (ADR 0002 Iter Entry Spec):
+  - cargo test --workspace --exclude bindings ≥ 12422 (iter 90 baseline)
+  - vaisdb-regression --all ≤ 8 (iter 92 신규 baseline, --all flaky)
+  - 단독 vaisdb tests baseline (test_btree=2, test_wal=1, test_buffer_pool=1, test_graph=1, test_migration=3)
+  - vais-server-regression --all = 2
+  - vais-web-regression cargo test = 271/0
+- ROADMAP `mode: auto`, iteration: 94, max_iterations: 100 (재진입 시 95로 +1, 6 iter 여유)
+
 ### iter 81~87 세션 종료 (2026-04-26, 자동진행 7 iter / 8 task LANDED)
 - 사용자 결정: "이어서 진행해줘 완료될때까지" → mode=auto 자동진행
 - 종료 사유: P1.2 (위험 8/10) + Pillar 1.x cascade 위험은 multi-session 의무 (위험 회피 원칙 4) → 본 세션 범위 외
