@@ -26,6 +26,33 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 81~87 세션 종료 (2026-04-26, 자동진행 7 iter / 8 task LANDED)
+- 사용자 결정: "이어서 진행해줘 완료될때까지" → mode=auto 자동진행
+- 종료 사유: P1.2 (위험 8/10) + Pillar 1.x cascade 위험은 multi-session 의무 (위험 회피 원칙 4) → 본 세션 범위 외
+- 본 세션 commits (총 11 = compiler 6 + lang 7):
+  - compiler: `d0a4c89a` (std E009) / `452fd066` (P4.1 ADR retro) / `47a0130e` (P4.3 의무화) / `604b2a1b` (P1.1 test) / `ac73e413` (P2.3 wave 1) / `3d4a19f0` (P2.3 wave 2)
+  - lang: `8ccfa81` `5546054` `4504303` `702f52a` `cb4f625` `ddf338e` `680381b` `9061e89`
+- LANDED task (8개):
+  - **iter 81**: P4.2 memory 정합성 검증 (iter 80 R3 baseline 7/7 정확 확증, 발견 5건)
+  - **iter 82**: #28 std E009 immutable assignment fix (38 std 파일, std PASS 44→82)
+  - **iter 83**: P4.1 ADR 0001 retrospective (Status sustained, 87% adoption)
+  - **iter 84**: P4.3 iter retrospective 의무화 (ADR 0002 정책 명문화)
+  - **iter 85**: P1.1 index_invariant_test 5→10 case (vaisdb 패턴 cover)
+  - **iter 86**: P2.3 wave 1 vais-server 통합 (2-test, baseline 2)
+  - **iter 87**: P2.3 wave 2 vais-web 통합 (cargo test 271/0)
+- **Pillar 2 wave 1 완성**: vaisdb (5-test) + vais-server (2-test) + vais-web (workspace)
+- 다음 세션 entry 권고:
+  - **A. P1.2 TC inference Var 해소** (iter 84~88 estimated, 위험 8/10, multi-session 의무) — Pillar 1 본격 진입
+  - **B. P2.3 server/web 추가 cascade testing** (실제 PR로 트리거 검증, 위험 1/10)
+  - **C. ADR 0003 신설** (P4.1 retro 백로그, "적용 범위" 절 추가, 위험 0)
+- 다음 세션 prerequisite (ADR 0002 Iter Entry Spec):
+  - cargo test --workspace --exclude bindings ≥ 5900 (iter 81 추정)
+  - check-integrity std=82/82 ✅ vaisdb=219~224 (flaky range)
+  - vaisdb-regression --all 합계 ≤ 9 (단독), 8 (--all flaky)
+  - vais-server-regression --all 합계 = 2
+  - vais-web-regression cargo test = 271/0
+- ROADMAP `mode: auto`, iteration: 88, max_iterations: 100 (재진입 시 89로 +1, 12 iter 여유)
+
 ### iter 81 세션 종료 (2026-04-26, P4.2 audit + 발견 5건)
 - 사용자 결정: P4.2가 큰 audit 결과 산출 → 별도 iter에서 발견 정리 (위험 회피 원칙 4: multi-session 의무)
 - 본 세션 commits (lang 1):
