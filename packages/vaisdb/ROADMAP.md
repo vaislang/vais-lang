@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 110
+iteration: 111
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,35 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 111 LANDED (2026-04-27, P1.4 R2 차단 테스트 — ADR 0002 의무 충족)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, tests-only iter, production code 0 변경)
+- 산출물:
+  - `compiler/crates/vais-codegen/tests/ret_invariant_test.rs` +214 LOC, 3 신규 테스트
+    - `ret_cast_migration_uses_legacy_prefix_format` — `%ret.cast.{N}` SSA 이름 보존 검증
+    - `ret_cast_is_immediately_followed_by_typed_load` — cast → load 페어링 검증
+    - `ret_cast_dst_type_is_pointer_to_specialized_form` — `%Result$T1$T2*` 형식 검증 (monomorphization loss 차단)
+  - 추가 helper: `find_ret_cast_bitcasts` (local to test file)
+- 검증:
+  - cargo test -p vais-codegen --test ret_invariant_test: **8 passed / 0 failed** (5 baseline + 3 신규)
+  - cargo test -p vais-codegen --lib: **823 passed / 0 failed** (regression 0)
+  - cargo clippy: ret_invariant_test 관련 0 warnings
+  - production code 0 변경 → check-integrity baseline 221/261 deterministic 보존 (구조적 보장)
+- 효과:
+  - **ADR 0002 R2 의무 충족** (iter 107 ret-cast 사이트 invariant 차단 테스트)
+  - **CLAUDE 규칙 8 준수** (Class 1 ret elem-ty invariant 명시)
+  - 이 테스트는 iter 107 마이그레이션 자체의 회귀를 차단 (예: `%ret.cast.{N}` → `%t{N}` 변경, dst type non-specialized 등)
+- 이 테스트가 차단하지 않는 것:
+  - iter 110 같은 production impact 회귀 (variance 재발) — 이는 IR invariant가 아닌 cross-module type info 흐름의 문제. 별도 메커니즘 필요 (예: 사전 3-run baseline 측정 자동화).
+  - 다른 사이트의 마이그레이션 (4 if-coerce 잔여) — 각 사이트마다 별도 R2 테스트 추가 의무 (iter 112+).
+- iter 111 산출물:
+  - compiler 1 commit `4ab1597d`: ret_invariant_test.rs +214 LOC
+  - lang 1 commit: 본 ROADMAP iter 111 LANDED
+- 다음 iter 112 entry:
+  - **A. iter 110 가설 심화 분석** (위험 1/10) — load 마이그레이션의 +variance 메커니즘 specific 측정. 어떤 .vais 파일이 +/- 전환되는지 .ll diff로 확인. iter 113+ "load 결과 타입 분류" 신규 sub-task 결정 데이터.
+  - **B. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 6/10) — call ret coerce site, val_ty == "i64" branch. iter 110 학습 의무: 사이트별 3-run 측정 후 결정.
+  - **C. emit_typed.rs allow(dead_code) 일부 제거** (위험 1/10) — 이미 production caller가 있는 항목 (LlvmType, TypedTemp, TypedEmitter, emit_bitcast_with_prefix)은 dead_code 제외. emit_load_with_prefix 등 미사용 항목만 allow 유지.
 
 ### iter 110 REVERTED (2026-04-27, P1.4 ret-load migration regression — variance 재발)
 - 사용자 결정: "이어서 진행해줘"
