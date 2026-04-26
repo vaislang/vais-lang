@@ -15,20 +15,29 @@ iteration: 74
 max_iterations: 100
 current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invariant 1개 사이트 적용 (2026-04-26)
 
-**iter 74 완료 산출물 (3 commits)**:
+**iter 74 완료 산출물 (6 compiler commits + 1 vaisdb commit)**:
 - compiler `c683bd42` — docs(policy): Phase Ω Pillar 3+2 (CLAUDE 규칙 8~12 + ADR 0001 + vaisdb regression CI)
 - compiler `7cfc5caf` — fix(codegen): Mini Pillar 1 coerce_ret_value 단일 coerce point
-- vaisdb 본 ROADMAP iter 74 entry (이 commit)
+- compiler `1b99766c` — test(codegen): ret_invariant_test 5개 (ADR R2 차단 테스트)
+- compiler `c0d5bd31` — refactor(codegen): expr-body ret → coerce_ret_value
+- compiler `628674ec` — refactor(codegen): stmt.rs ret → coerce_ret_value + case 4/5 gating
+- compiler `2ab0a421` — refactor(codegen): Block path else-fallback ret → coerce_ret_value
+- vais-lang `b490e0d` — docs(vaisdb): iter 74 entry
 
 **vaisdb Task #6 RESOLVED ✅** (node.ll:1736)
-- ret 클래스 invariant 1개 사이트 적용 → Vec→fat-ptr 정상 emit
-- 검증: cargo 796/796 ✅, regression 2→2 (1 resolved + 1 newly exposed call-arg class)
+- ret 클래스 invariant 4 사이트 적용 (~85% vaisdb 사용자 코드 ret)
+- coerce_ret_value 5 케이스 처리: int width / float width / Vec→fat-ptr / i64→fat-ptr (gated) / i64→struct (gated)
+- 검증: cargo 796/796 + 21 integration suite + 5 ret_invariant 모두 ✅
+- regression baseline: 2 errors → 2 errors (1 resolved, 1 newly exposed call-arg class)
 
-**잔여 (다음 iter 대상)**:
-- node.ll:1848 — 신규 노출, call-arg coercion 클래스 (별도 invariant 필요)
-- key.ll:1128 — Task #7 미해결, slice indexing emit (별도 클래스)
+**잔여 (다음 세션 대상)**:
+- node.ll:1848 — call-arg coercion 클래스 (옵션 B, recon 완료 — Vec→slice deref coercion 부재)
+- key.ll:1128 — Task #7, slice indexing emit (별도 클래스)
+- Block path C/D/F branches — 각자 다른 invariant 분석 필요
 
-**상세 인계**: `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_mini_pillar1_first_iter_2026-04-26.md`
+**상세 인계**:
+- `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_mini_pillar1_first_iter_2026-04-26.md`
+- `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_options_C_A_extended_2026-04-26.md`
 
 **iter 74 (2026-04-26) — recon completed + 메타 분석 LANDED**:
 - Task #1 recon ✅ 완료. emit path 정확히 식별 (memory `vaisdb_iter74_recon_2026-04-26.md`):
