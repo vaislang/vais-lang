@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 107
+iteration: 108
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,32 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 108 LANDED (2026-04-27, P1.4 baseline 안정성 검증 + 측정 결론)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, 측정-only iter 0 LOC 변경)
+- 산출물:
+  - **vaisdb 안정성 측정**: check-integrity 3회 연속 측정
+    - run 1: vaisdb 221/261
+    - run 2: vaisdb 221/261
+    - run 3: vaisdb 221/261
+    - 3/3 동일 → **본 git tree의 결정적 baseline = 221/261**
+- 결론:
+  - iter 107 첫 측정 222는 flaky outlier (재현 안 됨)
+  - iter 105/106의 220 측정은 측정 시점 특이값 가능성 (단일 측정만 보유)
+  - **net production impact**: iter 105 stash clean 빌드(220)도 단일 측정이라 결정적 비교 불가. 본 git tree 결정적 = 221
+  - **vaisdb regression CI baseline 신규 lock**: 221/261 (Pillar 2 wave 1 prerequisite 갱신)
+- iter 108 산출물:
+  - compiler 0 commits (측정-only)
+  - lang 1 commit: 본 ROADMAP iter 108 LANDED
+- 다음 iter 109 entry:
+  - **A. iter 105 stash clean 빌드 3회 재측정** (위험 1/10) — 220 vs 221 결정적 차이 검증. P1.4 production impact를 결정적으로 수립할 데이터 확보.
+    - 절차: emit_typed.rs + lib.rs/stmt_visitor.rs 변경분 stash → release rebuild → check-integrity 3회 → stash pop → 보고
+  - **B. stmt_visitor.rs:723 load 마이그레이션** (위험 4/10) — emit_load_with_prefix 적용. iter 107 ret-cast와 같은 site에 이어진 패턴.
+  - **C. R2 차단 테스트 추가** (ADR 0002 의무) — `record_emitted_type` 누락 검출 invariant test.
+- baseline lock 갱신:
+  - vaisdb-regression CI baseline 221/261 (이전 220~222 flaky range → 221 결정적)
+  - cargo test -p vais-codegen --lib: 823 passed / 0 failed
 
 ### iter 107 LANDED (2026-04-27, P1.4 첫 production migration — stmt_visitor.rs:708)
 - 사용자 결정: "이어서 진행해줘"
