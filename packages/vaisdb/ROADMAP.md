@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 69, RESUMING — 사용자 "전체 자동 진행" 승인 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+mode: auto (iter 70, RESUMING — 사용자 "전체 자동 진행" 승인 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
 
 **다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
 
@@ -83,6 +83,19 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   - lang regression: 311/311 ✅ (zero regression)
   - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer, 잔여 3건 그대로)
   - 다음 iter: Task #3 slice ABI fat-ptr-of-fat-ptr fix.
+  iter_70_strategy: Opus direct, Task #3 slice ABI fat-ptr-of-fat-ptr fix. key.ll:1128 + test_btree.ll:815 — `&[&[u8]]` element fat-ptr 인덱싱. expr_helpers_data.rs slice path 의심. cascade 위험 vais compiler codegen 수정.
+
+  **iter 70 (2026-04-26) — Task #3 partial: site 2 LANDED ✅, site 1 분리 → Task #5**:
+  - 변경: vais compiler `expr_helpers_call/method_call.rs` `generate_method_call_expr`에 Vec→slice coerce path 추가 (generate_static_method_call_expr와 mirror)
+    - Generic param substitution 후 sub가 Slice일 때
+    - Non-generic param이 Slice일 때
+  - 적중: test_btree.ll:815 `Vec_push$slice_u8(_, %k1.1)` Vec→slice 자동 변환 → 에러 사라짐
+  - 새 layer 노출: test_btree.ll:1142 `compare_keys({i8*,i64} %stored.35, ...)` `stored.35`은 alloca-of-fat-ptr → load 누락 — 별도 카테고리
+  - Site 1 (key.ll:1128) 분리 → Task #5: `&[&[u8]]` element fat-ptr indexing path. expr_helpers_data slice index 깊이 들어가는 작업, cascade 위험 매우 높음. Task #4 완료 후 정리.
+  - cargo test -p vais-codegen --lib: 796/796 ✅
+  - lang regression: 311/311 ✅ (zero regression)
+  - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer, 잔여 site 1 + node + new prefix layer + new test_btree layer)
+  - 다음 iter: Task #4 node.ll BTreeInternalEntry 8B struct fix.
 
   **iter 65 (2026-04-25) — Phase α.1 진행 보고: layer 노출 패턴**:
   - Compiler fixes (4 commits):
