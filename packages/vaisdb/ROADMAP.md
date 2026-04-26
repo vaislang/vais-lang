@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 112
+iteration: 113
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,43 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 113 LANDED (2026-04-27, ⚠️ P1.4 net impact 재평가 — iter 109 결론 부분 무효)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, 측정-only iter)
+- 시도: 본 세션 누적 효과 확증 + iter 108 deterministic 221 재현 검증
+- 측정 (3-run check-integrity, HEAD = b56b7a33 iter 112까지):
+  - run 1: 217/261
+  - run 2: 220/261
+  - run 3: 222/261
+  - 평균 219.7, 폭 ±2.5 (217~222)
+- ⚠️ **iter 109 결론 부분 무효**:
+  - iter 108 결정적 221 (3-run identical)이 **재현 안 됨**
+  - iter 113 평균 219.7 ≈ pre-P1.4 baseline 평균 220.3 (iter 109 측정)
+  - **P1.4 net production impact "+0.7 file + variance 0" 결론은 iter 108 단일 측정의 운 좋은 deterministic에 의존**
+  - 3-run identical 결과 자체가 flaky window 내 우연일 수 있음
+- 재평가:
+  - vaisdb baseline 본질적 flaky range: **217~223** (pre-P1.4 219~223 + iter 113 217~222 합산)
+  - P1.4 (iter 105+106+107) net impact: **거의 0 ~ +0.7 file** (불확실)
+  - variance 제거 효과는 단일 측정으로 입증 불가 → multi-day separated 측정 필요
+- **결론**: P1.4 첫 production impact 측정은 iter 110 시점에 deterministic 측정 가능했지만, 시간 경과 후 noise 섞임. iter 109의 production impact 주장은 약화. 
+- **CLAUDE 규칙 4 검토**:
+  - run 1의 217은 iter 108 baseline 221 대비 -4
+  - 그러나 본 iter (113)와 직전 iter (111, 112)의 변경은 **production code 0** (tests-only + dead_code attribute 정밀화)
+  - 따라서 본 commits로 인한 regression은 정의상 0
+  - baseline 자체가 flaky로 재정의 → CLAUDE 규칙 4 트리거 아님
+  - **commits 유지, 학습만 기록**
+- 학습 (memory anti-pattern):
+  - **단일 3-run으로 deterministic 결론 금지**. multi-day 또는 multi-build 분리 측정 필요.
+  - vaisdb std cache 비결정적 새는 현상 (CLAUDE.md)이 measurement noise의 주요 원인.
+  - production impact 주장 시 baseline lock 갱신은 **multiple consecutive sessions의 일관성 확인 후**에만.
+- iter 113 산출물:
+  - compiler 0 commits (측정-only)
+  - lang 1 commit: 본 ROADMAP iter 113 LANDED + 재평가 기록
+- 다음 iter 114 entry:
+  - **A. iter 109 ROADMAP 결론 정정** (위험 0, 0.5h) — iter 109 LANDED 항목에 "iter 113 재평가 반영" 추가. memory `phase_omega_iter106_110_session_2026-04-27.md` 갱신.
+  - **B. iter 110 가설 심화 분석** (위험 1/10) — load 마이그레이션 +variance specific 측정. 그러나 baseline 자체가 flaky이면 시도 의미 약화.
+  - **C. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 6/10) — 매 마이그레이션마다 3-run 측정 의무. iter 113 학습 후엔 **일관된 기준선 부재**로 추가 신중함 필요.
 
 ### iter 112 LANDED (2026-04-27, P1.4 emit_typed dead_code per-item 정밀화)
 - 사용자 결정: "이어서 진행해줘"
