@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 88
+iteration: 90
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -69,6 +69,24 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 89 strategy + 결과 (2026-04-26, P1.2 recon 1/5 완료, 0 commits)
+- task: P1.2 TC inference Var 해소 — multi-session iter 1/5 (recon only)
+- strategy: Opus direct (코드 탐색 + 가설 수립, fix 시도 금지 = 위험 회피 원칙 4)
+- 산출 (memory phase_omega_iter89_p1_2_recon_2026-04-26.md, 0 commits):
+  - 정확한 fail shape 식별: `vec_of_vec_no_annotation_loses_inner_type` 표준 repro
+  - 코드젠 측 가드 정확 위치: `type_inference.rs:386` `if contains_unresolved_var(tc_ty) { return local; }`
+  - prior 시도 2건 메커니즘 정확 식별: ca06fafa (var_info update) + 76a740bc (expr_types sweep)
+  - **3가지 가설 명문화** (A/B/C):
+    - A. sweep 시점에 keys[0] expr_types가 누락 (file_id mismatch)
+    - B. unify가 다른 Var ID에 substitution 저장 (Var chain 이상)
+    - C. codegen이 fn_ctx.locals frozen state만 보고 expr_types/var_info 무시
+- iter 90 작업: instrumentation 3 사이트 추가 (eprintln만, production path 무영향) → 가설 확정 후 제거
+- iter 91+: 확정된 가설에 따라 fix territory 결정 (var_info propagate / sweep scope / codegen lookup path)
+- ADR 0001 분류: 본 iter는 recon (R1/R2/R3 게이트 무관)
+- ADR 0002 분류: Class 4 (var-to-llvm) 영역
+- 본 iter commits 0 (recon only — fix는 iter 91+)
+- 다음 task (iter 90): P1.2 instrumentation iter (위험 1/10, eprintln 추가만)
 
 ### iter 87 strategy + 결과 (2026-04-26, P2.3 wave 2 vais-web 통합 LANDED — Pillar 2 완성)
 - task: #29 P2.3 wave 2 vais-web cargo test 통합 (단독, 위험 2/10, ~30분)
