@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 96
+iteration: 97
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -96,6 +96,26 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 96 strategy + 결과 (2026-04-26, P1.3 recon 1/4 완료, 0 commits)
+- task: P1.3 codegen indexing 4-path 통합 — multi-session iter 1/4 (recon only)
+- strategy: Opus direct (코드 탐색, fix 시도 금지 = 위험 회피 원칙 4)
+- 산출 (memory phase_omega_iter96_p1_3_recon_2026-04-26.md, 0 commits):
+  - **4 path 정확 위치 식별**:
+    - Path 1 (data read): `expr_helpers_data.rs:410` `generate_index_expr`
+    - Path 2/3 (assign simple/compound): `expr_helpers_assign.rs` getelementptr 7 사이트
+    - Path 4 (inkwell): `inkwell/gen_aggregate.rs:313` `generate_index`
+  - **Path 1 type derivation 패턴 분석**: match arr_ty 442-489, Named/Unknown/Generic → "i64" fallback (Class 4)
+  - **단일 helper 후보 시그니처**: `resolve_index_access(arr_ty) -> CodegenResult<IndexAccess>` + `IndexAccess { elem_llvm, access_kind, elem_resolved }` + `AccessKind { Direct/FatPtr/VecData/StrByte }`
+- **점진 migration 4 iter 전략 명문화**:
+  - iter 97: helper 신설 + Path 1 migration (위험 5/10)
+  - iter 98: Path 2/3 migration (위험 6/10, stash@{0} 검토 동반)
+  - iter 99: Path 4 inkwell migration (위험 7/10, backend 차이)
+  - iter 100: validation + baseline 측정 (위험 1/10)
+- ADR 0001 분류: 본 iter recon (R1/R2/R3 무관)
+- ADR 0002 분류: Class 2 (index-store) 영역
+- 본 iter commits 0 (recon only)
+- 다음 iter (97): P1.3 helper 신설 + Path 1 migration (위험 5/10)
 
 ### iter 95 strategy + 결과 (2026-04-26, ADR 0001 적용 범위 절 추가 LANDED)
 - task: #30 ADR 0003 신설 → 결정: ADR 0001 in-place 갱신 (옵션 1, ceremony 최소화)
