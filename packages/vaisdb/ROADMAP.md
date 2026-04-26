@@ -26,6 +26,18 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 76~79 세션 종료 (2026-04-26)
+- 사용자 결정: 4 iter 누적 + Pillar 2 wave 1 LANDED → 세션 종료. 다음 세션 iter 80+ 진입
+- 본 세션 산출 commits:
+  - lang: `ef31246` (76) / `72df1cf` `462d88f` (77) / `af5540f` `322b8e0` (78) / `43d1d86` (79)
+  - compiler: `55c3528d` (P2.2c script) / `4cdb7150` (P2.2d workflow)
+- LANDED task: P3.1 / P2.1 / P2.2a / P2.2b / P2.2c / P2.2d (6개 + audit 1개)
+- 다음 entry 권고: Pillar 1.0 (ADR 0002 codegen invariant, 1주 doc-only, 위험 0). multi-session 의무
+- 보존:
+  - per-test KNOWN_FAILURE_COUNTS: btree=2 / wal=1 / buffer_pool=1 / graph=2 / migration=3 (합계 9)
+  - test_planner_types wave 2 defer (25 errors transitive cluster, slice coerce 9건이 핵심)
+  - recon false-negative 교훈: import 기반 정적 분석 → standalone build cross-check 의무
+
 ### iter 79 strategy + 결과 (2026-04-26, P2.2c+P2.2d 완료)
 - task: P2.2c (script 확장) → P2.2d (workflow 갱신, blockedBy 해제)
 - strategy: sequential
