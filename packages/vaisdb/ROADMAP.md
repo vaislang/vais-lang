@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 90
+iteration: 91
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -69,6 +69,34 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 90 strategy + 결과 (2026-04-26, P1.2 first fix LANDED — multi-session 2/5)
+- task: P1.2 TC inference Var 해소 — 첫 fix iter (recon iter 89 후속)
+- strategy: Opus direct (root cause 정확 식별 → 3-line fix → instrumentation revert)
+- 산출 (compiler commit `7fcdd285`):
+  - **Root cause 정확 식별**: `calls.rs:1131` Vec.push **builtin dispatch**가 receiver element type generic과 arg type을 unify하지 않음
+  - **prior 시도 (ca06fafa, 76a740bc) 효과 한계 설명**: 둘 다 struct-method 경로만 다루고 builtin dispatch는 손대지 않음 → ?N never bound → 76a740bc sweep도 무력
+  - **3-step fix 추가**: (1) unify(elem_ty, arg_ty) (2) apply_substitutions로 generics 재해석 (3) update_var_type
+  - **검증**:
+    - vaisc check standalone repro: OK No errors found ✅ (이전 fail)
+    - vaisc build + clang link + run: exit 0 ✅
+    - vaisdb-regression test_btree: 2=2 hold ✅
+    - cargo test --workspace --exclude bindings: **12,422 passed / 19 failed**
+      - 19 fails 모두 pre-existing 확증 (git reset로 검증)
+      - exec_std_*/exec_struct_* (8): immutable assign — Phase 158/198 strict mode 미migration
+      - snapshot_* (9): 진단 텍스트 mismatch
+      - integrity living_spec (1): iter 81 P4.2에서 발견한 동일 fail
+      - strict_conditionals_and_loops (1): pre-existing
+    - **cascade from P1.2 fix: 0 확정**
+- 한계: codegen-only test (call_arg_invariant_test::vec_of_vec_no_annotation)는 여전히 ignored — TC 미경유라 별개
+- 한계: vaisdb 2 errors (node.ll:1848, key.ll:1128)는 codegen 4-path territory (Pillar 1.3 대상), P1.2 무영향
+- ADR 0001 분류: 근본 fix (R1/R2/R3 충족, R3 audit 권고)
+- ADR 0002 분류: Class 4 (var-to-llvm) 일부 해소
+- 다음 iter (91+) 작업:
+  - **R3 audit**: 다른 builtin dispatch site (HashMap.insert/get_mut, BTreeMap, IndexMap 등) 동일 패턴 검토 (위험 1/10, mechanical)
+  - vaisdb 통합 검증: 실제 vaisdb 빌드에서 Vec<T> 패턴 카운트 변화 측정
+  - Pillar 1.3 (codegen indexing 4-path) 진입 시 codegen-only test enable 검토
+- 본 iter commits 1: compiler `7fcdd285`
 
 ### iter 89 strategy + 결과 (2026-04-26, P1.2 recon 1/5 완료, 0 commits)
 - task: P1.2 TC inference Var 해소 — multi-session iter 1/5 (recon only)
