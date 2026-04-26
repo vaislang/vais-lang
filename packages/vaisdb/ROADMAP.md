@@ -32,12 +32,14 @@ current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invaria
 - 검증: cargo 796/796 + 21 integration suite + 5 ret_invariant 모두 ✅
 - regression baseline: 2 errors → 2 errors (1 resolved, 1 newly exposed call-arg class)
 
-**잔여 (다음 세션 대상)**:
-- node.ll:1848 — **진짜 근본 식별**: expr_helpers_data.rs Vec<Vec<u8>> indexing path가 element를 i64로 erase. 옵션 B method_call guard만으로 해결 불가. expr_helpers_data.rs Vec indexing path (line 571-677) 수정 필요.
-- key.ll:1128 — Task #7, slice indexing emit (같은 클래스: indexing path elem_type)
-- Block path C/D/F branches — 각자 다른 invariant 분석 필요
+**잔여 (다음 세션 대상) — 진짜 근본 추적 완료**:
+- node.ll:1848 + key.ll:1128 = **같은 클래스** (TC inference Vec<Vec<T>> push site 미흐름)
+- standalone repro 작성됨 (commit 10c53305): `vec_of_vec_no_annotation_loses_inner_type` test (#[ignore]'d)
+- **진짜 fix 위치**: `vais-types/src/checker_expr/calls.rs:291` `check_method_call` — receiver의 generic Var를 args type으로 unify하는 path 추가 필요
+- **위험**: TC inference 변경은 cascade 매우 큼 (Phase 158 5회 토글 같은 클래스). single-step 의무, multi-session commitment 권장
+- 상세 인계: `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_tc_inference_recon_2026-04-26.md`
 
-**중요 발견**: node.ll:1848과 key.ll:1128은 **같은 클래스** — 둘 다 Vec/slice indexing path의 element type erasure 문제. 다음 세션은 이 indexing path 한 곳 수정으로 두 errors 동시 해결 가능성.
+- Block path C/D/F branches — 각자 다른 invariant 분석 필요 (별도)
 
 **상세 인계**:
 - `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_mini_pillar1_first_iter_2026-04-26.md`
