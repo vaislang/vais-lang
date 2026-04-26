@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 94
+iteration: 96
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -96,6 +96,21 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 95 strategy + 결과 (2026-04-26, ADR 0001 적용 범위 절 추가 LANDED)
+- task: #30 ADR 0003 신설 → 결정: ADR 0001 in-place 갱신 (옵션 1, ceremony 최소화)
+- strategy: Opus direct (doc-only, P4.1 백로그 1번 처리)
+- 산출 (compiler commit `fa61c444`):
+  - ADR 0001 docs에 "적용 범위" 절 추가 (+37 lines)
+  - 의무 적용: codegen Rust / TC inference / ADR 0002 4 클래스
+  - 면제 (commit message 분류만): .vais source-only / 문서 / CI / 테스트 추가
+  - 경계 사례 명시: vais-node/python binding, CLAUDE.md, stdlib (.vais)
+- BTreeMap audit 결과 (recon only): BTreeMap/IndexMap은 std에 정의되지 않음 → 추가 fix 불필요
+  - StrHashMap만 std 정의 (`hashmap.vais:676`), 이미 P1.2 R3 fix가 cover
+- 본 iter commits 1: compiler `fa61c444`
+- 다음 task 후보 (iter 96+):
+  - **P1.3 codegen indexing 4-path 통합** (위험 9/10, multi-session 의무) — Pillar 1.3 본격
+  - 또는 vais-server-regression PR 트리거 (위험 1/10)
 
 ### iter 93 strategy + 결과 (2026-04-26, P1.2 task 종료 LANDED — multi-session 5/5 완료)
 - task: P1.2 마무리 — cargo test 재실측 + task 종료
