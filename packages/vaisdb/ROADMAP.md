@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 111
+iteration: 112
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,42 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 112 LANDED (2026-04-27, P1.4 emit_typed dead_code per-item 정밀화)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, refactor-only iter, production code 0 변경)
+- 산출물:
+  - `compiler/crates/vais-codegen/src/emit_typed.rs` +60/-22 (실 코드 +38)
+    - 모듈 레벨 `#![allow(dead_code)]` 제거 (iter 105 도입, iter 107 이후 일부 production 사용)
+    - per-item `#[allow(dead_code)]` 변경 (사용 항목과 미사용 항목 명시 분리)
+    - 미사용 항목마다 "first caller iter N" docstring 명시
+- 사용 중인 항목 (lint-active, allow 제거):
+  - `LlvmType::as_str` + `Display` + `From<&str>` + `From<String>`
+  - `TypedTemp::name()` + `Display`
+  - `TypedEmitter::new` + `emit_bitcast_with_prefix` + `fresh_temp_with_prefix`
+  - `impl TypeRegistrar for FunctionContext` + `record_emitted_type`
+- 미사용 (per-item allow + 다음 사용 iter 명시):
+  - `LlvmType::new` → iter 116+
+  - `TypedTemp::unregistered` → iter 117+ (function parameter 리피케이션)
+  - `TypedTemp::ty()` → iter 116+ (type-driven dispatch)
+  - `TypeRegistrar::get_emitted_type` → iter 116+
+  - `emit_call`, `emit_call_void`, `emit_bitcast` (default), `emit_store`, `fresh_temp` (default) → iter 116+
+  - `emit_load`, `emit_load_with_prefix` → iter 113+ (iter 110 variance 분석 후)
+- 효과:
+  - 신규 API 추가 시 dead_code lint 즉시 작동 (이전엔 모듈 allow가 마스킹)
+  - 마이그레이션 진척도가 attribute 분포로 visualize됨
+  - iter 107 LANDED API의 lint 정상 노출 → 향후 사용 변화 추적 가능
+- 검증:
+  - cargo build -p vais-codegen: emit_typed 관련 0 warnings
+  - cargo test -p vais-codegen --lib: **823 passed / 0 failed** (regression 0)
+  - production code 0 변경 → check-integrity 221/261 deterministic 보존 (구조적)
+- iter 112 산출물:
+  - compiler 1 commit `b56b7a33`: emit_typed.rs per-item dead_code
+  - lang 1 commit: 본 ROADMAP iter 112 LANDED
+- 다음 iter 113 entry:
+  - **A. iter 110 가설 심화 분석** (위험 1/10) — load 마이그레이션 +variance specific 측정
+  - **B. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 6/10) — call ret coerce site
+  - **C. 현 baseline 재측정** (위험 1/10) — 본 세션 누적 효과 + 안정성 확증
 
 ### iter 111 LANDED (2026-04-27, P1.4 R2 차단 테스트 — ADR 0002 의무 충족)
 - 사용자 결정: "이어서 진행해줘"
