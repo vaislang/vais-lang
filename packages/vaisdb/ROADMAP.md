@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 72 — Task #5 진입, 사용자 "이어서 진행" 요청 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL. iter 67→71에서 vaisdb test_btree +3 fix landed. 잔여 4 site 모두 같은 deep slice/Vec ABI 카테고리. **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+mode: RESUMING (iter 72 종료 — 다음 세션 진입점). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL. iter 67→71에서 vaisdb test_btree +3 fix landed. 잔여 4 site 모두 같은 deep slice/Vec ABI 카테고리. **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
 
 **다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
 
@@ -107,6 +107,15 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer node.ll:1736 slice ABI / Task #5 카테고리 합류)
   - 사용자 결정: 소스 타입 명시 fix (최소 위험) — compiler-side inference pollution 차단은 별도 작업
   - 다음 iter: Task #5 (slice ABI 카테고리, 누적 3 site: key.ll:1128, test_btree.ll:1142, node.ll:1736)
+
+  **iter 72 (2026-04-26) — 종합 정리 + 다음 세션 인계**:
+  - 누적 (iter 67→72, 6 iter): vais compiler +2 commit + vaisdb source +2 commit. 4건 → 2건.
+  - 잔여 2 site (모두 codegen 영역, 별도 task #6, #7로 분리):
+    - test_btree_node.ll:1736 — Vec ptr → slice ret coerce (Task #6)
+    - test_btree_key.ll:1128 — fat-ptr-of-fat-ptr indexing (Task #7)
+  - Task #6/#7 모두 codegen 깊은 작업 + cascade 위험 매우 높음 (Wave 시리즈 trigger class). 다음 세션은 emit path 정확히 식별 후 design-driven 접근 권장.
+  - 이번 iter 시도된 codegen fix (revert): stmt.rs Stmt::Return Vec→slice 분기 + codegen.rs FunctionBody::Block ret 분기 — 둘 다 fire 안 함 (probe 결과 0회). emit path가 inkwell 또는 다른 module이라 추가 조사 필요. revert 후 cargo 796/796 + lang 311/311 유지.
+  - Task #5 closed as "source-side fix 3 sites landed" — 잔여는 #6/#7로.
 
   **iter 72 (2026-04-26) — Task #5 partial: source-side 3 site fix LANDED ✅ (4→2)**:
   - 변경: vaisdb source 2 files, 3 sites
