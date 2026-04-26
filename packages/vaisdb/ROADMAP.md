@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 79
+iteration: 80
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,18 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 80 strategy + 결과 (2026-04-26, P1.0a Draft 완료)
+- task: P1.0a — ADR 0002 Draft 작성 (P1.0 split, 0a Draft / 0b Accepted 전환)
+- strategy: Opus direct (design intent 고도)
+- 위험: 0 (doc-only)
+- 산출: compiler/docs/adr/0002-codegen-invariants.md (210 lines, 11KB)
+  - 4 클래스 invariant: ret (LANDED partial) / index-store (P1.1 대기) / call-arg (P1.4 대기) / var-to-llvm (NEW)
+  - R1+R2+R3 충족 매트릭스 (iter 80 baseline 표)
+  - 단계적 도입 plan (P1.0~P1.4, ~6주 multi-session)
+  - CLAUDE 규칙 8/11 연결, ADR 0001 의존
+  - Status: Draft → 다음 iter 사용자 승인 (P1.0b)
+- 다음 iter (81+): P1.0b — 사용자 review + Accepted 전환 + (옵션) ADR 0003 (integer-constant 클래스)
 
 ### iter 76~79 세션 종료 (2026-04-26)
 - 사용자 결정: 4 iter 누적 + Pillar 2 wave 1 LANDED → 세션 종료. 다음 세션 iter 80+ 진입
@@ -254,7 +266,13 @@ exit_audit:
   - 완료 기준: 두 패키지 모두 baseline 측정 + CI 등록
 
 ### Pillar 1.0 — invariant 명세 (iter 80~82, 1주, 위험 0)
-- [ ] P1.0. codegen 4 클래스 invariant 문서화
+- [x] P1.0a. ADR 0002 Draft 작성 ✅ 2026-04-26 (iter 80, Opus direct)
+  changes: compiler/docs/adr/0002-codegen-invariants.md (210 lines) — 4 클래스 명세 (ret/index-store/call-arg/var-to-llvm), R1+R2+R3 충족 매트릭스, 단계적 도입 plan (P1.0→P1.4 ~6주), CLAUDE 규칙 8/11 연결. Status: Draft
+- [ ] P1.0b. ADR 0002 사용자 승인 + Accepted 전환 [iter 81+ 대기]
+  - 사용자 review → 피드백 반영 → Status Draft→Accepted
+  - (옵션) ADR 0003 신설 (integer-constant / undefined fn 클래스, iter 78 baseline에서 발견)
+  - CLAUDE.md 규칙 8 강화 (4 클래스 분류 의무 명시)
+- [ ] P1.0. codegen 4 클래스 invariant 문서화 [legacy entry — P1.0a/0b로 split]
   - 위치: `compiler/docs/adr/0002-codegen-invariants.md` (신규)
   - 4 클래스:
     1. ret elem-ty: 이미 ADR 0001 §1 R1 (iter 74 LANDED)
