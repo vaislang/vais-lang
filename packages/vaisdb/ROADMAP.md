@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 81
+iteration: 83
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,20 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 82 strategy + 결과 (2026-04-26, std E009 mut fix LANDED)
+- task: #28 std E009 immutable assignment fix (38 std 파일, 위험 0, mechanical)
+- strategy: Opus direct (mechanical loop, 자동 fixer 스크립트 작성 + 검증)
+- 산출 (compiler commit `d0a4c89a`):
+  - 38 std .vais 파일 mut 일괄 추가 (binding := mut + function param mut)
+  - check-integrity std PASS: **44/82 → 82/82** (+38) ✅ ADR 0002 exit_audit 회복
+  - vaisdb: 220 → 219 (-1, flaky range 내, 측정마다 220~224 변동)
+  - living_spec: 116/117 (1 pre-existing fail unchanged)
+- 도구: `/tmp/std_e009_fix_v2.sh` (idempotent loop, vaisc check 기반, function param case 처리)
+- ADR 0001: 근본 fix (std 정합성 회복, 사이트 fix 아님)
+- ADR 0002: codegen 4 클래스 invariant 무영향 (.vais source만 변경)
+- 다음 task 후보 (iter 83+): P4.1 ADR 0001 retrospective (위험 0) 또는 P1.1 index_invariant_test 보강 (위험 1/10)
+- 본 iter commits 1: compiler `d0a4c89a`
 
 ### iter 81 strategy + 결과 (2026-04-26, P4.2 LANDED)
 - task: P4.2 memory 정합성 검증 (단독, 위험 0, 실측 ~40분)
