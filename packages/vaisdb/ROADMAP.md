@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 97
+iteration: 98
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -96,6 +96,25 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 97 strategy + 결과 (2026-04-26, P1.3 helper 신설 + Path 1 migration LANDED — multi-session 2/4)
+- task: P1.3 단일 helper 신설 + Path 1 (data read) migration
+- strategy: Opus direct (helper 신설 / 단일 path migration / R2 차단 테스트 동반)
+- 산출 (compiler commit `d837ecfb`):
+  - **신설**: `crates/vais-codegen/src/index_access.rs` (210 LOC)
+    - `resolve_index_access(arr_ty)` → `IndexAccess { elem_llvm, access_kind, elem_resolved }`
+    - `AccessKind`: Direct / FatPtr / VecData / StrByte
+    - 7 unit tests (모두 PASS)
+  - **Migration**: Path 1 (`expr_helpers_data.rs:410` `generate_index_expr`)
+    - inline match arr_ty (50 LOC) → `self.resolve_index_access(&arr_ty)?` (1 line)
+    - 동작 byte-identical
+- 검증:
+  - cargo test -p vais-codegen: **1776/0** ✅ (+9 from index_access tests)
+  - vaisdb-regression test_btree: 2=2 hold ✅
+- ADR 0001 분류: 근본 fix (R1+R2+R3 충족)
+- ADR 0002 분류: Class 2 (index/store) — 단일 helper 도입 첫 step
+- 본 iter commits 1: compiler `d837ecfb`
+- 다음 iter (98): Path 2/3 (assign simple/compound) migration. 7 getelementptr 사이트, stash@{0} 적용 검토
 
 ### iter 96 strategy + 결과 (2026-04-26, P1.3 recon 1/4 완료, 0 commits)
 - task: P1.3 codegen indexing 4-path 통합 — multi-session iter 1/4 (recon only)
