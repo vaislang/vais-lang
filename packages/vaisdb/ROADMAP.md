@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 104
+iteration: 105
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -26,7 +26,37 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
-### iter 104 진행 중 (2026-04-26, P1.4 Stage A recon-only)
+### iter 105 LANDED (2026-04-26, P1.4 typed wrapper API skeleton)
+- 사용자 결정: "이어서 진행해줘" (iter 104 직후, mode=auto 유지)
+- strategy: Opus direct (design-impl inseparable, P1.4 위험 9/10 multi-session 의무 — 본 iter는 5/10 sub-step)
+- 산출물:
+  - 신설: `compiler/crates/vais-codegen/src/emit_typed.rs` (~410 LOC, 13 unit tests, 0 production caller)
+    - `LlvmType(String)` newtype + `From<&str>`/`From<String>`/`Display`
+    - `TypedTemp { name: String, ty: LlvmType }` with `unregistered()` + `name()`/`ty()`/`Display`
+    - `TypeRegistrar` trait (record_emitted_type / get_emitted_type) — `FunctionContext` 호환 시그니처
+    - `TypedEmitter<'a, R: TypeRegistrar + ?Sized>` with `emit_call` / `emit_call_void` (skeleton)
+    - 외부 `&mut usize` counter 패턴 (helpers.rs:210 `next_temp` 일치)
+    - `#![allow(dead_code)]` (iter 106에서 첫 production caller 추가 시 제거)
+  - lib.rs: `mod emit_typed;` 등록 (1 line)
+- 검증:
+  - cargo test -p vais-codegen --lib: **816 passed / 0 failed** (iter 105 baseline 803 + 13 신규 정확 일치)
+  - cargo clippy -p vais-codegen: emit_typed 관련 0 warnings (allow(dead_code) 정당화)
+  - 검증 누락: cargo test --workspace + check-integrity.sh + vaisdb-regression.sh — Pillar 1 단일 패키지 변경(neue module + 0 사이트 마이그레이션)이라 영향 0 가정
+- 설계 결정 핵심:
+  - **TypeRegistrar trait** 도입 (FunctionContext 직접 의존 회피) — 테스트가 minimal StubRegistry로 fn_ctx 없이 검증 가능
+  - **외부 counter** 받기 (FunctionContext에 next_temp_counter 필드 추가 회피) — 기존 helpers.rs::next_temp 패턴과 호환
+  - **`%tN` 이름 형식** 유지 (helpers.rs:210와 동일) — iter 106+ 마이그레이션 시 이름 변경 불요
+  - inkwell 백엔드는 별도 추상이라 본 module 미적용 (iter 104 recon 결과 write_ir!=0건)
+- iter 105 산출물:
+  - compiler 1 commit: emit_typed.rs 신설 + lib.rs 등록
+  - lang 1 commit: 본 ROADMAP iter 105 LANDED
+- 다음 iter 106 entry:
+  - 첫 production caller 추가 — 5건 if-coerce 분기 중 하나(가장 단순한 stmt_visitor.rs:746 권고) 마이그레이션
+  - `impl TypeRegistrar for FunctionContext` 한 줄 bridge 추가
+  - `#![allow(dead_code)]` 제거
+  - R2 차단 테스트 추가 의무 (ADR 0002): 마이그레이션된 사이트의 type-mismatch IR을 차단
+
+### iter 104 LANDED (2026-04-26, P1.4 Stage A recon-only)
 - 사용자 결정: "전체 자동 진행" (mode=auto)
 - strategy: P1.4 위험 9/10 + multi-session 의무 → Opus direct + recon-only iter (0 LOC 변경, git revert 단위 = 본 ROADMAP 항목)
 - opus_direct: design-impl inseparable — Type-Tagged IR Builder API 설계는 763 사이트 분류 정확성에 의존 (skill-config criteria)
