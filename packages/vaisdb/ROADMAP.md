@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 87
+iteration: 88
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,23 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 87 strategy + 결과 (2026-04-26, P2.3 wave 2 vais-web 통합 LANDED — Pillar 2 완성)
+- task: #29 P2.3 wave 2 vais-web cargo test 통합 (단독, 위험 2/10, ~30분)
+- strategy: Opus direct (cargo test --workspace 래퍼 + workflow yml)
+- 산출 (compiler commit `3d4a19f0`):
+  - scripts/vais-web-regression.sh (KNOWN_PASS_COUNT=271 baseline)
+  - .github/workflows/vais-web-regression.yml
+  - 검증: bash scripts/vais-web-regression.sh → 271=271 hold ✅
+- baseline: vais-web cargo test --workspace = 271 passed / 0 failed / 4 ignored
+- **이로써 Pillar 2 wave 1 완성**:
+  - vaisdb: 5-test (vaisdb-regression.sh)
+  - vais-server: 2-test (vais-server-regression.sh)
+  - vais-web: workspace test (vais-web-regression.sh)
+- ADR 0001 분류: Pillar 2 자동화 인프라 마무리
+- ADR 0002 분류: codegen 4 클래스 무영향
+- 본 iter commits 1: compiler `3d4a19f0`
+- 다음 task 후보 (iter 88+): P1.2 TC inference Var 해소 (위험 8/10, multi-session 의무 — 단일 iter 시작만)
 
 ### iter 86 strategy + 결과 (2026-04-26, P2.3 wave 1 vais-server 통합 LANDED)
 - task: P2.3 wave 1 vais-server compiler regression 통합 (단독, 위험 2/10, ~40분)
@@ -396,8 +413,8 @@ exit_audit:
   결과: scripts/vais-server-regression.sh + workflow yml 신설 (compiler `ac73e413`). 2-test (test_shutdown + test_http), baseline 1+1=2.
   - test_shutdown: 1 clang error (Vec_push undefined, cross-module symbol)
   - test_http: 1 clang error (var-to-llvm typing, ADR 0002 Class 4)
-- [ ] P2.3 wave 2 (vais-web). web 패키지 cargo test 통합 (별도 task #29)
-  - vais-web은 Rust workspace → cargo test 패턴 (vaisc build 아님)
+- [x] P2.3 wave 2 (vais-web). web 패키지 cargo test 통합 ✅ 2026-04-26 (iter 87, Opus direct)
+  결과: scripts/vais-web-regression.sh + workflow yml 신설 (compiler `3d4a19f0`). cargo test --workspace 패턴, baseline 271 PASS / 0 FAILED. Pillar 2 wave 1 완성.
 
 ### Pillar 1.0 — invariant 명세 (iter 80~82, 1주, 위험 0)
 - [x] P1.0a. ADR 0002 Draft 작성 ✅ 2026-04-26 (iter 80, Opus direct)
