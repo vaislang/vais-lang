@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 84
+iteration: 85
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,18 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 84 strategy + 결과 (2026-04-26, P4.3 retrospective 의무화 LANDED)
+- task: P4.3 iter retrospective 의무화 (단독, 위험 0, 메타 정책)
+- strategy: Opus direct (정책 문서 갱신, ADR 0002에 추가)
+- 산출 (compiler commit `47a0130e`):
+  - ADR 0002 docs에 "Iter Retrospective" 절 추가 (+30 lines)
+  - iter 76~83 자발적 관행화된 형식 (task/strategy/산출/ADR 분류/검증/다음 후보) 정책 명문화
+  - 적용 시점: 본 ADR 갱신 이후 모든 iter
+- ADR 0001 분류: N/A (정책 문서)
+- ADR 0002 분류: N/A (정책 자체 갱신)
+- 본 iter commits 1: compiler `47a0130e`
+- 다음 task 후보 (iter 85+): P1.1 index_invariant_test 보강 (위험 1/10) 또는 P2.3 server/web 통합 (위험 3/10)
 
 ### iter 83 strategy + 결과 (2026-04-26, P4.1 ADR retrospective LANDED)
 - task: P4.1 ADR 0001 retrospective (단독, 위험 0, ~30분)
@@ -417,8 +429,8 @@ exit_audit:
 - [x] P4.2. memory 정합성 검증 ✅ 2026-04-26 (iter 81, Opus direct)
   결과: iter 80 ADR 0002 R3 baseline 7/7 정확 확증. 발견 5건 (cargo test 빌드 실패, integrity PASS regression -38/-13, index_invariant_test 2/5 R2 fail, vaisdb-regression flaky, std E009 mut 누락). memory phase_omega_iter81_p4_2_audit_2026-04-26.md 산출.
   - memory 가설 vs 실측 정정 (이번 iter 74에서 3건 정정)
-- [ ] P4.3. iter retrospective 의무화 (각 iter 종료 시)
-  - mode/iteration 갱신, 산출물/실패 기록, 다음 iter entry point
+- [x] P4.3. iter retrospective 의무화 ✅ 2026-04-26 (iter 84, Opus direct)
+  결과: ADR 0002에 "Iter Retrospective" 절 추가 (compiler `47a0130e`). iter 76~83 자발적 관행화된 형식 (task/strategy/산출/ADR 분류/검증/다음 후보)을 정책으로 명문화. 매 iter LANDED 시 ROADMAP 추가 의무.
 
 ---
 
