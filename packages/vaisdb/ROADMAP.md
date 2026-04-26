@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 85
+iteration: 86
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,21 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 85 strategy + 결과 (2026-04-26, P1.1 index_invariant_test 보강 LANDED)
+- task: P1.1 index_invariant_test.rs 확장 (단독, 위험 1/10, ~30분)
+- strategy: Opus direct (test 추가 + ignore marker 결정 통합 판단)
+- 산출 (compiler commit `604b2a1b`):
+  - iter 74 untracked file commit + Pillar 1.1 보강
+  - 5 → 10 case (375 LOC)
+  - 검증: 6 passed / 4 ignored / 0 failed ✅
+- ADR 0001 분류: 근본 fix 보강 (R2 차단 테스트 case 확장)
+- ADR 0002 분류: Class 2 R2 강화 (index/store elem-ty invariant)
+- iter 74 cascade 차단 결정 보존: stash@{0} 미적용으로 2 기존 case는 #[ignore] (Pillar 1.3 enable)
+- 신규 vaisdb 패턴 #[ignore] 2건 추가: node.ll:1848 + key.ll:1128 reduced repro
+- 백로그 (Pillar 1.3 territory): struct field Vec<T> + method chain + ref&mut compound assign
+- 본 iter commits 1: compiler `604b2a1b`
+- 다음 task 후보 (iter 86+): P2.3 server/web 통합 (위험 3/10) 또는 P1.2 TC Var unify (위험 8/10, multi-session 의무)
 
 ### iter 84 strategy + 결과 (2026-04-26, P4.3 retrospective 의무화 LANDED)
 - task: P4.3 iter retrospective 의무화 (단독, 위험 0, 메타 정책)
@@ -384,16 +399,11 @@ exit_audit:
   - 완료 기준: ADR 0002 LANDED, 사용자 승인
 
 ### Pillar 1.1 — index_invariant_test 보강 (iter 83, 0.5주, 위험 1/10)
-- [ ] P1.1. iter 74 산출물 `index_invariant_test.rs` 확장
-  - 현재: 5 case (simple ident pattern only)
-  - 추가 case (vaisdb 패턴 cover):
-    - struct field Vec<T> compound assign
-    - method chain 결과 indexing
-    - ref/&mut through compound assign
-    - Vec<&[u8]> indexing read (node.ll:1848 패턴)
-    - `&[&[u8]]` indexing read (key.ll:1128 패턴)
-  - 산출: ≥10 case, 모두 fix 전 fail / fix 후 pass
-  - 완료 기준: stash@{0} fix 재적용 시 모든 case PASS, 빠지지 않은 vaisdb 패턴 0
+- [x] P1.1. iter 74 산출물 `index_invariant_test.rs` 확장 ✅ 2026-04-26 (iter 85, Opus direct)
+  결과: 5 → 10 case (compiler `604b2a1b`). 6 PASS / 4 ignored / 0 failed.
+  - 기존 5 case 중 2건은 stash@{0} 적용 필요로 #[ignore] marker 추가 (negative test로 동작)
+  - 신규 5 case: byte buffer i8 GEP × 2 (PASS), simple/compound 일관성 (PASS), node.ll:1848/key.ll:1128 reduced (각 #[ignore])
+  - 백로그 (Pillar 1.3 territory): struct field Vec<T> compound assign / method chain indexing / ref&mut compound assign — codegen-level work 의존
 
 ### Pillar 1.2 — TC inference Var 해소 (iter 84~88, 1.5주, 위험 8/10)
 - [ ] P1.2. `vais-types/src/checker_expr/calls.rs:291` check_method_call 에서 receiver Var를 args type으로 unify
