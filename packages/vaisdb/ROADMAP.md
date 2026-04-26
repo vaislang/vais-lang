@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 98
+iteration: 99
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -96,6 +96,21 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 98 strategy + 결과 (2026-04-26, P1.3 Path 2 migration LANDED — multi-session 3/4)
+- task: P1.3 Path 2 (data write simple) migration
+- strategy: Opus direct (mechanical migration, downstream emit 로직 보존)
+- 산출 (compiler commit `8629da3d`):
+  - expr_helpers_assign.rs:266 inline match (13 LOC) → resolve_index_access + AccessKind mapping
+  - 동작 byte-identical (cargo + vaisdb 검증)
+  - **Path 3 (compound assign) iter 99 분리 결정**: line 723 minimal 폴백, iter 74 stash@{0} 영역 = cascade 위험 7-8/10. 단순 helper 마이그레이션이 아닌 stash 적용 + 검증 multi-session 필요.
+- 검증:
+  - cargo test -p vais-codegen: 1776/0 ✅
+  - vaisdb-regression test_btree: 2=2 hold ✅
+- ADR 0001 분류: 근본 fix R1 (helper 단일 source 유지)
+- ADR 0002 분류: Class 2 (index/store) Path 2 흡수
+- 본 iter commits 1: compiler `8629da3d`
+- 다음 iter (99): Path 3 (compound assign) — stash@{0} 적용 검토 + 위험 7-8/10 multi-session
 
 ### iter 97 strategy + 결과 (2026-04-26, P1.3 helper 신설 + Path 1 migration LANDED — multi-session 2/4)
 - task: P1.3 단일 helper 신설 + Path 1 (data read) migration
