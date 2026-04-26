@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 86
+iteration: 87
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,22 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 86 strategy + 결과 (2026-04-26, P2.3 wave 1 vais-server 통합 LANDED)
+- task: P2.3 wave 1 vais-server compiler regression 통합 (단독, 위험 2/10, ~40분)
+- strategy: Opus direct (vaisdb-regression.sh 패턴 복제 + 신규 workflow yml)
+- 산출 (compiler commit `ac73e413`):
+  - scripts/vais-server-regression.sh (2-test wave: test_shutdown + test_http, baseline 1+1=2)
+  - .github/workflows/vais-server-regression.yml (cross-repo checkout, graceful skip)
+  - 검증: bash scripts/vais-server-regression.sh --all → baseline 2=2 hold ✅
+- baseline:
+  - test_shutdown: 1 (Vec_push undefined, cross-module symbol)
+  - test_http: 1 (var-to-llvm typing, ADR 0002 Class 4)
+- 분리 결정: vais-web은 Rust workspace cargo test 패턴 (vaisc build 아님) → 별도 task #29 wave 2
+- ADR 0001 분류: Pillar 2 자동화 인프라 (사이트 fix 아님)
+- ADR 0002 분류: codegen 4 클래스 무영향
+- 본 iter commits 1: compiler `ac73e413`
+- 다음 task 후보 (iter 87+): #29 P2.3 wave 2 vais-web (위험 2/10, ~30분) 또는 P1.2 multi-session 시작 (위험 8/10)
 
 ### iter 85 strategy + 결과 (2026-04-26, P1.1 index_invariant_test 보강 LANDED)
 - task: P1.1 index_invariant_test.rs 확장 (단독, 위험 1/10, ~30분)
@@ -376,9 +392,12 @@ exit_audit:
   - 완료 기준: 추가 5개 테스트 + 모두 known-failure 또는 known-pass로 분류
 
 ### Pillar 2.3 — vais-server / vais-web 통합 (iter 78~79, 3일, 위험 3/10)
-- [ ] P2.3. server/web 패키지를 compiler regression suite에 추가
-  - 절차: 각 패키지 strict build → known-failure 등록
-  - 완료 기준: 두 패키지 모두 baseline 측정 + CI 등록
+- [x] P2.3 wave 1 (vais-server). server 패키지를 compiler regression suite에 추가 ✅ 2026-04-26 (iter 86, Opus direct)
+  결과: scripts/vais-server-regression.sh + workflow yml 신설 (compiler `ac73e413`). 2-test (test_shutdown + test_http), baseline 1+1=2.
+  - test_shutdown: 1 clang error (Vec_push undefined, cross-module symbol)
+  - test_http: 1 clang error (var-to-llvm typing, ADR 0002 Class 4)
+- [ ] P2.3 wave 2 (vais-web). web 패키지 cargo test 통합 (별도 task #29)
+  - vais-web은 Rust workspace → cargo test 패턴 (vaisc build 아님)
 
 ### Pillar 1.0 — invariant 명세 (iter 80~82, 1주, 위험 0)
 - [x] P1.0a. ADR 0002 Draft 작성 ✅ 2026-04-26 (iter 80, Opus direct)
