@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: RESUMING (iter 67). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+mode: auto (iter 69, RESUMING — 사용자 "전체 자동 진행" 승인 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
 
 **다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
 
@@ -58,6 +58,31 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   iter_63_strategy: Opus direct, Wave 4a partial completed + memory consolidation. Task #12 closed. memory `phase17_wave2_3_4a_progress.md` 신설. mode → stopped (사용자 결정 대기).
   iter_64_strategy: Opus direct, **방향 전환**. 사용자 "사람들이 믿고 쓸 수 있어야"에 응답하여 Master Roadmap 신설 (`docs/MASTER_ROADMAP.md`). Phase α/β/γ/δ/ε trust-building. Wave 4 보류, "0/14 → 1/14 → 5/14 → 14/14 + production hardening" 단계. iter 64 Phase α.1 시작 — test_page_manager link errors 4→3.
   iter_65_strategy: Opus direct, Phase α.1 강행. 결과: layer-by-layer 노출 패턴 확인.
+  iter_68_strategy: sequential. Task #1 baseline은 Opus direct (Bash 빌드+측정, 코드 변경 0). Task #2~#4 fix는 Opus direct (vais compiler codegen 수정, memory subagent_delegation_for_compiler_tasks 정책). Task #1 → #2 → #3 → #4 순.
+
+  **iter 68 (2026-04-26) — Task #1 baseline ✅ 인계 메모와 100% 일치**:
+  - vaisdb test_btree 빌드: vaisc emit OK, clang link 4 errors (변동 없음)
+    1. test_btree_key.ll:1128 — %t29 ptr vs `{ ptr, i64 }` (slice ABI)
+    2. test_btree_node.ll:740 — %t61 `%BTreeInternalEntry` vs ptr (8B small-struct)
+    3. test_btree_prefix.ll:830 — %t33 i8 vs i64 (zext 누락)
+    4. test_btree_test_btree.ll:815 — %k1.1 ptr vs `{ ptr, i64 }` (slice ABI 동류)
+  - lang regression: 311 passed, 0 failed, 0 xfail ✅
+  - cargo test -p vais-codegen --lib: 796/796 ✅
+  - 다음 iter: Task #2 prefix.ll i8→i64 zext fix (가장 단순부터).
+  iter_69_strategy: Opus direct, Task #2 prefix.ll i8→i64 zext fix. cascade 위험 vais compiler codegen 수정 — memory subagent_delegation_for_compiler_tasks 정책. site별 emit path 추적 후 단일 fix 시도, cascade 시 즉시 revert.
+
+  **iter 69 (2026-04-26) — Task #2 prefix.ll i8→i64 zext fix LANDED ✅ (1 fix, 1 새 layer)**:
+  - 변경: vais compiler 3 files
+    - `expr_helpers_call/method_call.rs:615` arg coerce path
+    - `expr_helpers_call/call_gen.rs:186` store-via-arg path
+    - `generate_expr_call.rs:843` direct call coerce path
+  - 모든 fix: i64-erased → struct coerce 직전 `llvm_type_of(val)` 확인. narrow int (i1/i8/i16/i32)이면 zext to i64 후 inttoptr.
+  - 적중: `%t34 = zext i8 %t33 to i64` 추가 → prefix.ll:830 에러 사라짐
+  - 새 layer 노출: prefix.ll:1475 — `%t100` `%Vec$u8` vs `%Vec$u64` (reconstruct_key Vec<u8> 반환을 current_key Vec<u64>에 store). Vec specialization mix — 별도 카테고리.
+  - cargo test -p vais-codegen --lib: 796/796 ✅
+  - lang regression: 311/311 ✅ (zero regression)
+  - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer, 잔여 3건 그대로)
+  - 다음 iter: Task #3 slice ABI fat-ptr-of-fat-ptr fix.
 
   **iter 65 (2026-04-25) — Phase α.1 진행 보고: layer 노출 패턴**:
   - Compiler fixes (4 commits):
