@@ -10,22 +10,63 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: RESUMING (iter 73 종료 — net 0 진전, cache state 함정 학습).
+mode: pending
+iteration: 73
+max_iterations: 100
+current_phase: vaisdb test_btree clang errors (잔여 2건, 둘 다 codegen 깊은 영역)
 
-**현재 baseline (cache 정리 후 정확한 상태)**:
-- key.ll:1128 — `&[&[u8]]` element fat-ptr indexing (Task #7)
-- node.ll:1736 — Vec ptr → slice fat-ptr ret coerce in method tail (Task #6)
+**다음 세션 harness 진입점**:
+- 활성 작업: Task #6 (in_progress), Task #7 (pending) — TaskList()로 복구됨
+- 현재 baseline (clean cache 확정 — iter 73 commit `e4de277`): 2 clang errors
+  - test_btree_key.ll:1128 — `&[&[u8]]` element fat-ptr indexing (Task #7)
+  - test_btree_node.ll:1736 — `R &self.data` Vec→slice ret coerce 누락 (Task #6)
+- vais 컴파일러 clean (no diff), vaisdb source clean (no diff)
+- cargo 796/796 + lang 311/311 ✅
 
-**iter 73 학습**:
-- vaisc cache (`tests/storage/.vais-cache/`) 가 이전 빌드의 잘못된 specialization을 보존하여 source/codegen fix 효과를 가린다.
-- `entries: Vec<BTreeInternalEntry>` 같은 source annotation이 cache 새로고침 후 use-after-move TC 에러를 유발 (committed 933e03e fix가 사실은 cache state에서만 동작, clean rebuild에선 fail).
-- BTreeInternalNode_flush의 `R &self.data` 사이트는 stmt.rs `Stmt::Return`도 codegen.rs `FunctionBody::Block` 도 firing하지 않음. inkwell `gen_stmt.rs:293` Stmt::Return + stmt_visitor.rs `generate_return_stmt_visitor` + codegen.rs `generate_method_with_span` 4개 path 모두 try했으나 코드 변경 ZERO net (cache 함정).
-- 다음 세션은 cache nuke 자동화 + emit path 정확히 식별 (eprintln 직접 추가 후 cargo install + nuke + build 순서) 필수.
+**다음 세션 Day 1 procedure (반드시 이 순서)**:
+1. `TaskList()` 호출 — Task #6/#7 확인
+2. Cache nuke + baseline 재확인:
+   ```bash
+   cd /Users/sswoo/study/projects/vais/lang/packages/vaisdb
+   find . -name ".vais-cache" -type d -exec rm -rf {} + 2>/dev/null
+   rm -rf /tmp/test_btree*
+   VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" \
+     ~/.cargo/bin/vaisc build tests/storage/test_btree.vais --emit-ir -o /tmp/test_btree.ll --force-rebuild
+   clang -O0 -o /tmp/test_btree_bin /tmp/test_btree_*.ll /tmp/runtime.o /tmp/sync.o -lm 2>&1
+   ```
+   → 2 errors (key.ll:1128 + node.ll:1736) 확인되어야 함
+3. **Task #6 우선** — emit path 식별이 prerequisite. iter 73 시도된 4개 path 모두 fire 안 함 (probe 0 hits). 아직 안 본 후보: `emit.rs`, `async_gen.rs`, `function_gen/generics.rs`, AST level lowering.
+4. 단일-사이트 fix 금지 (memory phase17_3_negatives_escalation). 매 fix 시도 후:
+   - cache nuke + clean rebuild
+   - lang 311/311 + cargo 796/796 검증 (절대 조건)
+   - cascade 발생 시 즉시 revert
 
-상세 인계: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase0_complete_vaisdb_resume.md` 참조 — 4건 site별 진단, 빌드 명령, 우선순위, lang regression 정책 기록됨.
+**iter 73 핵심 학습 (반드시 다음 세션에 적용)**:
+- vaisc cache (`tests/storage/.vais-cache/`)가 specialization 결과 보존 → fix 효과 가림. 매 빌드 전 nuke 필수.
+- Task #4 commit (`933e03e`) `entries: Vec<BTreeInternalEntry>` annotation이 사실 cache state에 의존하는 illusion. Clean rebuild 시 use-after-move TC 에러 → fail. **이 commit revert 검토 필요.**
+- `--force-rebuild` flag만으로는 cache 정리 부족.
 
-mode: stopped (unknown)
-current_phase: Phase 17 (Compiler Invariant Hardening)
+**상세 인계**: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase0_complete_vaisdb_resume.md`
+
+---
+
+## 작업 목록 (TaskList 복구용)
+
+- [ ] 6. codegen: Vec ptr → slice fat-ptr at function return path (in_progress)
+  scope: BTreeInternalNode_flush의 `R &self.data;` (data: Vec<u8>) 사이트가 `ret { i8*, i64 } %vec_field_ptr` 직접 emit. ret_type `{i8*,i64}` + value `%Vec*`일 때 Vec data/len 추출 후 fat-ptr 구성.
+  prerequisite: emit path 식별 (iter 73 시도 4 path 모두 fire 안 함).
+  verify: clang error count 1 감소 (key.ll:1128만 남음), cargo 796/796 + lang 311/311.
+
+- [ ] 7. codegen: fat-ptr-of-fat-ptr indexing (&[&[u8]] element)
+  scope: btree/key.vais:104 `comp := mut &components[i]`. components: `&[&[u8]]`. element는 `{i8*,i64}` (16B fat ptr). expr_helpers_data.rs:514+ slice index path가 inner-fat-ptr 처리 누락 + bitcast 누락.
+  scope: Wave 시리즈 cascade trigger class와 동일. 단일-사이트 fix 시 cascade 위험 매우 높음. design-driven 접근 필요.
+  verify: clang error 0, cargo 796/796 + lang 311/311.
+
+---
+
+## 과거 phase (참고용)
+
+current_phase_legacy: Phase 17 (Compiler Invariant Hardening)
 task_order: Wave 2a (alloca 14) → 2b (gep 76) → 2c.1 (load wide) → 2c.2 (load narrow, full audit) → 2d (call 54) → Wave 3 (phi/extract/insert) → Wave 4 (catch-all 제거, strict 100%)
 iteration: 65
 max_iterations: 100
