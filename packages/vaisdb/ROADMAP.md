@@ -11,8 +11,8 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 99
-max_iterations: 100
+iteration: 101
+max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
 
@@ -123,6 +123,26 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 100 strategy + 결과 (2026-04-26, P1.3 task 종료 + max_iterations 100→150 LANDED)
+- task: P1.3 Path 4 (inkwell) 검토 → scope clarification + task 종료
+- strategy: Opus direct (inkwell 분석 → P1.4 흡수 결정)
+- 사용자 결정 적용:
+  - max_iterations 100 → 150 (Phase Ω 7~13주 commitment 확장)
+  - Path 4 진행 → scope clarification (인inkwell BasicTypeEnum 호환성 분석)
+- 산출 (compiler commit `6c081cae`):
+  - index_access.rs docs에 Path 3/4 deferral 사유 명시
+  - Path 3: iter 74 stash@{0} 영역 (cascade 위험 7-8/10) → 별도 task #31 분리
+  - Path 4: inkwell BasicTypeEnum incompatible with String elem_llvm → P1.4 흡수
+- **P1.3 task 종료**: Text IR backend 3 path 중 2 migrated (Path 1, 2). Path 3은 task #31, Path 4는 P1.4에 흡수.
+- 검증: cargo test -p vais-codegen --lib resolve_ → 7/0 ✅, build OK
+- ADR 0001 분류: 정책 결정 문서화 (source-only doc)
+- ADR 0002 분류: scope 명시
+- 본 iter commits 1: compiler `6c081cae`
+- 다음 iter (101+) 후보:
+  - **A. P1.4 Type-Tagged IR Builder** (위험 9/10, multi-session) — Pillar 1 최종, Path 4 inkwell도 자연 흡수
+  - **B. #31 Path 3 compound assign** (위험 7-8/10, stash 적용 검토)
+  - **C. vais-server-regression PR 트리거** (위험 1/10)
 
 ### iter 98 strategy + 결과 (2026-04-26, P1.3 Path 2 migration LANDED — multi-session 3/4)
 - task: P1.3 Path 2 (data write simple) migration
@@ -711,7 +731,11 @@ exit_audit:
   - 완료 기준: `#[ignore]` 제거 후 통과, 0 regression
 
 ### Pillar 1.3 — codegen indexing 4-path 통합 (iter 89~93, 2주, 위험 9/10)
-- [ ] P1.3. `expr_helpers_data.rs` + `expr_helpers_assign.rs` + inkwell 4 path를 단일 helper로 수렴
+- [x] P1.3. `expr_helpers_data.rs` + `expr_helpers_assign.rs` + inkwell 4 path를 단일 helper로 수렴 ✅ 2026-04-26 (iter 96~100, multi-session, Opus direct)
+  결과: Text IR backend 단일 helper 신설 (index_access.rs 210 LOC) + Path 1+2 migration. compiler commits `d837ecfb` (helper+Path 1) `8629da3d` (Path 2) `6c081cae` (scope doc).
+  - Path 3 compound assign deferred → 별도 task #31 (iter 74 stash@{0} 영역, cascade 위험 7-8/10)
+  - Path 4 inkwell deferred → P1.4에 자연 흡수 (BasicTypeEnum 호환성으로 별도 helper 필요)
+  - 검증: cargo test -p vais-codegen 1776/0 ✅, vaisdb 2=2 hold ✅
   - 4 path: data read / data write (simple) / data write (compound) / inkwell index
   - 단일 helper: `fn resolve_index_access(arr_ty) -> (elem_llvm, AccessKind, elem_resolved)` 
   - 위치 후보: `vais-codegen/src/index_access.rs` (신규)
