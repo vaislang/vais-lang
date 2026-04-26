@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 109
+iteration: 110
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,33 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 110 REVERTED (2026-04-27, P1.4 ret-load migration regression — variance 재발)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 4/10 — iter 107과 같은 site 후속 instruction)
+- 시도: stmt_visitor.rs:723~738 ret-load (Class 1 ret elem-ty load) 마이그레이션
+  - 변경: `format!("%ret.{}", counter)` + `*counter += 1` + `write_ir!(...)` → `TypedEmitter::emit_load_with_prefix("ret.", LlvmType::from(llvm_ty.as_str()), &src_ptr)`
+  - byte-for-byte IR 동일, 추가 효과: loaded value에 record_emitted_type 자동 호출
+- 검증:
+  - cargo test -p vais-codegen --lib: 823/0 (regression 0)
+  - cargo build --release: 29s OK
+  - **check-integrity 3-run**: 221 / 222 / 220 (평균 221, 폭 ±1 = variance 재발)
+  - vs iter 108 P1.4 baseline (iter 107까지): 221/221/221 (deterministic)
+- 🚫 **net 결과**: 평균 변화 0 + variance 0→±1 재발 = **net negative** (안정성 손실)
+- **CLAUDE 규칙 4 트리거**: 1건이라도 regression이면 즉시 revert. run 3의 220은 iter 108 baseline 221 대비 -1 file regression.
+- **즉시 revert 결정**: `git checkout crates/vais-codegen/src/stmt_visitor.rs` (commit 무 — 워킹 트리만 변경됨)
+- 학습 (memory 보존):
+  - 자동 `record_emitted_type` 호출은 **사이트별 영향이 다름**. iter 107 ret-cast는 deterministic-positive (+0.7 file + variance 제거), iter 110 ret-load는 variance-introducing.
+  - **가설**: load 결과는 cast 결과와 달리 다양한 LLVM 타입 (struct, scalar, ptr 모두 가능). 자동 register가 일부 .vais에 추가 type info 노출 → 일부 +1 빌드 성공, 다른 -1 실패. net 0.
+  - **사이트별 영향 측정 의무**: 마이그레이션은 위험 4/10 추정이었지만 실측 결과 +variance. **단순 마이그레이션이 곧 production-positive가 아님**. P1.4 multi-session 진행 시 매 사이트 마이그레이션 후 3-run 측정 의무화 (ADR 0002 R2/R3 + 안정성 검증).
+- iter 110 산출물:
+  - compiler 0 commits (revert 완료, HEAD = 3d597f81 iter 107)
+  - lang 1 commit: 본 ROADMAP iter 110 REVERTED 기록
+- 다음 iter 111 entry:
+  - **A. R2 차단 테스트** (ADR 0002 의무, 위험 1/10) — `record_emitted_type` 누락 검출 invariant test 추가. iter 107 ret-cast registration이 자동 호출됨을 직접 검증. iter 110 시도가 R2 fail로 차단되도록 보강.
+  - **B. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 6/10) — call ret coerce site, val_ty == "i64" branch. iter 110 학습 따라 3-run 측정 후 결정.
+  - **C. iter 110 가설 심화 분석** — load 마이그레이션의 정확한 +variance 메커니즘 측정. 어떤 .vais 파일이 새로 PASS/FAIL 전환되는지 specific debugging.
+- baseline lock 유지: vaisdb 221/261 deterministic (iter 108 lock).
 
 ### iter 109 LANDED (2026-04-27, P1.4 net production impact 결정적 측정 — 🎯)
 - 사용자 결정: "이어서 진행해줘"
