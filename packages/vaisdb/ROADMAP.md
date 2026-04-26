@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 83
+iteration: 84
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -42,6 +42,18 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 83 strategy + 결과 (2026-04-26, P4.1 ADR retrospective LANDED)
+- task: P4.1 ADR 0001 retrospective (단독, 위험 0, ~30분)
+- strategy: Opus direct (정책 효과 평가, git log + grep audit)
+- 산출 (compiler commit `452fd066`):
+  - ADR 0001 docs에 retrospective 절 추가 (+77 lines)
+  - 정량: 13/15 commits ADR 인용 (87%), 0 revert, 0 TEMP-SITE-FIX, 1 stash (cascade 차단), 2 신규 invariant
+  - 질적: R3 게이트가 cascade 1건 사전 차단, 단일 coerce point (Mini Pillar 1) 성공, ADR 0002로 정밀화
+  - 개선 제안 3건 (백로그): 적용 범위 명시 / R1 부담 감소 / retrospective 의무화
+  - Status: Accepted (sustained) — 정책 변경 미권장
+- 본 iter commits 1: compiler `452fd066`
+- 다음 task 후보 (iter 84+): P1.1 index_invariant_test 보강 (위험 1/10) 또는 P4.3 iter retrospective 의무화
 
 ### iter 82 strategy + 결과 (2026-04-26, std E009 mut fix LANDED)
 - task: #28 std E009 immutable assignment fix (38 std 파일, 위험 0, mechanical)
@@ -400,8 +412,8 @@ exit_audit:
   - 완료 기준: 산발 사이트 763개 → 0, 모든 Pillar 1 차단 테스트 PASS
 
 ### Pillar 4 — 지속적 메타 (iter 75~100, 백그라운드)
-- [ ] P4.1. ADR 0001 retrospective (iter 80, Pillar 1.0 시작 시점)
-  - 정책이 실제 cascade 차단했는지 평가
+- [x] P4.1. ADR 0001 retrospective ✅ 2026-04-26 (iter 83, Opus direct)
+  결과: Status sustained. 87% adoption (13/15 commits cite ADR), 0 revert, 0 TEMP-SITE-FIX, 1 stash (cascade 차단). 개선 제안 3건 (적용 범위 명시 / R1 부담 감소 / retrospective 의무화) → 백로그. compiler commit `452fd066`.
 - [x] P4.2. memory 정합성 검증 ✅ 2026-04-26 (iter 81, Opus direct)
   결과: iter 80 ADR 0002 R3 baseline 7/7 정확 확증. 발견 5건 (cargo test 빌드 실패, integrity PASS regression -38/-13, index_invariant_test 2/5 R2 fail, vaisdb-regression flaky, std E009 mut 누락). memory phase_omega_iter81_p4_2_audit_2026-04-26.md 산출.
   - memory 가설 vs 실측 정정 (이번 iter 74에서 3건 정정)
