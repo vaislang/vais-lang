@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: RESUMING (iter 71 종료 — 다음 세션 진입점). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL. **이번 세션 (iter 67→71)**: vaisdb test_btree 4건 중 2 compiler fix + 1 source fix landed (vais@45c04e82, b8fb12c1; vaisdb@933e03e). 누적 4건 잔여 (모두 같은 deep slice/Vec ABI 카테고리). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+mode: auto (iter 72 — Task #5 진입, 사용자 "이어서 진행" 요청 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL. iter 67→71에서 vaisdb test_btree +3 fix landed. 잔여 4 site 모두 같은 deep slice/Vec ABI 카테고리. **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
 
 **다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
 
@@ -107,6 +107,18 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer node.ll:1736 slice ABI / Task #5 카테고리 합류)
   - 사용자 결정: 소스 타입 명시 fix (최소 위험) — compiler-side inference pollution 차단은 별도 작업
   - 다음 iter: Task #5 (slice ABI 카테고리, 누적 3 site: key.ll:1128, test_btree.ll:1142, node.ll:1736)
+
+  **iter 72 (2026-04-26) — Task #5 partial: source-side 3 site fix LANDED ✅ (4→2)**:
+  - 변경: vaisdb source 2 files, 3 sites
+    - `src/storage/btree/prefix.vais:138, 214` — `current_key: Vec<u8> := mut Vec.with_capacity(...)` 명시 type (Task #4와 같은 패턴, Vec inference pollution 회피)
+    - `tests/storage/test_btree.vais:151, 191` — `compare_keys(stored, ...)` / `decode_i64_key(found_key)` (`&` 제거; slice 변수에 `&` 적용은 alloca-of-fat-ptr 생성)
+  - 적중: prefix.ll:1475 ✅, test_btree.ll:1142 ✅, test_btree.ll:1446 ✅
+  - 잔여 2 site (둘 다 codegen 영역, source 우회 어려움):
+    - key.ll:1128 — `&[&[u8]]` element fat-ptr indexing (expr_helpers_data slice path inner-fat-ptr)
+    - node.ll:1736 — `R &self.data` Vec→slice ret path (codegen ret coerce 누락)
+  - cargo 796/796 ✅
+  - lang regression: source-only 변경, 영향 없음
+  - 다음 iter: 잔여 2 site는 codegen fix만 가능. 단일-사이트 fix 위험 — 묶어서 design.
 
   **iter 71 종료 — 사용자 결정 "세션 종료 + 인계 메모 갱신"**:
   - 누적 진전 (iter 67→71, 5 iter, +3 fix landed):
