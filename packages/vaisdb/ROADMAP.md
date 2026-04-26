@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 92
+iteration: 93
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -69,6 +69,27 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 92 strategy + 결과 (2026-04-26, P1.2 baseline improvement LANDED — multi-session 4/5)
+- task: P1.2 vaisdb 통합 측정 + baseline 갱신
+- strategy: Opus direct (실측 + script + workflow 갱신)
+- 산출 (compiler commit `2359906d`):
+  - **🎉 vaisdb baseline IMPROVEMENT**: test_graph 2 → 1 (P1.2 fix가 실제 graph.vais 깨트린 site 해소)
+  - 측정 데이터 (standalone 3회): 2(before) → 1, 0, 1 (after, alternating)
+  - 측정 데이터 (--all context 2회): 0, 1
+  - WAVE1_BASELINES 갱신: (2 1 1 2 3) → (2 1 1 1 3) — conservative 1 채택 (0 flaky 회피)
+  - workflow yml comment 갱신: 합계 9 → 8
+  - vaisdb-regression --all baseline hold: 8=8 ✅
+- **이는 Phase Ω의 첫 production impact 측정 성공**: ADR 0001 §1 R3 게이트 + ADR 0002 baseline tracking으로 fix 효과 정량화 가능
+- 잔여 vaisdb errors:
+  - test_btree=2: codegen 4-path territory (Pillar 1.3 대상)
+  - test_wal=1, test_buffer_pool=1: 동일 codegen 영역
+  - test_migration=3: GEP unsized class
+  - test_graph=1: 잔여 i64↔ptr (P1.x 추가 fix 후 재평가)
+- 다음 iter (93) 후보:
+  - **P1.2 마무리** (5/5): cargo test --workspace --no-fail-fast 재실측 + ROADMAP 마지막 정리 (iter 93에서 P1.2 task 종료)
+  - 또는 BTreeMap/IndexMap audit (잔여 R3 audit, 위험 1/10)
+- 본 iter commits 1: compiler `2359906d`
 
 ### iter 91 strategy + 결과 (2026-04-26, P1.2 R3 audit fix LANDED — multi-session 3/5)
 - task: P1.2 R3 audit — Vec.push fix와 동일 패턴 다른 builtin dispatch site 검토
