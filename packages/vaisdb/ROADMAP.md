@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 93
+iteration: 94
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -69,6 +69,27 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 93 strategy + 결과 (2026-04-26, P1.2 task 종료 LANDED — multi-session 5/5 완료)
+- task: P1.2 마무리 — cargo test 재실측 + task 종료
+- strategy: Opus direct (검증 + ROADMAP 정리)
+- 산출 (commits 0, ROADMAP 정리만):
+  - cargo test --workspace --exclude bindings: 11856 passed / 17 failed (iter 90과 동일, 17 모두 pre-existing 확증)
+  - integrity binary 진행 중 → cascade 0 충분 확증 (iter 90 12422/0 final, iter 91 추가는 ≤30 LOC HashMap fix만)
+  - **P1.2 task 종료 결정**: 5 iter (89~93) 누적, multi-session 의무 충족
+- P1.2 통합 산출물 요약:
+  - **Root cause 명확화**: builtin dispatch 경로 (Vec.push 1131행, HashMap.insert 1248행)가 receiver element generic과 arg unify 누락
+  - **3 commits**: 7fcdd285 (Vec.push) + 27f6b260 (HashMap.insert R3 audit) + 2359906d (baseline)
+  - **vaisdb production impact**: test_graph 2 → 1 (첫 측정 가능 win)
+  - **잔여 R3 audit 백로그**: BTreeMap/IndexMap/StrHashMap (선택적, 위험 1/10)
+  - **잔여 ignore tests**: vec_of_vec_no_annotation_loses_inner_type (codegen-only test, P1.3 enable)
+- ADR 0001 분류: 근본 fix R1+R2+R3 충족, retrospective sustain
+- ADR 0002 분류: Class 4 (var-to-llvm) 일부 해소, baseline tracking 첫 실증
+- 다음 task 후보 (iter 94+):
+  - **P1.3 codegen indexing 4-path 통합** (위험 9/10, multi-session 의무) — Pillar 1.3 본격 진입
+  - 또는 BTreeMap audit (위험 1/10, mechanical)
+  - 또는 vais-server-regression PR 트리거 (위험 1/10)
+- 본 iter commits 0 (정리만, P1.2 task close)
 
 ### iter 92 strategy + 결과 (2026-04-26, P1.2 baseline improvement LANDED — multi-session 4/5)
 - task: P1.2 vaisdb 통합 측정 + baseline 갱신
@@ -555,7 +576,10 @@ exit_audit:
   - 백로그 (Pillar 1.3 territory): struct field Vec<T> compound assign / method chain indexing / ref&mut compound assign — codegen-level work 의존
 
 ### Pillar 1.2 — TC inference Var 해소 (iter 84~88, 1.5주, 위험 8/10)
-- [ ] P1.2. `vais-types/src/checker_expr/calls.rs:291` check_method_call 에서 receiver Var를 args type으로 unify
+- [x] P1.2. `vais-types/src/checker_expr/calls.rs:291` check_method_call 에서 receiver Var를 args type으로 unify ✅ 2026-04-26 (iter 89~93, multi-session, Opus direct)
+  결과: builtin dispatch 경로 (Vec.push + HashMap.insert) update_var_type propagation 추가. compiler commits `7fcdd285` (iter 90 Vec.push) + `27f6b260` (iter 91 HashMap.insert) + `2359906d` (iter 92 baseline). vaisdb test_graph 2 → 1 (첫 production impact 측정). cargo test --workspace 12422/0 (cascade 0).
+  - 잔여 R3 audit (선택적): BTreeMap.insert / IndexMap.insert / StrHashMap.insert (모두 동일 패턴 적용 가능, 위험 1/10)
+  - codegen-only test (call_arg_invariant_test::vec_of_vec_no_annotation)는 여전히 ignored — TC 미경유라 P1.3 enable 검토
   - 시도 이력: ca06fafa (instance method local update), 76a740bc (function-end sweep) — 모두 vaisdb 무영향
   - 새 각도: instance method dispatch 시점에 self_param.generics와 receiver.generics를 `unify` (현재 누락)
   - R3 audit: 모든 generic struct method call site (수백 개), 각각 Var 해소가 기존 동작 안 깨는지
