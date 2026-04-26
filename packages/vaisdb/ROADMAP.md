@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 108
+iteration: 109
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,31 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 109 LANDED (2026-04-27, P1.4 net production impact 결정적 측정 — 🎯)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, 측정-only iter, compiler/git checkout만)
+- 산출물:
+  - **pre-P1.4 baseline 3-run** (compiler `git checkout 76fe8a7e` — P1.4 변경 0 시점):
+    - run 1: vaisdb 219/261
+    - run 2: vaisdb 223/261
+    - run 3: vaisdb 219/261
+    - 평균: ~220.3, 폭: ±2 (219~223 flaky range)
+  - **P1.4 LANDED baseline 3-run** (iter 108 측정, HEAD = 3d597f81):
+    - run 1, 2, 3 모두 221/261 (identical)
+- 🎯 **Phase Ω P1.4 net production impact 결정적 결과**:
+  - **flaky range 제거**: pre 219~223 → post 221 (deterministic)
+  - **평균 +0.7 file** (pre 220.3 → post 221)
+  - **variance 0**: 3-run identical (pre는 +4 폭의 flakiness)
+  - **의미**: Pillar 1 invariant ("763 산발 사이트 → 단일 API 수렴")의 첫 실증. emit_typed.rs 도입의 자동 `record_emitted_type` 호출이 cast result type을 결정적으로 기록 → vaisdb std cache 비결정적 새는 현상 (CLAUDE.md "Vec<T> 제네릭 인스턴스 비결정적") 부분 완화.
+  - **iter 92 P1.2 +1 file (test_graph 2→1)에 이은 P1.4 첫 production impact**.
+- iter 109 산출물:
+  - compiler 0 commits (측정-only, git checkout 76fe8a7e + main 복귀만)
+  - lang 1 commit: 본 ROADMAP iter 109 LANDED
+- 다음 iter 110 entry:
+  - **A. stmt_visitor.rs:723 load 마이그레이션** (위험 4/10) — emit_load_with_prefix("ret.", ...) 적용. iter 107 ret-cast와 같은 site의 후속 instruction. iter 107의 +0.7 effect가 iter 110 추가 자동 register로 더 누적될지 측정.
+  - **B. R2 차단 테스트** (ADR 0002 의무) — `record_emitted_type` 누락 검출. ret_invariant_test.rs에 ret-cast type registration invariant 추가.
+  - **C. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 6/10) — call ret coerce site, val_ty == "i64" branch.
 
 ### iter 108 LANDED (2026-04-27, P1.4 baseline 안정성 검증 + 측정 결론)
 - 사용자 결정: "이어서 진행해줘"
