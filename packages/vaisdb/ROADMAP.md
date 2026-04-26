@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 102
+iteration: 103
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -123,6 +123,21 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 102 strategy + 결과 (2026-04-26, vaisdb baseline 재측정 — flaky 확증, 갱신 불요)
+- task: option B vaisdb baseline 재측정 (iter 101 stash 통합 후 영향 측정)
+- strategy: Opus direct (read-only, 5 runs --all + 3 runs standalone test_graph)
+- 측정:
+  - --all 5 runs: 8/8/8/8/7 (4/5 = baseline hold, 1/5 = test_graph 1→0 flaky)
+  - test_graph standalone 3 runs: 1/1/1 (모두 baseline 1 hold)
+- **결론**: 베이스라인 갱신 불요 — test_graph 0은 --all context flaky artifact, conservative baseline 1 정확
+- 잔여 vaisdb errors 8 = test_btree(2) + test_wal(1) + test_buffer_pool(1) + test_graph(1) + test_migration(3)
+- 모두 codegen 4-path 영역 (Path 4 inkwell 또는 P1.4 흡수 territory)
+- 본 iter commits 0 (측정만)
+- 다음 iter (103+) 후보:
+  - **A. P1.4 Type-Tagged IR Builder 시작** (위험 9/10) — Pillar 1 최종, recon 1/N
+  - **B. cargo test --workspace 전체 재실측** (위험 0) — 본 세션 누적 fix cascade 0 확증
+  - **C. 세션 종료** — iter 95~102 8 iter 누적, P1.3 완전 종료
 
 ### iter 101 strategy + 결과 (2026-04-26, #31 Path 3 compound assign 완료 + 4 R2 tests enable 🎉)
 - task: #31 Path 3 (compound assign) migration — stash@{0} 통합 + helper 흡수
