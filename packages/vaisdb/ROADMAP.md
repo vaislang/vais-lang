@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 91
+iteration: 92
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -69,6 +69,25 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 91 strategy + 결과 (2026-04-26, P1.2 R3 audit fix LANDED — multi-session 3/5)
+- task: P1.2 R3 audit — Vec.push fix와 동일 패턴 다른 builtin dispatch site 검토
+- strategy: Opus direct (mechanical pattern apply, audit + fix)
+- 산출 (compiler commit `27f6b260`):
+  - HashMap.insert/set에 update_var_type propagation 추가
+  - 기존: Phase 6.27d.c가 unify(K, k_actual) + unify(V, v_actual)는 했지만 update_var_type 누락
+  - 추가: apply_substitutions로 generics 재해석 → any_changed 시 update_var_type
+- 검증:
+  - cargo test -p vais-codegen: 1767/0 ✅
+  - cargo test -p vais-types: 1471/0 ✅
+  - vaisdb-regression test_btree: 2=2 hold ✅
+  - call_arg_invariant_test: 3 passed / 1 ignored / 0 failed ✅
+- 영향: vaisdb HashMap.with_capacity → insert → get 패턴이 receiver var update 받음
+- 잔여 R3 audit: BTreeMap.insert / IndexMap.insert / StrHashMap.insert (모두 동일 패턴 가능성)
+- ADR 0001 분류: R3 audit (근본 fix 추가 site)
+- ADR 0002 분류: Class 4 일부 추가 해소
+- 본 iter commits 1: compiler `27f6b260`
+- 다음 iter (92) 후보: BTreeMap/IndexMap audit (위험 1/10) 또는 vaisdb 통합 측정
 
 ### iter 90 strategy + 결과 (2026-04-26, P1.2 first fix LANDED — multi-session 2/5)
 - task: P1.2 TC inference Var 해소 — 첫 fix iter (recon iter 89 후속)
