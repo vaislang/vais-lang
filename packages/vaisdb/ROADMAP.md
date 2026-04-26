@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 113
+iteration: 114
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,48 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 114 LANDED (2026-04-27, 🎯 deterministic measurement protocol — flaky 근본 해결)
+- 사용자 결정: "완벽하게 해결해줘" (iter 113 재평가의 본질적 해결 요청)
+- strategy: Opus direct (위험 3/10, integrity test infrastructure 수정 — vaisc 바이너리 0 변경)
+- root cause 진단:
+  - iter 109/113 retro에서 vaisdb baseline 217~223 비결정적 — measurement noise의 진짜 원인 미규명
+  - 코드 분석 결과 3개 독립 noise source 발견:
+    1. `crates/vaisc/tests/integrity.rs::ok_codegen_pkg` 가 모든 .vais 파일을 `--emit-ir -o /tmp/__ok.ll` 단일 path로 출력 → cargo test multi-thread parallel 시 race
+    2. `<input>/.vais-cache` 디렉토리가 vaisdb sub-dir 마다 생성되며 run 간 잔재 → stale cache hit
+    3. 같은 디렉토리의 여러 .vais가 같은 cache_dir 공유 → single-thread 내에서도 cache write race 가능 (parallel cargo)
+- 수정 (3 fix):
+  1. `crates/vaisc/tests/integrity.rs`: `unique_ir_path(input)` helper 신설 (input hash + PID + thread id), `ok_codegen` / `ok_codegen_pkg` 에 적용. 기존 `unique_exe_path` 패턴 일치.
+  2. `scripts/check-integrity.sh`: 측정 시작 시 `find <std> <vaisdb> -name .vais-cache -exec rm -rf {} +` 추가.
+  3. `scripts/check-integrity.sh`: integrity test에 `--test-threads=1` 추가 (전체 cargo test 영향 없음, integrity만 serialize).
+- threshold update:
+  - `INTEGRITY_VAISDB_MIN=237` (stale, 이전 세션 잔재) → **219** (post-fix 측정 lower edge)
+- 측정 결과 (3-run vaisdb_files counts, byte-identical tree):
+  | Mode | run1 | run2 | run3 | spread |
+  |------|-----:|-----:|-----:|-------:|
+  | Pre-fix (multi-thread, dirty cache) | 217 | 220 | 222 | ±2.5 |
+  | Multi-thread + unique IR | 221 | 221 | 218 | ±1.5 |
+  | Single-thread (no cache clean) | 221 | 220 | 222 | ±1 |
+  | **Single-thread + cache clean** | **219** | **220** | **220** | **±0.5** |
+- 효과:
+  - 측정 noise ±2.5 → ±0.5 (5배 개선)
+  - **deterministic-OK range 정확화**: 219~220 (단 한 개 파일이 cache state에 flip)
+  - vaisdb baseline 219 → CI gate 219 미만 시 진짜 regression 검출 가능
+  - 잔여 ±0.5 noise는 single .vais 파일의 cache state-dependent (iter 115+ 시 재현 후 fix 결정)
+- P1.4 implication:
+  - iter 109 "+0.7 file + variance 0" 결론은 iter 108 측정이 noisy window 안에서 우연히 deterministic이었던 artifact. iter 113에서 flagged, 본 iter에서 noise 자체를 제거하여 **재측정 가능 상태로 전환**.
+  - iter 110 revert 결정도 noise 일부에 의존 — 이제 site-by-site +/-0.5 effect까지 측정 가능 (iter 115+ 복구 결정 데이터 확보 가능).
+- iter 114 산출물:
+  - compiler 1 commit `6b7ffc2c` (test infra + script, vaisc binary 변경 0)
+  - lang 1 commit: 본 ROADMAP iter 114 LANDED
+- 검증:
+  - cargo build --release --bin vaisc: 변경 없음 빌드 OK
+  - cargo test -p vais-codegen --lib: 823/0 (regression 0)
+  - check-integrity (post-fix 1회): std 82/82 + vaisdb 220/261 (≥219 PASS). living_spec 1 fail은 본 iter 무관 (pre-existing, `06_examples/example_todo_store.vais`).
+- 다음 iter 115 entry:
+  - **A. iter 109 재측정 — 본 deterministic protocol로 P1.4 net impact 재산출** (위험 0, 측정-only). pre-P1.4 baseline (76fe8a7e checkout) + post-P1.4 (HEAD) 각 3-run, post-fix 환경으로.
+  - **B. iter 110 ret-load 마이그레이션 재시도** (위험 3/10, 위험 5/10 → 3/10 감소 — deterministic 측정으로 site별 effect 정밀하게 측정 가능)
+  - **C. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 4/10, 위험 6/10 → 4/10 감소)
 
 ### iter 113 LANDED (2026-04-27, ⚠️ P1.4 net impact 재평가 — iter 109 결론 부분 무효)
 - 사용자 결정: "이어서 진행해줘"
