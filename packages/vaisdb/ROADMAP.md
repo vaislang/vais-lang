@@ -10,7 +10,7 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto (iter 71, RESUMING — 사용자 "전체 자동 진행" 승인 2026-04-26). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
+mode: RESUMING (iter 71 종료 — 다음 세션 진입점). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL. **이번 세션 (iter 67→71)**: vaisdb test_btree 4건 중 2 compiler fix + 1 source fix landed (vais@45c04e82, b8fb12c1; vaisdb@933e03e). 누적 4건 잔여 (모두 같은 deep slice/Vec ABI 카테고리). **Phase 0 v1.0 ✅ 완료** (2026-04-26): vais 컴파일러 모든 사용자 path ZERO FAIL — lang 311/311, stdlib 7/7, hello 12/12, e2e text-IR 2625/2625, bootstrap 17/17. 이제 vaisdb 빌드 작업 재개.
 
 **다음 세션 진입점**: vaisdb test_btree.vais 빌드 시 5종 IR mismatch 중 1건만 해결됨 (commit `f57900d4` — bytebuffer scalar-shape guard, vais compiler repo). 잔여 4건은 ROADMAP Phase 17 Wave 시리즈의 연장 — module-cross `infer_expr_type` pollution이 codegen SSA registry에 잘못된 Named 타입을 부여하여 emit/use mismatch 발생.
 
@@ -107,6 +107,19 @@ phase_doc: docs/MASTER_ROADMAP.md (Phase α/β/γ/δ/ε trust-building)
   - vaisdb test_btree clang: 4 → 4 (1 fix, 1 new layer node.ll:1736 slice ABI / Task #5 카테고리 합류)
   - 사용자 결정: 소스 타입 명시 fix (최소 위험) — compiler-side inference pollution 차단은 별도 작업
   - 다음 iter: Task #5 (slice ABI 카테고리, 누적 3 site: key.ll:1128, test_btree.ll:1142, node.ll:1736)
+
+  **iter 71 종료 — 사용자 결정 "세션 종료 + 인계 메모 갱신"**:
+  - 누적 진전 (iter 67→71, 5 iter, +3 fix landed):
+    - vais@45c04e82: codegen 3-path zext narrow→i64 before inttoptr in arg coerce
+    - vais@b8fb12c1: codegen Vec→slice coerce in instance method call
+    - vaisdb@933e03e: source-side `entries: Vec<BTreeInternalEntry>` type annotation
+  - vaisdb test_btree 4건 잔여 (모두 같은 deep ABI 카테고리, Task #5로 묶음):
+    - test_btree_key.ll:1128 — `&[&[u8]]` element fat-ptr 인덱싱 (slice index path inner-fat-ptr 처리 누락)
+    - test_btree_prefix.ll:1475 — `%t100` `Vec$u8` vs `Vec$u64` (Vec specialization mix from `reconstruct_key` 반환)
+    - test_btree_test_btree.ll:1142 — `%stored.35` alloca-of-fat-ptr load 누락 (`compare_keys({i8*,i64}, ...)` 에 alloca ptr 직접 전달)
+    - test_btree_node.ll:1736 — `%t43` ptr vs `{ptr,i64}` (slice ABI, 같은 카테고리)
+  - cargo 796/796 + lang 311/311 throughout zero regression
+  - **다음 세션 진입점**: 4 site 모두 같은 카테고리 → expr_helpers_data.rs slice indexing의 inner-fat-ptr path 종합 fix 또는 alloca-of-fat-ptr load 자동 wrap. Wave 4 catch-all 제거 또는 inference pollution 차단 설계 후 진입 권장. 단일-사이트 fix 시 cascade 위험 매우 높음 (memory phase17_3_negatives_escalation).
 
   **iter 65 (2026-04-25) — Phase α.1 진행 보고: layer 노출 패턴**:
   - Compiler fixes (4 commits):
