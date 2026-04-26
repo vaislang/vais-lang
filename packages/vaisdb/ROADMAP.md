@@ -10,10 +10,54 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: pending (Mini Pillar 1 다음 iter 결정 대기)
-iteration: 74
+mode: auto
+iteration: 76
 max_iterations: 100
-current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invariant 1개 사이트 적용 (2026-04-26)
+current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
+entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
+
+invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
+  1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
+  2. codegen indexing/store/call-arg/ret 4 클래스에 invariant 명시 + R2 차단 테스트 + R3 audit 충족 (Pillar 1)
+  3. 165 ad-hoc if-coerce + 329 수동 register_temp_type 산발 사이트가 단일 API로 수렴 (Pillar 1)
+exit_audit:
+  - vaisdb regression CI: KNOWN_FAILURE_COUNT=0
+  - cargo test --workspace: ≥ 2625 (현 baseline)
+  - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
+  - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 76 strategy + 결과 (2026-04-26)
+- strategy: P3.1 (read-only audit) + P2.1 (workflow 정적 검증) → independent parallel, no worktree (compiler repo, read-only)
+- 실행: research-haiku 2개 spawn → 둘 다 idle_notification (work 종료) but text 보고 미수신 → Opus direct로 최종 audit 수행 (data 수집 grep 4회로 충분)
+- 산출:
+  - P3.1: 10/10 PASS (5 CLAUDE 규칙 + 3 ADR 요건 + 1 commit + 1 변경 0건)
+  - P2.1: 차단력 STRONG (wave 1 scope) — workflow + script 정적 검증으로 KNOWN_FAILURE_COUNT 차단 로직 확증
+- 다음 iter (77+) 후보: Pillar 2.2 (vaisdb wave 1 추가 등록, test_btree 외 5개) 또는 P2.1 PR 트리거 실측 (위험 1/10, 사용자 결정 필요)
+
+### iter 74 산출물 (LANDED, 2026-04-26)
+- compiler 7 commits: c683bd42 (Pillar 3+2 정책) / 7cfc5caf (coerce_ret_value) / 1b99766c (ret_invariant_test) / c0d5bd31, 628674ec, 2ab0a421 (3 ret 사이트 migration) / 041685e6 (call-arg structural guard 부분)
+- vaisdb Task #6 RESOLVED (node.ll:1736)
+- vaisdb regression baseline: 2 errors (node.ll:1848 + key.ll:1128)
+- TC fix 2회 시도 (ca06fafa, 76a740bc) — cascade 0이지만 vaisdb fire 안 함
+
+### iter 74 추가 audit (2026-04-26 후속 세션)
+- compound assign fix 시도 → -3 vaisdb regression → REVERTED (CLAUDE 규칙 4)
+  - stash 보관: `stash@{0}: phaseO_compound_assign_fix`
+  - test 파일 신규 (유지): `compiler/crates/vais-codegen/tests/index_invariant_test.rs` (5 case, R2 차단)
+  - 학습: cargo test 2625/0 통과 + R2 test 5/5 통과해도 integrity 깨질 수 있음 → vaisdb 실제 패턴 cover 의무 추가
+- vaisdb 2 errors 진짜 클래스 재확증:
+  - node.ll:1848 = call-arg slice coerce miss (Vec_push$slice_u8 호출 시 i64→{i8*,i64} 누락)
+  - key.ll:1128 = slice indexing read fat-ptr extract miss (`&[&[u8]]` indexing 시 inner fat-ptr load 누락)
+  - 공통 origin: TC inference에서 `Vec.with_capacity()`의 T가 push site로부터 역추론 안 됨 → i64 fallback → codegen이 fat-ptr 처리 path 미진입
+- 진짜 fix 위치 (cascade 위험 9~10/10):
+  - codegen: `vais-codegen/src/expr_helpers_data.rs:484-489` Named/Unknown/Generic → "i64" fallback
+  - codegen: `vais-codegen/src/types/conversion.rs:360-366` Var/Unknown → "i64" fallback
+  - TC: `vais-types/src/checker_expr/calls.rs:291` check_method_call (instance method receiver Var unify 누락)
+- baseline (2026-04-26 fix 시작 시점):
+  - std_files: 44/82 (baseline 82 대비 -38 pre-existing)
+  - vaisdb_files: 222/261 (baseline 237 대비 -15 pre-existing)
+  - cargo test --workspace: 2625/0/1ignored
+  - vaisdb 2 errors (node.ll:1848 + key.ll:1128)
 
 **iter 74 완료 산출물 (7 compiler commits + 2 vaisdb commits)**:
 - compiler `c683bd42` — docs(policy): Phase Ω Pillar 3+2 (CLAUDE 규칙 8~12 + ADR 0001 + vaisdb regression CI)
@@ -85,17 +129,122 @@ current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invaria
 
 ---
 
-## 작업 목록 (TaskList 복구용)
+## 작업 목록 (TaskList 복구용 — Phase Ω 4-Pillar)
 
-- [ ] 6. codegen: Vec ptr → slice fat-ptr at function return path (in_progress)
-  scope: BTreeInternalNode_flush의 `R &self.data;` (data: Vec<u8>) 사이트가 `ret { i8*, i64 } %vec_field_ptr` 직접 emit. ret_type `{i8*,i64}` + value `%Vec*`일 때 Vec data/len 추출 후 fat-ptr 구성.
-  prerequisite: emit path 식별 (iter 73 시도 4 path 모두 fire 안 함).
-  verify: clang error count 1 감소 (key.ll:1128만 남음), cargo 796/796 + lang 311/311.
+> **iter 74 Task #6/#7은 Pillar 1로 흡수**됨 (cascade 위험으로 단일-사이트 fix 차단). 아래 task가 새 진입점.
 
-- [ ] 7. codegen: fat-ptr-of-fat-ptr indexing (&[&[u8]] element)
-  scope: btree/key.vais:104 `comp := mut &components[i]`. components: `&[&[u8]]`. element는 `{i8*,i64}` (16B fat ptr). expr_helpers_data.rs:514+ slice index path가 inner-fat-ptr 처리 누락 + bitcast 누락.
-  scope: Wave 시리즈 cascade trigger class와 동일. 단일-사이트 fix 시 cascade 위험 매우 높음. design-driven 접근 필요.
-  verify: clang error 0, cargo 796/796 + lang 311/311.
+### Pillar 3.1 — 정책 점검 (iter 75 첫 task, 0.5~1일, 위험 0)
+- [x] P3.1. CLAUDE 규칙 8~12 + ADR 0001 LANDED 상태 재검증 ✅ 2026-04-26 (iter 76, Opus direct)
+  - 결과: 10/10 PASS — CLAUDE 규칙 8(line 75)/9(line 93)/10(line 101)/11(line 110)/12(line 124) 모두 본문 그대로. ADR 0001 R1/R2/R3 명문화 (line 53-85). c683bd42 LANDED 이후 변경 commit 0개.
+  - 위치: `compiler/CLAUDE.md` line 75/93/101/110/124 + `compiler/docs/adr/0001-root-cause-definition.md`
+  - 절차: grep으로 5 규칙 존재 + ADR R3 게이트 명문화 확인
+  - 산출: PASS/FAIL 보고. iter 74 recon-a가 5/5 PASS 확증했지만 iter 75 시작 시 재확증
+  - 완료 기준: 모든 항목 PASS, 변동 시 git log로 변경 사유 추적
+
+### Pillar 2.1 — vaisdb regression CI 검증 (iter 75, 1일, 위험 1/10)
+- [x] P2.1. `compiler/.github/workflows/vaisdb-regression.yml` 정적 검증 ✅ 2026-04-26 (iter 76, Opus direct)
+  - 결과: 차단력 STRONG (wave 1 scope 한정)
+  - workflow trigger PASS (push/PR main+develop), build chain PASS (vaisc → IR → clang -O0)
+  - `scripts/vaisdb-regression.sh:31` KNOWN_FAILURE_COUNT="${KNOWN_FAILURE_COUNT:-2}" 명문화
+  - 차단 로직: CLANG_ERRORS > KNOWN_FAILURE_COUNT → exit 1, ADR 0001 §1 R3 메시지 (script line 121)
+  - improvement detection: CLANG_ERRORS < KNOWN_FAILURE_COUNT → KNOWN_FAILURE_COUNT 갱신 의무 (script line 130-135)
+  - 한계: cross-repo (vais-lang) 의존, smoke wave 1 (test_btree only). cargo test ≥ 2625 게이트는 별도 workflow 영역
+  - PR 트리거 실측 (의도적 regression 시 fail 확인)은 사용자 결정 후 별도 step (위험 1/10이지만 PR push 권한 필요)
+  - README 갱신: 미확인. 차단력 자체는 workflow + script 코드로 확증
+  - 현재 KNOWN_FAILURE_COUNT=2 (node.ll:1848 + key.ll:1128)
+  - 절차: PR 생성하여 CI 트리거 → 실측 fail/pass 확인 → README 갱신
+  - 산출: CI가 진짜 차단력 있는지 검증
+  - 완료 기준: 의도적 regression 추가 시 CI fail, fix 시 CI pass
+
+### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 76~77, 2일, 위험 2/10)
+- [ ] P2.2. test_btree 외 vaisdb 테스트 추가 등록
+  - 후보: 21 integration suite 중 cascade 위험 낮은 5개 (CRUD only)
+  - 절차: 각 테스트 standalone build → 0 error 확인 → CI 등록
+  - 산출: KNOWN_FAILURE_COUNT가 명확하게 분류된 baseline
+  - 완료 기준: 추가 5개 테스트 + 모두 known-failure 또는 known-pass로 분류
+
+### Pillar 2.3 — vais-server / vais-web 통합 (iter 78~79, 3일, 위험 3/10)
+- [ ] P2.3. server/web 패키지를 compiler regression suite에 추가
+  - 절차: 각 패키지 strict build → known-failure 등록
+  - 완료 기준: 두 패키지 모두 baseline 측정 + CI 등록
+
+### Pillar 1.0 — invariant 명세 (iter 80~82, 1주, 위험 0)
+- [ ] P1.0. codegen 4 클래스 invariant 문서화
+  - 위치: `compiler/docs/adr/0002-codegen-invariants.md` (신규)
+  - 4 클래스:
+    1. ret elem-ty: 이미 ADR 0001 §1 R1 (iter 74 LANDED)
+    2. **index/store elem-ty**: GEP/store의 elem-ty는 ResolvedType에서 도출, fallback 금지
+    3. **call-arg coerce**: callee param type vs caller arg type mismatch는 명시적 coerce
+    4. **var-to-llvm**: ResolvedType::Var는 codegen 도달 시 에러 (현 i64 fallback 제거)
+  - 산출: 각 invariant + R1/R2/R3 의무 + 초기 차단 테스트 후보
+  - 완료 기준: ADR 0002 LANDED, 사용자 승인
+
+### Pillar 1.1 — index_invariant_test 보강 (iter 83, 0.5주, 위험 1/10)
+- [ ] P1.1. iter 74 산출물 `index_invariant_test.rs` 확장
+  - 현재: 5 case (simple ident pattern only)
+  - 추가 case (vaisdb 패턴 cover):
+    - struct field Vec<T> compound assign
+    - method chain 결과 indexing
+    - ref/&mut through compound assign
+    - Vec<&[u8]> indexing read (node.ll:1848 패턴)
+    - `&[&[u8]]` indexing read (key.ll:1128 패턴)
+  - 산출: ≥10 case, 모두 fix 전 fail / fix 후 pass
+  - 완료 기준: stash@{0} fix 재적용 시 모든 case PASS, 빠지지 않은 vaisdb 패턴 0
+
+### Pillar 1.2 — TC inference Var 해소 (iter 84~88, 1.5주, 위험 8/10)
+- [ ] P1.2. `vais-types/src/checker_expr/calls.rs:291` check_method_call 에서 receiver Var를 args type으로 unify
+  - 시도 이력: ca06fafa (instance method local update), 76a740bc (function-end sweep) — 모두 vaisdb 무영향
+  - 새 각도: instance method dispatch 시점에 self_param.generics와 receiver.generics를 `unify` (현재 누락)
+  - R3 audit: 모든 generic struct method call site (수백 개), 각각 Var 해소가 기존 동작 안 깨는지
+  - 매 step 검증: cargo + integrity + vaisdb regression 3축
+  - 산출: standalone repro test (`vec_of_vec_no_annotation_loses_inner_type`) PASS
+  - 완료 기준: `#[ignore]` 제거 후 통과, 0 regression
+
+### Pillar 1.3 — codegen indexing 4-path 통합 (iter 89~93, 2주, 위험 9/10)
+- [ ] P1.3. `expr_helpers_data.rs` + `expr_helpers_assign.rs` + inkwell 4 path를 단일 helper로 수렴
+  - 4 path: data read / data write (simple) / data write (compound) / inkwell index
+  - 단일 helper: `fn resolve_index_access(arr_ty) -> (elem_llvm, AccessKind, elem_resolved)` 
+  - 위치 후보: `vais-codegen/src/index_access.rs` (신규)
+  - R3 audit: 모든 indexing emit 사이트 (≥6 파일)
+  - vaisdb 2 errors 해소 검증: clang -c 후 0 error
+  - 매 step 검증: cargo + integrity + vaisdb 3축
+  - 완료 기준: clang errors 0, cargo ≥ 2625, integrity vaisdb ≥ 261, std ≥ 82
+
+### Pillar 1.4 — Type-Tagged IR Builder 도입 (iter 94~100, 3~4주, 위험 9/10)
+- [ ] P1.4. write_ir! 매크로를 typed wrapper로 교체
+  - 현재: `write_ir!(ir, "  {} = call ...", ret, args)` — 타입 unchecked
+  - 신규: `emit_call(ret, fn_name, args: &[(LlvmType, Value)])` — 타입 typed
+  - 자동 register_temp_type (329 수동 호출 흡수)
+  - 자동 coerce (165 ad-hoc if-coerce 흡수)
+  - R3 audit: 165 + 329 사이트 모두 신규 API로 마이그레이션
+  - 완료 기준: 산발 사이트 763개 → 0, 모든 Pillar 1 차단 테스트 PASS
+
+### Pillar 4 — 지속적 메타 (iter 75~100, 백그라운드)
+- [ ] P4.1. ADR 0001 retrospective (iter 80, Pillar 1.0 시작 시점)
+  - 정책이 실제 cascade 차단했는지 평가
+- [ ] P4.2. memory 정합성 검증 (iter 75, 95)
+  - memory 가설 vs 실측 정정 (이번 iter 74에서 3건 정정)
+- [ ] P4.3. iter retrospective 의무화 (각 iter 종료 시)
+  - mode/iteration 갱신, 산출물/실패 기록, 다음 iter entry point
+
+---
+
+## Day 1 procedure (iter 75 시작 시)
+
+1. ROADMAP 본 섹션 읽기 → mode/iteration 확인
+2. P3.1 + P2.1 병렬 진행:
+   - P3.1: 5분 grep 검증
+   - P2.1: 1일 (CI 검증 PR + 실측)
+3. 두 task 완료 후 사용자 승인 받고 P2.2 착수
+4. cascade 위험 매번 측정: cargo + integrity + vaisdb 3축
+
+## 위험 회피 원칙 (Phase 17 stopped 패턴 재발 방지)
+
+1. **단일 사이트 fix 금지**: ADR 0001 R3 audit 없이 변경 금지
+2. **각 iter 종료 시 검증 의무**: cargo ≥ 2625, integrity ≥ baseline
+3. **stash 정책**: regression 발생 시 즉시 stash, drop 금지 (학습 자료)
+4. **multi-session 의무**: Pillar 1 iter는 단일 세션 내 완결 시도 금지
+5. **rollback 명확**: 각 iter는 git revert 가능한 단위로 분할
 
 ---
 
