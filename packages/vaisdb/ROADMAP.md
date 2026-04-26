@@ -187,7 +187,8 @@ exit_audit:
 
 ### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 77~78~79, 2~3일, 위험 2/10)
 - [x] P2.2a. wave 1 recon (iter 77, 2026-04-26) ✅ — 5 후보 선정 완료 (commit 72df1cf)
-- [ ] P2.2b. wave 1 standalone build + baseline 측정 [iter 78 진행 중, build 완료]
+- [x] P2.2b. wave 1 standalone build + baseline 측정 ✅ 2026-04-26 (iter 78, Opus direct)
+  changes: 5 standalone build (cache nuke + force-rebuild) + clang -O0 link → 32 errors total. wave 1 재정의 (4-test, 7 errors). commit af5540f
   - **baseline (iter 78, 2026-04-26 실측)** — recon "0 generic struct" 분류 false-negative 확정
     | # | test | LOC | IR files | clang errors | 주요 클래스 |
     |---|------|----:|---:|---:|---|
