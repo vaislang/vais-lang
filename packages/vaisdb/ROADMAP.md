@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 78
+iteration: 79
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,15 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 79 strategy + 결과 (2026-04-26, P2.2c+P2.2d 완료)
+- task: P2.2c (script 확장) → P2.2d (workflow 갱신, blockedBy 해제)
+- strategy: sequential
+- P2.2c (impl-sonnet, background, 72s, 6 tools): bash 3.2 호환 parallel arrays + lookup, +126/-63 LOC, 3 검증 PASS. compiler commit `55c3528d`
+- P2.2d (Opus direct, 3 Edit): workflow name + NOTE + --all + artifact log path. YAML 파싱 검증 PASS
+- per-test baseline: test_btree=2, test_wal=1, test_buffer_pool=1, test_graph=2, test_migration=3 (합계 9). test_planner_types wave 2 defer
+- 검증: test_btree backward compat hold (2=2), --all 5-test sequential 9=9 hold, unknown test exit 2
+- 다음 iter (80+): Pillar 1.0 (codegen 4 클래스 invariant 명세, ADR 0002 신설) 또는 P2.3 (server/web 통합) 또는 PR 트리거 실측
 
 ### iter 78 strategy + 결과 (2026-04-26, P2.2b 완료)
 - task: P2.2b — vaisdb wave 1 standalone build + baseline 측정
@@ -203,10 +212,10 @@ exit_audit:
     - **wave 1-clean (cascade-low 검증된 1~3 error 그룹)**: test_wal (1), test_buffer_pool (1), test_graph (2) — 합계 4 errors, 4 클래스
     - **wave 1-medium (3 errors)**: test_migration (GEP unsized 클래스 신규)
     - **wave 1-defer (25 errors, transitive 폭증)**: test_planner_types — wave 2로 미루는 것이 안전
-- [ ] P2.2c. compiler/scripts/vaisdb-regression.sh 확장 [iter 79 대기]
-  - 4 후보 (test_wal/buffer_pool/graph/migration)만 등록, planner_types는 wave 2로 defer
-  - per-test KNOWN_FAILURE_COUNT (각 1/1/2/3) 또는 합산 baseline (7) 결정 필요
-- [ ] P2.2d. compiler/.github/workflows/vaisdb-regression.yml `--all` 구현 [iter 79 대기]
+- [x] P2.2c. compiler/scripts/vaisdb-regression.sh 5-test 확장 ✅ 2026-04-26 (iter 79, impl-sonnet)
+  changes: scripts/vaisdb-regression.sh +126/-63 LOC. parallel arrays (bash 3.2 호환) + per-test KNOWN_FAILURE_COUNTS (test_btree=2, test_wal=1, test_buffer_pool=1, test_graph=2, test_migration=3 / 합계 9). `--all` 구현, glob verdict (FAILED_TESTS/IMPROVED_TESTS array). 3 검증 PASS (test_btree backward compat / --all 9=9 hold / unknown test exit 2)
+- [x] P2.2d. compiler/.github/workflows/vaisdb-regression.yml `--all` 구현 ✅ 2026-04-26 (iter 79, Opus direct)
+  changes: workflow.yml — name "wave 1 (5 tests) build + link", NOTE 갱신 (5-test + per-test KNOWN_FAILURE_COUNTS), `./scripts/vaisdb-regression.sh` → `--all`, 실패 시 artifact upload 5-test IR pattern 추가. YAML 파싱 검증 PASS
   - **recon 결과 (iter 77, 2026-04-26, research-haiku)**: 14 후보 중 cascade-low 5개 선정
     | # | file | LOC | rationale |
     |---|------|----:|---|
