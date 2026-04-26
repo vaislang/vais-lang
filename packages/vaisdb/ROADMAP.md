@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 76
+iteration: 77
 max_iterations: 100
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,14 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 77 strategy + 결과 (2026-04-26)
+- task: P2.2a recon (P2.2 원본 split)
+- multi-session 의무에 따라 wiring(P2.2b)은 iter 78로 분리
+- 실행: research-haiku 1개 background → 35 tool uses, 93s, recon 정상 완료 (PROMISE: COMPLETE)
+- 산출: 14 후보 중 5 선정 (test_wal/test_buffer_pool/test_migration/test_planner_types/test_graph), 0 generic struct + 0 cascade signal
+- 검증 의문: grep `S [A-Z][a-z]+<` 패턴이 narrow했을 가능성 (전체 14개에 generic 0건은 의외). iter 78 standalone build 시 실제 컴파일 결과로 cross-check
+- 다음 iter (78): P2.2b — 5개 standalone build → script 등록 → workflow 확장 → baseline 확정
 
 ### iter 76 strategy + 결과 (2026-04-26)
 - strategy: P3.1 (read-only audit) + P2.1 (workflow 정적 검증) → independent parallel, no worktree (compiler repo, read-only)
@@ -156,8 +164,23 @@ exit_audit:
   - 산출: CI가 진짜 차단력 있는지 검증
   - 완료 기준: 의도적 regression 추가 시 CI fail, fix 시 CI pass
 
-### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 76~77, 2일, 위험 2/10)
-- [ ] P2.2. test_btree 외 vaisdb 테스트 추가 등록
+### Pillar 2.2 — vaisdb wave 1 추가 등록 (iter 77~78, 2일, 위험 2/10)
+- [ ] P2.2. test_btree 외 vaisdb 테스트 추가 등록 [iter 77 recon 완료, iter 78 wiring 대기]
+  - **recon 결과 (iter 77, 2026-04-26, research-haiku)**: 14 후보 중 cascade-low 5개 선정
+    | # | file | LOC | rationale |
+    |---|------|----:|---|
+    | 1 | tests/storage/test_wal.vais | 219 | WAL serde unit, 0 generic, 0 cascade |
+    | 2 | tests/storage/test_buffer_pool.vais | 223 | clock replacer, line 10에 cascade 회피 명시 |
+    | 3 | tests/sql/test_migration.vais | 332 | 4 imports only, pure struct CRUD |
+    | 4 | tests/planner/test_planner_types.vais | 499 | constants validation, 0 dispatch |
+    | 5 | tests/graph/test_graph.vais | 558 | graph constants, 3 imports |
+  - **비추천 9개** (이유): test_vector(float precision), test_fulltext(BM25 scoring), test_cross_engine(HashMap+multi-engine), test_types(78 `as` cast / Phase 158 risk), test_planner(1380 LOC hybrid), test_transaction(MVCC), test_page_manager(Tuple/Option), test_planner_cache(cache composition), test_planner_rag(semantic search)
+  - **iter 78 wiring 단계** (다음 세션):
+    1. 5개 standalone build (cache nuke + force-rebuild) → clang errors 측정
+    2. per-test KNOWN_FAILURE_COUNT 분류 → `compiler/scripts/vaisdb-regression.sh` 확장
+    3. workflow `--all` 또는 5개 명시 호출 구현
+    4. baseline 확정 후 README/ROADMAP 갱신
+  - target files (iter 78): compiler/scripts/vaisdb-regression.sh, compiler/.github/workflows/vaisdb-regression.yml
   - 후보: 21 integration suite 중 cascade 위험 낮은 5개 (CRUD only)
   - 절차: 각 테스트 standalone build → 0 error 확인 → CI 등록
   - 산출: KNOWN_FAILURE_COUNT가 명확하게 분류된 baseline
