@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 101
+iteration: 102
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -123,6 +123,33 @@ exit_audit:
   - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
   - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
 - ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
+### iter 101 strategy + 결과 (2026-04-26, #31 Path 3 compound assign 완료 + 4 R2 tests enable 🎉)
+- task: #31 Path 3 (compound assign) migration — stash@{0} 통합 + helper 흡수
+- strategy: Opus direct (stash apply → refactor to helper → enable ignored tests)
+- 산출 (compiler commit `76fe8a7e`):
+  - **stash@{0} `phaseO_compound_assign_fix` 안전 통합** (iter 74 -3 regression 회피)
+  - **iter 74 -3 regression의 진짜 원인 규명**: P1.2 fixes (Vec.push + HashMap.insert builtin dispatch) 이전 상태에서만 발생. P1.2 LANDED 후 재시도는 cascade 0
+  - Path 3 inline match → resolve_index_access helper (Path 2 패턴)
+  - **R2 차단 테스트 4건 모두 활성화** (이전 #[ignore]):
+    - compound_assign_i32_keeps_i32_elem_type ✅
+    - compound_assign_i64_still_emits_i64_gep ✅
+    - vec_of_vec_u8_outer_push_emits_struct_gep (vaisdb node.ll:1848 reduced) ✅
+    - slice_of_slices_u8_indexing (vaisdb key.ll:1128 reduced) ✅
+  - bonus: vaisdb test_graph 1→0 IMPROVEMENT (flaky, conservative baseline 1 유지)
+- 검증:
+  - cargo test -p vais-codegen: **1778/0** ✅
+  - cargo test -p vais-types: 1471/0 ✅
+  - index_invariant_test: **10/10 (0 ignored)** ✅
+  - vaisdb-regression --all: 8=8 hold (3 runs) ✅
+- **🎉 Phase Ω 가장 큰 production impact**: 4 ignored R2 tests 활성화 + cascade 0 확인 + vaisdb 잠재 잔여 errors 흡수 가능성
+- ADR 0001 분류: 근본 fix (R1+R2+R3 충족)
+- ADR 0002 분류: Class 2 (index/store) Path 3 흡수 — Text IR backend 3/4 path migration 완료
+- 본 iter commits 1: compiler `76fe8a7e`
+- 다음 iter (102+) 후보:
+  - **A. P1.4 Type-Tagged IR Builder** (위험 9/10) — Pillar 1 최종, Path 4 inkwell 자연 흡수
+  - **B. vaisdb baseline 재측정** (위험 1/10) — 본 iter fix가 vaisdb 잔여 errors 영향 측정
+  - **C. cargo test --workspace 전체 재실측** (위험 0) — 본 iter cascade 0 확증
 
 ### iter 100 strategy + 결과 (2026-04-26, P1.3 task 종료 + max_iterations 100→150 LANDED)
 - task: P1.3 Path 4 (inkwell) 검토 → scope clarification + task 종료
