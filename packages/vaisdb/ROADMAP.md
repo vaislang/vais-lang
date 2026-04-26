@@ -26,6 +26,12 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 76+77 세션 종료 (2026-04-26)
+- 사용자 결정: multi-session 의무 (위험 회피 원칙 4) 준수 → 세션 종료
+- LANDED: iter 76 commit `ef31246` (P3.1+P2.1 audit), iter 77 commit `72df1cf` (P2.2a recon)
+- 다음 세션 entry: iter 78 — P2.2b (5개 standalone build → script `compiler/scripts/vaisdb-regression.sh` 확장 → workflow `--all` 구현 → baseline 확정)
+- 다음 세션 prerequisite: `/tmp/vais-lib/std` symlink 확인, `~/.cargo/bin/vaisc` 또는 `compiler/target/debug/vaisc` 존재 확인
+
 ### iter 77 strategy + 결과 (2026-04-26)
 - task: P2.2a recon (P2.2 원본 split)
 - multi-session 의무에 따라 wiring(P2.2b)은 iter 78로 분리
