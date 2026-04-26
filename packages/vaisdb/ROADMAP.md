@@ -10,43 +10,60 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: pending
-iteration: 73
+mode: pending (Mini Pillar 1 다음 iter 결정 대기)
+iteration: 74
 max_iterations: 100
-current_phase: vaisdb test_btree clang errors (잔여 2건, 둘 다 codegen 깊은 영역)
+current_phase: Phase Ω — Mini Pillar 1 첫 iter 완료, ret 클래스 invariant 1개 사이트 적용 (2026-04-26)
 
-**다음 세션 harness 진입점**:
-- 활성 작업: Task #6 (in_progress), Task #7 (pending) — TaskList()로 복구됨
-- 현재 baseline (clean cache 확정 — iter 73 commit `e4de277`): 2 clang errors
-  - test_btree_key.ll:1128 — `&[&[u8]]` element fat-ptr indexing (Task #7)
-  - test_btree_node.ll:1736 — `R &self.data` Vec→slice ret coerce 누락 (Task #6)
-- vais 컴파일러 clean (no diff), vaisdb source clean (no diff)
-- cargo 796/796 + lang 311/311 ✅
+**iter 74 완료 산출물 (3 commits)**:
+- compiler `c683bd42` — docs(policy): Phase Ω Pillar 3+2 (CLAUDE 규칙 8~12 + ADR 0001 + vaisdb regression CI)
+- compiler `7cfc5caf` — fix(codegen): Mini Pillar 1 coerce_ret_value 단일 coerce point
+- vaisdb 본 ROADMAP iter 74 entry (이 commit)
 
-**다음 세션 Day 1 procedure (반드시 이 순서)**:
-1. `TaskList()` 호출 — Task #6/#7 확인
-2. Cache nuke + baseline 재확인:
-   ```bash
-   cd /Users/sswoo/study/projects/vais/lang/packages/vaisdb
-   find . -name ".vais-cache" -type d -exec rm -rf {} + 2>/dev/null
-   rm -rf /tmp/test_btree*
-   VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" \
-     ~/.cargo/bin/vaisc build tests/storage/test_btree.vais --emit-ir -o /tmp/test_btree.ll --force-rebuild
-   clang -O0 -o /tmp/test_btree_bin /tmp/test_btree_*.ll /tmp/runtime.o /tmp/sync.o -lm 2>&1
-   ```
-   → 2 errors (key.ll:1128 + node.ll:1736) 확인되어야 함
-3. **Task #6 우선** — emit path 식별이 prerequisite. iter 73 시도된 4개 path 모두 fire 안 함 (probe 0 hits). 아직 안 본 후보: `emit.rs`, `async_gen.rs`, `function_gen/generics.rs`, AST level lowering.
-4. 단일-사이트 fix 금지 (memory phase17_3_negatives_escalation). 매 fix 시도 후:
-   - cache nuke + clean rebuild
-   - lang 311/311 + cargo 796/796 검증 (절대 조건)
-   - cascade 발생 시 즉시 revert
+**vaisdb Task #6 RESOLVED ✅** (node.ll:1736)
+- ret 클래스 invariant 1개 사이트 적용 → Vec→fat-ptr 정상 emit
+- 검증: cargo 796/796 ✅, regression 2→2 (1 resolved + 1 newly exposed call-arg class)
 
-**iter 73 핵심 학습 (반드시 다음 세션에 적용)**:
+**잔여 (다음 iter 대상)**:
+- node.ll:1848 — 신규 노출, call-arg coercion 클래스 (별도 invariant 필요)
+- key.ll:1128 — Task #7 미해결, slice indexing emit (별도 클래스)
+
+**상세 인계**: `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_mini_pillar1_first_iter_2026-04-26.md`
+
+**iter 74 (2026-04-26) — recon completed + 메타 분석 LANDED**:
+- Task #1 recon ✅ 완료. emit path 정확히 식별 (memory `vaisdb_iter74_recon_2026-04-26.md`):
+  - Task #6: `crates/vais-codegen/src/stmt.rs:344-539` ret 처리 통합 path. line 492-505에 이미 `ret_type == "{ i8*, i64 }"` 분기 존재 (void placeholder만 처리). **누락**: `val_ty == "%Vec$T*"` 케이스.
+  - Task #7: `crates/vais-codegen/src/expr_helpers_data.rs` slice indexing **별도 emit path** (`comp := mut &components[i]` 형태). 정상 path는 line 514-569.
+  - iter 73 4-path 실패 원인: AST/구조 레벨에 후킹 시도 → 실제 emit은 stmt.rs ret 처리 통합 path 내부.
+- 정량 분석 완료: codegen 70,530 LOC / 142 파일 / **165 ad-hoc if-coerce** / **329 수동 register_temp_type** / **77 bitcast / 53 insertvalue / 139 inttoptr·ptrtoint** 산발 사이트
+- 사용자 진단: "몇달 동안 계속 진행하다 다시 뜯어고치고 반복" — Phase 158 5회 토글, Phase 17 stopped, MASTER_ROADMAP pivot 후 다시 사이트 fix 회귀 확인
+- **4-Pillar 안정화 제안 (Phase Ω, 7~13주)**:
+  - Pillar 1 (6~10주): Type-Tagged IR Builder + Single Coerce Point + Auto Type Registration → 763개 산발 사이트 단일 API 수렴
+  - Pillar 2 (2주): vaisdb/server/web을 compiler regression suite에 통합 → 같은 클래스 버그 재발 자동 차단
+  - Pillar 3 (1주): 정책 코드화 (CLAUDE.md 규칙 8~12, "근본 해결" 정의 합의)
+  - Pillar 4 (지속): ADR 신설, MASTER_ROADMAP 재활성화, memory 강화
+- **사용자 결정 필요 (2026-04-26)**:
+  1. Task #6/#7 진행 시점: (A) Phase Ω 시작 전 사이트 fix / (B) Pillar 2 적용 후 fix [추천 B]
+  2. Phase Ω 착수 commitment: 7~13주 단일 드라이브 가능한가?
+  3. 작은 commitment 버전: Pillar 3 (1주, 위험 0)부터 시작
+
+**다음 세션 Day 1 procedure (사용자 결정에 따라 분기)**:
+- 결정 A (사이트 fix 즉시): stmt.rs:492-505 분기 옆에 Vec→fat-ptr 분기 추가 (~30-40 LOC). cache nuke + cargo 796/796 + lang 311/311 검증 의무.
+- 결정 B (Pillar 2 먼저): compiler CI에 vaisdb 빌드 step 추가 → known-failure 등록 → Task #6/#7 fix는 known-failure 해제 형태로 영구 차단.
+- 결정 C (Phase Ω 착수): Pillar 3 정책 1주 → Pillar 2 living tests 2주 → Pillar 1 invariant 6~10주.
+
+**iter 73 핵심 학습 (여전히 유효)**:
 - vaisc cache (`tests/storage/.vais-cache/`)가 specialization 결과 보존 → fix 효과 가림. 매 빌드 전 nuke 필수.
-- Task #4 commit (`933e03e`) `entries: Vec<BTreeInternalEntry>` annotation이 사실 cache state에 의존하는 illusion. Clean rebuild 시 use-after-move TC 에러 → fail. **이 commit revert 검토 필요.**
 - `--force-rebuild` flag만으로는 cache 정리 부족.
+- Task #4 commit (`933e03e`) cache-state illusion 사례 — clean rebuild 시 use-after-move TC 에러.
 
-**상세 인계**: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase0_complete_vaisdb_resume.md`
+**iter 74 추가 환경 prerequisite**:
+- `/tmp/vais-lib/std` symlink 부재 시 빌드 실패 — `mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/compiler/std /tmp/vais-lib/std`
+
+**상세 인계**:
+- emit path 식별: `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/vaisdb_iter74_recon_2026-04-26.md`
+- 워크어라운드 금지 원칙: `~/.claude/projects/-Users-sswoo-study-projects-vais/memory/feedback_root_cause_only.md`
+- 종합 인계: `~/.claude/projects/-Users-sswoo-study-projects-vais-lang/memory/phase0_complete_vaisdb_resume.md`
 
 ---
 
