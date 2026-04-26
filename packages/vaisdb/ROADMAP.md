@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 105
+iteration: 106
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,41 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 106 LANDED (2026-04-27, P1.4 emit_bitcast/load/store + TypeRegistrar bridge)
+- 사용자 결정: "이어서 진행해줘" (iter 105 직후, mode=auto 유지)
+- strategy: Opus direct (P1.4 multi-session, 위험 3/10 — production caller 0 유지로 위험 5/10 → 3/10 분산)
+- 산출물:
+  - 확장: `compiler/crates/vais-codegen/src/emit_typed.rs` (+270 LOC, +7 unit tests)
+    - `emit_bitcast(src_ty, src, dst_ty) -> TypedTemp`
+    - `emit_bitcast_with_prefix(prefix, src_ty, src, dst_ty) -> TypedTemp` (legacy `%ret.cast.{counter}` 호환)
+    - `emit_load(pointee_ty, ptr) -> TypedTemp`
+    - `emit_load_with_prefix(prefix, pointee_ty, ptr) -> TypedTemp` (legacy `%ret.{counter}` 호환)
+    - `emit_store(val_ty, val, ptr)` (no SSA, no register)
+    - `fresh_temp_with_prefix(prefix) -> %{prefix}{counter}` (helper)
+  - **신규: `impl TypeRegistrar for crate::state::FunctionContext`** — production bridge (iter 107 첫 caller 진입로)
+- iter 106 vs 원래 plan 차이:
+  - 원래: stmt_visitor.rs:746 if-coerce 마이그레이션 (위험 5/10)
+  - 실제: API 확장 + bridge만, 마이그레이션 0 (위험 3/10) → iter 107 분리
+  - 변경 이유: stmt_visitor.rs:708의 SSA 이름이 `%ret.cast.{counter}` 커스텀 prefix → emit_bitcast 기본 `%tN`로는 IR diff 발생. emit_bitcast_with_prefix 필요. iter 106에서 **API 충실성 확보** + **production caller는 iter 107**.
+- 검증:
+  - cargo test -p vais-codegen --lib: **823 passed / 0 failed** (iter 105 baseline 816 + 7 신규 정확)
+  - emit_typed test: 20/20 PASS (iter 105 13 + iter 106 7)
+  - cargo clippy -p vais-codegen: emit_typed 관련 0 warnings
+  - check-integrity: vaisdb 220/261 — iter 105 clean baseline 220/261과 정확 일치 (regression-neutral 재확증)
+- 설계 결정 (iter 105 보강):
+  - **\_with_prefix 변형**: legacy 사이트 (`%ret.cast.N`, `%ret.N` 등) 마이그레이션 시 IR diff 0 보장 의무
+  - **bridge impl in emit_typed.rs**: state.rs를 건드리지 않음 — 본 module 내에 production 의존 격리
+- iter 106 산출물:
+  - compiler 1 commit: emit_typed.rs +270 LOC
+  - lang 1 commit: 본 ROADMAP iter 106 LANDED
+- 다음 iter 107 entry:
+  - 첫 production migration: stmt_visitor.rs:708 (Class 1 ret elem-ty bitcast)
+  - 변경: `write_ir!(ir, "  {} = bitcast {} {} to {}*", cast, base_ptr_ty, val, llvm_ty)` → `TypedEmitter::new(ir, &mut self.fn_ctx, counter).emit_bitcast_with_prefix("ret.cast.", LlvmType::from(base_ptr_ty), &val, LlvmType::from(format!("{}*", llvm_ty)))`
+  - **IR diff 0 보장**: byte-for-byte 동일 출력 (counter prefix + format 일치)
+  - R2 차단 테스트 추가 의무 (ADR 0002): `record_emitted_type` 누락 시 fail
+  - `#![allow(dead_code)]` 제거 (첫 production caller 도달)
+  - 위험 5/10
 
 ### iter 105 LANDED (2026-04-26, P1.4 typed wrapper API skeleton)
 - 사용자 결정: "이어서 진행해줘" (iter 104 직후, mode=auto 유지)
