@@ -26,6 +26,23 @@ exit_audit:
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
 
+### iter 81 세션 종료 (2026-04-26, P4.2 audit + 발견 5건)
+- 사용자 결정: P4.2가 큰 audit 결과 산출 → 별도 iter에서 발견 정리 (위험 회피 원칙 4: multi-session 의무)
+- 본 세션 commits (lang 1):
+  - lang: `8ccfa81` (iter 81 P4.2 LANDED)
+  - compiler: 0 (read-only audit)
+- LANDED: P4.2 (memory 정합성 검증, iter 80 R3 baseline 7/7 정확 확증)
+- 신규 task 등록: #28 std E009 immutable assignment fix (38 std 파일, 위험 0, P4.2 발견 권고 A)
+- 다음 세션 entry 권고:
+  - **A. #28 std E009 mut fix** (위험 0, 1~2h, mechanical) — integrity PASS 회복 (44/82→82/82)
+  - **B. P1.1 index_invariant_test 보강** (위험 1/10) — untracked 5-case commit + ≥5 case 추가
+  - **C. P4.1 ADR 0001 retrospective** (위험 0, 백그라운드 메타)
+- 다음 세션 prerequisite (ADR 0002 Iter Entry Spec):
+  - /tmp/vais-lib/std symlink, ~/.cargo/bin/vaisc 확인
+  - cargo test --workspace --exclude vais-node --exclude vais-python (≥2625 추정 충족)
+  - ./scripts/vaisdb-regression.sh --all 합계 ≤ 9 (단독 실행 권장, --all flaky)
+- ROADMAP `mode: auto`, iteration: 81, max_iterations: 100 (재진입 시 82로 +1)
+
 ### iter 81 strategy + 결과 (2026-04-26, P4.2 LANDED)
 - task: P4.2 memory 정합성 검증 (단독, 위험 0, 실측 ~40분)
 - strategy: Opus direct (read-only audit, 통합 판단 필요)
