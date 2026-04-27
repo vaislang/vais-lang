@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 117
+iteration: 119
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,36 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 118+119 LANDED+REVERTED (2026-04-28, RegisterPolicy enum 도입 + Skip 시도 결정적 negative)
+- 사용자 결정: "이어서 완료할 때까지 진행"
+- iter 118 (LANDED, compiler `e70f36f3`):
+  - `crates/vais-codegen/src/emit_typed.rs` +98/-11
+  - `RegisterPolicy::{Auto, Skip}` enum 신설 (iter 117 카테고리 B 대응)
+  - `emit_load_with_prefix(prefix, ty, ptr, policy: RegisterPolicy)` 시그니처 변경
+  - 신규 unit test: `emit_load_with_prefix_skip_does_not_record` (Skip 모드 검증)
+  - 검증: cargo test --lib 824/0 (823+1)
+- iter 119 (시도 + REVERTED, compiler 0 commits):
+  - 시도: stmt_visitor.rs:729 ret-load 마이그레이션 (RegisterPolicy::Skip 사용)
+  - **5-run 결과**: 221 / 222 / 218 / 221 / 219
+    - 평균 **220.2** (vs post-P1.4 221.6, **-1.4 file**)
+    - 폭 **±2** (vs ±0.5, 4배 증가)
+    - **min 218 (threshold 219 미만 도달)** — CLAUDE 규칙 4 트리거
+  - **🚫 iter 116 (Auto -0.4)보다 더 나쁨 (Skip -1.4)**
+- 🎯🎯🎯 **iter 119의 본질적 학습 — 자동 register 가설 폐기**:
+  - iter 116에서는 "자동 register가 i64 fallback과 충돌"이 가설이었음
+  - iter 119에서 Skip도 결정적 negative → **자동 register 자체가 원인이 아님**
+  - 진짜 원인: **wrapper 마이그레이션 자체의 부작용**
+    - 가능: (a) Rust borrow split (counter mut + fn_ctx mut + ir mut) 패턴이 release 빌드 inlining 변화시킴
+    - 가능: (b) 추가 alloc (`loaded_temp.name().to_string()`) 또는 TypedTemp 생성/destruct
+    - 가능: (c) 후속 self method 호출 (defer_cleanup 등)와의 borrow scope 차이
+  - **iter 117 카테고리 B 분류는 옳음** — 단지 자동 register가 아니라 **wrapper 사용 자체가 negative**
+- **결론**: 카테고리 B 사이트는 wrapper 적용 무용. 카테고리 A만 P1.4 wrapper 사용 가능.
+- iter 118+119 산출물:
+  - compiler 1 commit `e70f36f3` (iter 118 RegisterPolicy enum, 유지)
+  - compiler 0 commits (iter 119 revert)
+  - lang 1 commit (본 ROADMAP)
+- baseline 변동 없음: vaisdb 221.6 ±0.5 (iter 115 lock 유지)
 
 ### iter 117 LANDED (2026-04-27, 🎯 P1.4 사이트별 LLVM 타입 단일성 분류 — 마이그레이션 안전성 체계화)
 - 사용자 결정: "이어서 진행해줘"
