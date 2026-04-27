@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: pending
-iteration: 124
+iteration: 125
 max_iterations: 150
-current_phase: 🎯 **Phase Ω 4-Pillar 모두 LANDED**. 다음 phase 결정 사용자 위임.
-entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121~124 Task #32~35 자동 진행 세션 close.
+current_phase: Phase Ω 4-Pillar LANDED. vaisdb -42 error 분류 완료. 추가 fix는 P1.5 (closure/method dispatch generic propagation) 사용자 결정 위임.
+entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 (recon-only, P1.5 식별).
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,49 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 125 LANDED (2026-04-28, ⚠️ Task #36~#38 vaisdb error 분류 — production fix 0건, P1.5 후보 식별)
+- 사용자 결정: "vaisdb -42 error fix 다수 진행" (Phase Ω 4-Pillar 완료 후 후속)
+- strategy: sequential, Opus direct (3 task 모두 recon-only로 close)
+- 산출물: 코드 변경 0 (production code 0건). ROADMAP entries만.
+
+#### Task #36 E006 (4건) — 100% vaisdb source bug
+| Site | 시그니처 | 호출 | 진단 |
+|------|----------|------|------|
+| fulltext/mod.vais:198,291 `self.lock.write_lock()?` | `F write_lock(&self) -> RwLockWriteGuard<T>` | 0 args | `?` 연산자 + non-Result return type 잘못 사용 (vaisdb source) |
+| graph/mod.vais:197 `GraphMeta.deserialize(&meta_data)` | `F deserialize(buf: &ByteBuffer, page_size: u32)` | 1 of 2 args | page_size 누락 (vaisdb source) |
+| rag/mod.vais:126 `RagWalManager.new()` | `F new(gcm: &GroupCommitManager)` | 0 of 1 args | gcm 누락 (vaisdb source) |
+| vector/search.vais:92 `Row.new()` | `F new(values: Vec<SqlValue>)` | 0 of 1 args | values 누락 (vaisdb source) |
+
+격리 테스트: write_lock 정상 동작 (compiler self-counting 버그 아님 확정).
+**user feedback `feedback_root_cause_only`**: vaisdb source 수정 금지 → fix 불가.
+
+#### Task #37 E030 (3건) + Task #38 E004 (6건) — 공통 root cause: closure/method receiver type inference 실패
+- 공통 패턴 발견: error 메시지에 `?2032`, `?1167`, `?1215` (Var) 등장
+- 원인: receiver의 generic이 ?N으로 unresolved → method dispatch (builtin OR user) 모두 실패
+- 격리 테스트 (`Vec<Item>.sort_by(|a,b| ...)`) 재현 → E004 "function 'sort_by' not found"
+- P1.2 (iter 90~92, Vec.push/HashMap.insert)가 자동 unify 했지만 다른 모든 method (sort_by/get/get_mut/swap/insert_node/get_node/release/...) 누락
+- **단일 method add (sort_by handler)로는 해결 안 됨** — closure 인자 hint propagation + method dispatch 일반화 필요
+- 위험 5-7/10 (multi-iter, ADR 0003 R4 적용 의무)
+
+#### P1.5 후보 (별도 task로 분리, 사용자 결정)
+- **Pillar 1.5 — closure/method dispatch generic propagation 일반화**
+  - scope: P1.2 패턴을 Vec/HashMap의 모든 method + user struct method로 확장
+  - 위험: 5-7/10 (cascade 가능, ADR 0003 R4 5-run measurement 의무)
+  - 예상 fix: vaisdb +9~12 file (E030 3 + E004 6 + 일부 E001)
+  - 예상 iter: 3~5 iter
+  - 의존: P1.2 commit `7fcdd285`, `27f6b260` 패턴 + closure 인자 hint 메커니즘 신설
+
+#### 학습
+1. **위험 평가의 부정확성**: Task #33 Stage A에서 E006/E030/E004를 "위험 3-4/10"으로 추정했으나, 실측 시 E006 100% vaisdb source bug + E030+E004 공통 root cause로 실제 위험 5-7/10. **위험 평가는 stderr 첫 줄 메시지만으로 부족** — 격리 테스트로 root cause 확증 후만 정확.
+2. **카테고리 분류의 한계**: 에러 코드 (E001/E004/E006/E030) 분류는 sympton level. 실제 root cause는 cross-category (E030+E004 공통).
+3. **recon-only iter의 가치**: production fix 0건이지만 P1.5 후보 정확 식별 → 미래 work 위험 감소. ADR 0001 §"적용 범위" 면제 영역 (분석 only).
+
+#### 다음 entry 후보 (사용자 결정)
+- A. P1.5 진입 (closure/method dispatch propagation, 위험 5-7/10, 3~5 iter, 예상 +9~12 file)
+- B. E001 16건 또는 Codegen panic 9건 별도 task (위험 5-7/10, multi-iter)
+- C. Phase Ω 종료 + Phase β 진입 (MASTER_ROADMAP 후보)
+- D. 본 자동 진행 세션 종료 (사용자 추가 결정 대기)
 
 ### iter 124 LANDED (2026-04-28, ✅ Task #35 Pillar 4 — ADR 0003 신설 + ADR 0002 amendment + MASTER_ROADMAP 재활성화. 🎯 Phase Ω 4-Pillar 완료)
 - 사용자 결정: A→D 순차 자동 진행 (iter 123 Task #34 close 후 자동, 본 task가 마지막)
