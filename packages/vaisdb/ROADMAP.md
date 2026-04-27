@@ -33,7 +33,7 @@ exit_audit:
   - **compiler `bc502ed3`**: vais-server-regression.sh + workflow yaml — wave 2 6 tests 추가
     - core/test_error(0) / http/test_status(1) / http/test_response(1) / middleware/test_pipeline(1) / util/test_yaml(3) / ws/test_protocol(5)
     - 합계 baseline 13 (wave 1 2 + wave 2 11), --all/--wave1/--wave2 분기 추가
-  - **lang `<TBD>`**: vais-web/REGRESSION_BASELINE.md — crate별 271 split 명문화 (vaisx-compiler 109 + vaisx-parser 152 + vaisx-wasm 10)
+  - **lang `99c72ba`**: vais-web/REGRESSION_BASELINE.md — crate별 271 split 명문화 (vaisx-compiler 109 + vaisx-parser 152 + vaisx-wasm 10)
 - 검증:
   - `vais-server-regression.sh --all` 8 tests baseline 13 PASS
   - `--wave1` (2/2 baseline 2) / `--wave2` (6/6 baseline 11) 모두 PASS
