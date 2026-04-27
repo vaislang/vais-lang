@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 116
+iteration: 117
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,42 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 117 LANDED (2026-04-27, 🎯 P1.4 사이트별 LLVM 타입 단일성 분류 — 마이그레이션 안전성 체계화)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 1/10, recon-only iter, code 0 변경)
+- 동기: iter 116 REVERTED 학습으로부터 "자동 register는 항상 positive 아님" — site별 LLVM 타입 단일성에 따라 effect 다름. P1.4 추가 마이그레이션 결정에 분류 체계 필요.
+- 사이트 분류 (iter 104 recon 5건 + iter 116 학습 적용):
+  - **카테고리 A (단일 타입, 자동 register positive)**:
+    - iter 107 stmt_visitor.rs:708 ret-cast bitcast: dst 항상 `%T*` ptr. **LANDED, +0.6 file 확정**.
+    - 특징: dst type이 syntactic 형식 결정 (예: `format!("{}*", llvm_ty)`). 단일 LLVM 타입.
+  - **카테고리 B (다양 타입, 자동 register negative)**:
+    - iter 110/116 stmt_visitor.rs:729 ret-load: result 타입 다양 (struct/scalar/ptr 혼재). **REVERTED**.
+    - generate_expr_call.rs:745 (val_ty == "i64"): scalar_shape + inferred Named 의존, multi-modal dispatch.
+    - 특징: result type이 runtime 타입 정보에 의존. 자동 register가 일부 .vais의 i64 fallback 가정과 충돌.
+  - **카테고리 C (구조적 단순, 검증 후 적용 가능)**:
+    - generate_expr_call.rs:661 (val_ty == "{ i8*, i64 }"): fat pointer 단일 타입
+    - generate_expr_call.rs:808 (val_ty == "i1"): boolean 단일
+    - 특징: 단일 LLVM 타입이지만 conditional dispatch. iter 117 외 사이트별 측정 필요.
+  - **카테고리 D (단순 마이그레이션 대상)**:
+    - generate_expr_call.rs:813, 834 (val_ty != arg_ty arg coerce): general type mismatch coerce, sub-case 다수
+    - 특징: 일반화된 분기, 카테고리 A/B 혼합 가능
+- iter 117 결론:
+  - **카테고리 A만 자동 register 안전**: iter 107 (1 site) 이미 LANDED. 추가 카테고리 A 후보 발견 시 자동 register positive 기대.
+  - **카테고리 B는 wrapper 사용해도 자동 register 적용 금지**: TypedEmitter API에 "register suppress" 옵션 추가 필요 (iter 118+ work) 또는 카테고리 B는 wrapper 사용 안 함.
+  - **카테고리 C는 사이트별 5-run 측정 후 결정**: 위험 4/10 (iter 116 학습 적용)
+  - **카테고리 D는 sub-분류 필요**: iter 118+ 추가 분석.
+- 본질적 P1.4 제약 명문화:
+  - "763 사이트 → 단일 API 수렴" 목표는 **API 도입은 가능 (iter 105+106 LANDED), 자동 register는 site별 선택적**으로 수정.
+  - 자동 register 의무화는 카테고리 A만. 카테고리 B는 wrapper 사용해도 manual `record_emitted_type` 유지 또는 register skip.
+- iter 117 산출물:
+  - compiler 0 commits (recon-only)
+  - lang 1 commit: 본 ROADMAP iter 117 LANDED + 분류 체계 명시
+- 다음 iter 118 entry:
+  - **A. TypedEmitter에 "skip register" 옵션 추가** (위험 2/10) — 카테고리 B 사이트도 wrapper 사용 가능하게. `emit_load_with_prefix_no_register` 또는 `register: bool` 파라미터.
+  - **B. 카테고리 C 사이트 측정** (위험 4/10) — generate_expr_call.rs:661, 808 마이그레이션 후 5-run 측정. 분류 검증.
+  - **C. iter 104 recon의 763 사이트 카테고리 분류** (위험 1/10) — 본 분류 체계를 모든 사이트에 적용. P1.4 진척도 정확 산출.
+- baseline 변동 없음: vaisdb 221.6 ±0.5 (iter 115 lock 유지)
 
 ### iter 116 REVERTED (2026-04-27, ⚠️ ret-load 재시도 결정적 negative — iter 110 직관 옳음 확증)
 - 사용자 결정: "이어서 진행해줘"
