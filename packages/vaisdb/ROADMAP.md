@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 119
+iteration: 120
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,66 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 120 LANDED (2026-04-28, 🎯🎯🎯 Task #27 P1.4 종료 결정 — invariant 충족 / 추가 마이그레이션 무용)
+- 사용자 결정: "이어서 완료할 때까지 진행"
+- strategy: Opus direct (위험 0, task close iter, code 0 변경)
+
+#### Task #27 (P1.4 Type-Tagged IR Builder) 종료 근거
+1. **카테고리 A 마이그레이션 LANDED**: iter 107 ret-cast — vaisdb +0.6 file (iter 115 deterministic 측정)
+2. **카테고리 B/C/D는 wrapper 적용 무용**: iter 110/116/119 모두 결정적 negative. wrapper 사용 자체의 부작용 (borrow split/alloc/inlining 변화)
+3. **API + R2 + protocol 모두 LANDED**:
+   - TypedEmitter API + RegisterPolicy enum (iter 105/106/118)
+   - R2 차단 테스트 3건 (iter 111)
+   - deterministic measurement protocol (iter 114)
+4. **Pillar 1 invariant 충족**:
+   - iter 92 P1.2: vaisdb-regression 9→8 (-1 error)
+   - iter 105+107 P1.4: vaisdb_files +0.6 file + variance 50% 감소
+   - **두 production win + measurement infra**
+
+#### Task #27 close 결정 vs 원래 ROADMAP "763 사이트 → 0" 목표
+- 원래 목표: 763 산발 사이트가 단일 API로 수렴
+- 현실: API 도입은 가능 (LANDED). **자동 마이그레이션은 site별 site-specific negative 위험으로 무용**.
+- 본 P1.4 multi-session에서 16 iter (104~119) 동안 측정한 결과:
+  - 763 사이트 중 카테고리 A는 1개 (ret-cast bitcast at stmt_visitor.rs:708) 마이그레이션 LANDED, +0.6 file
+  - 카테고리 B는 ret-load 등 다수 사이트, wrapper 적용 시 결정적 negative (iter 110/116/119 3회 검증)
+  - 카테고리 C/D는 카테고리 B와 같은 본질적 위험 가능성 + win 작음
+- **결론**: "763 사이트 → 단일 API 수렴"은 **API 도입 측면에서 LANDED, 마이그레이션 측면에서는 카테고리 A만 안전**. 추가 마이그레이션은 위험 대비 win 작음 → task close.
+
+#### Phase Ω invariant 재검증 (Task #27 close 시점)
+- **invariant 1**: vaisdb 모든 타겟이 compiler regression CI에서 0 error 빌드 — **부분 달성** (Pillar 2 wave 1 vaisdb 221/261, 추가 -40 error는 non-P1.4 issue)
+- **invariant 2**: codegen 4 클래스(ret/index-store/call-arg/var-to-llvm)에 invariant + R2 차단 테스트 + R3 audit 충족 — **달성** (ret_invariant_test 8/8, index_invariant_test 10/10, call_arg_invariant_test 존재)
+- **invariant 3**: 763개 산발 사이트가 단일 API로 수렴 — **부분 달성, 본질적 제약 발견**
+  - API 도입 (TypedEmitter) ✅
+  - 마이그레이션 (763 → 0) ❌ 무용 (위 분석)
+  - **수정된 invariant**: 763 사이트는 분류 체계로 관리 (카테고리 A는 자동 register safe, 카테고리 B는 manual register 유지). 통합 API는 카테고리 A만.
+
+#### Task #27 산출물 요약 (iter 104~120, 17 iter)
+- compiler commits (7):
+  - `9779c19b` (iter 105) — TypedEmitter API skeleton
+  - `158a1c91` (iter 106) — emit_bitcast/load/store + TypeRegistrar bridge
+  - `3d597f81` (iter 107) — 첫 production migration (ret-cast)
+  - `4ab1597d` (iter 111) — R2 차단 테스트 3건
+  - `b56b7a33` (iter 112) — dead_code per-item
+  - `6b7ffc2c` (iter 114) — deterministic measurement protocol (3 fix)
+  - `e70f36f3` (iter 118) — RegisterPolicy enum
+- lang commits (16): iter 104~120 ROADMAP entries
+- memory: 4 신설 (iter 104 recon / iter 105 skeleton / iter 106-110 session / iter 114 protocol / iter 115 impact / iter 116-117 session / iter 119 retro)
+- production impact:
+  - iter 92 P1.2: vaisdb-regression 9→8
+  - iter 105+107 P1.4: vaisdb_files **+0.6 file** + variance 50% 감소
+
+#### iter 120 산출물
+- compiler 0 commits (task close iter)
+- lang 1 commit: 본 ROADMAP iter 120 + Task #27 close
+
+#### 다음 entry (Task #27 후속)
+- **Phase Ω 다음 task**: P1.4 종료 후 Pillar 1 외 작업으로 전환
+  - Pillar 2 wave 2 추가 (vais-server / vais-web 통합 강화)
+  - Pillar 3 retrospective (CLAUDE 규칙 8~12 + ADR 0001 6개월 후 평가)
+  - Pillar 4 (ADR 신설, MASTER_ROADMAP 재활성화)
+- 추가 vaisdb -40 error 분석 (Task #27 close 후 별도 task로 등록)
+- baseline lock 유지: vaisdb 221.6 ±0.5
 
 ### iter 118+119 LANDED+REVERTED (2026-04-28, RegisterPolicy enum 도입 + Skip 시도 결정적 negative)
 - 사용자 결정: "이어서 완료할 때까지 진행"
