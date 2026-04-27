@@ -11,7 +11,7 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 115
+iteration: 116
 max_iterations: 150
 current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
 entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
@@ -25,6 +25,40 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 116 REVERTED (2026-04-27, ⚠️ ret-load 재시도 결정적 negative — iter 110 직관 옳음 확증)
+- 사용자 결정: "이어서 진행해줘"
+- strategy: Opus direct (위험 3/10, deterministic protocol로 정밀 측정)
+- 시도: stmt_visitor.rs:729 ret-load → emit_load_with_prefix("ret.", ...) (iter 110과 동일 마이그레이션)
+- 검증:
+  - cargo test -p vais-codegen --lib: 823/0 (regression 0)
+  - cargo build --release: 31s OK
+  - **5-run check-integrity (iter 114 deterministic protocol)**: 223 / 223 / 220 / 219 / 221
+  - 평균 **221.2**, 폭 **±2** (219~223)
+- vs post-P1.4 baseline (iter 115):
+  - 평균 221.6 ±0.5 → 221.2 ±2
+- 🚫 **net 결과**:
+  - **평균 -0.4 file** (221.6 → 221.2)
+  - **variance 4배 증가** (±0.5 → ±2)
+  - **min count -2 하락** (221 → 219, threshold INTEGRITY_VAISDB_MIN=219 도달)
+  - distribution shift: 222 (안정 mode) 사라짐, 219/220 (낮은 outlier) 등장
+- **CLAUDE 규칙 4 트리거**: run 4의 219는 threshold 도달. 즉시 revert.
+- 🎯 **iter 110 직관 옳음 확증**:
+  - iter 110 revert는 measurement noise 의존이 아닌 **진짜 site-specific negative effect** 였음
+  - iter 115에서 "iter 110 revert 재평가 가능" 제기했으나 본 iter에서 결정적으로 **iter 110 결론 옳음** 확증
+  - iter 109/iter 110 학습 모두 본질적으로 valid
+- 🎯🎯 **새로운 구조적 학습 (P1.4 본질적 제약)**:
+  - **자동 `record_emitted_type` 호출은 항상 positive가 아님**
+  - 가설: ret-load 결과 타입은 다양 (struct/scalar/ptr 혼재). 자동 register가 정확한 type info를 노출 → 일부 .vais의 downstream 코드의 (이전 누락 register로 인한) i64 fallback 가정과 충돌 → 빌드 fail
+  - ret-cast (iter 107)는 dst가 항상 명시적 ptr이라 type info가 단일하고 잘 매치됨. ret-load는 type 다양성으로 multi-modal effect.
+  - **결론**: P1.4 마이그레이션은 site별 LLVM 타입 단일성에 따라 effect 다름. 자동 register 적용 가능성을 site별로 사전 분류 필요.
+- iter 116 산출물:
+  - compiler 0 commits (revert, 워킹 트리만 변경)
+  - lang 1 commit: 본 ROADMAP iter 116 REVERTED 기록
+- 다음 iter 117 entry:
+  - **A. site별 LLVM 타입 단일성 분류** (위험 1/10, 분석-only) — iter 104 recon의 5건 if-coerce + 16 coerce_* + load/store/call 사이트의 결과 타입 단일성 분류. positive 후보 (iter 107류 단일 타입) vs negative 후보 (iter 110류 다양) 구분.
+  - **B. generate_expr_call.rs:745 if-coerce 마이그레이션** (위험 4/10) — 분류 결과에 따라 적용 여부 결정. val_ty == "i64" 단일 분기는 iter 107류 가능성.
+  - **C. 잠정 결론**: ret-cast 마이그레이션 1개로 P1.4 win 확보. 추가 마이그레이션은 사이트별 사전 검증 의무.
 
 ### iter 115 LANDED (2026-04-27, 🎯🎯 P1.4 net production impact 결정적 산출 — iter 109 결론 정정 + 검증)
 - 사용자 결정: "완벽하게 해결" (iter 114 fix 후속)
