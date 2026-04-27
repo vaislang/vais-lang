@@ -33,7 +33,7 @@ exit_audit:
   - **compiler `26cc865e`**:
     - `docs/adr/0003-wrapper-migration-hidden-cost.md` (신규) — R4 (Hidden Cost Audit) 4 항목: R4.1 5-run baseline / R4.2 5-run post-migration (threshold: 평균 -0.5 / variance 2배 / min -1) / R4.3 Rust 변경 영향 분석 / R4.4 카테고리 분류
     - `docs/adr/0002-codegen-invariants.md` Amendment §"단일 API 수렴 한계" + Self-Audit 항목 10번 + 변경 이력 entry
-  - **lang `<TBD>`**:
+  - **lang `fbad254`**:
     - `packages/vaisdb/docs/MASTER_ROADMAP.md` Reactivation Status 절 신설 (~80줄) — Phase Ω 누적 진척 표 + vaisdb test 진척 (176→219 +43 file) + Phase β 후보 4건
 - 검증:
   - 코드 변경 없음 (ADR 문서 + memory만)
