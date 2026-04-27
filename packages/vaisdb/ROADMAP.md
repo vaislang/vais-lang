@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 120
+iteration: 121
 max_iterations: 150
-current_phase: Phase Ω — 정식 착수 (4-Pillar, 7~13주 multi-session commitment)
-entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터
+current_phase: Phase Ω — Pillar 2 wave 2 (vais-server / vais-web 통합 강화) 진행 중
+entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121부터 Task #32 (P2 wave 2) 시작.
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,26 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 121 LANDED (2026-04-28, ✅ Task #32 Pillar 2 wave 2 — vais-server regression coverage 2→8 tests)
+- 사용자 결정: "작업 진행해야될 것 진행완료될때까지 진행" + A→D 순차 자동 진행
+- strategy: impl-sonnet × 2 병렬 (2.3 vais-web baseline audit + 2.1 vais-server +6 tests, 영역 분리)
+- 산출물:
+  - **compiler `bc502ed3`**: vais-server-regression.sh + workflow yaml — wave 2 6 tests 추가
+    - core/test_error(0) / http/test_status(1) / http/test_response(1) / middleware/test_pipeline(1) / util/test_yaml(3) / ws/test_protocol(5)
+    - 합계 baseline 13 (wave 1 2 + wave 2 11), --all/--wave1/--wave2 분기 추가
+  - **lang `<TBD>`**: vais-web/REGRESSION_BASELINE.md — crate별 271 split 명문화 (vaisx-compiler 109 + vaisx-parser 152 + vaisx-wasm 10)
+- 검증:
+  - `vais-server-regression.sh --all` 8 tests baseline 13 PASS
+  - `--wave1` (2/2 baseline 2) / `--wave2` (6/6 baseline 11) 모두 PASS
+  - vais-web cargo test --workspace 271/0 baseline 유지
+- recon 결과 (P2 wave 2 후보 5개 중 wave 2 범위 = 2.1+2.3, 2.2/2.4/2.5는 후속 task):
+  - 2.2 vais-server invariant integration: ret/index/call_arg invariant test가 이미 compiler crate에 존재 → server-specific 추가는 marginal
+  - 2.4/2.5 (Index access wrapper / GEP invariant 신설): Pillar 1 close 의존, wave 2 범위 외
+- production impact:
+  - vais-server regression coverage **4배 확대** (2 tests → 8 tests, baseline 2 → 13)
+  - vais-web regression model 명문화 (crate별 split, 향후 fine-grained 검출 기반)
+- 다음 entry: Task #33 (vaisdb 잔여 -40 error 분석 + fix). vaisdb baseline 221.6 ±0.5 → 261 목표.
 
 ### iter 120 LANDED (2026-04-28, 🎯🎯🎯 Task #27 P1.4 종료 결정 — invariant 충족 / 추가 마이그레이션 무용)
 - 사용자 결정: "이어서 완료할 때까지 진행"
