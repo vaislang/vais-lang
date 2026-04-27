@@ -1,8 +1,56 @@
 # VaisDB Master Roadmap — Trust & Production Readiness
 
 > **Created**: 2026-04-25 (after Phase 17 Wave 2/3/4a completion, 258 codegen sites migrated)
+> **Reactivated**: 2026-04-28 (Phase Ω Task #35, iter 124 — Pillar 4)
 > **Mission**: Build a database that users *trust enough to depend on for real work*.
 > **Philosophy**: Earn trust incrementally. Every phase produces something *demonstrable to a stranger*.
+
+---
+
+## Reactivation Status (2026-04-28, Phase Ω Task #35)
+
+본 MASTER_ROADMAP은 2026-04-25 작성 후 Phase Ω (2026-04-26 시작) 진행 중 동결되었다. Pillar 4 작업으로 재활성화하며, Phase Ω가 본 MASTER_ROADMAP의 Phase α/β 진척에 어떤 영향을 줬는지 명문화한다.
+
+### Phase Ω 누적 진척 (2026-04-26 ~ 2026-04-28, iter 74~123)
+
+| Phase Ω 영역 | LANDED | MASTER_ROADMAP 영향 |
+|---|---|---|
+| **Pillar 1.2** (Vec/HashMap dispatch fix) | iter 90~92 | vaisdb-regression test_graph 2→1 (-1 error) — Phase α "test passes" 패턴의 첫 production win |
+| **Pillar 1.3** (resolve_index_access) | iter 94~101 | index access wrapper 신설, vaisdb baseline 220 → 221 (+1 file) |
+| **Pillar 1.4** (TypedEmitter) | iter 104~120 | TypedEmitter API + 카테고리 A/B/C/D 분류, vaisdb_files +0.6 file + variance 50% 감소 |
+| **Pillar 2 wave 1** (vaisdb-regression CI) | iter 75~79 | Phase α "GitHub Action that runs this test on every push" 진입 — 5-test wave 1 LANDED |
+| **Pillar 2 wave 2** (server/web) | iter 86~87 + 121 | vais-server 2-test → 8-test, vais-web 271/0 cargo test 통합 |
+| **Pillar 3** (정책 코드화 + retrospective) | iter 74 LANDED + iter 83/123 retrospective | ADR 0001/0002 sustained, mid-term reaffirmed |
+| **Pillar 4** (ADR + MASTER_ROADMAP) | **iter 124 (본 task)** | ADR 0003 신설 + ADR 0002 amendment + MASTER_ROADMAP 재활성화 |
+| **Task #33 Stage A** | iter 122 | debug println 2건 제거 (vaisdb 218→219 +1 file) |
+
+### vaisdb test 진척 (Phase α 기준)
+
+| 지표 | 2026-04-25 (MASTER_ROADMAP 작성 시) | 2026-04-28 (현재) | Delta |
+|---|---:|---:|---:|
+| 14/14 strict 빌드 통과 (Phase 15) | ✅ | ✅ | 유지 |
+| compiler regression CI 통합 | ❌ (Phase α 목표) | ✅ wave 1+2 (5+5 tests) | LANDED |
+| vaisdb_files codegen pass | 176/261 (Phase α 작성 시점) | **219/261** | +43 file |
+| Tests linking + executable + assertion | 0/14 (Phase α 목표) | wave 1 5-test + wave 2 5-test (vais-server) baseline-tracked | partial |
+
+**평가**: Phase α "One Test Passes"의 본질적 목표 (compiler가 vaisdb를 안정적으로 빌드 + CI 게이트로 regression 검출)는 Phase Ω Pillar 2로 LANDED. 단, "test가 link + 실행 + assertion-pass"의 마지막 단계는 vaisdb의 잔여 -42 error (Task #33 Stage B 분리)로 진행 중.
+
+### Phase β 후보 (Phase Ω 후속 작업)
+
+Phase Ω invariant 충족 후 Phase β (5 tests pass + CLI demo) 진입 가능. 후보:
+
+1. **vaisdb 잔여 -42 error fix** (Task #33 Stage B 후속) — 카테고리별 sub-task로 분리 (E001 16 / E004 6 / E006 4 / E030 3 / Codegen panic 9 / E022 1 + E009 3 mut param)
+2. **vaisdb test link + executable** — 위 fix 후 actual `./test_btree` 실행 가능 상태 도달
+3. **CLI demo** — `vaisdb --memory` 5-line interactive demo (Phase β.3)
+4. **README quickstart** + STATUS.md + GitHub Action
+
+### 전략 결정 (Pillar 4 본 task)
+
+- Phase Ω는 "compiler 무결점화"가 핵심 → Phase α "test passes"의 인프라 층 완성
+- Phase β 진입 결정은 별도 task (Task #36+ 또는 Phase Ω 종료 시점에 사용자 결정)
+- 본 reactivation은 **status 명문화만** — 새 phase 등록은 사용자 승인 후
+
+---
 
 ## 0. The Brutal Honest Diagnosis
 

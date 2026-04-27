@@ -10,11 +10,11 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto
-iteration: 123
+mode: pending
+iteration: 124
 max_iterations: 150
-current_phase: Phase Ω — Task #34 Pillar 3 mid-term retrospective (sustained)
-entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121 Task #32 / iter 122 Task #33 / iter 123 Task #34.
+current_phase: 🎯 **Phase Ω 4-Pillar 모두 LANDED**. 다음 phase 결정 사용자 위임.
+entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121~124 Task #32~35 자동 진행 세션 close.
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,57 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 124 LANDED (2026-04-28, ✅ Task #35 Pillar 4 — ADR 0003 신설 + ADR 0002 amendment + MASTER_ROADMAP 재활성화. 🎯 Phase Ω 4-Pillar 완료)
+- 사용자 결정: A→D 순차 자동 진행 (iter 123 Task #34 close 후 자동, 본 task가 마지막)
+- strategy: Opus direct (위험 0, ADR 신설 + 디자인 판단)
+- 산출물:
+  - **compiler `26cc865e`**:
+    - `docs/adr/0003-wrapper-migration-hidden-cost.md` (신규) — R4 (Hidden Cost Audit) 4 항목: R4.1 5-run baseline / R4.2 5-run post-migration (threshold: 평균 -0.5 / variance 2배 / min -1) / R4.3 Rust 변경 영향 분석 / R4.4 카테고리 분류
+    - `docs/adr/0002-codegen-invariants.md` Amendment §"단일 API 수렴 한계" + Self-Audit 항목 10번 + 변경 이력 entry
+  - **lang `<TBD>`**:
+    - `packages/vaisdb/docs/MASTER_ROADMAP.md` Reactivation Status 절 신설 (~80줄) — Phase Ω 누적 진척 표 + vaisdb test 진척 (176→219 +43 file) + Phase β 후보 4건
+- 검증:
+  - 코드 변경 없음 (ADR 문서 + memory만)
+  - cargo test 영향 0건
+  - ADR 0003 R4 적용 시점: 2026-04-28부터 모든 신규 wrapper migration commit
+  - 기존 LANDED 마이그레이션 (P1.3 Path 1+2+3, P1.4 stmt_visitor.rs:708) retro 적용 면제
+
+### 🎯 Phase Ω 4-Pillar 완료 평가 (iter 74 ~ 124, 50 iter)
+
+| Pillar | Sub-phases LANDED | 핵심 산출 |
+|--------|-------------------|-----------|
+| **Pillar 1** | P1.0 / P1.1 / P1.2 / P1.3 / P1.4 | ret/index/call_arg invariant + TypedEmitter API + 카테고리 분류 |
+| **Pillar 2** | wave 1 (vaisdb 5-test + server 2-test + web 271/0) + wave 2 (server 8-test) | compiler regression CI 통합 |
+| **Pillar 3** | iter 74 정책 코드화 + iter 83 P4.1 retrospective + iter 123 mid-term retrospective | ADR 0001/0002 sustained |
+| **Pillar 4** | P4.1 / P4.2 / P4.3 (LANDED iter 81~84) + P4.4 (본 iter 124) | ADR 0003 신설 + ADR 0002 amendment + MASTER_ROADMAP 재활성화 |
+
+#### 누적 production impact (Phase Ω, 50 iter)
+- vaisdb-regression test_graph: 2 → 1 (-1 error, P1.2 iter 92)
+- vaisdb_files: ~218 → 219.6 (+1.6 file 평균, P1.4 +0.6 + Task #33 +1)
+- variance: ±2.5 → ±0.5 (deterministic protocol, P1.4 iter 114)
+- vais-server regression coverage: 2-test → 8-test (+6, P2 wave 2 iter 121)
+- vais-web baseline 명문화: crate별 split (Task #32 iter 121)
+- ADR 신설/amendment: 3건 (0001+0002 sustained, 0003 신설, 0002 amendment)
+
+#### invariant 충족 평가 (Phase Ω 종료 후 보장)
+1. ✅ **codegen 4 클래스 invariant + R2 차단 테스트 + R3 audit 충족** — ret/index/call_arg LANDED, var-to-llvm은 ADR 0002에 spec only (P1.x 후속)
+2. ⚠️ **vaisdb 모든 타겟이 compiler regression CI에서 0 error 빌드** — 부분 달성 (vaisdb 219/261, +42 잔여 → Task #33 후속)
+3. ⚠️ **165 ad-hoc if-coerce + 329 수동 register_temp_type 산발 사이트 단일 API 수렴** — ADR 0002 amendment로 수정 (카테고리 A만 자동, B/C/D는 manual)
+
+#### exit_audit 결과
+- vaisdb regression CI KNOWN_FAILURE_COUNT: 8 (목표 0, -42 vaisdb error 추가 fix 필요)
+- cargo test --workspace: 변경 무 (Task #35 코드 변경 0)
+- integrity: std 82/82 ✅, vaisdb 219/261 (목표 261, -42)
+- ret/index/call_arg invariant test: 모두 PASS
+
+#### 결론
+- **Phase Ω 핵심 작업 완료** (4-Pillar 모두 LANDED)
+- **잔여 작업 명시화**: vaisdb -42 error fix는 Task #33 후속 sub-task로 분리 가능 (위험 4-7/10, multi-iter)
+- 다음 phase 결정은 사용자 위임:
+  - A. vaisdb -42 error fix multi-iter (Phase α "test passes" 직접 진입)
+  - B. Phase β 진입 (CLI demo, 5-line interactive — MASTER_ROADMAP 후보)
+  - C. Phase Ω 종료 + 별도 phase (사용자 결정)
 
 ### iter 123 LANDED (2026-04-28, ✅ Task #34 Pillar 3 mid-term retrospective — ADR 0001+0002 sustained)
 - 사용자 결정: A→D 순차 자동 진행 (iter 122 Task #33 close 후 자동)
