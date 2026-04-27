@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 122
+iteration: 123
 max_iterations: 150
-current_phase: Phase Ω — Task #33 vaisdb 잔여 -42 error 분류 + low-risk fix
-entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121 Task #32 / iter 122 Task #33.
+current_phase: Phase Ω — Task #34 Pillar 3 mid-term retrospective (sustained)
+entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121 Task #32 / iter 122 Task #33 / iter 123 Task #34.
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,37 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 123 LANDED (2026-04-28, ✅ Task #34 Pillar 3 mid-term retrospective — ADR 0001+0002 sustained)
+- 사용자 결정: A→D 순차 자동 진행 (iter 122 Task #33 close 후 자동)
+- strategy: Opus direct (위험 0, analysis-only retrospective, 디자인 판단 — ADR 평가 + memory 통합 + production impact 분석)
+- 산출물:
+  - **compiler `001ed008`**: ADR 0001에 mid-term retrospective 절 추가 (+109줄)
+    - 측정 윈도우: c683bd42 (ADR 0001 LANDED, iter 74) → a0751070 (iter 122)
+    - 누적: 37 commits (P4.1 시점 15 + 추가 22)
+    - ADR 인용 76% (-11pt vs P4.1 87%, refactor migration의 R1 prior 인용 관행화)
+    - TEMP-SITE-FIX(adr-0001) 0건 유지 (37 commits 후에도)
+    - Production code revert 0건 (3 measurement-based REVERTED는 vaisc 변경 없음)
+  - **memory 신설 3건 + MEMORY.md 인덱스 갱신**:
+    - phase_omega_pillar3_retrospective_2026-04-28.md
+    - phase_omega_iter121_p2_wave2_2026-04-28.md (Task #32 보강)
+    - phase_omega_iter122_task33_debug_println_2026-04-28.md (Task #33 보강)
+- 검증:
+  - ADR 0001 Status: **Accepted (sustained, mid-term reaffirmed)**
+  - ADR 0002 Status: **Accepted (mid-term reaffirmed)**
+  - 정책 변경 없음 (현 효과 충분히 검증)
+  - 누적 production impact (Pillar 1): ~1.6 file + 1 error reduction
+- 본질적 학습 5건 (mid-term):
+  1. multi-session "이어서 진행" 패턴 안정화 (5회 모두 cascade 0건)
+  2. measurement infra의 메타 적용 (P1.4 deterministic protocol에 R1+R2+R3 패턴)
+  3. ADR 0002 4 클래스 invariant ⊥ P1.4 카테고리 A/B/C/D 분류 (직교 axes)
+  4. wrapper migration의 hidden cost (ADR 게이트 외 영역) — 일반화 가능성 미확정
+  5. "763 사이트 단일 API 수렴"의 본질적 제약 (카테고리 A로만 한정)
+- 백로그 (Task #35 Pillar 4 신설 검토):
+  - ADR 0002 amendment §"단일 API 수렴 한계" — P1.4 학습
+  - ADR 0003 후보 — "wrapper migration의 hidden cost 평가 의무"
+- 다음 retrospective: long-term (iter 150+ 또는 ~6개월 후)
+- 다음 entry: Task #35 (Pillar 4 — ADR 신설 + MASTER_ROADMAP 재활성화).
 
 ### iter 122 LANDED (2026-04-28, ✅ Task #33 Stage A — debug println 제거 + 42 error 카테고리 분류 명문화)
 - 사용자 결정: A→D 순차 자동 진행 (iter 121 Task #32 close 후 자동)
