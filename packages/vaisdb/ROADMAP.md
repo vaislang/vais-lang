@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 121
+iteration: 122
 max_iterations: 150
-current_phase: Phase Ω — Pillar 2 wave 2 (vais-server / vais-web 통합 강화) 진행 중
-entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121부터 Task #32 (P2 wave 2) 시작.
+current_phase: Phase Ω — Task #33 vaisdb 잔여 -42 error 분류 + low-risk fix
+entry_point: iter 75는 Pillar 3.1 (정책 점검) + Pillar 2.1 (regression CI 검증)부터. iter 121 Task #32 / iter 122 Task #33.
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,39 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 122 LANDED (2026-04-28, ✅ Task #33 Stage A — debug println 제거 + 42 error 카테고리 분류 명문화)
+- 사용자 결정: A→D 순차 자동 진행 (iter 121 Task #32 close 후 자동)
+- strategy: Opus direct (위험 1/10 — debug println 2건 제거, codegen logic 무변경)
+- 산출물:
+  - **compiler `a0751070`**: debug println 2건 제거
+    - `crates/vais-types/src/checker_expr/collections.rs:768` — Expr::StructLit `[TC DEBUG] enum_name=...` 제거
+    - `crates/vais-codegen/src/init.rs:191-203` — set_resolved_functions의 `[DEBUG resolved_function_sigs]` 제거 (TestSuite/ByteBuffer/TestCase/TestRunner 키 필터)
+- 검증:
+  - cargo test -p vais-codegen --lib: 824/0 PASS
+  - cargo test -p vais-types --lib: 355/0 PASS
+  - check-integrity (post-removal):
+    - vaisdb_files: **218 → 219 (+1 file)**
+    - std_files: 82/82 (변동 없음)
+    - living_spec: 116/117 (pre-existing 1 fail = example_todo_store.vais E009)
+- 🎯 **production impact**: vaisdb +1 file. iter 92 P1.2 (-1 vaisdb-regression error)와 iter 105+107 P1.4 (+0.6 file)에 이은 **세 번째 production win**.
+- recon agent 실패 학습: research-haiku로 위임한 vaisdb 잔여 error 분류가 9분 후 잘림 (PROMISE 신호 없음, 변경 0건). 261개 .vais 빌드 시도가 단일 agent에 너무 큼. **Opus direct 재실행으로 직접 측정 (`bash check-integrity.sh` + `grep ok_codegen_pkg FAIL`)이 더 효율** — recon 우선이 항상 옳지 않음.
+- 카테고리 분류 (42 vaisdb failures, debug noise 제거 후):
+  - **E001 Type mismatch**: 16건 — u8↔str unification (4-5건) / Vec<T> generic erasure (2건) / cross-module type info (1건) / enum variant destructure (3-4건) / generic indexable (2건) / 기타 (2-3건)
+  - **E004 Undefined function**: 6건 — dispatch / module resolution
+  - **E006 Wrong argument count**: 4건 — call site mismatch
+  - **E030 No such field**: 3건 — struct field resolution
+  - **E009 Immutable assignment**: 3건 — function param mutation 시도 (mut param syntax 미지원) + `_ = expr` ignore pattern (compiler 미인식)
+  - **Codegen error (panic/ICE)**: 9건 — policy/parser_select/search/retrieval/graph
+  - **E022 Use after move**: 1건
+- 위험 평가 (잔여 fix):
+  - E009: 위험 5/10 (mut param 추가는 언어 변경, vaisdb source 수정은 user feedback `feedback_root_cause_only` 위반)
+  - E001 u8↔str: 위험 4-5/10 (P1.4 외 영역, P1.2 P1.4 패턴 적용 가능 여부 미확정)
+  - E001 Vec<T> erasure: 위험 6/10 (P1.4가 흡수했어야 할 영역의 잔재)
+  - Codegen panic: 위험 6-7/10 (cascade 가능성)
+  - E004/E006/E030: 위험 4-5/10 (각각 별도 root cause, 단일 패턴 fix 불가)
+- **Task #33 Stage B 결정**: 잔여 fix는 모두 위험 4-7/10. 본 iter 122에서 **debug noise 제거 + 카테고리 분류 명문화로 close**. 추가 fix는 별도 task로 분리 (Task #36+ 예정 — Pillar 1 follow-up). user feedback `feedback_root_cause_only` 적용으로 vaisdb source 수정 자체가 금지되어 컴파일러 변경만 가능 → 신중한 multi-iter 접근 필요.
+- 다음 entry: Task #34 (Pillar 3 retrospective).
 
 ### iter 121 LANDED (2026-04-28, ✅ Task #32 Pillar 2 wave 2 — vais-server regression coverage 2→8 tests)
 - 사용자 결정: "작업 진행해야될 것 진행완료될때까지 진행" + A→D 순차 자동 진행
