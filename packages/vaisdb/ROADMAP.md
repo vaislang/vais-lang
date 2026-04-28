@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: pending
-iteration: 125
+iteration: 126
 max_iterations: 150
-current_phase: Phase Ω 4-Pillar LANDED. vaisdb -42 error 분류 완료. 추가 fix는 P1.5 (closure/method dispatch generic propagation) 사용자 결정 위임.
-entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 (recon-only, P1.5 식별).
+current_phase: Phase Ω 4-Pillar LANDED + vaisdb 42 failure 분류 완료 (Task #33/36~39). 단일 iter fix 가능 0건 확정. P1.5 (multi-iter) 진입 결정 사용자 위임.
+entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 / iter 126 Task #39.
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,49 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 126 LANDED (2026-04-28, ⚠️ Task #39 E001 16건 격리 분류 close — Sub-A 5건 모두 격리 OK, vaisdb cross-module 환경에서만 fail, P1.5 영역 흡수)
+- 사용자 결정: "이어서 진행" (iter 125 close 후 자동 진입)
+- strategy: Opus direct, recon-only (memory feedback_risk_assessment_isolation_test 적용 — 격리 테스트 의무)
+- 산출물: 코드 변경 0 (production code 0건). ROADMAP entry만.
+
+#### E001 16건 sub-카테고리 분류 (vaisdb only)
+| Sub | Count | 패턴 | 격리 테스트 | 진단 |
+|-----|-------|------|-------------|------|
+| **A. Vec<X>.push(arr[i])** | 5 | client/mod:392, key.vais:130, prefix.vais:56,80, scan.vais:543 | ✅ 격리 OK | cross-module / generic monomorphization 환경에서만 fail. P1.5 영역 (closure/method receiver type inference 일반화에 흡수) |
+| **B. cross-module type info loss** | 2 | server/copy:326, server/mod (imported byte offset 9097) | (격리 시도 안 함, 이미 cross-module 명시) | cross-module function signature info 누락. P1.5 또는 별도 cross-module fix |
+| **C. Vec<T> vs Vec generic erasure** | 2 | sql/parser/mod, parser_expr | (Phase 4 Stage A 학습 패턴) | generic instantiation erasure. monomorphization 영역 |
+| **D. Other type mismatch** | 4 | sort_agg:419,466, window:338, conflict:175, deadlock | mixed | 일부 closure inference (window의 `?1403`), 일부 vaisdb source (sort_agg `*sum = result.0`은 Option destructure 잘못) |
+| **E. Trait bound** | 1 | bulk.vais:456 | — | vaisdb source bug (S struct가 NodeStore impl 안 함) |
+| **F. Other (cow.vais 등)** | 2 | hnsw/cow + 1 | — | 미상세 (단일 패턴 불확실) |
+
+#### 결론
+- Sub-A 5건 격리 테스트 모두 통과 → vaisdb cross-module 환경의 P1.5 영역
+- Sub-B/C 4건 = monomorphization / cross-module fix 영역 (multi-iter)
+- Sub-D 4건 = mixed (source bug + closure)
+- Sub-E 1건 = vaisdb source bug
+- Sub-F 2건 = 미상세
+- **단일 iter 안전 fix 가능 후보: 0건**
+- **P1.5 흡수 후보: 9~11건** (Sub-A 5 + Sub-B 2 + Sub-C 2 + Sub-D 일부)
+- **별도 task 후보: 1~3건** (Sub-D source bug + Sub-E + Sub-F)
+
+#### 학습 (memory feedback_risk_assessment_isolation_test 검증)
+- iter 125에서 E006/E030/E004 격리 후 위험 정확화 → iter 126 E001도 동일 패턴
+- E001 추정 4-6/10 → 실제 P1.5 (5-7/10) 흡수 영역으로 확정
+- 격리 테스트 의무가 잘못된 위험 평가 차단 — 본 task 진입 비용 1 iter (recon-only)
+
+#### Phase Ω 후속 task 통합 결론 (iter 122~126 누적)
+- Task #33 (iter 122) 분류: 42 vaisdb failure
+- Task #36 (iter 125): E006 4건 → 100% vaisdb source bug
+- Task #37+38 (iter 125): E030+E004 9건 → P1.5 후보
+- Task #39 (iter 126): E001 16건 → P1.5 흡수 9~11건 + source bug 1~5건
+- **종합**: 잔여 42 fail 중 P1.5 흡수 가능 18~22건 (E030+E004+E001 일부), vaisdb source bug 5~10건, codegen panic 9건 별도
+- **단일 task로 fix 가능한 영역 = 0건** (모두 multi-iter P1.5 또는 source bug 또는 panic recon)
+
+#### 다음 entry 후보
+- A. P1.5 진입 (closure/method dispatch + monomorphization + cross-module 일반화) — 위험 5-7/10, 5~10 iter, 예상 +18~22 file
+- B. Codegen panic 9건 분리 task (위험 6-7/10)
+- C. 본 분석 결과 보고 + 사용자 결정 대기 (mode: pending)
 
 ### iter 125 LANDED (2026-04-28, ⚠️ Task #36~#38 vaisdb error 분류 — production fix 0건, P1.5 후보 식별)
 - 사용자 결정: "vaisdb -42 error fix 다수 진행" (Phase Ω 4-Pillar 완료 후 후속)
