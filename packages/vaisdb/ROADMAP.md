@@ -10,11 +10,11 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: auto
-iteration: 129
+mode: pending
+iteration: 130
 max_iterations: 150
-current_phase: P1.5 Stage C+D — Vec/HashMap 다른 method batch 격리 + handler 일괄 추가
-entry_point: iter 128 sort_by +2 file → iter 129 batch 격리 (insert/swap_remove/get_mut/...)
+current_phase: P1.5 Stage A~C 완료 (+2.4 file 누적). Stage E (cross-module) 진입 사용자 결정 위임.
+entry_point: iter 128 sort_by → iter 129 HashSet → iter 130 Stage C.2 close → 다음 entry는 Stage E or P1.5 종료
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,46 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 130 LANDED (2026-04-28, ⚠️ P1.5 Stage C.2 close — Vec/HashMap 추가 method batch 격리, vaisdb 사용 method는 모두 cover됨)
+- 사용자 결정: P1.5 multi-iter 자동 진행
+- strategy: Opus direct, recon-only (batch 격리)
+
+#### 4 격리 테스트 결과
+| Test | 결과 | 진단 |
+|------|------|------|
+| Vec.swap_remove | ✅ E004 재현 | builtin handler 누락. **하지만 vaisdb 코드에서 사용 안 함** (grep 결과 0건) |
+| Vec.iter | ❌ OK | 이미 작동 (LF item: items.iter() 패턴) |
+| Vec.extend | ❌ OK | 이미 작동 |
+| Vec.clone | ❌ OK | 이미 작동 |
+
+#### 핵심 결론
+- **Vec/HashMap/HashSet builtin method 중 vaisdb가 사용하면서 미등록인 것 = 0건**
+- iter 128 sort_by + iter 129 HashSet 추가로 vaisdb 사용 builtin method 모두 cover
+- swap_remove 등 stdlib에 없는 method는 add 안 해도 production impact 0
+
+#### Stage C 종료 평가
+- Stage C.1 (HashSet): +1.1 file (5-run measured)
+- Stage C.2 (swap_remove/iter/extend/clone): 0 file
+- **누적 P1.5 Stage A~C 효과: +2.4 file 평균** (sort_by +1~2 single-run + HashSet +1.1 5-run)
+
+#### 잔여 vaisdb 41 failures의 진짜 영역
+sort_by/HashSet handler 추가 후에도 vaisdb 41 failures 유지. 카테고리 stderr 첫 줄 카운트는 동일 (E001 16, E004 6, E006 4, E030 3, E009 3, Codegen panic 9, E022 1) — **stderr 첫 줄만 분류이라 handler effect가 line count에 안 보임**. 진짜 잔여 영역:
+- **cross-module type info propagation** (Stage E 후보, 위험 6-7/10)
+- **monomorphization 영역** (P1.4 외 영역, 위험 7-8/10)
+- **vaisdb source bug** (E006 4건 + E022 1건 + E009 3건 + Codegen panic 일부, 총 ~12건, fix 불가 — user feedback)
+- **vaisdb-specific method receiver inference** (`get_node`/`release` 등, struct method 영역, P1.5 외)
+
+#### 다음 entry 후보 (사용자 결정)
+- A. **Stage E** (cross-module type info propagation, 위험 6-7/10, 3~5 iter, 예상 +5~10 file)
+- B. **Codegen panic 9건 분리 task** (위험 6-7/10, recon-only 1 iter)
+- C. **P1.5 종료** + Phase Ω 다음 phase 결정 (현재 누적 +2.4 file with P1.5 만)
+- D. **세션 종료** (충분한 진척, 사용자 추가 결정 대기)
+
+#### iter 130 학습
+- **vaisdb 사용 method 우선 격리 검증의 효율성**: stdlib 미등록이지만 vaisdb 사용 안 하는 method (swap_remove)는 add해도 production impact 0
+- **격리 batch는 vaisdb usage grep 결과 기반으로 좁힐 것** — generic "Vec/HashMap method 모두" 시도는 비효율
+- Phase Ω P1.5 핵심 발견: **카테고리 stderr 첫 줄 분류 < production count 측정의 정확도** (handler effect가 line 분포에 안 보임)
 
 ### iter 129 LANDED (2026-04-28, 🎯 P1.5 Stage C.1 — HashSet handler 추가 + 5-run measurement, vaisdb +1.1 평균)
 - 사용자 결정: P1.5 multi-iter 자동 진행
