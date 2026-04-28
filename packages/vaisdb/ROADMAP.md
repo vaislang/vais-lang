@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: pending
-iteration: 130
+iteration: 131
 max_iterations: 150
-current_phase: P1.5 Stage A~C 완료 (+2.4 file 누적). Stage E (cross-module) 진입 사용자 결정 위임.
-entry_point: iter 128 sort_by → iter 129 HashSet → iter 130 Stage C.2 close → 다음 entry는 Stage E or P1.5 종료
+current_phase: 🎯 P1.5 종료 (Stage A~C 완료, +2.4 file 누적 평균). Stage E는 별도 task (Pillar 1.6 후보, 위험 7-8/10).
+entry_point: iter 128 sort_by → iter 129 HashSet → iter 130 Stage C close → iter 131 Stage E recon → P1.5 종료 결정
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,55 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 131 LANDED (2026-04-28, ⚠️ P1.5 Stage E recon close — cross-module fail = 2 mod.vais, root cause는 import한 root file)
+- 사용자 결정: P1.5 multi-iter 자동 진행 ("이어서 진행")
+- strategy: Opus direct, recon-only (cross-module 영역 식별)
+
+#### Cross-module fail 정확 식별
+명시적 "imported module" 표지 = 2 파일:
+- server/mod.vais: byte offset 9097..9111 (expected u8 found str) — server/copy.vais의 from_utf8_lossy 영향
+- sql/executor/mod.vais: byte offset 8410..8422 (no field 'column_index' on ?1215) + 9682..9718 (expected 1 args got 2) — sql/executor/scan/sort_agg 영향
+
+#### server/copy.vais root cause 격리
+```vais
+field_str := mut from_utf8_lossy(&current_field)  // current_field: Vec<u8>
+```
+- 격리 test (Vec<u8> → &[u8] slice coerce): **OK**
+- vaisdb 환경에서만 fail = **cross-module function signature info 누락**
+- `from_utf8_lossy(bytes: &[u8])`는 vaisdb storage/bytes.vais 정의
+- compiler가 cross-module lookup 시 `&[u8]` slice info 손실 → arg를 u8 로 잘못 추론
+
+#### Stage E의 진짜 영역
+- **cross-module function signature info propagation**
+- incremental cache 또는 module signature serialization 변경 영역
+- P1.5 Stage A~C (builtin handler add)와 본질적으로 다른 작업
+- 위험 7-8/10 (cache invalidation + cascade 가능성)
+
+#### Stage E 결정: 별도 task로 분리
+- Stage E는 본 P1.5 multi-iter 범위 외
+- 별도 task (Pillar 1.6 후보) 또는 별도 phase 적합
+- multi-iter commitment 필요 (3~5 iter)
+- **본 iter 131 recon-only close**
+
+#### P1.5 종료 평가 (Stage A~E)
+- Stage A (iter 127): batch 격리 — stale binary false-positive 발견
+- Stage B (iter 128): sort_by handler +1~2 file
+- Stage C.1 (iter 129): HashSet handler +1.1 file (5-run)
+- Stage C.2 (iter 130): vaisdb 사용 method 모두 cover 확정
+- Stage E (iter 131): cross-module recon → 별도 task 분리 결정
+- **누적 +2.4 file 평균 (5-run measured)**
+
+#### 다음 entry 후보 (사용자 결정)
+- A. **Pillar 1.6 (cross-module function signature info)** 별도 task 신설 — 위험 7-8/10, 3~5 iter
+- B. **Codegen panic 9건 분리 task** — 위험 6-7/10, recon-only 1 iter
+- C. **P1.5 종료** + Phase Ω 다음 phase 결정
+- D. **세션 종료** (충분한 진척, 사용자 추가 결정 대기)
+
+#### iter 131 학습
+- **Cross-module fail은 root file 식별이 우선** — mod.vais의 byte offset은 import한 file의 fail location
+- **stderr 첫 줄 카테고리 분류 ≠ 진짜 root cause** — server/mod E001 첫 줄은 server/copy의 cross-module 영향
+- **fix multiplier**: root file 1개 fix → mod.vais 1개 자동 회복 (즉 +N file with multiplier)
 
 ### iter 130 LANDED (2026-04-28, ⚠️ P1.5 Stage C.2 close — Vec/HashMap 추가 method batch 격리, vaisdb 사용 method는 모두 cover됨)
 - 사용자 결정: P1.5 multi-iter 자동 진행
