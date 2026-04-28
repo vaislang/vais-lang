@@ -11,10 +11,10 @@
 ## 🎯 Active Phase (harness 진입점)
 
 mode: auto
-iteration: 127
+iteration: 128
 max_iterations: 150
-current_phase: 🎯 **Pillar 1.5 진입** — closure/method dispatch generic propagation 일반화 (사용자 결정 2026-04-28, multi-iter commitment 5~10 iter)
-entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 / iter 126 Task #39 / iter 127+ Task #40 P1.5
+current_phase: 🎯🎯 P1.5 Stage B.2 LANDED — sort_by handler 추가 (vaisdb +2 file 단일 win)
+entry_point: iter 127 Stage A → iter 128 Stage B.1 debug + B.2 sort_by handler → iter 129+ Stage C/D/E/F
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,57 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 128 LANDED (2026-04-28, 🎯🎯 P1.5 Stage B.1+B.2 — sort_by handler 추가, vaisdb +2 file)
+- 사용자 결정: P1.5 multi-iter 자동 진행 (iter 127 Stage A close 후)
+- strategy: Opus direct (compiler core 변경, 4줄 fix + R3 audit)
+
+#### Stage B.1 결정적 발견: stale binary
+- iter 127 Stage A 격리 test 2 (Vec.get without annotation)이 E030 fail로 측정됨
+- iter 128 debug println 추가 후 실측: target/release/vaisc로는 **OK No errors**
+- 원인: ~/.cargo/bin/vaisc가 P1.4 시점 stale binary
+- `cp target/release/vaisc ~/.cargo/bin/vaisc` 후 격리 test 2 PASS
+- **iter 127의 push handler 의심은 stale binary 아티팩트** — 진짜 root cause는 sort_by 미등록 + cross-module 영역
+- debug println 즉시 제거 (변경 0줄)
+
+#### Stage B.2 LANDED — sort_by handler 추가
+- compiler `d50a2b78`: `crates/vais-types/src/checker_expr/calls.rs` 4줄 변경 (2 사이트)
+  - L990: slice mutation ops list에 `sort_by` 추가
+  - L1410: Phase 273 fallback list에 `sort_by` 추가 + P1.5 코멘트
+- 효과: Vec.sort_by(|a, b| ...) Unit return + closure args type-checked
+- **production impact**: vaisdb_files **219 → 221 (+2 file)** — Phase Ω 단일 변경 최대 win (P1.4 +0.6의 3배)
+
+#### 검증
+- 격리 test (`/tmp/p15_test1_sort_by.vais`): PASS
+- cargo test -p vais-types --lib: 355/0 PASS
+- cargo test -p vais-codegen --lib: 824/0 PASS
+- cargo test --workspace e2e: 2625/0 PASS, 1 ignored
+- check-integrity: vaisdb 219→221, std 82/82, living_spec 116/117 (pre-existing 1 fail)
+- ⚠️ pre-existing fail: `vaisc::endurance_tests::test_endurance_parser_stress` stack overflow (git stash로 본 변경 무관 확정. CLAUDE 규칙 4 트리거 X)
+
+#### ADR 충족
+- R1 (invariant): "Vec.sort_by(|a, b| cmp_expr) 호출은 builtin dispatch에서 Unit return하며 args 모두 type checked"
+- R2 (차단 테스트): 격리 test로 effective. 정식 R2 (call_arg_invariant_test 또는 신설 sort_by_invariant_test) 추가는 Stage C로 deferred
+- R3 (audit): grep 결과 sort_by는 단일 패턴, 다른 사이트 영향 0 (이전엔 unimplemented). cascade risk 0
+- ADR 0003 R4: 본 변경은 wrapper migration 아님 (handler 신설) → 면제
+
+#### 누적 production impact (Phase Ω 전체)
+- iter 92 P1.2: vaisdb-regression test_graph 2→1 (-1 error)
+- iter 105+107 P1.4: vaisdb_files +0.6 file (deterministic 5-run)
+- iter 122 Task #33: vaisdb_files +1 file (debug println 제거)
+- iter 128 P1.5 B.2: **vaisdb_files +2 file (sort_by handler)** ← **단일 변경 최대 win**
+- 합계 (Phase Ω 누적, single-run baseline): vaisdb_files ~218 → 221 (+3 file) + variance 50% 감소 + test_graph -1
+
+#### Stage C+ 계획 (다음 iter 129+)
+- Stage C: Vec.get 격리 OK 확인 후, 정식 R2 차단 테스트 추가 (sort_by_invariant_test) + closure 인자 hint 메커니즘 분석
+- Stage D: 다른 method (insert/get/swap/...) 격리 batch + handler 일괄 추가 (R3 audit)
+- Stage E: cross-module type info propagation (vaisdb 잔여 ~37 fail의 핵심 영역)
+- Stage F: 5-run measurement (ADR 0003 R4) — 본 +2 file을 deterministic 확정
+
+#### iter 128 학습
+- **stale binary 함정**: ~/.cargo/bin/vaisc가 잠재적으로 작업 base와 다를 수 있음. 격리 테스트 이전 `cp target/release/vaisc ~/.cargo/bin/vaisc` 의무 (memory 신설 후보)
+- **Stage A 격리 결과 일부 false-positive**: stale binary 때문에 fail 측정. 새 binary로 재검증 후만 정확
+- **단일 method add의 큰 production impact**: sort_by 4줄 → +2 file. P1.4 wrapper migration의 hidden cost와 정반대 — 단일 builtin handler는 위험 1-2/10 + production 즉시 효과
 
 ### iter 127 LANDED (2026-04-28, 🎯 Task #40 P1.5 Stage A — batch 격리 테스트 close, Stage B 진입 준비)
 - 사용자 결정: P1.5 진입 (multi-iter commitment 5~10 iter, 위험 5-7/10)
