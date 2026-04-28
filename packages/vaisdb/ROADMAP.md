@@ -10,11 +10,37 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: pending
+mode: auto
 iteration: 131
-max_iterations: 150
-current_phase: 🎯 P1.5 종료 (Stage A~C 완료, +2.4 file 누적 평균). Stage E는 별도 task (Pillar 1.6 후보, 위험 7-8/10).
-entry_point: iter 128 sort_by → iter 129 HashSet → iter 130 Stage C close → iter 131 Stage E recon → P1.5 종료 결정
+max_iterations: 200
+current_phase: 🎯 사용자 결정 (2026-04-28) "완벽 완료까지 진행" — Task #41 P1.6 → #42 Codegen panic → #43 Phase Ω 종료 검증
+entry_point: /clear 후 /harness 재진입 시 본 ROADMAP + vais/ROADMAP.md "Phase Ω" 섹션 + Task #41~#43 description 읽으면 정확히 이어서 진행 가능
+
+next_task: Task #41 Pillar 1.6 — cross-module function signature info propagation
+  - 위험 7-8/10, 3~5 iter
+  - Stage A: cross-module signature 직렬화 코드 read (checker_module/mod.rs, codegen/init.rs, vaisc/incremental/)
+  - Stage B: root cause 식별 (slice info / generic param / cache hash 가설)
+  - Stage C: fix + 5-run measurement (ADR 0003 R4)
+  - Stage D: vaisdb 41 fail 재측정으로 multiplier 확인
+
+후속 task:
+  - Task #42 Codegen panic 9건 (위험 6-7/10, blockedBy #41)
+  - Task #43 Phase Ω 종료 검증 (위험 0, blockedBy #41+#42)
+
+핵심 명령어 (재진입 시 즉시 실행 가능):
+  - 현재 baseline 측정: cd compiler && bash scripts/check-integrity.sh 2>&1 | grep "INTEGRITY"
+  - vaisdb fail list: bash scripts/check-integrity.sh 2>&1 | grep "ok_codegen_pkg FAIL.*vaisdb" | sed 's/.*file=//'
+  - cross-module fail: bash scripts/check-integrity.sh 2>&1 | grep -B1 "imported module"
+  - 격리 테스트 전 binary 동기화 의무 (memory feedback_stale_vaisc_binary):
+    cargo build --release --bin vaisc && cp target/release/vaisc ~/.cargo/bin/vaisc
+
+핵심 의무 (재진입 시 적용):
+  - ADR 0001 R1+R2+R3 + ADR 0003 R4 (5-run measurement) 모두 의무
+  - user feedback feedback_root_cause_only: vaisdb source 수정 금지 (compiler 변경만)
+  - user feedback feedback_risk_assessment_isolation_test: 격리 테스트 후 위험 평가
+  - user feedback feedback_stale_vaisc_binary: ~/.cargo/bin/vaisc 동기화 의무
+
+다음 entry: iter 132~ Task #41 P1.6 Stage A (recon)
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
