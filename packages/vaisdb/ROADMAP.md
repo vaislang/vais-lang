@@ -10,11 +10,11 @@
 
 ## 🎯 Active Phase (harness 진입점)
 
-mode: pending
-iteration: 126
+mode: auto
+iteration: 127
 max_iterations: 150
-current_phase: Phase Ω 4-Pillar LANDED + vaisdb 42 failure 분류 완료 (Task #33/36~39). 단일 iter fix 가능 0건 확정. P1.5 (multi-iter) 진입 결정 사용자 위임.
-entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 / iter 126 Task #39.
+current_phase: 🎯 **Pillar 1.5 진입** — closure/method dispatch generic propagation 일반화 (사용자 결정 2026-04-28, multi-iter commitment 5~10 iter)
+entry_point: iter 121~124 Task #32~35 / iter 125 Task #36~38 / iter 126 Task #39 / iter 127+ Task #40 P1.5
 
 invariant: Phase Ω 종료 후 다음 세 가지가 동시에 보장됨
   1. vaisdb 모든 타겟이 compiler regression CI에서 0 error로 빌드 (Pillar 2)
@@ -25,6 +25,46 @@ exit_audit:
   - cargo test --workspace: ≥ 2625 (현 baseline)
   - integrity: std_files ≥ 82, vaisdb_files ≥ 261, 모든 .vais 빌드 0 error
   - ret_invariant_test + index_invariant_test + call_arg_invariant_test 모두 PASS
+
+### iter 127 LANDED (2026-04-28, 🎯 Task #40 P1.5 Stage A — batch 격리 테스트 close, Stage B 진입 준비)
+- 사용자 결정: P1.5 진입 (multi-iter commitment 5~10 iter, 위험 5-7/10)
+- strategy: Opus direct, Stage A recon-only
+
+#### 5 격리 테스트 결과
+| Test | 결과 | Pattern |
+|------|------|---------|
+| 1. sort_by | ✅ E004 재현 | Vec method 미등록 (calls.rs handler 누락) |
+| 2. Vec.get without annotation | ✅ E030 `&?0` 재현 | push 후 receiver Vec<?>의 element Var 미해결, get이 `&?0` Optional 반환 |
+| 3. HashMap insert+get | ❌ OK | P1.2 commit 27f6b260 효과 (HashMap K/V propagation) |
+| 4. user struct method | E034 (totality) 차단 | partial keyword 영역 별도 |
+| 5. Vec.swap → get | ✅ E030 재현 | swap 후 receiver type info 보존 안 됨 (get fail) |
+
+#### 핵심 발견
+- **P1.2 push handler (calls.rs:1140~1170)가 update_var_type 호출하지만 작동 안 함**
+  - `name == "Vec" && args.len() == 1` 조건 + unify + apply_substitutions + update_var_type 흐름은 정상으로 보임
+  - 그러나 격리 test 2에서 push 후 items.get(0)이 `Option<&?0>` 반환 — items의 var type이 stale
+  - 가설 1: receiver_type의 name이 정확히 "Vec"이 아닌 경우 (e.g., `Vec` not `Vec<?>` form)
+  - 가설 2: generics.first()가 빈 경우
+  - 가설 3: any_changed가 false (unify가 substitution을 성립 안 시킴)
+  - **Stage B 첫 작업**: push handler에 debug println으로 실제 path 추적 + 작동 안 하는 이유 확증
+
+#### Stage B 계획 (다음 iter 128)
+- Stage B.1: push handler debug 추가 + 격리 test 2로 path 추적 (1 iter)
+- Stage B.2: 진짜 root cause fix (가설 1/2/3 중 확증된 것) (1 iter)
+- Stage B.3: Vec.get/swap/등 다른 method handler 확장 (R3 audit 후, 1-2 iter)
+
+#### Stage C+ 계획 (iter 129+)
+- Stage C: sort_by handler + closure 인자 hint 메커니즘 (1-2 iter, 신설 영역)
+- Stage D: R3 audit 후 Vec/HashMap method 일괄 (2-4 iter)
+- Stage E: cross-module type info propagation (1 iter)
+- Stage F: 5-run measurement (ADR 0003 R4) (1 iter)
+
+#### 현 위험 평가
+- Stage B: 위험 4/10 (debug println은 위험 1/10, fix는 P1.2 패턴 directly 확장 4-5/10)
+- Stage C: 위험 5-6/10 (closure hint 메커니즘 신설)
+- Stage D: 위험 4-5/10 (Stage B 패턴 반복 + R3 audit)
+- Stage E: 위험 6-7/10 (cross-module은 inherently complex)
+- Stage F: 위험 0 (measurement only)
 
 ### iter 126 LANDED (2026-04-28, ⚠️ Task #39 E001 16건 격리 분류 close — Sub-A 5건 모두 격리 OK, vaisdb cross-module 환경에서만 fail, P1.5 영역 흡수)
 - 사용자 결정: "이어서 진행" (iter 125 close 후 자동 진입)
