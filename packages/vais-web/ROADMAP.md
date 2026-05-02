@@ -11,7 +11,7 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=17/17` in
+- `WEB RUNTIME smoke=18/18` in
   `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
@@ -25,7 +25,8 @@ Current promoted surface:
   `packages/kit/__tests__/e2e/vais-web-production-bundle-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts` and
-  `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts`.
+  `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts` and
+  `packages/kit/__tests__/e2e/vais-web-server-action-production-runtime.test.ts`.
 - The runtime bridge implementation is
   `packages/kit/src/ssr/server-bridge.ts`.
 
@@ -98,12 +99,32 @@ The current gate also verifies a bounded SSR/data-loading production app path:
   Playwright Chromium, loads its dynamic chunk, handles clicks, and produces no
   browser console/page errors.
 
+The current gate also verifies a bounded server action production runtime path:
+
+- a temporary real `app/contact/page.vaisx` route with `action()` is
+  discovered by `buildRouteTree()` and preserved in the route manifest;
+- prerender skips the server-action route instead of emitting stale static
+  HTML;
+- local HTTP rendering injects CSRF hidden fields into enhanced and plain
+  forms;
+- `handleServerAction()` validates same-origin POSTs, CSRF tokens,
+  form-urlencoded bodies, and schema errors;
+- enhanced browser submit receives JSON validation errors and JSON success
+  payloads;
+- plain browser form submit follows a `303` redirect and renders the submitted
+  state after navigation;
+- a minified code-split production bundle hydrates the action form in
+  Playwright Chromium, loads its dynamic chunk, and produces no unexpected
+  browser console/page errors.
+
 ## Not Certified Yet
 
 These are not product-complete claims:
 
 - production browser/device hydration runtime beyond the promoted local
   Chromium/Firefox/WebKit smoke;
+- server action auth-required, rate-limit, file upload, or live deployed action
+  behavior;
 - full dynamic production application runtime;
 - live deployed platform runtime;
 - JS/WASM compiler integration beyond the existing package tests.
