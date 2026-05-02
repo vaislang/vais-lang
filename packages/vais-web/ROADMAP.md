@@ -11,7 +11,7 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=13/13` in
+- `WEB RUNTIME smoke=16/16` in
   `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
@@ -23,7 +23,8 @@ Current promoted surface:
   `packages/kit/__tests__/e2e/vais-web-real-browser-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-platform-output-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-production-bundle-runtime.test.ts` and
-  `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts`.
+  `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts` and
+  `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts`.
 - The runtime bridge implementation is
   `packages/kit/src/ssr/server-bridge.ts`.
 
@@ -78,17 +79,21 @@ The current gate also verifies bounded cloud/static browser runtime paths:
   production assets served over local HTTP in Playwright Chromium.
 - production code-split hydration chunk loading, route metadata, marker/state
   cleanup, click handling, and missing-route 404 fallback.
+- generated static adapter `client.js` hydration in Playwright Chromium,
+  Firefox, and WebKit.
+- cross-browser state restoration, hydration event detail, mount metadata,
+  marker cleanup, click handling, and no browser console/page errors.
 
 ## Not Certified Yet
 
 These are not product-complete claims:
 
 - a compiled `vais-server` binary forwarding requests into the SSR bridge;
-- production browser/device hydration runtime beyond the promoted local smoke;
+- production browser/device hydration runtime beyond the promoted local
+  Chromium/Firefox/WebKit smoke;
 - SSR/data-loading production application runtime;
 - full dynamic production application runtime;
 - live deployed platform runtime;
-- cross-browser runtime matrix;
 - JS/WASM compiler integration beyond the existing package tests.
 
 ## Next Candidates
@@ -96,8 +101,7 @@ These are not product-complete claims:
 Promote exactly one bounded runtime gate at a time:
 
 1. A live deployed adapter smoke for the next selected target platform.
-2. A cross-browser hydration matrix smoke.
-3. A production SSR/data-loading app smoke.
+2. A production SSR/data-loading app smoke.
 
 Keep downstream failures classified as product/API drift, compiler regression,
 or unsupported non-Core feature before changing the frozen Core compiler.
