@@ -1,11 +1,25 @@
 # VAIS Lang Monorepo — Roadmap
 
 > **현재 상태**: 서브패키지 ROADMAP (vaisdb, vais-server)은 각자 관리. lang/ 루트 ROADMAP은 **모노레포 공통 + 크로스패키지** 작업만 다룸.
-> **최종 업데이트**: 2026-04-17
+> **최종 업데이트**: 2026-05-01
 >
 > mode: pending
 > iteration: 0
 > max_iterations: 10
+
+---
+
+## Compiler Core Gate Dependency (2026-04-29)
+
+lang/ 패키지 재승격은 compiler Core gate 뒤로 이동한다. 기준 순서는:
+
+1. `compiler/scripts/core-certify.sh`
+2. `compiler/scripts/check-integrity.sh`의 `CORE`, `MIR`, `CODEGEN` gate
+3. `ECOSYSTEM` gate의 package별 count
+
+따라서 lang/ 루트 또는 하위 패키지의 실패 수는 Core/codegen gate가 통과한 뒤에만 제품 진척 지표로 해석한다.
+
+2026-05-01 기준 Core/MIR/CODEGEN/ECOSYSTEM/VAISDB runtime gate는 통과 상태다. 단, `vais-server`와 `vais-web` 재승격은 root ROADMAP에서 별도 task로 승격될 때까지 보류한다. 현재 active surface는 compiler invariant와 VaisDB runtime smoke이며, server/web 문서는 과거 완료 주장보다 최신 gate 결과를 우선한다.
 
 ---
 
@@ -15,8 +29,8 @@
 |------|--------------|
 | vaisdb 내부 작업 | `packages/vaisdb/ROADMAP.md` |
 | vais-server 내부 작업 | `packages/vais-server/ROADMAP.md` |
-| vais-web 내부 작업 | (ROADMAP 파일 없음 — working tree / 이 ROADMAP) |
-| vaisc 컴파일러 변경 | `/Users/sswoo/study/projects/vais/compiler/ROADMAP.md` |
+| vais-web 내부 작업 | (ROADMAP 파일 없음 — root ROADMAP에서 재승격 task로 promoted될 때만 진행) |
+| vaisc 컴파일러 변경 | `/Users/sswoo/study/projects/vais/ROADMAP.md` + `compiler/` |
 | **vais-apps/monitor, signature 자체 수정** | **이 ROADMAP 소관 아님** — 생태계 ROADMAP (`/Users/sswoo/study/projects/vais/ROADMAP.md`)에서 관리 |
 
 **경계 위반 사례 (2026-04-17 학습)**: 직전 커밋 `8fc79af`가 이 파일에 monitor FFI 10-task plan을 작성했으나, (1) 작업 대상이 `vais-apps/monitor/` 하위라 lang/ scope 밖이었고, (2) 전제("29 undefined symbols 링크 실패")가 outdated였음. 해당 plan은 전면 폐기됨. → 신규 작업 추가 시 위 표로 scope 먼저 확인.

@@ -52,7 +52,7 @@ F btree_insert(
     I leaf.can_fit(key.len() as u32) {
         # Simple case: leaf has space
         # WAL-first: write WAL record before modifying page
-        tid_bytes := mut tid.to_le_bytes()
+        tid_bytes := mut u32_to_le_bytes(tid)
         wal_btree_insert(gcm, txn_id, tree.file_id, leaf_info.page_id, key, &tid_bytes)?;
         # FPI: capture page image before first modification after checkpoint
         I pool.needs_fpi(leaf_frame) {
@@ -73,18 +73,10 @@ F btree_insert(
     # First do the split, then propagate separator up
     split_result := mut split_leaf(tree, &leaf, key, tid, txn_id, gcm, leaf_frame, pool)?;
 
-    # Propagate split up through internal nodes
-    M split_result {
-        Done => {},
-        NeedsSplit(separator, new_page_id) => {
-            propagate_split(tree, &path, separator, new_page_id, txn_id, gcm, pool)?;
-        },
-    }
-
-    leaf_latch.release()
-    pool.unpin_page(leaf_frame, true)
-    tree.inc_entries()
-    Ok(true)
+    # Propagate split up through internal nodes, then clean up the leaf pin/latch
+    R finish_insert_after_split(
+        tree, &path, split_result, txn_id, gcm, pool, &mut leaf_latch, leaf_frame
+    )
 }
 
 # Path entry recording the descent through the tree
@@ -100,9 +92,9 @@ F collect_insert_path(
     key: &[u8],
     pool: &mut BufferPool,
 ) -> Result<Vec<PathEntry>, VaisError> {
-    path := mut Vec.with_capacity(tree.height as u64)
+    path: Vec<PathEntry> := mut Vec.with_capacity(tree.height as u64)
     current_page := mut tree.root_page_id
-    parent_guard := mut None
+    parent_guard: Option<LatchGuard> := mut None
 
     LF level: 0..(tree.height - 1) {
         # Acquire read latch on current internal node
@@ -126,7 +118,6 @@ F collect_insert_path(
         # Release parent latch — child is safe once we descend
         M parent_guard {
             Some(pg) => {
-                pg := mut pg
                 pg.release();
             },
             None => {},
@@ -139,7 +130,6 @@ F collect_insert_path(
     # Release the last internal node latch before latching the leaf
     M parent_guard {
         Some(pg) => {
-            pg := mut pg
             pg.release();
         },
         None => {},
@@ -165,6 +155,49 @@ F find_child_index(internal: &BTreeInternalNode, key: &[u8]) -> u64 {
         }
     }
     lo
+}
+
+F propagate_insert_split(
+    tree: &mut BTree,
+    path: &[PathEntry],
+    split_result: InsertResult,
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+) -> Result<(), VaisError> {
+    M split_result {
+        Done => { R Ok(()) },
+        NeedsSplit(separator, new_page_id) => {
+            R propagate_split(tree, path, separator, new_page_id, txn_id, gcm, pool)
+        },
+    }
+    Ok(())
+}
+
+F finish_insert_after_split(
+    tree: &mut BTree,
+    path: &[PathEntry],
+    split_result: InsertResult,
+    txn_id: u64,
+    gcm: &mut GroupCommitManager,
+    pool: &mut BufferPool,
+    leaf_latch: &mut LatchGuard,
+    leaf_frame: u32,
+) -> Result<bool, VaisError> {
+    propagate_result := mut propagate_insert_split(tree, path, split_result, txn_id, gcm, pool)
+    leaf_latch.release()
+    pool.unpin_page(leaf_frame, true)
+
+    M propagate_result {
+        Ok(_) => {
+            tree.inc_entries()
+            R Ok(true)
+        },
+        Err(e) => {
+            R Err(e)
+        },
+    }
+    Ok(true)
 }
 
 # Split a leaf node and insert the new key
@@ -202,19 +235,19 @@ F split_leaf(
 
     # Move entries [mid..] to new leaf
     # Plus insert the new key at the right position
-    all_keys := mut Vec.with_capacity(0)
-    all_tids := mut Vec.with_capacity(0)
+    all_keys: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+    all_tids: Vec<u32> := mut Vec.with_capacity(0)
 
     LF i: 0..leaf.entry_count() as u64 {
         I i == insert_pos {
-            all_keys.push(key.to_vec())
+            all_keys.push(copy_insert_bytes(key))
             all_tids.push(tid)
         }
-        all_keys.push(leaf.get_key(i).to_vec())
+        all_keys.push(copy_insert_bytes(leaf.get_key(i)))
         all_tids.push(leaf.entries[i].tid)
     }
     I insert_pos >= leaf.entry_count() as u64 {
-        all_keys.push(key.to_vec())
+        all_keys.push(copy_insert_bytes(key))
         all_tids.push(tid)
     }
 
@@ -355,17 +388,21 @@ F split_internal(
     pool: &mut BufferPool,
 ) -> Result<InternalSplitResult, VaisError> {
     # Collect all keys + the new key in sorted order
-    all_keys := mut Vec.with_capacity(0)
-    all_children := mut Vec.with_capacity(0)
+    all_keys: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+    all_children: Vec<u32> := mut Vec.with_capacity(0)
 
     # leftmost_child goes first
     all_children.push(internal.leftmost_child)
 
     inserted := mut false
     LF i: 0..internal.entry_count() as u64 {
-        entry_key := mut internal.get_key(i).to_vec()
-        I !inserted && compare_keys(new_key, &entry_key) == Less {
-            all_keys.push(new_key.to_vec())
+        entry_key := mut copy_insert_bytes(internal.get_key(i))
+        insert_before := mut M compare_keys(new_key, &entry_key) {
+            KeyCmp.Less => true,
+            _ => false,
+        }
+        I !inserted && insert_before {
+            all_keys.push(copy_insert_bytes(new_key))
             all_children.push(new_child)
             inserted = true
         }
@@ -373,7 +410,7 @@ F split_internal(
         all_children.push(internal.entries[i].child_page)
     }
     I !inserted {
-        all_keys.push(new_key.to_vec())
+        all_keys.push(copy_insert_bytes(new_key))
         all_children.push(new_child)
     }
 
@@ -461,14 +498,33 @@ F create_new_root(
         write_fpi(gcm.writer(), txn_id, tree.file_id, left_child, fpi_data)?;
         pool.clear_fpi(old_root_frame)
     }
-    old_root_data := mut pool.get_page(old_root_frame)
-    old_header := mut PageHeader.from_bytes(old_root_data)?;
+    old_root_data := mut pool.get_page_mut(old_root_frame)
+    old_header := mut PageHeader.read_from_page_vec(old_root_data)?;
     old_flags := mut old_header.get_flags()
     old_flags.set_root(false)
     old_header.set_flags(old_flags)
-    old_header.serialize_into(old_root_data)
+    old_header.write_to_page_vec(old_root_data)
     pool.unpin_page(old_root_frame, true)
 
     tree.set_root(new_root_page)
     Ok(())
+}
+
+F u32_to_le_bytes(value: u32) -> Vec<u8> {
+    bytes: Vec<u8> := mut Vec.with_capacity(4)
+    bytes.push((value & 255) as u8)
+    bytes.push(((value >> 8) & 255) as u8)
+    bytes.push(((value >> 16) & 255) as u8)
+    bytes.push(((value >> 24) & 255) as u8)
+    bytes
+}
+
+F copy_insert_bytes(data: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(data.len())
+    i := mut 0
+    LW i < data.len() {
+        result.push(data[i])
+        i += 1
+    }
+    result
 }

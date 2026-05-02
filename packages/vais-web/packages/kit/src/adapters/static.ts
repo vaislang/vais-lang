@@ -1,4 +1,12 @@
-import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult, RouteDefinition } from "../types.js";
+import type {
+  Adapter,
+  RouteManifest,
+  AdapterConfig,
+  AdapterBuildResult,
+  RouteDefinition,
+  ClientBundleConfig,
+} from "../types.js";
+import { generateClientBundle } from "../client/bundle.js";
 
 /**
  * Check if a route is SSG-compatible (no server-only functions).
@@ -36,18 +44,24 @@ function routePatternToFilePath(pattern: string): string {
 /**
  * Generate a minimal HTML page for a route.
  */
-function generateHtmlPage(pattern: string): string {
+function generateHtmlPage(
+  pattern: string,
+  clientScriptPath = "/client.js",
+  modulePreloads: string[] = []
+): string {
   const title = pattern === "/" ? "Home" : pattern.replace(/^\//, "").replace(/\//g, " / ");
+  const preloadLinks = generateModulePreloads(modulePreloads);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${title}</title>
+${preloadLinks}
 </head>
 <body>
   <div id="app"></div>
-  <script type="module" src="/client.js"></script>
+  <script type="module" src="${clientScriptPath}"></script>
 </body>
 </html>
 `;
@@ -56,21 +70,81 @@ function generateHtmlPage(pattern: string): string {
 /**
  * Generate a fallback/404 HTML page.
  */
-function generateFallbackPage(fallbackName: string): string {
+function generateFallbackPage(
+  fallbackName: string,
+  clientScriptPath = "/client.js",
+  modulePreloads: string[] = []
+): string {
   const is404 = fallbackName === "404.html";
+  const preloadLinks = generateModulePreloads(modulePreloads);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${is404 ? "404 - Page Not Found" : "App"}</title>
+${preloadLinks}
 </head>
 <body>
   <div id="app">${is404 ? "<h1>404 - Page Not Found</h1>" : ""}</div>
-  <script type="module" src="/client.js"></script>
+  <script type="module" src="${clientScriptPath}"></script>
 </body>
 </html>
 `;
+}
+
+function generateModulePreloads(paths: string[]): string {
+  return paths.map((path) => `  <link rel="modulepreload" href="${path}">`).join("\n");
+}
+
+function normalizePublicAssetPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    throw new Error("Client bundle asset path cannot be empty.");
+  }
+
+  const publicPath = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const normalized = publicPath.replace(/\/+/g, "/");
+  const segments = normalized.split("/");
+  if (segments.includes("..") || normalized.includes("\\") || normalized.endsWith("/")) {
+    throw new Error(`Invalid client bundle asset path: ${path}`);
+  }
+
+  return normalized;
+}
+
+function copyClientBundleAssets(
+  outDir: string,
+  bundle: ClientBundleConfig,
+  files: string[],
+  generatedFiles: Record<string, string>
+): { entry: string; modulePreloads: string[] } {
+  const entry = normalizePublicAssetPath(bundle.entry);
+  const normalizedAssets = new Map<string, string>();
+
+  for (const [path, content] of Object.entries(bundle.assets)) {
+    const publicPath = normalizePublicAssetPath(path);
+    normalizedAssets.set(publicPath, content);
+  }
+
+  if (!normalizedAssets.has(entry)) {
+    throw new Error(`Client bundle entry "${entry}" is missing from clientBundle.assets.`);
+  }
+
+  for (const [publicPath, content] of normalizedAssets) {
+    const filePath = `${outDir}${publicPath}`;
+    files.push(filePath);
+    generatedFiles[filePath] = content;
+  }
+
+  const modulePreloads = (bundle.modulePreloads ?? []).map(normalizePublicAssetPath);
+  for (const preload of modulePreloads) {
+    if (!normalizedAssets.has(preload)) {
+      throw new Error(`Client bundle preload "${preload}" is missing from clientBundle.assets.`);
+    }
+  }
+
+  return { entry, modulePreloads };
 }
 
 /**
@@ -113,6 +187,12 @@ export function createStaticAdapter(): Adapter {
 
       const files: string[] = [];
       const generatedFiles: Record<string, string> = {};
+      const client = config.clientBundle
+        ? copyClientBundleAssets(outDir, config.clientBundle, files, generatedFiles)
+        : {
+            entry: "/client.js",
+            modulePreloads: [],
+          };
 
       // Collect all routes and generate HTML files
       const allRoutes = collectRoutes(manifest.routes);
@@ -121,7 +201,7 @@ export function createStaticAdapter(): Adapter {
         // Only generate pages for routes that have a page component
         if (route.page) {
           const filePath = `${outDir}/${routePatternToFilePath(route.pattern)}`;
-          const html = generateHtmlPage(route.pattern);
+          const html = generateHtmlPage(route.pattern, client.entry, client.modulePreloads);
           files.push(filePath);
           generatedFiles[filePath] = html;
         }
@@ -129,14 +209,16 @@ export function createStaticAdapter(): Adapter {
 
       // Generate fallback page
       const fallbackPath = `${outDir}/${fallback}`;
-      const fallbackHtml = generateFallbackPage(fallback);
+      const fallbackHtml = generateFallbackPage(fallback, client.entry, client.modulePreloads);
       files.push(fallbackPath);
       generatedFiles[fallbackPath] = fallbackHtml;
 
-      // Add client-side assets placeholder
-      const clientJsPath = `${outDir}/client.js`;
-      files.push(clientJsPath);
-      generatedFiles[clientJsPath] = "// Client-side bundle placeholder\n";
+      if (!config.clientBundle) {
+        // Add the standalone client-side hydration bootstrap.
+        const clientJsPath = `${outDir}/client.js`;
+        files.push(clientJsPath);
+        generatedFiles[clientJsPath] = generateClientBundle();
+      }
 
       const result: AdapterBuildResult & {
         generatedFiles?: Record<string, string>;

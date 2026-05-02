@@ -6,6 +6,7 @@ U std/bytebuffer
 U storage/error
 
 X F ftruncate(fd: i64, len: i64) -> i64
+X F __strlen(s: str) -> i64
 
 EN OpenMode {
     ReadOnly,
@@ -345,6 +346,41 @@ F create_dir_all(path: &str) -> Result<(), VaisError> {
     Ok(())
 }
 
+F clone_dir_entry_name(raw_name: str) -> str {
+    name_len := mut __strlen(raw_name)
+    src := mut str_to_ptr(raw_name)
+    dst := mut malloc(name_len + 1)
+    memcpy(dst, src, name_len + 1)
+    ptr_to_str(dst)
+}
+
+F join_dir_entry_path(path: &str, name: str) -> str {
+    name_len := mut __strlen(name)
+    name_src := mut str_to_ptr(name)
+
+    I path.len() == 0 {
+        dst := mut malloc(name_len + 1)
+        memcpy(dst, name_src, name_len + 1)
+        R ptr_to_str(dst)
+    }
+
+    path_len := mut __strlen(path)
+    path_src := mut str_to_ptr(path)
+
+    I path == "/" {
+        dst_root := mut malloc(name_len + 2)
+        store_byte(dst_root, 47)
+        memcpy(dst_root + 1, name_src, name_len + 1)
+        R ptr_to_str(dst_root)
+    }
+
+    dst_full := mut malloc(path_len + name_len + 2)
+    memcpy(dst_full, path_src, path_len)
+    store_byte(dst_full + path_len, 47)
+    memcpy(dst_full + path_len + 1, name_src, name_len + 1)
+    ptr_to_str(dst_full)
+}
+
 F read_dir(path: &str) -> Result<Vec<DirEntry>, VaisError> {
     raw := mut fs_list_dir(path)
     I raw == 0 {
@@ -356,18 +392,44 @@ F read_dir(path: &str) -> Result<Vec<DirEntry>, VaisError> {
     i := mut 0
     LW i < count {
         raw_name := mut fs_list_dir_get(raw, i) as str
-        name := mut raw_name.to_string()
-        full_path := mut I path.len() == 0 {
-            name.clone()
-        } EL I path == "/" {
-            "/{name}"
-        } EL {
-            "{path}/{name}"
-        }
+        name := mut clone_dir_entry_name(raw_name)
+        full_path := mut join_dir_entry_path(path, name)
         entries.push(DirEntry { path: full_path, name })
         i += 1
     }
     fs_list_dir_free(raw)
 
     Ok(entries)
+}
+
+F remove_dir_contents(path: &str) -> Result<(), VaisError> {
+    I !path_exists(path) {
+        R Ok(())
+    }
+
+    entries := mut read_dir(path)?;
+    LF entry: entries {
+        I fs_is_dir(entry.path) == 1 {
+            remove_dir_contents(&entry.path)?;
+            I fs_rmdir(entry.path) != 0 {
+                R Err(err_io(&entry.path, "rmdir failed"))
+            }
+        } EL {
+            remove_file(&entry.path)?;
+        }
+    }
+
+    Ok(())
+}
+
+S Dir {}
+
+X Dir {
+    F create(path: str) -> Result<(), VaisError> {
+        create_dir_all(&path)
+    }
+
+    F remove_contents(path: str) -> Result<(), VaisError> {
+        remove_dir_contents(&path)
+    }
 }

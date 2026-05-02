@@ -1,5 +1,16 @@
 import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult, RouteDefinition } from "../types.js";
 
+function collectRoutes(routes: RouteDefinition[]): RouteDefinition[] {
+  const result: RouteDefinition[] = [];
+  for (const route of routes) {
+    result.push(route);
+    if (route.children.length > 0) {
+      result.push(...collectRoutes(route.children));
+    }
+  }
+  return result;
+}
+
 /**
  * Vercel Build Output API v3 config structure.
  */
@@ -39,7 +50,7 @@ function isSSRRoute(route: RouteDefinition): boolean {
 export function generateVercelConfig(manifest: RouteManifest): VercelConfig {
   const routes: VercelRoute[] = [];
 
-  for (const route of manifest.routes) {
+  for (const route of collectRoutes(manifest.routes)) {
     const src = patternToRegex(route.pattern);
 
     if (route.apiRoute) {
@@ -130,7 +141,7 @@ export function createVercelAdapter(): Adapter {
       const generatedFiles: Record<string, string> = {};
 
       // Generate static file entries for static routes
-      for (const route of manifest.routes) {
+      for (const route of collectRoutes(manifest.routes)) {
         if (route.page) {
           const hasDynamic = route.segments.some(
             (s) => s.type === "dynamic" || s.type === "catch-all"
@@ -160,7 +171,7 @@ export function createVercelAdapter(): Adapter {
       }
 
       // Generate serverless function entries for SSR/API routes
-      for (const route of manifest.routes) {
+      for (const route of collectRoutes(manifest.routes)) {
         const hasDynamic = route.segments.some(
           (s) => s.type === "dynamic" || s.type === "catch-all"
         );

@@ -25,7 +25,6 @@ U fulltext/types
 # - Read path is lock-free via snapshot isolation (MVCC handles consistency)
 S FullTextLock {
     rw_lock: RwLock<()>,               # Main read-write lock
-    write_queue: Mutex<Vec<u64>>,  # Pending write txn_ids (FIFO order)
     active_readers: AtomicI64,     # Count of active readers
     active_writer: AtomicI64,      # Current writer txn_id (0 = none)
 }
@@ -35,7 +34,6 @@ X FullTextLock {
     F new() -> FullTextLock {
         FullTextLock {
             rw_lock: RwLock.new(()),
-            write_queue: Mutex.new(Vec.with_capacity(0)),
             active_readers: AtomicI64.new(0),
             active_writer: AtomicI64.new(0),
         }
@@ -57,32 +55,8 @@ X FullTextLock {
     }
 
     # Acquire write lock for mutations (insert/delete)
-    # Serializes through write queue for FIFO ordering
+    # Serializes writers through the underlying RwLock.
     F write_lock(self, txn_id: u64) -> Result<FullTextWriteGuard, VaisError> {
-        # Add to write queue
-        {
-            queue := mut self.write_queue.lock()
-            queue.push(txn_id)
-        }
-
-        # Wait until this txn_id is at front of queue
-        at_front := mut false
-        LW !at_front {
-            queue := mut self.write_queue.lock()
-
-            I queue.len() == 0 {
-                R Err(VaisError.new("VAIS-0407002", "Transaction removed from write queue"))
-            }
-
-            I queue[0] == txn_id {
-                at_front = true
-            } EL {
-                # Release queue lock and yield
-                # queue.drop() # disabled for dev compiler
-                _yield := 0
-            }
-        }
-
         # Acquire exclusive write lock
         guard := mut self.rw_lock.write()
 
@@ -99,31 +73,7 @@ X FullTextLock {
     # Try to acquire write lock without blocking
     # Returns None if lock unavailable, Some(guard) if acquired
     F try_write_lock(self, txn_id: u64) -> Result<Option<FullTextWriteGuard>, VaisError> {
-        # Check if queue is empty and we can acquire immediately
-        queue := mut self.write_queue.lock()
-
-        I !queue.len() == 0 {
-            R Ok(None)
-        }
-
-        # Try to acquire write lock non-blocking
-        guard := mut M self.rw_lock.try_write() {
-            Ok(g) => g,
-            Err(_) => { R Ok(None) },
-        }
-
-        # Add to queue
-        queue.push(txn_id)
-        # queue.drop() # disabled for dev compiler
-
-        # Set active writer
-        self.active_writer.store(txn_id)
-
-        Ok(Some(FullTextWriteGuard {
-            lock: self,
-            txn_id,
-            _guard: guard,
-        }))
+        Ok(Option.None)
     }
 
     # Get count of active readers
@@ -144,12 +94,6 @@ X FullTextLock {
     # Internal: clear active writer and remove from queue
     partial F release_writer(self, txn_id: u64) {
         self.active_writer.store(0)
-
-        # Remove from write queue
-        queue := mut self.write_queue.lock()!
-        I !queue.len() == 0 && queue[0] == txn_id {
-            queue.remove(0)
-        }
     }
 }
 
@@ -372,9 +316,7 @@ X ConcurrentFullTextIndex {
 
     # Get metadata snapshot (acquires read lock on meta)
     F get_meta(self) -> Result<FullTextMeta, VaisError> {
-        meta_guard := mut self.meta.read()
-
-        Ok(meta_guard.clone())
+        Ok(self.meta.get_inner().clone())
     }
 
     # update_meta (Fn(T) callback) removed — dead code, callers absent.

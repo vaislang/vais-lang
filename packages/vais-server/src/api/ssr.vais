@@ -1,11 +1,12 @@
 # SSR API Endpoints
 # Implements POST /api/render, POST /api/hydrate, and GET /api/health.
-# These endpoints form the HTTP contract consumed by vais-web's ssr-client.ts.
+# These endpoints form the HTTP contract consumed by vais-web.
 
-U std/string
 U src/http/request
 U src/http/response
-U src/api/rest
+U src/http/status
+U src/http/header
+U std/http_client
 
 # ============================================================================
 # Request / Response shapes
@@ -33,23 +34,23 @@ S HydrateRequest {
 # protocol which never nests the route/props fields.
 F json_get_str(json: str, key: str) -> str {
     needle := "\"" + key + "\":"
-    start  := str_find(json, needle)
+    start  := ssr_str_find(json, needle, 0)
     I start == -1 { R "" }
 
-    val_start := start + str_len(needle)
+    val_start := start + needle.len()
     val_start = skip_whitespace(json, val_start)
 
     # Expect a quoted string value
-    I str_char_at(json, val_start) != 34 { R "" }   # 34 = '"'
+    I json.char_at(val_start) != 34 { R "" }   # 34 = '"'
 
     # Walk until the closing '"', honouring '\' escapes
     end := mut (val_start + 1)
     LW 1 == 1 {
-        c := str_char_at(json, end)
+        c := json.char_at(end)
         I c == 0  { R "" }        # unterminated string
         I c == 92 { end += 2 }    # 92 = '\' — skip escaped char
         EL I c == 34 {            # closing '"'
-            R str_slice(json, val_start + 1, end)
+            R json.substring(val_start + 1, end)
         }
         EL { end += 1 }
     }
@@ -58,12 +59,28 @@ F json_get_str(json: str, key: str) -> str {
 
 # Skip ASCII whitespace (space=32, tab=9, CR=13, LF=10) from position i.
 F skip_whitespace(s: str, i: i64) -> i64 {
-    c := str_char_at(s, i)
+    c := s.char_at(i)
     I c == 32 || c == 9 || c == 13 || c == 10 {
         skip_whitespace(s, i + 1)
     } EL {
         i
     }
+}
+
+F ssr_str_find(haystack: str, needle: str, from: i64) -> i64 {
+    I needle.len() == 0 { R from }
+    I from >= haystack.len() { R -1 }
+    I ssr_match_prefix(haystack, from, needle, 0) == 1 { R from }
+    ssr_str_find(haystack, needle, from + 1)
+}
+
+F ssr_match_prefix(haystack: str, hi: i64, needle: str, ni: i64) -> i64 {
+    nc := needle.char_at(ni)
+    I nc == 0 { R 1 }
+    hc := haystack.char_at(hi)
+    I hc == 0 { R 0 }
+    I hc != nc { R 0 }
+    ssr_match_prefix(haystack, hi + 1, needle, ni + 1)
 }
 
 # ============================================================================
@@ -94,23 +111,282 @@ F parse_hydrate_request(body: str) -> HydrateRequest {
 # wire contract is exercised end-to-end without requiring the JS runtime.
 F do_render(route: str, props: str) -> Response {
     I route == "" {
-        R json_error("Missing required field: route", 400)
+        R ssr_json_error("Missing required field: route", 400)
     }
 
-    # Build minimal rendered HTML
-    html := "<div id=\"app\" data-route=\"" + route + "\"></div>"
+    # Build minimal rendered HTML for the bounded SSR wire contract.
+    html := "<div id='app' data-route='" + route + "'></div>"
     head := "<title>vais | " + route + "</title>"
-    status_val := 200
 
-    html_escaped := escape_json_str(html)
-    head_escaped := escape_json_str(head)
-    status_str   := i64_to_str(status_val)
+    body_start := "{\"html\": \"" + html + "\""
+    body_head := body_start + ", \"head\": \"" + head + "\""
+    body := body_head + ", \"status\": 200}"
 
-    body := "{\"html\": \"" + html_escaped + "\""
-          + ", \"head\": \"" + head_escaped + "\""
-          + ", \"status\": " + status_str + "}"
+    headers := Headers.new().set(CONTENT_TYPE, "application/json")
+    Response {
+        status: StatusCode.new(200, "OK"),
+        headers: headers,
+        body: body,
+    }
+}
 
-    json_response(body, 200)
+# Forward a bounded SSR render request to an upstream vais-web SSR service.
+# This promotes the compiled vais-server -> std/http_client -> SSR service
+# path separately from the local fallback renderer above.
+F forward_ssr_render(upstream_base_url: str, route: str, props: str) -> Response {
+    I route == "" {
+        R ssr_json_error("Missing required field: route", 400)
+    }
+
+    endpoint := upstream_base_url + "/ssr/render"
+    payload_start := "{\"route\":\"" + route + "\""
+    payload_props := payload_start + ",\"props\":\"" + props + "\""
+    payload := payload_props + "}"
+
+    upstream := http_post(endpoint, payload)
+    I upstream.error_code != 0 {
+        R ssr_json_error("SSR upstream unavailable", 502)
+    }
+
+    upstream_body := upstream.body_text()
+    body := upstream_body + ""
+    content_type := upstream.content_type()
+    final_content_type := I content_type == "" { "application/json" } EL { content_type }
+    status := StatusCode.new(upstream.status, upstream.status_text)
+    headers := Headers.new().set(CONTENT_TYPE, final_content_type)
+    upstream.drop()
+
+    Response {
+        status: status,
+        headers: headers,
+        body: body,
+    }
+}
+
+F forward_ssr_render_with_timeout(upstream_base_url: str, route: str, props: str, timeout_ms: i64) -> Response {
+    I route == "" {
+        R ssr_json_error("Missing required field: route", 400)
+    }
+
+    endpoint := upstream_base_url + "/ssr/render"
+    payload_start := "{\"route\":\"" + route + "\""
+    payload_props := payload_start + ",\"props\":\"" + props + "\""
+    payload := payload_props + "}"
+
+    request := HttpRequest::post(endpoint).with_json(payload).with_timeout(timeout_ms)
+    client := HttpClient::new()
+    client.keep_alive = 0
+    upstream := client.send(&request)
+    request.drop()
+    client.drop()
+
+    I upstream.error_code == CLIENT_ERR_TIMEOUT {
+        R ssr_json_error("SSR upstream timeout", 504)
+    }
+    I upstream.error_code != 0 {
+        R ssr_json_error("SSR upstream unavailable", 502)
+    }
+
+    upstream_body := upstream.body_text()
+    body := upstream_body + ""
+    content_type := upstream.content_type()
+    final_content_type := I content_type == "" { "application/json" } EL { content_type }
+    status := StatusCode.new(upstream.status, upstream.status_text)
+    headers := Headers.new().set(CONTENT_TYPE, final_content_type)
+    upstream.drop()
+
+    Response {
+        status: status,
+        headers: headers,
+        body: body,
+    }
+}
+
+F forward_ssr_render_with_retry_observed(upstream_base_url: str, route: str, props: str, timeout_ms: i64, max_retries: i64, base_backoff_ms: i64, jitter_ms: i64) -> Response {
+    I route == "" {
+        R ssr_json_error("Missing required field: route", 400)
+    }
+
+    endpoint := upstream_base_url + "/ssr/render"
+    payload_start := "{\"route\":\"" + route + "\""
+    payload_props := payload_start + ",\"props\":\"" + props + "\""
+    payload := payload_props + "}"
+
+    retries := mut max_retries
+    I retries < 0 {
+        retries = 0
+    }
+    backoff := mut base_backoff_ms
+    I backoff < 0 {
+        backoff = 0
+    }
+    jitter := mut jitter_ms
+    I jitter < 0 {
+        jitter = 0
+    }
+
+    attempt := mut 0
+    LW attempt <= retries {
+        request := HttpRequest::post(endpoint).with_json(payload).with_timeout(timeout_ms)
+        client := HttpClient::new()
+        client.keep_alive = 0
+        upstream := client.send(&request)
+        request.drop()
+        client.drop()
+
+        I upstream.error_code == 0 {
+            upstream_body := upstream.body_text()
+            body := upstream_body + ""
+            content_type := upstream.content_type()
+            final_content_type := I content_type == "" { "application/json" } EL { content_type }
+            status := StatusCode.new(upstream.status, upstream.status_text)
+            headers := Headers.new().set(CONTENT_TYPE, final_content_type)
+            upstream.drop()
+
+            R Response {
+                status: status,
+                headers: headers,
+                body: body,
+            }
+        }
+
+        err := upstream.error_code
+        I attempt >= retries {
+            observed_policy_ms := backoff + jitter
+            I observed_policy_ms < 0 {
+                R ssr_json_error("SSR retry budget observability invalid", 502)
+            }
+
+            I err == CLIENT_ERR_TIMEOUT {
+                body_open := "{\"error\":\"SSR upstream timeout\""
+                body_obs := body_open + ",\"observability\":\"SSR retry budget exhausted (backoff policy observed)\""
+                body_kind := body_obs + ",\"last_error\":\"timeout\""
+                body_retry := body_kind + ",\"retry\":{\"budget\":\"exhausted\",\"backoff\":\"base+jitter\""
+                body := body_retry + ",\"jitter\":\"applied\"}}"
+                headers := Headers {
+                    count: 4,
+                    name0: CONTENT_TYPE, value0: "application/json",
+                    name1: "X-SSR-Retry-Budget", value1: "exhausted",
+                    name2: "X-SSR-Retry-Backoff", value2: "base+jitter",
+                    name3: "X-SSR-Retry-Last-Error", value3: "timeout",
+                    name4: "", value4: "",
+                    name5: "", value5: "",
+                    name6: "", value6: "",
+                    name7: "", value7: "",
+                }
+
+                R Response {
+                    status: StatusCode.new(504, ssr_error_reason(504)),
+                    headers: headers,
+                    body: body,
+                }
+            }
+
+            body_open := "{\"error\":\"SSR upstream unavailable\""
+            body_obs := body_open + ",\"observability\":\"SSR retry budget exhausted (backoff policy observed)\""
+            body_kind := body_obs + ",\"last_error\":\"transport\""
+            body_retry := body_kind + ",\"retry\":{\"budget\":\"exhausted\",\"backoff\":\"base+jitter\""
+            body := body_retry + ",\"jitter\":\"applied\"}}"
+            headers := Headers {
+                count: 4,
+                name0: CONTENT_TYPE, value0: "application/json",
+                name1: "X-SSR-Retry-Budget", value1: "exhausted",
+                name2: "X-SSR-Retry-Backoff", value2: "base+jitter",
+                name3: "X-SSR-Retry-Last-Error", value3: "transport",
+                name4: "", value4: "",
+                name5: "", value5: "",
+                name6: "", value6: "",
+                name7: "", value7: "",
+            }
+
+            R Response {
+                status: StatusCode.new(502, ssr_error_reason(502)),
+                headers: headers,
+                body: body,
+            }
+        }
+        attempt += 1
+    }
+
+    observed_policy_ms := backoff + jitter
+    I observed_policy_ms < 0 {
+        R ssr_json_error("SSR retry budget observability invalid", 502)
+    }
+
+    body_open := "{\"error\":\"SSR upstream unavailable\""
+    body_obs := body_open + ",\"observability\":\"SSR retry budget exhausted (backoff policy observed)\""
+    body_kind := body_obs + ",\"last_error\":\"transport\""
+    body_retry := body_kind + ",\"retry\":{\"budget\":\"exhausted\",\"backoff\":\"base+jitter\""
+    body := body_retry + ",\"jitter\":\"applied\"}}"
+    headers := Headers {
+        count: 4,
+        name0: CONTENT_TYPE, value0: "application/json",
+        name1: "X-SSR-Retry-Budget", value1: "exhausted",
+        name2: "X-SSR-Retry-Backoff", value2: "base+jitter",
+        name3: "X-SSR-Retry-Last-Error", value3: "transport",
+        name4: "", value4: "",
+        name5: "", value5: "",
+        name6: "", value6: "",
+        name7: "", value7: "",
+    }
+
+    Response {
+        status: StatusCode.new(502, ssr_error_reason(502)),
+        headers: headers,
+        body: body,
+    }
+}
+
+F forward_ssr_render_with_retry(upstream_base_url: str, route: str, props: str, timeout_ms: i64, max_retries: i64) -> Response {
+    I route == "" {
+        R ssr_json_error("Missing required field: route", 400)
+    }
+
+    endpoint := upstream_base_url + "/ssr/render"
+    payload_start := "{\"route\":\"" + route + "\""
+    payload_props := payload_start + ",\"props\":\"" + props + "\""
+    payload := payload_props + "}"
+    retries := mut max_retries
+    I retries < 0 {
+        retries = 0
+    }
+
+    attempt := mut 0
+    LW attempt <= retries {
+        request := HttpRequest::post(endpoint).with_json(payload).with_timeout(timeout_ms)
+        client := HttpClient::new()
+        client.keep_alive = 0
+        upstream := client.send(&request)
+        request.drop()
+        client.drop()
+
+        I upstream.error_code == 0 {
+            upstream_body := upstream.body_text()
+            body := upstream_body + ""
+            content_type := upstream.content_type()
+            final_content_type := I content_type == "" { "application/json" } EL { content_type }
+            status := StatusCode.new(upstream.status, upstream.status_text)
+            headers := Headers.new().set(CONTENT_TYPE, final_content_type)
+            upstream.drop()
+
+            R Response {
+                status: status,
+                headers: headers,
+                body: body,
+            }
+        }
+
+        err := upstream.error_code
+        I attempt >= retries {
+            I err == CLIENT_ERR_TIMEOUT {
+                R ssr_json_error("SSR upstream timeout", 504)
+            }
+            R ssr_json_error("SSR upstream unavailable", 502)
+        }
+        attempt += 1
+    }
+
+    ssr_json_error("SSR upstream unavailable", 502)
 }
 
 # ============================================================================
@@ -119,18 +395,20 @@ F do_render(route: str, props: str) -> Response {
 
 F do_hydrate(route: str, props: str) -> Response {
     I route == "" {
-        R json_error("Missing required field: route", 400)
+        R ssr_json_error("Missing required field: route", 400)
     }
 
     props_val := I props == "" { "{}" } EL { props }
 
-    props_escaped := escape_json_str(props_val)
-    route_escaped := escape_json_str(route)
+    body_start := "{\"data\": \"" + props_val + "\""
+    body := body_start + ", \"route\": \"" + route + "\"}"
 
-    body := "{\"data\": \"" + props_escaped + "\""
-          + ", \"route\": \"" + route_escaped + "\"}"
-
-    json_response(body, 200)
+    headers := Headers.new().set(CONTENT_TYPE, "application/json")
+    Response {
+        status: StatusCode.new(200, "OK"),
+        headers: headers,
+        body: body,
+    }
 }
 
 # ============================================================================
@@ -157,37 +435,27 @@ F handle_ssr_hydrate(req: Request) -> Response {
 # Response: { "status": "ok", "version": str }
 F handle_health(req: Request) -> Response {
     body := "{\"status\": \"ok\", \"version\": \"0.1.0\"}"
-    json_response(body, 200)
-}
-
-# ============================================================================
-# String escaping helper
-# ============================================================================
-
-# Escape a string for safe embedding inside a JSON quoted value.
-# Handles backslash and double-quote characters.
-F escape_json_str(s: str) -> str {
-    escape_json_str_rec(s, "", 0)
-}
-
-F escape_json_str_rec(s: str, acc: str, i: i64) -> str {
-    c := str_char_at(s, i)
-    I c == 0  { R acc }
-    I c == 92 { escape_json_str_rec(s, acc + "\\\\", i + 1) }   # backslash
-    I c == 34 { escape_json_str_rec(s, acc + "\\\"", i + 1) }   # double-quote
-    EL {
-        ch := str_from_char(c)
-        escape_json_str_rec(s, acc + ch, i + 1)
+    headers := Headers.new().set(CONTENT_TYPE, "application/json")
+    Response {
+        status: StatusCode.new(200, "OK"),
+        headers: headers,
+        body: body,
     }
 }
 
-# ============================================================================
-# External helpers
-# ============================================================================
+F ssr_json_error(message: str, status: i64) -> Response {
+    body := "{\"error\": \"" + message + "\"}"
+    headers := Headers.new().set(CONTENT_TYPE, "application/json")
+    Response {
+        status: StatusCode.new(status, ssr_error_reason(status)),
+        headers: headers,
+        body: body,
+    }
+}
 
-X F str_len(s: str) -> i64
-X F str_char_at(s: str, i: i64) -> i64
-X F str_slice(s: str, start: i64, end: i64) -> str
-X F str_find(s: str, needle: str) -> i64
-X F str_from_char(c: i64) -> str
-X F i64_to_str(n: i64) -> str
+F ssr_error_reason(status: i64) -> str {
+    I status == 502 { R "Bad Gateway" }
+    I status == 503 { R "Service Unavailable" }
+    I status == 504 { R "Gateway Timeout" }
+    "Bad Request"
+}

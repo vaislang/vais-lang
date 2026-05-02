@@ -16,16 +16,11 @@
 #
 # Error codes: VAIS-0202NNN (EE=02 vector, CC=02 insert, NNN=004-006)
 
-U storage/bytes
 U storage/error
 U storage/wal/group_commit
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U vector/hnsw/types
-U vector/hnsw/insert
-U vector/storage
 U vector/distance
+U vector/hnsw/insert
+U vector/hnsw/types
 
 # ============================================================================
 # Error Codes
@@ -271,6 +266,11 @@ X BulkLoader {
         BulkLoader.new(BulkLoadConfig.default())!
     }
 
+    # Assign the next HNSW layer using the loader's deterministic RNG.
+    F next_layer(mut self, m: u16) -> u8 {
+        self.rng.random_layer(m)
+    }
+
     # Main bulk insert entry point
     # Inserts multiple vectors into HNSW index efficiently
     #
@@ -282,22 +282,12 @@ X BulkLoader {
     #
     # Parameters:
     # - vectors: Array of vectors to insert
-    # - meta: HNSW index metadata (mutable, updated)
-    # - store: Node store for graph construction
-    # - vector_store: Vector storage for raw vector data
-    # - distance: Distance computer
-    # - gcm: Group commit manager (None if skip_wal)
     # - txn_id: Transaction ID
     #
     # Returns: BulkLoadResult with statistics
-    F bulk_insert<S: NodeStore>(
+    F bulk_insert(
         mut self,
         vectors: &[&[f32]],
-        mut meta: HnswMeta,
-        store: &mut S,
-        vector_store: &mut VectorStore,
-        distance: &DistanceComputer,
-        gcm: Option<&mut GroupCommitManager>,
         txn_id: u64
     ) -> Result<BulkLoadResult, VaisError> {
         # Validate inputs
@@ -305,219 +295,269 @@ X BulkLoader {
             R Err(err_bulk_load_failed("No vectors to insert"))
         }
 
-        # Check WAL bypass consistency
-        I self.config.skip_wal && gcm.is_some() {
-            R Err(err_bulk_config_invalid("Cannot skip WAL when GCM is provided"))
+        Err(err_bulk_load_failed("bulk_insert requires pre-stored vectors and a NodeStore"))
+    }
+}
+
+# Bulk insert vectors whose raw payloads have already been written to VectorStore.
+# The caller owns vector storage and provides VectorMeta records that bind each
+# input vector to the allocated HNSW node ID and vector page location.
+F bulk_insert_stored_vectors(
+    config: &BulkLoadConfig,
+    vectors: &[&[f32]],
+    vector_meta: &[VectorMeta],
+    mut meta: HnswMeta,
+    store: &mut dyn NodeStore,
+    distance_computer: &DistanceComputer,
+    txn_id: u64
+) -> Result<HnswMeta, VaisError> {
+        I vectors.len() == 0 {
+            R Err(err_bulk_load_failed("No vectors to insert"))
         }
 
-        # Initialize progress tracking
-        start_time_ms := mut 0u64;  # In real implementation, use system time
-        progress := mut BulkLoadProgress.new(vectors.len())
+        I vectors.len() != vector_meta.len() {
+            R Err(err_bulk_load_failed("vector metadata count does not match input vectors"))
+        }
 
-        # Phase 1: Store all vectors to pages
-        progress.set_phase("storing_vectors")
-        vector_metas := mut self.store_vectors_batch(
-            vectors,
-            vector_store,
-            store,
-            txn_id,
-            &mut progress
-        )?;
+        I !config.skip_wal {
+            R Err(err_bulk_load_failed("WAL-enabled bulk graph construction is not implemented"))
+        }
 
-        # Phase 2: Build HNSW graph by inserting nodes sequentially
-        progress.set_phase("building_index")
-        max_layer_built := mut self.build_graph(
-            vectors,
-            &vector_metas,
-            &mut meta,
-            store,
-            distance,
-            gcm,
-            txn_id,
-            &mut progress
-        )?;
-
-        # Phase 3: Update meta
-        progress.set_phase("updating_meta")
-        end_time_ms := mut 0u64;  # In real implementation, use system time
-        elapsed_ms := mut end_time_ms - start_time_ms
-        progress.set_elapsed(elapsed_ms)
-
-        Ok(BulkLoadResult.new(
-            vectors.len(),
-            max_layer_built,
-            elapsed_ms,
-            self.config.skip_wal
-        ))
-    }
-
-    # Phase 1: Store all vectors to pages in batches
-    # Returns vector metadata (node_id, layer, page_id, offset) for each vector
-    F store_vectors_batch<S: NodeStore>(
-        mut self,
-        vectors: &[&[f32]],
-        vector_store: &mut VectorStore,
-        store: &mut S,
-        txn_id: u64,
-        progress: &mut BulkLoadProgress
-    ) -> Result<Vec<VectorMeta>, VaisError> {
-        vector_metas := mut Vec.with_capacity(vectors.len())
-
-        # Process vectors in batches
+        current_meta := mut meta
         i := mut 0
         LW i < vectors.len() {
-            # Determine batch end
-            batch_end := mut I i + self.config.batch_size < vectors.len() {
-                i + self.config.batch_size
-            } EL {
-                vectors.len()
+            vmeta := mut &vector_meta[i]
+            vector := mut vectors[i]
+
+            I current_meta.config.dim != 0 && vector.len() != current_meta.config.dim as u64 {
+                R Err(err_bulk_load_failed("vector dimension does not match HNSW metadata"))
             }
 
-            # Process batch
-            j := mut i
-            LW j < batch_end {
-                # Allocate node ID
-                node_id := mut store.allocate_node_id()
-
-                # Assign random layer
-                layer := mut self.rng.random_layer(meta.config.m)
-
-                # Store vector to page
-                (page_id, offset) := mut vector_store.write_vector(
-                    vectors[j],
-                    txn_id,
-                    0  # cmd_id = 0 for bulk load
-                )?;
-
-                # Store metadata
-                vector_metas.push(VectorMeta.new(
-                    j,
-                    node_id,
-                    layer,
-                    page_id,
-                    offset
-                ))
-
-                j += 1
-            }
-
-            # Update progress
-            I self.config.progress_interval > 0 {
-                I (batch_end % self.config.progress_interval) == 0 {
-                    progress.set_inserted(batch_end)
-                }
-            }
-
-            i = batch_end
-        }
-
-        Ok(vector_metas)
-    }
-
-    # Phase 2: Build HNSW graph by inserting nodes sequentially
-    # Reuses hnsw_insert for each node to maintain correctness
-    # Returns maximum layer built
-    F build_graph<S: NodeStore>(
-        mut self,
-        vectors: &[&[f32]],
-        vector_metas: &[VectorMeta],
-        meta: &mut HnswMeta,
-        store: &mut S,
-        distance: &DistanceComputer,
-        gcm: Option<&mut GroupCommitManager>,
-        txn_id: u64,
-        progress: &mut BulkLoadProgress
-    ) -> Result<u8, VaisError> {
-        max_layer := mut 0u8
-
-        # Insert nodes one by one using hnsw_insert
-        i := mut 0
-        LW i < vector_metas.len() {
-            vmeta := mut &vector_metas[i]
-            vector := mut vectors[vmeta.vector_index]
-
-            # Create HNSW node
             node := mut HnswNode.new(
                 vmeta.node_id,
                 vmeta.page_id,
                 vmeta.offset,
                 vmeta.layer,
                 txn_id,
-                0  # cmd_id = 0 for bulk load
+                vmeta.vector_index as u32
             )
 
-            # Insert into HNSW graph
-            # If skip_wal, pass None for gcm (handled by caller check)
-            updated_meta := mut I self.config.skip_wal {
-                # Skip WAL: create dummy GCM-like behavior
-                # In real implementation, hnsw_insert should handle Option<GCM>
-                # For now, we assume caller ensures gcm is None when skip_wal=true
-                hnsw_insert(
-                    node,
-                    vector,
-                    meta,
-                    &meta.config,
-                    store,
-                    distance,
-                    gcm!,  # This would panic I skip_wal=true; needs refactor
-                    txn_id,
-                    0
-                )?;
-            } EL {
-                hnsw_insert(
-                    node,
-                    vector,
-                    meta,
-                    &meta.config,
-                    store,
-                    distance,
-                    gcm!,
-                    txn_id,
-                    0
-                )?;
-            }
-
-            # Update meta reference
-            *meta = updated_meta
-
-            # Track max layer
-            I vmeta.layer > max_layer {
-                max_layer = vmeta.layer
-            }
-
-            # Update progress
-            I self.config.progress_interval > 0 {
-                I ((i + 1) % self.config.progress_interval) == 0 {
-                    progress.set_inserted(i + 1)
-                }
-            }
+            updated_meta := mut insert_without_wal(
+                node,
+                vector,
+                current_meta,
+                store,
+                distance_computer,
+                txn_id
+            )?;
+            current_meta = updated_meta;
 
             i += 1
         }
 
-        Ok(max_layer)
+        Ok(current_meta)
     }
 
-    # Alternative simplified insertion for skip_wal case
-    # Insert nodes without WAL logging (for initial bulk load)
-    # This is a placeholder for a WAL-free version of hnsw_insert
-    F insert_without_wal<S: NodeStore>(
-        node: HnswNode,
-        vector: &[f32],
-        meta: &mut HnswMeta,
-        config: &HnswConfig,
-        store: &mut S,
-        distance: &DistanceComputer,
-        txn_id: u64
-    ) -> Result<HnswMeta, VaisError> {
-        # This would be a copy of hnsw_insert logic but without WAL writes
-        # For simplicity, we assume hnsw_insert can handle gcm=None
-        # In production, refactor hnsw_insert to accept Option<&mut GroupCommitManager>
+# Bulk insert pre-stored vectors while preserving the normal HNSW WAL path.
+# Raw vector pages are already allocated by the caller; this helper only
+# delegates graph mutation to hnsw_insert(), matching single-vector insert WAL.
+F bulk_insert_stored_vectors_with_wal(
+    config: &BulkLoadConfig,
+    vectors: &[&[f32]],
+    vector_meta: &[VectorMeta],
+    mut meta: HnswMeta,
+    store: &mut dyn NodeStore,
+    distance_computer: &DistanceComputer,
+    gcm: &mut GroupCommitManager,
+    txn_id: u64
+) -> Result<HnswMeta, VaisError> {
+        I vectors.len() == 0 {
+            R Err(err_bulk_load_failed("No vectors to insert"))
+        }
 
-        # Placeholder: return error for now
-        Err(err_bulk_load_failed("WAL-free insertion not yet implemented"))
+        I vectors.len() != vector_meta.len() {
+            R Err(err_bulk_load_failed("vector metadata count does not match input vectors"))
+        }
+
+        I config.skip_wal {
+            R bulk_insert_stored_vectors(
+                config,
+                vectors,
+                vector_meta,
+                meta,
+                store,
+                distance_computer,
+                txn_id
+            )
+        }
+
+        current_meta := mut meta
+        i := mut 0
+        LW i < vectors.len() {
+            vmeta := mut &vector_meta[i]
+            vector := mut vectors[i]
+
+            I current_meta.config.dim != 0 && vector.len() != current_meta.config.dim as u64 {
+                R Err(err_bulk_load_failed("vector dimension does not match HNSW metadata"))
+            }
+
+            node := mut HnswNode.new(
+                vmeta.node_id,
+                vmeta.page_id,
+                vmeta.offset,
+                vmeta.layer,
+                txn_id,
+                vmeta.vector_index as u32
+            )
+
+            updated_meta := mut hnsw_insert(
+                node,
+                vector,
+                current_meta,
+                &current_meta.config,
+                store,
+                distance_computer,
+                gcm,
+                txn_id,
+                vmeta.vector_index as u32
+            )?;
+            current_meta = updated_meta;
+
+            i += 1
+        }
+
+        Ok(current_meta)
     }
-}
+
+# Alternative simplified insertion for skip_wal case
+# Insert nodes without WAL logging (for initial bulk load)
+F insert_without_wal(
+    mut new_node: HnswNode,
+    query_vec: &[f32],
+    mut meta: HnswMeta,
+    store: &mut dyn NodeStore,
+    distance_computer: &DistanceComputer,
+    txn_id: u64
+) -> Result<HnswMeta, VaisError> {
+        config := mut meta.config.clone()
+        new_node_id := mut new_node.node_id
+        new_layer := mut new_node.max_layer
+
+        I config.dim != 0 && query_vec.len() != config.dim as u64 {
+            R Err(err_bulk_load_failed("vector dimension does not match HNSW metadata"))
+        }
+
+        I meta.is_empty() {
+            meta.update_entry_point(new_node_id, new_layer)
+            meta.add_node()
+            store.store_node(new_node)?;
+            R Ok(meta)
+        }
+
+        entry_point := mut meta.entry_point
+        current_nearest := mut entry_point
+
+        lc := mut meta.max_layer
+        LW lc > new_layer {
+            search_results := mut search_layer(
+                query_vec,
+                current_nearest,
+                1,
+                lc,
+                store,
+                distance_computer
+            )?;
+
+            I search_results.len() > 0 {
+                current_nearest = search_results[0].node_id;
+            }
+
+            lc -= 1;
+        }
+
+        insert_layer := mut I new_layer < meta.max_layer { new_layer } EL { meta.max_layer }
+
+        layers_done := mut false
+        LW !layers_done {
+            candidates := mut search_layer(
+                query_vec,
+                current_nearest,
+                config.ef_construction,
+                insert_layer,
+                store,
+                distance_computer
+            )?;
+
+            m_max := mut I insert_layer == 0 { config.m_max_0 } EL { config.m }
+            selected_neighbors := mut select_neighbors_heuristic(
+                query_vec,
+                &candidates,
+                m_max,
+                insert_layer,
+                store,
+                distance_computer
+            )?;
+
+            i := mut 0
+            LW i < selected_neighbors.len() {
+                new_node.add_neighbor(insert_layer, selected_neighbors[i])?;
+                i += 1;
+            }
+
+            j := mut 0
+            LW j < selected_neighbors.len() {
+                neighbor_id := mut selected_neighbors[j].node_id
+                neighbor_node := mut store.load_node(neighbor_id)?;
+                neighbor_node_mut := mut neighbor_node
+
+                neighbor_node_mut.add_neighbor(
+                    insert_layer,
+                    HnswNeighbor.new(new_node_id, selected_neighbors[j].distance)
+                )?;
+
+                neighbor_neighbors := mut neighbor_node_mut.get_neighbors(insert_layer)?;
+                I neighbor_neighbors.len() > m_max as u64 {
+                    pruned_neighbors := mut prune_connections(
+                        &neighbor_node_mut,
+                        insert_layer,
+                        m_max,
+                        store,
+                        distance_computer
+                    )?;
+
+                    new_neighbor_list := mut neighbor_node_mut.get_neighbors_mut(insert_layer)?;
+                    new_neighbor_list.clear()
+                    k := mut 0
+                    LW k < pruned_neighbors.len() {
+                        new_neighbor_list.push(pruned_neighbors[k])
+                        k += 1;
+                    }
+                }
+
+                store.store_node(neighbor_node_mut)?;
+                j += 1;
+            }
+
+            I candidates.len() > 0 {
+                current_nearest = candidates[0].node_id;
+            }
+
+            I insert_layer == 0 {
+                layers_done = true;
+            } EL {
+                insert_layer -= 1;
+            }
+        }
+
+        I new_layer > meta.max_layer {
+            meta.update_entry_point(new_node_id, new_layer)
+        }
+
+        meta.add_node()
+        store.store_node(new_node)?;
+
+        Ok(meta)
+    }
 
 # ============================================================================
 # Batch Insert Helper Functions

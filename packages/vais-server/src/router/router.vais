@@ -1,9 +1,6 @@
-U std/string
 U std/vec
-U std/option
-U router/tree
-U router/route
-U router/params
+U src/router/route
+U src/router/params
 
 # HTTP method constants
 C METHOD_GET: i64    = 0
@@ -76,58 +73,96 @@ X RouterMatchResult {
     }
 }
 
-# One RadixTree per HTTP method
-S MethodTrees {
-    trees: Vec<RadixTree>,
-}
-
-X MethodTrees {
-    F new() -> MethodTrees {
-        trees := Vec.new()
-        I i = 0; i < METHOD_COUNT; i = i + 1 {
-            trees.push(RadixTree.new())
-        }
-        MethodTrees { trees: trees }
-    }
-
-    F get_tree(self, method: i64) -> RadixTree {
-        self.trees.get(method)
-    }
-
-    F get_tree_mut(mut self, method: i64) -> RadixTree {
-        self.trees.get(method)
-    }
-}
-
 S Router {
-    routes: Vec<RouteEntry>,
-    trees: MethodTrees,
+    route_count: i64,
+    method0: i64, path0: str, handler0: i64,
+    method1: i64, path1: str, handler1: i64,
+    method2: i64, path2: str, handler2: i64,
+    method3: i64, path3: str, handler3: i64,
+    method4: i64, path4: str, handler4: i64,
+    method5: i64, path5: str, handler5: i64,
+    method6: i64, path6: str, handler6: i64,
+    method7: i64, path7: str, handler7: i64,
 }
 
 X Router {
     F new() -> Router {
         Router {
-            routes: Vec.new(),
-            trees: MethodTrees.new(),
+            route_count: 0,
+            method0: -1, path0: "", handler0: 0,
+            method1: -1, path1: "", handler1: 0,
+            method2: -1, path2: "", handler2: 0,
+            method3: -1, path3: "", handler3: 0,
+            method4: -1, path4: "", handler4: 0,
+            method5: -1, path5: "", handler5: 0,
+            method6: -1, path6: "", handler6: 0,
+            method7: -1, path7: "", handler7: 0,
         }
     }
 
     # Register a route for any HTTP method integer
     F add(mut self, method: i64, path: str, handler_id: i64) {
-        route := Route.new(method, path, handler_id)
-        entry := RouteEntry.new(route)
-        self.routes.push(entry)
-        tree := self.trees.get_tree_mut(method)
-        tree.insert(path, handler_id)
+        I self.route_count == 0 {
+            self.method0 = method
+            self.path0 = path
+            self.handler0 = handler_id
+            self.route_count = 1
+            R
+        }
+        I self.route_count == 1 {
+            self.method1 = method
+            self.path1 = path
+            self.handler1 = handler_id
+            self.route_count = 2
+            R
+        }
+        I self.route_count == 2 {
+            self.method2 = method
+            self.path2 = path
+            self.handler2 = handler_id
+            self.route_count = 3
+            R
+        }
+        I self.route_count == 3 {
+            self.method3 = method
+            self.path3 = path
+            self.handler3 = handler_id
+            self.route_count = 4
+            R
+        }
+        I self.route_count == 4 {
+            self.method4 = method
+            self.path4 = path
+            self.handler4 = handler_id
+            self.route_count = 5
+            R
+        }
+        I self.route_count == 5 {
+            self.method5 = method
+            self.path5 = path
+            self.handler5 = handler_id
+            self.route_count = 6
+            R
+        }
+        I self.route_count == 6 {
+            self.method6 = method
+            self.path6 = path
+            self.handler6 = handler_id
+            self.route_count = 7
+            R
+        }
+        I self.route_count == 7 {
+            self.method7 = method
+            self.path7 = path
+            self.handler7 = handler_id
+            self.route_count = 8
+            R
+        }
     }
 
     # Register a route with associated middleware IDs
     F add_with_middleware(mut self, method: i64, path: str, handler_id: i64, middleware_ids: Vec<i64>) {
-        route := Route.new(method, path, handler_id)
-        entry := RouteEntry.with_middleware(route, middleware_ids)
-        self.routes.push(entry)
-        tree := self.trees.get_tree_mut(method)
-        tree.insert(path, handler_id)
+        self.add(method, path, handler_id)
     }
 
     # Convenience methods
@@ -166,56 +201,180 @@ X Router {
             R RouterMatchResult.not_found()
         }
 
-        # Try to match in the tree for the given method
-        tree := self.trees.get_tree(method)
-        tree_result := tree.match_path(path)
-
-        M tree_result {
-            Some(match_res) => {
-                # Build Params from tree ParamEntry list
-                params := Params.new()
-                I i = 0; i < match_res.params.len(); i = i + 1 {
-                    pe := match_res.params.get(i)
-                    params.add_path(pe.key, pe.value)
+        rank := mut 0
+        LW rank < 3 {
+            i := mut 0
+            LW i < self.route_count {
+                slot_path := router_slot_path(self, i)
+                same_method := router_slot_method(self, i) == method
+                same_rank := router_pattern_rank(slot_path) == rank
+                path_matches := router_path_matches(slot_path, path)
+                I same_method && same_rank && path_matches {
+                    R RouterMatchResult.found(
+                        router_slot_handler(self, i),
+                        router_extract_params(slot_path, path),
+                        Vec.new(),
+                    )
                 }
+                i += 1
+            }
+            rank += 1
+        }
 
-                # Find the RouteEntry to retrieve middleware_ids
-                middleware_ids := Vec.new()
-                I i = 0; i < self.routes.len(); i = i + 1 {
-                    entry := self.routes.get(i)
-                    I entry.method() == method && entry.handler_id() == match_res.handler_id {
-                        middleware_ids = entry.middleware_ids
-                    }
-                }
-
-                RouterMatchResult.found(match_res.handler_id, params, middleware_ids)
-            },
-            None => {
-                # Path not matched for this method — check other methods for 405
-                allowed := self._find_allowed_methods(path)
-                I allowed.len() > 0 {
-                    RouterMatchResult.method_not_allowed(allowed)
-                } else {
-                    RouterMatchResult.not_found()
-                }
-            },
+        allowed := self._find_allowed_methods(path)
+        I allowed.len() > 0 {
+            RouterMatchResult.method_not_allowed(allowed)
+        } EL {
+            RouterMatchResult.not_found()
         }
     }
 
     # Check all method trees for matches on the same path (for 405 detection)
     F _find_allowed_methods(self, path: str) -> Vec<str> {
-        allowed := Vec.new()
-        method_names := ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
-        I i = 0; i < METHOD_COUNT; i = i + 1 {
-            tree := self.trees.get_tree(i)
-            result := tree.match_path(path)
-            M result {
-                Some(_) => {
-                    allowed.push(method_names.get(i))
-                },
-                None => {},
+        allowed := mut Vec.new()
+        i := mut 0
+        LW i < self.route_count {
+            I router_path_matches(router_slot_path(self, i), path) {
+                allowed.push(method_to_str(router_slot_method(self, i)))
             }
+            i += 1
         }
         allowed
     }
+}
+
+F router_slot_method(router: Router, index: i64) -> i64 {
+    I index == 0 { R router.method0 }
+    I index == 1 { R router.method1 }
+    I index == 2 { R router.method2 }
+    I index == 3 { R router.method3 }
+    I index == 4 { R router.method4 }
+    I index == 5 { R router.method5 }
+    I index == 6 { R router.method6 }
+    I index == 7 { R router.method7 }
+    -1
+}
+
+F router_slot_path(router: Router, index: i64) -> str {
+    I index == 0 { R router.path0 }
+    I index == 1 { R router.path1 }
+    I index == 2 { R router.path2 }
+    I index == 3 { R router.path3 }
+    I index == 4 { R router.path4 }
+    I index == 5 { R router.path5 }
+    I index == 6 { R router.path6 }
+    I index == 7 { R router.path7 }
+    ""
+}
+
+F router_slot_handler(router: Router, index: i64) -> i64 {
+    I index == 0 { R router.handler0 }
+    I index == 1 { R router.handler1 }
+    I index == 2 { R router.handler2 }
+    I index == 3 { R router.handler3 }
+    I index == 4 { R router.handler4 }
+    I index == 5 { R router.handler5 }
+    I index == 6 { R router.handler6 }
+    I index == 7 { R router.handler7 }
+    0
+}
+
+F router_path_matches(pattern: str, path: str) -> bool {
+    router_path_matches_rec(pattern, path, 0, 0)
+}
+
+F router_path_matches_rec(pattern: str, path: str, pi: i64, si: i64) -> bool {
+    pc := pattern.char_at(pi)
+    sc := path.char_at(si)
+
+    I pc == 0 && sc == 0 { R true }
+    I pc == 0 || sc == 0 { R false }
+
+    # '*' starts a terminal catch-all segment.
+    I pc == 42 {
+        I !router_is_segment_start(pattern, pi) { R false }
+        name_end := router_segment_end(pattern, pi + 1)
+        I pattern.char_at(name_end) != 0 { R false }
+        R true
+    }
+
+    # ':' starts a single path-segment parameter.
+    I pc == 58 {
+        name_end := router_segment_end(pattern, pi + 1)
+        value_end := router_segment_end(path, si)
+        I name_end == pi + 1 { R false }
+        I value_end == si { R false }
+        R router_path_matches_rec(pattern, path, name_end, value_end)
+    }
+
+    I pc == sc {
+        R router_path_matches_rec(pattern, path, pi + 1, si + 1)
+    }
+    false
+}
+
+F router_segment_end(s: str, start: i64) -> i64 {
+    c := s.char_at(start)
+    I c == 0 { R start }
+    I c == 47 { R start }  # '/'
+    router_segment_end(s, start + 1)
+}
+
+F router_extract_params(pattern: str, path: str) -> Params {
+    params := mut Params.new()
+    router_extract_params_rec(pattern, path, 0, 0, params)
+}
+
+F router_extract_params_rec(pattern: str, path: str, pi: i64, si: i64, params: Params) -> Params {
+    pc := pattern.char_at(pi)
+    sc := path.char_at(si)
+
+    I pc == 0 || sc == 0 { R params }
+
+    I pc == 42 {
+        I !router_is_segment_start(pattern, pi) { R params }
+        name_end := router_segment_end(pattern, pi + 1)
+        key := mut "wildcard"
+        I name_end > pi + 1 {
+            key = pattern.substring(pi + 1, name_end)
+        }
+        params.path_params.push(ParamPair {
+            key: key,
+            value: path.substring(si, path.len()),
+        })
+        R params
+    }
+
+    I pc == 58 {
+        name_end := router_segment_end(pattern, pi + 1)
+        value_end := router_segment_end(path, si)
+        I name_end > pi + 1 && value_end > si {
+            params.path_params.push(ParamPair {
+                key: pattern.substring(pi + 1, name_end),
+                value: path.substring(si, value_end),
+            })
+        }
+        R router_extract_params_rec(pattern, path, name_end, value_end, params)
+    }
+
+    router_extract_params_rec(pattern, path, pi + 1, si + 1, params)
+}
+
+F router_is_segment_start(s: str, i: i64) -> bool {
+    I i == 0 { R true }
+    s.char_at(i - 1) == 47
+}
+
+F router_pattern_rank(pattern: str) -> i64 {
+    router_pattern_rank_rec(pattern, 0, 0)
+}
+
+F router_pattern_rank_rec(pattern: str, i: i64, current: i64) -> i64 {
+    c := pattern.char_at(i)
+    I c == 0 { R current }
+    I c == 42 { R 2 }
+    I c == 58 && current == 0 {
+        R router_pattern_rank_rec(pattern, i + 1, 1)
+    }
+    router_pattern_rank_rec(pattern, i + 1, current)
 }

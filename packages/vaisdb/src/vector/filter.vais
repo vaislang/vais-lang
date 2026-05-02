@@ -26,6 +26,10 @@ U storage/page/heap
 U storage/txn/visibility
 U storage/constants
 
+F filter_ratio(num: u64, den: u64) -> f32 {
+    (num as f32) / (den as f32)
+}
+
 # Error codes: EE=02 (vector), CC=03 (search), NNN=010-012
 # 02-03-010: Filter strategy error
 # 02-03-011: Pre-filter evaluation failed
@@ -58,8 +62,8 @@ X FilterConfig {
     F default() -> FilterConfig {
         FilterConfig {
             strategy: Hybrid,
-            selectivity_threshold: 0.01,
-            post_filter_oversample: 2.0,
+            selectivity_threshold: filter_ratio(1, 100),
+            post_filter_oversample: 2 as f32,
         }
     }
 
@@ -88,14 +92,14 @@ X FilterConfig {
 
 S TableStats {
     row_count: u64,
-    distinct_counts: HashMap<str, u64>,  # column_name -> distinct count
+    distinct_counts: StrHashMap<u64>,  # column_name -> distinct count
 }
 
 X TableStats {
     F new(row_count: u64) -> TableStats {
         TableStats {
             row_count,
-            distinct_counts: HashMap.with_capacity(16),
+            distinct_counts: StrHashMap.with_capacity(16),
         }
     }
 
@@ -104,7 +108,7 @@ X TableStats {
     }
 
     F get_distinct_count(self, column: &str) -> Option<u64> {
-        self.distinct_counts.get(column).cloned()
+        self.distinct_counts.get_opt(column.clone())
     }
 }
 
@@ -153,10 +157,10 @@ X FilteredVectorSearch {
     F execute(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
         # If no predicate, just run regular vector search
         M &self.predicate {
-            None => {
+            Option.None => {
                 R execute_vector_search(&self.search_params, self.ctx)
             },
-            Some(_) => {
+            Option.Some(_) => {
                 # Determine strategy and execute
                 M self.config.strategy {
                     PreFilter => self.execute_pre_filter(),
@@ -203,17 +207,21 @@ X FilteredVectorSearch {
     # Hybrid: estimate selectivity and choose pre-filter or post-filter
     F execute_hybrid(mut self) -> Result<Vec<VectorSearchRow>, VaisError> {
         predicate := mut M &self.predicate {
-            Some(p) => p,
-            None => { R execute_vector_search(&self.search_params, self.ctx) },
+            Option.Some(p) => p,
+            Option.None => { R execute_vector_search(&self.search_params, self.ctx) },
         }
 
         # 1. Get table statistics
-        row_count := mut M self.ctx.catalog.get_table(&self.search_params.table_name) {
-            Some(ti) => ti.row_count_estimate,
-            None => {
+        row_count := mut 0u64
+        table_lookup := mut self.ctx.catalog.get_table(&self.search_params.table_name)
+        M table_lookup {
+            Option.Some(ti) => {
+                row_count = ti.row_count_estimate
+            },
+            Option.None => {
                 R Err(VaisError.new("VAIS-0203010", "Table not found for hybrid strategy"))
-            }
-        };
+            },
+        }
         table_stats := mut TableStats.new(row_count)
 
         # 2. Estimate selectivity
@@ -244,29 +252,29 @@ F estimate_selectivity(predicate: &Expr, table_stats: &TableStats) -> f32 {
             M op {
                 Eq => {
                     # Equality: assume 1/distinct_count or default 0.1 (10%)
-                    estimate_equality_selectivity(left, right, table_stats)
+                    estimate_equality_selectivity(&**left, &**right, table_stats)
                 },
                 Neq => {
                     # Not equal: 1 - equality selectivity
-                    1.0 - estimate_equality_selectivity(left, right, table_stats)
+                    1.0 - estimate_equality_selectivity(&**left, &**right, table_stats)
                 },
                 Lt | Le | Gt | Ge => {
                     # Range comparison: assume 30% (conservative estimate)
-                    0.3
+                    filter_ratio(3, 10)
                 },
                 And => {
                     # AND: multiply selectivities
-                    left_sel := mut estimate_selectivity(left, table_stats)
-                    right_sel := mut estimate_selectivity(right, table_stats)
+                    left_sel := mut estimate_selectivity(&**left, table_stats)
+                    right_sel := mut estimate_selectivity(&**right, table_stats)
                     left_sel * right_sel
                 },
                 Or => {
                     # OR: 1 - (1-s1) * (1-s2)
-                    left_sel := mut estimate_selectivity(left, table_stats)
-                    right_sel := mut estimate_selectivity(right, table_stats)
+                    left_sel := mut estimate_selectivity(&**left, table_stats)
+                    right_sel := mut estimate_selectivity(&**right, table_stats)
                     1.0 - (1.0 - left_sel) * (1.0 - right_sel)
                 },
-                _ => 0.5,  # Default for arithmetic ops
+                _ => filter_ratio(1, 2),  # Default for arithmetic ops
             }
         },
 
@@ -275,52 +283,52 @@ F estimate_selectivity(predicate: &Expr, table_stats: &TableStats) -> f32 {
             M op {
                 Not => {
                     # NOT: 1 - selectivity
-                    1.0 - estimate_selectivity(operand, table_stats)
+                    1.0 - estimate_selectivity(&**operand, table_stats)
                 },
-                _ => 0.5,
+                _ => filter_ratio(1, 2),
             }
         },
 
         # IS NULL
         IsNull { expr: _, negated } => {
             # Assume 5% NULL values
-            I *negated { 0.95 } EL { 0.05 }
+            I *negated { filter_ratio(19, 20) } EL { filter_ratio(1, 20) }
         },
 
         # BETWEEN
         Between { expr: _, low: _, high: _, negated } => {
             # Range: assume 20%
-            I *negated { 0.8 } EL { 0.2 }
+            I *negated { filter_ratio(4, 5) } EL { filter_ratio(1, 5) }
         },
 
         # IN list
         InList { expr: _, list, negated } => {
             # IN: selectivity = list_size / distinct_count
             # Default heuristic: 0.1 per item, capped at 0.9
-            sel := mut (list.len() as f32) * 0.1
-            I sel > 0.9 { sel = 0.9; }
+            sel := mut (list.len() as f32) * filter_ratio(1, 10)
+            I sel > filter_ratio(9, 10) { sel = filter_ratio(9, 10); }
             I *negated { 1.0 - sel } EL { sel }
         },
 
         # LIKE
         Like { expr: _, pattern: _, negated } => {
             # LIKE: assume 20% (conservative)
-            I *negated { 0.8 } EL { 0.2 }
+            I *negated { filter_ratio(4, 5) } EL { filter_ratio(1, 5) }
         },
 
         # Default for other expressions
-        _ => 0.5,
+        _ => filter_ratio(1, 2),
     }
 }
 
 # Estimate equality selectivity for column = value
 F estimate_equality_selectivity(left: &Expr, right: &Expr, table_stats: &TableStats) -> f32 {
     # Try to extract column name from left or right side
-    column_name := mut None
+    column_name := mut Option.None
 
     M left {
         ColumnRef { table: _, column } => {
-            column_name = Some(column.clone())
+            column_name = Option.Some(column.clone())
         },
         _ => {}
     }
@@ -328,28 +336,34 @@ F estimate_equality_selectivity(left: &Expr, right: &Expr, table_stats: &TableSt
     I column_name.is_none() {
         M right {
             ColumnRef { table: _, column } => {
-                column_name = Some(column.clone())
+                column_name = Option.Some(column.clone())
             },
             _ => {}
         }
     }
 
     M column_name {
-        Some(col) => {
+        Option.Some(col) => {
             # Use distinct count if available
             M table_stats.get_distinct_count(col) {
-                Some(distinct_count) => {
+                Option.Some(distinct_count) => {
                     I distinct_count == 0 || table_stats.row_count == 0 {
-                        R 0.1
+                        R filter_ratio(1, 10)
                     }
                     sel := mut 1.0 / (distinct_count as f32)
                     # Cap selectivity to avoid extreme values
-                    I sel < 0.001 { 0.001 } EL I sel > 0.5 { 0.5 } EL { sel }
+                    I sel < filter_ratio(1, 1000) {
+                        filter_ratio(1, 1000)
+                    } EL I sel > filter_ratio(1, 2) {
+                        filter_ratio(1, 2)
+                    } EL {
+                        sel
+                    }
                 },
-                None => 0.1,  # Default: assume 10%
+                Option.None => filter_ratio(1, 10),  # Default: assume 10%
             }
         },
-        None => 0.1,  # No column reference, default 10%
+        Option.None => filter_ratio(1, 10),  # No column reference, default 10%
     }
 }
 

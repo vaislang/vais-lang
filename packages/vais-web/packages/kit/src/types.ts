@@ -139,6 +139,18 @@ export interface AdapterConfig {
   host?: string;
   /** Static adapter options */
   fallback?: string;  // e.g., "404.html" or "index.html"
+  /** Optional production client bundle emitted by an external bundler. */
+  clientBundle?: ClientBundleConfig;
+}
+
+/** Production browser assets consumed by static-like adapters. */
+export interface ClientBundleConfig {
+  /** Public ESM entry path, e.g. "/assets/entry.js". */
+  entry: string;
+  /** Public asset path -> file content. */
+  assets: Record<string, string>;
+  /** Optional ESM chunks to preload before the entry runs. */
+  modulePreloads?: string[];
 }
 
 /** Adapter build output */

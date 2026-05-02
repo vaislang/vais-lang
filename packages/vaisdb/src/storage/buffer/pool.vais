@@ -52,11 +52,12 @@ X BufferPoolStats {
 X BufferPool {
     # Create a new buffer pool with given capacity (in pages)
     F new(page_manager: PageManager, page_size: u32, capacity: u32) -> BufferPool {
-        frames := mut Vec.with_capacity(capacity as u64)
-        free_list := mut Vec.with_capacity(capacity as u64)
+        frames: Vec<BufferFrame> := mut Vec.with_capacity(capacity as u64)
+        free_list: Vec<u32> := mut Vec.with_capacity(capacity as u64)
         LF i: 0..capacity {
-            frames.push(BufferFrame.new(i, page_size))
-            free_list.push(i)
+            frame_id := mut i as u32
+            frames.push(BufferFrame.new(frame_id, page_size))
+            free_list.push(frame_id)
         }
 
         BufferPool {
@@ -87,19 +88,26 @@ X BufferPool {
 
         # Check if page is already in buffer pool
         I self.page_table.contains_key(key) {
-            frame_id := mut self.page_table.get(key)
+            frame_id: u32 := mut self.page_table.get(key)
             self.frames[frame_id as u64].pin()
             self.stats.hits += 1
-            # guard.drop() # disabled for dev compiler
+            guard.unlock()
             R Ok(frame_id)
         }
 
         self.stats.misses += 1
 
         # Need to load from disk - find a free frame
-        frame_id := mut self.get_free_frame()?;
+        free_frame_result := mut self.get_free_frame()
+        frame_id := mut M free_frame_result {
+            Ok(id) => id,
+            Err(e) => {
+                guard.unlock()
+                R Err(e)
+            },
+        }
 
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
 
         # Read page from disk (outside lock to allow concurrent I/O)
         page_data := mut self.page_manager.read_page(file_id, page_id)?;
@@ -110,9 +118,9 @@ X BufferPool {
         I self.page_table.contains_key(key) {
             # Someone else loaded it - return our frame to free list
             self.free_list.push(frame_id)
-            existing_frame_id := mut self.page_table.get(key)
+            existing_frame_id: u32 := mut self.page_table.get(key)
             self.frames[existing_frame_id as u64].pin()
-            # guard2.drop() # disabled for dev compiler
+            guard2.unlock()
             R Ok(existing_frame_id)
         }
 
@@ -122,7 +130,7 @@ X BufferPool {
         # page_data.drop() # disabled for dev compiler
         self.page_table.set(key, frame_id)
 
-        # guard2.drop() # disabled for dev compiler
+        guard2.unlock()
 
         # Trigger prefetch if sequential access pattern detected
         M self.readahead.should_prefetch(file_id, page_id) {

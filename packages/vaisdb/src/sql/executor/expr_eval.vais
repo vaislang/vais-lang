@@ -24,7 +24,7 @@ S ColumnBinding {
 X ColumnBinding {
     F new(column: str, index: u64, data_type: SqlType) -> ColumnBinding {
         ColumnBinding {
-            table: None,
+            table: Option.None,
             column,
             index,
             data_type,
@@ -33,7 +33,7 @@ X ColumnBinding {
 
     F with_table(table: str, column: str, index: u64, data_type: SqlType) -> ColumnBinding {
         ColumnBinding {
-            table: Some(table),
+            table: Option.Some(table),
             column,
             index,
             data_type,
@@ -78,33 +78,37 @@ X EvalContext {
                 }
                 Err(VaisError.new(
                     "VAIS-0110002",
-                    "Column '{tbl}.{column}' not found"
+                    "Qualified column not found"
                 ))
             },
             None => {
                 # Unqualified reference: M column name only
-                found := mut None
+                found := mut false
+                found_idx := mut 0u64
                 ambiguous := mut false
                 LF b: &self.bindings {
                     I &b.column == column {
-                        M found {
-                            Some(_) => { ambiguous = true; },
-                            None => { found = Some(b.index); },
+                        I found {
+                            ambiguous = true;
+                        } EL {
+                            found = true;
+                            found_idx = b.index;
                         }
                     }
                 }
                 I ambiguous {
                     R Err(VaisError.new(
                         "VAIS-0101001",
-                        "Column reference '{column}' is ambiguous"
+                        "Column reference is ambiguous"
                     ))
                 }
-                M found {
-                    Some(idx) => Ok(idx),
-                    None => Err(VaisError.new(
+                I found {
+                    Ok(found_idx)
+                } EL {
+                    Err(VaisError.new(
                         "VAIS-0110002",
-                        "Column '{column}' not found"
-                    )),
+                        "Column not found"
+                    ))
                 }
             },
         }
@@ -143,22 +147,26 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
         # Column reference
         ColumnRef { table, column } => {
             idx := mut ctx.resolve(table, column)?;
-            Ok(row.get(idx).clone())
+            Ok(row.get_owned(idx))
         },
 
         # Binary operation
         BinaryOp { left, op, right } => {
-            eval_binary_op(left, op, right, row, ctx)
+            left_expr := mut **left
+            right_expr := mut **right
+            eval_binary_op(left_expr, op, right_expr, row, ctx)
         },
 
         # Unary operation
         UnaryOp { op, operand } => {
-            eval_unary_op(op, operand, row, ctx)
+            operand_expr := mut **operand
+            eval_unary_op(op, operand_expr, row, ctx)
         },
 
         # IS NULL / IS NOT NULL
         IsNull { expr: inner, negated } => {
-            val := mut eval_expr(inner, row, ctx)?;
+            inner_expr := mut **inner
+            val := mut eval_expr(&inner_expr, row, ctx)?;
             result := mut val.is_null()
             I *negated { result = !result; }
             Ok(SqlValue.BoolVal { v: result })
@@ -166,9 +174,12 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
         # BETWEEN
         Between { expr: inner, low, high, negated } => {
-            val := mut eval_expr(inner, row, ctx)?;
-            low_val := mut eval_expr(low, row, ctx)?;
-            high_val := mut eval_expr(high, row, ctx)?;
+            inner_expr := mut **inner
+            low_expr := mut **low
+            high_expr := mut **high
+            val := mut eval_expr(&inner_expr, row, ctx)?;
+            low_val := mut eval_expr(&low_expr, row, ctx)?;
+            high_val := mut eval_expr(&high_expr, row, ctx)?;
             result := mut val.between(&low_val, &high_val)
             I *negated {
                 Ok(result.not_bool())
@@ -179,8 +190,9 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
         # IN list
         InList { expr: inner, list, negated } => {
-            val := mut eval_expr(inner, row, ctx)?;
-            list_vals := mut Vec.with_capacity(list.len())
+            inner_expr := mut **inner
+            val := mut eval_expr(&inner_expr, row, ctx)?;
+            list_vals: Vec<SqlValue> := mut Vec.with_capacity(list.len())
             LF item: list {
                 list_vals.push(eval_expr(item, row, ctx)?)
             }
@@ -194,8 +206,10 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
         # LIKE
         Like { expr: inner, pattern, negated } => {
-            val := mut eval_expr(inner, row, ctx)?;
-            pat := mut eval_expr(pattern, row, ctx)?;
+            inner_expr := mut **inner
+            pattern_expr := mut **pattern
+            val := mut eval_expr(&inner_expr, row, ctx)?;
+            pat := mut eval_expr(&pattern_expr, row, ctx)?;
             result := mut val.like_match(&pat)
             I *negated {
                 Ok(result.not_bool())
@@ -211,7 +225,8 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
         # CAST
         Cast { expr: inner, target_type } => {
-            val := mut eval_expr(inner, row, ctx)?;
+            inner_expr := mut **inner
+            val := mut eval_expr(&inner_expr, row, ctx)?;
             val.cast_to(target_type)
         },
 
@@ -222,8 +237,10 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
         # String concatenation
         Concat { left, right } => {
-            lv := mut eval_expr(left, row, ctx)?;
-            rv := mut eval_expr(right, row, ctx)?;
+            left_expr := mut **left
+            right_expr := mut **right
+            lv := mut eval_expr(&left_expr, row, ctx)?;
+            rv := mut eval_expr(&right_expr, row, ctx)?;
 
             # NULL propagation
             I lv.is_null() || rv.is_null() {
@@ -280,14 +297,14 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 # ============================================================================
 
 F eval_binary_op(
-    left: &Expr,
+    left: Expr,
     op: &BinOp,
-    right: &Expr,
+    right: Expr,
     row: &Row,
     ctx: &EvalContext,
 ) -> Result<SqlValue, VaisError> {
-    lv := mut eval_expr(left, row, ctx)?;
-    rv := mut eval_expr(right, row, ctx)?;
+    lv := mut eval_expr(&left, row, ctx)?;
+    rv := mut eval_expr(&right, row, ctx)?;
 
     M op {
         # Arithmetic
@@ -358,11 +375,11 @@ F eval_binary_op(
 
 F eval_unary_op(
     op: &UnaryOp,
-    operand: &Expr,
+    operand: Expr,
     row: &Row,
     ctx: &EvalContext,
 ) -> Result<SqlValue, VaisError> {
-    val := mut eval_expr(operand, row, ctx)?;
+    val := mut eval_expr(&operand, row, ctx)?;
 
     M op {
         Neg => val.negate(),
@@ -384,7 +401,8 @@ F eval_case(
     M operand {
         Some(op_expr) => {
             # Simple CASE: CASE expr WHEN val THEN result ...
-            op_val := mut eval_expr(op_expr, row, ctx)?;
+            op_expr_value := mut **op_expr
+            op_val := mut eval_expr(&op_expr_value, row, ctx)?;
             LF wc: when_clauses {
                 when_val := mut eval_expr(&wc.condition, row, ctx)?;
                 eq := mut op_val.equals(&when_val)
@@ -412,7 +430,10 @@ F eval_case(
 
     # No WHEN clause matched — return ELSE or NULL
     M else_result {
-        Some(else_expr) => eval_expr(else_expr, row, ctx),
+        Some(else_expr) => {
+            else_expr_value := mut **else_expr
+            eval_expr(&else_expr_value, row, ctx)
+        },
         None => Ok(Null),
     }
 }

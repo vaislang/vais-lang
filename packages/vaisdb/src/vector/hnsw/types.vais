@@ -192,12 +192,11 @@ X HnswConfig {
 
     # Get human-readable distance metric name
     F distance_metric_name(self) -> str {
-        M self.distance_metric {
-            DISTANCE_COSINE => "Cosine",
-            DISTANCE_L2 => "L2",
-            DISTANCE_DOT_PRODUCT => "DotProduct",
-            _ => "Unknown",
-        }
+        metric := mut self.distance_metric as i64
+        I metric == 0 { R "Cosine" }
+        I metric == 1 { R "L2" }
+        I metric == 2 { R "DotProduct" }
+        "Unknown"
     }
 }
 
@@ -351,10 +350,10 @@ X HnswNode {
         cmd_id: u32
     ) -> HnswNode {
         # Initialize neighbor lists for all layers (0..=max_layer)
-        neighbors := mut Vec.with_capacity((max_layer + 1) as u64)
+        neighbors: Vec<Vec<HnswNeighbor>> := mut Vec.with_capacity((max_layer + 1) as u64)
         i := mut 0
         LW i <= max_layer {
-            tmp_neighbors := Vec.with_capacity(0)
+            tmp_neighbors: Vec<HnswNeighbor> := Vec.with_capacity(0)
             neighbors.push(tmp_neighbors)
             i += 1
         }
@@ -425,15 +424,20 @@ X HnswNode {
         expire_cmd_id := mut read_i32_le_checked(buf)?;
 
         # Neighbor lists
-        neighbors := mut Vec.with_capacity((max_layer + 1) as u64)
+        neighbors: Vec<Vec<HnswNeighbor>> := mut Vec.with_capacity((max_layer + 1) as u64)
         layer := mut 0
         LW layer <= max_layer {
             count := mut read_u16_le_checked(buf)? as u64
-            layer_neighbors := mut Vec.with_capacity(count)
+            layer_neighbors: Vec<HnswNeighbor> := mut Vec.with_capacity(count)
 
             i := mut 0
             LW i < count {
-                layer_neighbors.push(HnswNeighbor.deserialize(buf)?)
+                neighbor_node_id := mut read_i64_le_checked(buf)?;
+                neighbor_distance := mut get_f32_le_checked(buf)? as f32;
+                layer_neighbors.push(HnswNeighbor {
+                    node_id: neighbor_node_id,
+                    distance: neighbor_distance,
+                })
                 i += 1
             }
 
@@ -490,7 +494,8 @@ X HnswNode {
             R Err(err_hnsw_invalid_layer(layer, self.max_layer))
         }
         neighbor_value := mut neighbor.clone()
-        self.neighbors[layer as u64].push(neighbor_value)
+        layer_neighbors := mut &mut self.neighbors[layer as u64]
+        layer_neighbors.push(neighbor_value)
         Ok(())
     }
 
@@ -510,6 +515,22 @@ X HnswNode {
         }
         size
     }
+}
+
+# ============================================================================
+# Node Store Trait
+# ============================================================================
+
+# Abstract interface for HNSW graph storage.
+# Implementations provide node metadata, vector payload lookup, and page allocation
+# so insert/delete/WAL code can share one storage contract.
+W NodeStore {
+    F load_node(self, node_id: u64) -> Result<HnswNode, VaisError>
+    F load_vector(self, node_id: u64) -> Result<Vec<f32>, VaisError>
+    F store_node(mut self, node: HnswNode) -> Result<(), VaisError>
+    F allocate_node_id(mut self) -> u64
+    F get_file_page(self, node_id: u64) -> Result<(u8, u32), VaisError>
+    F allocate_node_page(mut self, node_id: u64) -> Result<(u8, u32), VaisError>
 }
 
 # HNSW Neighbor (node_id + distance)

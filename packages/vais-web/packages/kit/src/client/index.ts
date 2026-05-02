@@ -12,3 +12,5 @@ export { prefetchRoute, setupPrefetch } from "./prefetch.js";
 
 export { createScrollManager } from "./scroll.js";
 export type { ScrollManager } from "./scroll.js";
+
+export { generateClientBundle } from "./bundle.js";

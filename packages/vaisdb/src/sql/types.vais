@@ -393,6 +393,14 @@ X SqlValue {
         }
     }
 
+    # Check if this value is the SQL boolean TRUE
+    F is_bool_true(&self) -> bool {
+        M self {
+            SqlValue.BoolVal { v: true } => true,
+            _ => false,
+        }
+    }
+
     # Display representation of the value
     F to_string(self) -> str {
         M self {
@@ -810,15 +818,15 @@ X SqlValue {
 
         M (self, target) {
             # Identity casts
-            (SqlValue.IntVal { .. }, Int) => Ok(self),
-            (SqlValue.FloatVal { .. }, Float) => Ok(self),
-            (SqlValue.BoolVal { .. }, Bool) => Ok(self),
-            (SqlValue.StringVal { .. }, Text) => Ok(self),
-            (SqlValue.StringVal { .. }, Varchar { .. }) => Ok(self),
-            (SqlValue.BlobVal { .. }, Blob) => Ok(self),
-            (SqlValue.DateVal { .. }, Date) => Ok(self),
-            (SqlValue.TimestampVal { .. }, Timestamp) => Ok(self),
-            (SqlValue.VectorVal { .. }, Vector { .. }) => Ok(self),
+            (SqlValue.IntVal { v }, Int) => Ok(SqlValue.IntVal { v }),
+            (SqlValue.FloatVal { v }, Float) => Ok(SqlValue.FloatVal { v }),
+            (SqlValue.BoolVal { v }, Bool) => Ok(SqlValue.BoolVal { v }),
+            (SqlValue.StringVal { v }, Text) => Ok(SqlValue.StringVal { v }),
+            (SqlValue.StringVal { v }, Varchar { .. }) => Ok(SqlValue.StringVal { v }),
+            (SqlValue.BlobVal { v }, Blob) => Ok(SqlValue.BlobVal { v }),
+            (SqlValue.DateVal { v }, Date) => Ok(SqlValue.DateVal { v }),
+            (SqlValue.TimestampVal { v }, Timestamp) => Ok(SqlValue.TimestampVal { v }),
+            (SqlValue.VectorVal { v }, Vector { .. }) => Ok(SqlValue.VectorVal { v }),
 
             # INT -> FLOAT
             (SqlValue.IntVal { v }, Float) => {
@@ -976,20 +984,17 @@ X SqlValue {
         found_null := mut false
 
         LF i: 0..list.len() {
-            M self.equals(&list[i]) {
-                SqlValue.BoolVal { v: true } => {
-                    R SqlValue.BoolVal { v: true }
-                },
-                Null => {
-                    found_null = true
-                },
-                _ => {},
+            eq := self.equals(&list[i])
+            I eq.is_bool_true() {
+                R SqlValue.BoolVal { v: true }
+            } EL I eq.is_null() {
+                found_null = true
             }
         }
 
         # No M found
         I found_null {
-            Null
+            SqlValue.Null
         } EL {
             SqlValue.BoolVal { v: false }
         }
@@ -1082,7 +1087,7 @@ F agg_sum(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, Va
     M acc {
         None => {
             # First non-NULL value
-            Ok(Some(val.clone()))
+            Ok(Some((*val).clone()))
         },
         Some(sum) => {
             # Add to running sum
@@ -1105,16 +1110,21 @@ F agg_avg_accumulate(sum: &Option<SqlValue>, count: &u64, val: &SqlValue) -> Res
     M sum {
         None => {
             # First non-NULL value
-            Ok((Some(val.clone()), 1))
+            R Ok((Some((*val).clone()), 1 as u64))
         },
         Some(s) => {
             # Add to running sum
             M s.add(val) {
-                Ok(new_sum) => Ok((Some(new_sum), *count + 1)),
-                Err(e) => Err(e),
+                Ok(new_sum) => {
+                    new_count := mut *count + (1 as u64)
+                    R Ok((Some(new_sum), new_count))
+                },
+                Err(e) => { R Err(e) },
             }
         },
     }
+
+    R Err(VaisError.new("VAIS-0109007", "Invalid AVG accumulator state"))
 }
 
 F agg_avg_finalize(sum: &Option<SqlValue>, count: u64) -> Result<SqlValue, VaisError> {
@@ -1142,22 +1152,24 @@ F agg_min(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, Va
     M acc {
         None => {
             # First non-NULL value
-            Ok(Some(val.clone()))
+            R Ok(Some((*val).clone()))
         },
         Some(min) => {
             # Compare and keep smaller
             M min.compare(val) {
                 Ok(cmp) => {
                     I cmp > 0 {
-                        Ok(Some(val.clone()))
-                    } EL {
-                        Ok(Some(min.clone()))
+                        R Ok(Some((*val).clone()))
                     }
+                    R Ok(*acc)
                 },
-                Err(e) => Err(e),
+                Err(e) => {
+                    R Err(e)
+                },
             }
         },
     }
+    Ok(None)
 }
 
 F agg_max(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, VaisError> {
@@ -1169,22 +1181,24 @@ F agg_max(acc: &Option<SqlValue>, val: &SqlValue) -> Result<Option<SqlValue>, Va
     M acc {
         None => {
             # First non-NULL value
-            Ok(Some(val.clone()))
+            R Ok(Some((*val).clone()))
         },
         Some(max) => {
             # Compare and keep larger
             M max.compare(val) {
                 Ok(cmp) => {
                     I cmp < 0 {
-                        Ok(Some(val.clone()))
-                    } EL {
-                        Ok(Some(max.clone()))
+                        R Ok(Some((*val).clone()))
                     }
+                    R Ok(*acc)
                 },
-                Err(e) => Err(e),
+                Err(e) => {
+                    R Err(e)
+                },
             }
         },
     }
+    Ok(None)
 }
 
 # Compute a group key that treats all NULLs as equal (one group)
@@ -1244,9 +1258,14 @@ F group_key_hash(values: &[SqlValue]) -> u64 {
 # nulls_first: None=default (NULLS LAST for ASC, NULLS FIRST for DESC), Some(true/false)=explicit
 F order_by_compare(a: &SqlValue, b: &SqlValue, asc: bool, nulls_first: Option<bool>) -> i32 {
     # Determine NULL ordering
-    null_order := mut M nulls_first {
-        Some(nf) => nf,
-        None => !asc,  # Default: NULLS LAST for ASC (false), NULLS FIRST for DESC (true)
+    null_order := mut false
+    M nulls_first {
+        Some(nf) => {
+            null_order = nf
+        },
+        None => {
+            null_order = !asc  # Default: NULLS LAST for ASC (false), NULLS FIRST for DESC (true)
+        },
     }
 
     M (a.is_null(), b.is_null()) {
@@ -1279,34 +1298,34 @@ F order_by_compare(a: &SqlValue, b: &SqlValue, asc: bool, nulls_first: Option<bo
 F coerce_types(a: &SqlValue, b: &SqlValue) -> Result<(SqlValue, SqlValue), VaisError> {
     # NULL values don't need coercion
     I a.is_null() || b.is_null() {
-        R Ok((a.clone(), b.clone()))
+        R Ok(((*a).clone(), (*b).clone()))
     }
 
     M (a, b) {
         # Same types -> no coercion needed
-        (SqlValue.IntVal { .. }, SqlValue.IntVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.FloatVal { .. }, SqlValue.FloatVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.BoolVal { .. }, SqlValue.BoolVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.StringVal { .. }, SqlValue.StringVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.BlobVal { .. }, SqlValue.BlobVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.DateVal { .. }, SqlValue.DateVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.TimestampVal { .. }, SqlValue.TimestampVal { .. }) => Ok((a.clone(), b.clone())),
-        (SqlValue.VectorVal { .. }, SqlValue.VectorVal { .. }) => Ok((a.clone(), b.clone())),
+        (SqlValue.IntVal { .. }, SqlValue.IntVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.FloatVal { .. }, SqlValue.FloatVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.BoolVal { .. }, SqlValue.BoolVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.StringVal { .. }, SqlValue.StringVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.BlobVal { .. }, SqlValue.BlobVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.DateVal { .. }, SqlValue.DateVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.TimestampVal { .. }, SqlValue.TimestampVal { .. }) => Ok(((*a).clone(), (*b).clone())),
+        (SqlValue.VectorVal { .. }, SqlValue.VectorVal { .. }) => Ok(((*a).clone(), (*b).clone())),
 
         # INT + FLOAT -> both FLOAT
         (SqlValue.IntVal { v: av }, SqlValue.FloatVal { .. }) => {
-            Ok((SqlValue.FloatVal { v: av as f64 }, b.clone()))
+            Ok((SqlValue.FloatVal { v: av as f64 }, (*b).clone()))
         },
         (SqlValue.FloatVal { .. }, SqlValue.IntVal { v: bv }) => {
-            Ok((a.clone(), SqlValue.FloatVal { v: bv as f64 }))
+            Ok(((*a).clone(), SqlValue.FloatVal { v: bv as f64 }))
         },
 
         # DATE + TIMESTAMP -> both TIMESTAMP
         (SqlValue.DateVal { v: av }, SqlValue.TimestampVal { .. }) => {
-            Ok((SqlValue.TimestampVal { v: (av as i64) * 86400_000_000 }, b.clone()))
+            Ok((SqlValue.TimestampVal { v: (av as i64) * 86400_000_000 }, (*b).clone()))
         },
         (SqlValue.TimestampVal { .. }, SqlValue.DateVal { v: bv }) => {
-            Ok((a.clone(), SqlValue.TimestampVal { v: (bv as i64) * 86400_000_000 }))
+            Ok(((*a).clone(), SqlValue.TimestampVal { v: (bv as i64) * 86400_000_000 }))
         },
 
         # Incompatible types

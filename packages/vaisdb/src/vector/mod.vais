@@ -17,7 +17,6 @@ U storage
 
 # Search functionality
 U search
-U storage
 
 # Filtered search
 U filter
@@ -32,7 +31,6 @@ U hnsw/search
 U hnsw/delete
 U hnsw/layer
 U hnsw/wal
-U hnsw/cow
 U hnsw/bulk
 
 # Quantization
@@ -80,6 +78,37 @@ F err_vector_index_creation_failed(detail: str) -> VaisError {
     )
 }
 
+F err_vector_materialization_unavailable() -> VaisError {
+    VaisError.new(
+        "VAIS-0210004",
+        "Vector result materialization requires heap row lookup API"
+    )
+}
+
+F vector_distance_metric_from_tag(metric: u8) -> DistanceMetric {
+    tag := mut metric as i64
+    I tag == DISTANCE_L2 as i64 {
+        R L2
+    }
+    I tag == DISTANCE_DOT_PRODUCT as i64 {
+        R DotProduct
+    }
+    Cosine
+}
+
+F write_hnsw_meta_page(
+    pool: &BufferPool,
+    meta: &HnswMeta,
+    page_id: u32,
+) -> Result<(), VaisError> {
+    frame_id := mut pool.fetch_page(FILE_ID_VECTORS, page_id)?;
+    page_data := mut pool.get_page_mut(frame_id)
+    meta.serialize_to_page(page_data, page_id, 0)
+    pool.write_page(frame_id)?;
+    pool.unpin_page(frame_id, true)
+    Ok(())
+}
+
 # ============================================================================
 # VectorEngine — High-level facade for all vector operations
 # ============================================================================
@@ -94,7 +123,6 @@ S VectorEngine {
     distance_computer: DistanceComputer, # Distance metric computer
     layer_mgr: LayerManager,         # Upper layer (1+) pinning manager
     wal_mgr: HnswWalManager,         # WAL logging for HNSW operations
-    cow_store: CowNeighborStore,     # Copy-on-write neighbor lists (epoch-based)
     quantization: QuantizationManager, # Quantization (scalar/PQ)
     lock: HnswLock,                  # Concurrency control (RwLock)
     index_id: u32,                   # Catalog index ID
@@ -102,7 +130,7 @@ S VectorEngine {
     pool: &BufferPool,               # Shared buffer pool
     allocator: &PageAllocator,       # Shared page allocator
     bitmap: &FreelistBitmap,         # Freelist bitmap (FILE_ID_VECTORS)
-    gcm: &GroupCommitManager,        # Shared group commit manager
+    gcm: &mut GroupCommitManager,    # Shared group commit manager
 }
 
 X VectorEngine {
@@ -118,7 +146,7 @@ X VectorEngine {
         pool: &BufferPool,
         allocator: &PageAllocator,
         bitmap: &FreelistBitmap,
-        gcm: &GroupCommitManager,
+        gcm: &mut GroupCommitManager,
     ) -> Result<VectorEngine, VaisError> {
         # Validate configuration
         I config.m == 0 || config.m_max_0 == 0 {
@@ -136,12 +164,11 @@ X VectorEngine {
 
         # Initialize components
         store := mut VectorStore.new(config.dim, pool, allocator, bitmap)
-        node_store := mut HnswNodeStore.new(&store)
-        distance_computer := mut DistanceComputer.new(config.metric)
-        layer_mgr := mut LayerManager.new(pool, allocator)?;
-        wal_mgr := mut HnswWalManager.new(gcm)?;
-        cow_store := mut CowNeighborStore.new()?;
-        quantization := mut QuantizationManager.new(config.quantization_strategy)?;
+        node_store := mut HnswNodeStore.new(config.dim, pool, allocator, bitmap)
+        distance_computer := mut DistanceComputer.new(vector_distance_metric_from_tag(config.metric))
+        layer_mgr := mut LayerManager.new(config.clone())
+        wal_mgr := mut HnswWalManager.new(gcm)
+        quantization := mut QuantizationManager.new(config.dim)
         lock := mut HnswLock.new()
 
         Ok(VectorEngine {
@@ -152,7 +179,6 @@ X VectorEngine {
             distance_computer,
             layer_mgr,
             wal_mgr,
-            cow_store,
             quantization,
             lock,
             index_id,
@@ -177,7 +203,7 @@ X VectorEngine {
         # Load metadata page
         meta_page_id := self.index_id;  # Meta page is first page of index
         meta_data := self.pool.read_page(FILE_ID_VECTORS, meta_page_id)?;
-        self.meta = HnswMeta.deserialize(&meta_data)?;
+        self.meta = HnswMeta.deserialize_from_page(&meta_data)?;
 
         # Validate meta matches config
         I self.meta.dim != self.config.dim {
@@ -185,12 +211,7 @@ X VectorEngine {
         }
 
         # Load upper layers (layer 1+) into memory
-        LF layer: 1..(self.meta.max_layer + 1) {
-            self.layer_mgr.pin_layer(layer, &self.meta, self.pool)?;
-        }
-
-        # Initialize quantization with stored vectors
-        self.quantization.initialize(&self.store)?;
+        self.layer_mgr.load_upper_layers(&self.meta, self.pool)?;
 
         self.is_open = true
         Ok(())
@@ -203,14 +224,10 @@ X VectorEngine {
         }
 
         # Flush metadata page
-        meta_buf := mut ByteBuffer.new()
-        self.meta.serialize(&mut meta_buf)?;
-        self.pool.write_page(FILE_ID_VECTORS, self.index_id, &meta_buf.to_vec())?;
+        write_hnsw_meta_page(self.pool, &self.meta, self.index_id)?;
 
-        # Unpin all upper layers
-        LF layer: 1..(self.meta.max_layer + 1) {
-            self.layer_mgr.unpin_layer(layer)?;
-        }
+        # Release pinned upper-layer cache
+        self.layer_mgr.clear_all()
 
         # Flush all dirty pages
         self.pool.flush_file(FILE_ID_VECTORS)?;
@@ -227,45 +244,36 @@ X VectorEngine {
     F create_index(
         config: HnswConfig,
         catalog: &mut CatalogManager,
-        pool: &BufferPool,
-        allocator: &PageAllocator,
-        gcm: &GroupCommitManager,
+        pool: &mut BufferPool,
+        allocator: &mut PageAllocator,
+        bitmap: &mut FreelistBitmap,
+        gcm: &mut GroupCommitManager,
         txn_id: u64,
         index_name: str,
         table_id: u32,
-        column_id: u32,
+        column_name: str,
     ) -> Result<VectorEngine, VaisError> {
         # Allocate metadata page
-        meta_page_id := allocator.allocate_page(FILE_ID_VECTORS)?;
+        meta_page_id := allocator.allocate_page(FILE_ID_VECTORS, bitmap)?;
+
+        columns: Vec<str> := mut Vec.with_capacity(1)
+        columns.push(column_name.clone())
 
         # Register index in catalog
-        index_info := IndexInfo {
-            index_id: meta_page_id,
-            index_name: index_name.clone(),
+        index_info := mut IndexInfo.new(
+            meta_page_id,
+            index_name.clone(),
             table_id,
-            column_ids: Vec.of_one(column_id),
-            index_type: INDEX_TYPE_HNSW,
-            is_unique: false,
-            is_primary: false,
-            root_page: meta_page_id,
-        }
-        catalog.create_index(index_info, txn_id)?;
+            columns,
+            meta_page_id,
+        )
+        catalog.create_index(index_info, pool, gcm, txn_id)?;
 
         # Create engine instance
-        engine := mut VectorEngine.new(config, meta_page_id, pool, allocator, gcm)?;
+        engine := mut VectorEngine.new(config, meta_page_id, pool, allocator, bitmap, gcm)?;
 
         # Initialize metadata page
-        meta_buf := mut ByteBuffer.new()
-        engine.meta.serialize(&mut meta_buf)?;
-        pool.write_page(FILE_ID_VECTORS, meta_page_id, &meta_buf.to_vec())?;
-
-        # WAL-log index creation
-        engine.wal_mgr.log_index_created(
-            meta_page_id,
-            config.dim,
-            config.metric,
-            txn_id,
-        )?;
+        write_hnsw_meta_page(pool, &engine.meta, meta_page_id)?;
 
         # Mark as open
         engine.is_open = true
@@ -274,36 +282,26 @@ X VectorEngine {
     }
 
     ## Drop index: mark as deleted, release pages
-    F drop_index(mut self, catalog: &mut CatalogManager, txn_id: u64) -> Result<(), VaisError> {
+    F drop_index(
+        mut self,
+        catalog: &mut CatalogManager,
+        pool: &mut BufferPool,
+        gcm: &mut GroupCommitManager,
+        index_name: str,
+        txn_id: u64
+    ) -> Result<(), VaisError> {
         I !self.is_open {
             R Err(err_vector_engine_closed())
         }
 
-        # WAL-log drop operation
-        self.wal_mgr.log_index_dropped(self.index_id, txn_id)?;
-
         # Remove from catalog
-        catalog.drop_index(self.index_id, txn_id)?;
+        catalog.drop_index(index_name, pool, gcm, txn_id)?;
 
-        # Release all pages (meta + vector pages + layer pages)
-        # Meta page
-        self.allocator.free_page(FILE_ID_VECTORS, self.index_id)?;
-
-        # Vector pages
-        LF page_id: self.store.get_all_page_ids() {
-            self.allocator.free_page(FILE_ID_VECTORS, page_id)?;
-        }
-
-        # Layer pages
-        LF layer: 1..(self.meta.max_layer + 1) {
-            layer_page_ids := self.layer_mgr.get_page_ids_for_layer(layer)?;
-            LF page_id: layer_page_ids {
-                self.allocator.free_page(FILE_ID_VECTORS, page_id)?;
-            }
-        }
-
-        # Close engine
+        # Flush state and release the meta page. Vector data/HNSW node page ownership
+        # is not yet exposed by VectorStore, so page-list reclamation must be wired
+        # when the store gains an iterator over allocated vector pages.
         self.close()?;
+        self.allocator.deallocate_page(FILE_ID_VECTORS, self.index_id, self.bitmap)?;
 
         Ok(())
     }
@@ -336,7 +334,12 @@ X VectorEngine {
         write_guard := mut self.lock.write_lock(txn_id)?;
 
         # 1. Write vector to storage (allocate page space)
-        (vec_page_id, vec_offset) := mut self.store.write_vector(vector, txn_id, cmd_id)?;
+        (vec_page_id, vec_offset) := mut self.store.write_vector_with_wal(
+            vector,
+            txn_id,
+            cmd_id,
+            &mut self.wal_mgr,
+        )?;
 
         # 2. Allocate node ID and create HnswNode
         node_id := mut self.node_store.allocate_node_id()
@@ -350,21 +353,13 @@ X VectorEngine {
             vector,
             self.meta,
             &self.config,
-            &self.node_store,
+            &mut self.node_store,
             &self.distance_computer,
             self.gcm,
             txn_id,
             cmd_id,
         )?;
-
-        # 4. WAL-log insert operation
-        self.wal_mgr.log_insert(
-            self.index_id,
-            node_id,
-            vector,
-            txn_id,
-            cmd_id,
-        )?;
+        self.node_store.cache_vector(node_id, vector)
 
         Ok(node_id)
     }
@@ -391,10 +386,10 @@ X VectorEngine {
         self.store.delete_vector(node.vector_page_id, node.vector_offset, txn_id, cmd_id)?;
 
         # HNSW delete (mark as deleted, repair neighbor lists)
-        hnsw_delete(
+        layers_affected := mut hnsw_delete(
             node_id,
-            &self.meta,
-            &self.node_store,
+            &mut self.meta,
+            &mut self.node_store,
             txn_id,
             cmd_id,
             FILE_ID_VECTORS,
@@ -402,11 +397,12 @@ X VectorEngine {
         )?;
 
         # WAL-log delete operation
-        self.wal_mgr.log_delete(
-            self.index_id,
-            node_id,
+        self.wal_mgr.log_delete_node(
             txn_id,
-            cmd_id,
+            node_id,
+            &layers_affected,
+            FILE_ID_VECTORS,
+            node.vector_page_id,
         )?;
 
         Ok(())
@@ -419,7 +415,7 @@ X VectorEngine {
     ## MVCC-filtered k-NN search
     ## Returns top-k nearest neighbors visible to the snapshot
     F search(
-        self,
+        mut self,
         query: &[f32],
         k: u64,
         ef_search: Option<u32>,
@@ -443,8 +439,8 @@ X VectorEngine {
 
         # Use provided ef_search or default
         ef := M ef_search {
-            Some(val) => val,
-            None => self.config.ef_search,
+            Option.Some(val) => val,
+            Option.None => self.config.ef_search,
         }
 
         # MVCC-filtered search
@@ -453,7 +449,7 @@ X VectorEngine {
             k,
             ef,
             &self.meta,
-            &self.node_store,
+            &mut self.node_store,
             &self.distance_computer,
             snapshot,
             clog,
@@ -465,7 +461,9 @@ X VectorEngine {
     ## Filtered search: combines vector search with SQL WHERE predicate
     ## Uses pre/post/hybrid filter strategy
     F filtered_search(
-        self,
+        mut self,
+        table_name: str,
+        column_name: str,
         query: &[f32],
         k: u64,
         predicate: Option<Expr>,
@@ -485,20 +483,30 @@ X VectorEngine {
 
         # If no predicate, use regular search
         M predicate {
-            None => {
-                result := self.search(query, k, None, ctx.snapshot, ctx.clog)?;
+            Option.None => {
+                result := self.search(query, k, Option.None, ctx.snapshot, ctx.clog)?;
                 # Convert SearchResult to VectorSearchRow
                 R self.materialize_search_result(result, ctx)
             },
-            Some(expr) => {
+            Option.Some(expr) => {
                 # Use filtered search
                 filter_config := FilterConfig.default()
-                filtered_search := FilteredVectorSearch.new(
-                    self,
-                    filter_config,
+                params := mut VectorSearchParams {
+                    table_name: table_name.clone(),
+                    column_name: column_name.clone(),
+                    query_vector: query.to_vec(),
+                    top_k: k,
+                    ef_search: Option.None,
+                    index_id: self.index_id,
+                    table_id: 0,
+                }
+                filter_predicate := mut Option.Some(expr)
+                filtered_search := mut FilteredVectorSearch.new(
+                    params,
+                    filter_predicate,
                     ctx,
-                )?;
-                R filtered_search.execute(query, k, expr)
+                ).with_config(filter_config)
+                R filtered_search.execute()
             },
         }
     }
@@ -532,28 +540,70 @@ X VectorEngine {
         # Acquire write lock
         write_guard := mut self.lock.write_lock(txn_id)?;
 
-        # Create bulk loader
-        loader := mut BulkLoader.new(
-            &mut self.meta,
-            &self.config,
-            &mut self.store,
-            &mut self.layer_mgr,
-            &mut self.cow_store,
-            self.pool,
-            config,
-        )?;
+        # Store raw vectors first, then build the graph over the committed
+        # vector page locations without emitting WAL records.
+        loader := mut BulkLoader.new(config)?;
+        vector_meta: Vec<VectorMeta> := mut Vec.new()
 
-        # Execute bulk load
-        result := loader.load(vectors, txn_id)?;
+        i := mut 0
+        LW i < vectors.len() {
+            vector := mut vectors[i]
+            (vec_page_id, vec_offset) := mut I loader.config.skip_wal {
+                self.store.write_vector(
+                    vector,
+                    txn_id,
+                    i as u32
+                )?
+            } EL {
+                self.store.write_vector_with_wal(
+                    vector,
+                    txn_id,
+                    i as u32,
+                    &mut self.wal_mgr
+                )?
+            }
+            node_id := mut self.node_store.allocate_node_id()
+            layer := mut loader.next_layer(self.config.m)
+            vector_meta.push(VectorMeta.new(
+                i,
+                node_id,
+                layer,
+                vec_page_id,
+                vec_offset
+            ))
+            self.node_store.cache_vector(node_id, vector)
+            i += 1;
+        }
 
-        # WAL-log bulk load (if not bypassed)
-        I !config.bypass_wal {
-            self.wal_mgr.log_bulk_load(
-                self.index_id,
+        I loader.config.skip_wal {
+            self.meta = bulk_insert_stored_vectors(
+                &loader.config,
                 vectors,
-                txn_id,
+                &vector_meta,
+                self.meta,
+                &mut self.node_store,
+                &self.distance_computer,
+                txn_id
+            )?;
+        } EL {
+            self.meta = bulk_insert_stored_vectors_with_wal(
+                &loader.config,
+                vectors,
+                &vector_meta,
+                self.meta,
+                &mut self.node_store,
+                &self.distance_computer,
+                self.gcm,
+                txn_id
             )?;
         }
+
+        result := mut BulkLoadResult.new(
+            vectors.len(),
+            self.meta.max_layer,
+            0,
+            loader.config.skip_wal
+        )
 
         Ok(result)
     }
@@ -590,16 +640,8 @@ X VectorEngine {
     ) -> Result<Vec<VectorSearchRow>, VaisError> {
         rows := mut Vec.with_capacity(0)
 
-        LF entry: result.entries {
-            # Fetch original row from heap page
-            # node_id maps to TID (table row ID)
-            row := ctx.fetch_row_by_tid(entry.node_id)?;
-
-            rows.push(VectorSearchRow {
-                node_id: entry.node_id,
-                distance: entry.distance,
-                row,
-            })
+        I result.results.len() > 0 {
+            R Err(err_vector_materialization_unavailable())
         }
 
         Ok(rows)

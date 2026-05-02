@@ -15,6 +15,13 @@ U std/option
 U storage/constants
 U storage/error
 
+X F __rwlock_read_lock(handle: i64) -> i64
+X F __rwlock_try_read_lock(handle: i64) -> i64
+X F __rwlock_read_unlock(handle: i64) -> i64
+X F __rwlock_write_lock(handle: i64) -> i64
+X F __rwlock_try_write_lock(handle: i64) -> i64
+X F __rwlock_write_unlock(handle: i64) -> i64
+
 # Latch mode
 EN LatchMode {
     Read,
@@ -37,30 +44,30 @@ X PageLatch {
     }
 
     F read_lock(self) {
-        self.lock.read_lock()
+        ignored := mut __rwlock_read_lock(self.lock.os_rwlock)
     }
 
     F write_lock(self) {
-        self.lock.write_lock()
+        ignored := mut __rwlock_write_lock(self.lock.os_rwlock)
     }
 
     F read_unlock(self) {
-        self.lock.read_unlock()
+        ignored := mut __rwlock_read_unlock(self.lock.os_rwlock)
     }
 
     F write_unlock(self) {
-        self.lock.write_unlock()
+        ignored := mut __rwlock_write_unlock(self.lock.os_rwlock)
     }
 
     # Try to acquire write latch without blocking
     # Returns true on success, false if already held
     F try_write_lock(self) -> bool {
-        self.lock.try_write_lock()
+        __rwlock_try_write_lock(self.lock.os_rwlock) == 1
     }
 
     # Try to acquire read latch without blocking
     F try_read_lock(self) -> bool {
-        self.lock.try_read_lock()
+        __rwlock_try_read_lock(self.lock.os_rwlock) == 1
     }
 }
 
@@ -73,7 +80,7 @@ S LatchTable {
 
 X LatchTable {
     F new(capacity: u32) -> LatchTable {
-        latches := mut Vec.with_capacity(capacity as u64)
+        latches: Vec<PageLatch> := mut Vec.with_capacity(capacity as u64)
         LF i: 0..capacity {
             latches.push(PageLatch.new(i))
         }
@@ -165,8 +172,9 @@ S OptimisticDescent {
 
 X OptimisticDescent {
     F new() -> OptimisticDescent {
+        path: Vec<LatchedPathEntry> := mut Vec.with_capacity(0)
         OptimisticDescent {
-            path: Vec.with_capacity(0),
+            path,
             leaf_page_id: NULL_PAGE,
             needs_restart: false,
         }
@@ -180,10 +188,9 @@ X OptimisticDescent {
     # Get the parent of the current node
     F parent(self) -> Option<&LatchedPathEntry> {
         I self.path.len() >= 2 {
-            Some(&self.path[self.path.len() - 2])
-        } EL {
-            None
+            R Option.Some(&self.path[self.path.len() - 2])
         }
+        Option.None
     }
 
     # Mark that optimistic assumption failed (need split/merge)
@@ -211,8 +218,9 @@ S PessimisticDescent {
 
 X PessimisticDescent {
     F new() -> PessimisticDescent {
+        held_latches: Vec<u32> := mut Vec.with_capacity(0)
         PessimisticDescent {
-            held_latches: Vec.with_capacity(0),
+            held_latches,
         }
     }
 
@@ -239,7 +247,7 @@ X PessimisticDescent {
         }
 
         # Keep only latches from safe_page_id downward
-        remaining := mut Vec.with_capacity(0)
+        remaining: Vec<u32> := mut Vec.with_capacity(0)
         LF i: keep_from..self.held_latches.len() {
             remaining.push(self.held_latches[i])
         }

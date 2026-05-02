@@ -174,17 +174,17 @@ X MinHeap {
 
     F pop_min(mut self) -> Option<SearchCandidate> {
         I self.candidates.len() == 0 {
-            Option.None
-        } EL {
-            # Swap root with last element, pop last, then sift down root — O(log n)
-            last := self.candidates.len() - 1
-            self.candidates.swap(0, last)
-            min_val := self.candidates.pop()
-            I !self.candidates.len() == 0 {
-                self.sift_down(0)
-            }
-            Option.Some(min_val)
+            R Option.None
         }
+
+        # Swap root with last element, pop last, then sift down root — O(log n)
+        last := self.candidates.len() - 1
+        self.candidates.swap(0, last)
+        min_val := self.candidates.pop()
+        I !self.candidates.len() == 0 {
+            self.sift_down(0)
+        }
+        R Option.Some(min_val)
     }
 
     F is_empty(self) -> bool {
@@ -265,25 +265,21 @@ X MaxHeap {
 
     F pop_max(mut self) -> Option<SearchCandidate> {
         I self.candidates.len() == 0 {
-            Option.None
-        } EL {
-            # Swap root with last element, pop last, then sift down root — O(log n)
-            last := self.candidates.len() - 1
-            self.candidates.swap(0, last)
-            max_val := self.candidates.pop()
-            I !self.candidates.len() == 0 {
-                self.sift_down(0)
-            }
-            Option.Some(max_val)
+            R Option.None
         }
+
+        # Swap root with last element, pop last, then sift down root — O(log n)
+        last := self.candidates.len() - 1
+        self.candidates.swap(0, last)
+        max_val := self.candidates.pop()
+        I !self.candidates.len() == 0 {
+            self.sift_down(0)
+        }
+        R Option.Some(max_val)
     }
 
-    F peek_max(self) -> Option<&SearchCandidate> {
-        I self.candidates.len() == 0 {
-            Option.None
-        } EL {
-            Option.Some(&self.candidates[0])
-        }
+    F peek_max(self) -> &SearchCandidate {
+        &self.candidates[0]
     }
 
     F is_empty(self) -> bool {
@@ -323,7 +319,7 @@ F search_layer_ef(
     entry_points: &[SearchCandidate],
     ef: u32,
     layer: u8,
-    store: &dyn NodeLookup,
+    store: &mut dyn NodeStore,
     distance: &DistanceComputer,
     mut stats: &mut SearchResult,
 ) -> Result<Vec<SearchCandidate>, VaisError> {
@@ -350,19 +346,16 @@ F search_layer_ef(
             Option.Some(c) => {
                 # Check if we can still improve result set
                 should_stop := mut false
-                f_opt := mut result.peek_max()
-                M f_opt {
-                    Option.Some(f) => {
-                        I c.distance > f.distance {
-                            should_stop = true
-                        }
-                    },
-                    Option.None => {},
+                I result.len() > 0 {
+                    f := mut result.peek_max()
+                    I c.distance > f.distance {
+                        should_stop = true
+                    }
                 }
 
                 I !should_stop {
                     # Get current node
-                    node := mut store.get_node(c.node_id)?;
+                    node := mut store.load_node(c.node_id)?;
                     stats.increment_visited()
 
                     # Get neighbors at this layer
@@ -379,25 +372,22 @@ F search_layer_ef(
                             visited.insert(n_id)
 
                             # Get neighbor node and check if deleted
-                            n_node := mut store.get_node(n_id)?;
+                            n_node := mut store.load_node(n_id)?;
                             I !n_node.is_deleted {
                                 # Compute distance to query
-                                n_vec := mut store.get_vector(n_id)?;
-                                dist_n := mut distance.compute(query, n_vec)?;
+                                n_vec := mut store.load_vector(n_id)?;
+                                dist_n := mut distance.compute(query, &n_vec)?;
                                 stats.increment_computations()
 
                                 # Check if this neighbor should be added to result set
                                 should_add := mut false
-                                f_dist_opt := mut result.peek_max()
-                                M f_dist_opt {
-                                    Option.Some(f_dist) => {
-                                        I dist_n < f_dist.distance || (result.len() as u32) < ef {
-                                            should_add = true
-                                        }
-                                    },
-                                    Option.None => {
+                                I result.len() == 0 || (result.len() as u32) < ef {
+                                    should_add = true
+                                } EL {
+                                    f_dist := mut result.peek_max()
+                                    I dist_n < f_dist.distance {
                                         should_add = true
-                                    },
+                                    }
                                 }
 
                                 I should_add {
@@ -448,7 +438,7 @@ F knn_search(
     k: u64,
     ef_search: u32,
     meta: &HnswMeta,
-    store: &dyn NodeLookup,
+    store: &mut dyn NodeStore,
     distance: &DistanceComputer,
 ) -> Result<SearchResult, VaisError> {
     # Validate parameters
@@ -482,8 +472,8 @@ F knn_search(
     }
 
     # Compute distance to entry point
-    ep_vec := mut store.get_vector(ep_id)?;
-    ep_dist := mut distance.compute(query, ep_vec)?;
+    ep_vec := mut store.load_vector(ep_id)?;
+    ep_dist := mut distance.compute(query, &ep_vec)?;
     result.increment_computations()
 
     current_candidates := mut Vec.with_capacity(1)
@@ -557,12 +547,12 @@ F greedy_search_single(
     query: &[f32],
     entry_point: u64,
     layer: u8,
-    store: &dyn NodeLookup,
+    store: &mut dyn NodeStore,
     distance: &DistanceComputer,
     mut stats: &mut SearchResult,
 ) -> Result<SearchCandidate, VaisError> {
-    ep_vec := mut store.get_vector(entry_point)?;
-    current_dist := mut distance.compute(query, ep_vec)?;
+    ep_vec := mut store.load_vector(entry_point)?;
+    current_dist := mut distance.compute(query, &ep_vec)?;
     stats.increment_computations()
 
     current_id := mut entry_point
@@ -571,7 +561,7 @@ F greedy_search_single(
     # Greedy descent: keep moving to closer neighbor until local minimum
     LW improved {
         improved = false
-        node := mut store.get_node(current_id)?;
+        node := mut store.load_node(current_id)?;
         stats.increment_visited()
 
         neighbors := mut node.get_neighbors(layer)?;
@@ -582,10 +572,10 @@ F greedy_search_single(
             n_id := mut neighbor.node_id
 
             # Skip deleted nodes
-            n_node := mut store.get_node(n_id)?;
+            n_node := mut store.load_node(n_id)?;
             I !n_node.is_deleted {
-                n_vec := mut store.get_vector(n_id)?;
-                n_dist := mut distance.compute(query, n_vec)?;
+                n_vec := mut store.load_vector(n_id)?;
+                n_dist := mut distance.compute(query, &n_vec)?;
                 stats.increment_computations()
 
                 I n_dist < current_dist {

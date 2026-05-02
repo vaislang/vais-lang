@@ -117,7 +117,7 @@ F hnsw_delete(
         ))
     }
 
-    node_res := mut store.get_node(node_id)
+    node_res := mut store.load_node(node_id)
     node := mut M node_res {
         Ok(n) => n,
         Err(e) => { R Err(err_delete_failed(
@@ -136,14 +136,16 @@ F hnsw_delete(
 
     # Step 3: Mark node as deleted (soft delete)
     node.mark_deleted(txn_id, cmd_id)
+    node_max_layer := mut node.max_layer
+    store.store_node(node)?;
 
     # Step 4: Update metadata deleted count
     meta.delete_node()
 
     # Step 5: Collect affected layers for WAL record
-    layers_affected := mut Vec.with_capacity((node.max_layer + 1) as u64)
-    layer := mut 0
-    LW layer <= node.max_layer {
+    layers_affected: Vec<u8> := mut Vec.with_capacity((node_max_layer + 1) as u64)
+    layer := mut 0 as u8
+    LW layer <= node_max_layer {
         layers_affected.push(layer)
         layer = layer + 1
     }
@@ -201,6 +203,19 @@ F calculate_oversample_factor(meta: &HnswMeta) -> f64 {
     }
 }
 
+F ceil_scaled_k(k: u64, factor: f64) -> u64 {
+    scaled := mut (k as f64) * factor
+    whole := mut scaled as u64
+    I (whole as f64) < scaled {
+        whole += 1
+    }
+    I whole == 0 {
+        1
+    } EL {
+        whole
+    }
+}
+
 # mvcc_filtered_search performs top-K ANN search with MVCC post-filtering.
 #
 # Algorithm:
@@ -230,7 +245,7 @@ F mvcc_filtered_search(
     k: u64,
     ef_search: u32,
     meta: &HnswMeta,
-    store: &dyn NodeStore,
+    store: &mut dyn NodeStore,
     distance: &DistanceComputer,
     snapshot: &Snapshot,
     clog: &Clog,
@@ -244,7 +259,7 @@ F mvcc_filtered_search(
 
     LW retry < max_retries {
         # Calculate actual k and ef for this attempt
-        actual_k := mut ((k as f64) * oversample).ceil() as u64
+        actual_k := mut ceil_scaled_k(k, oversample)
         actual_ef := mut I (actual_k as u32) > ef_search {
             actual_k as u32
         } EL {
@@ -262,14 +277,14 @@ F mvcc_filtered_search(
         )?;
 
         # Filter results by MVCC visibility
-        visible_results := mut Vec.with_capacity(k)
+        visible_results: Vec<SearchResultEntry> := mut Vec.with_capacity(k)
         idx := mut 0
         LW idx < search_result.results.len() {
             entry := mut &search_result.results[idx]
             node_id := mut entry.node_id
 
             # Get node and check visibility
-            node_res := mut store.get_node(node_id)
+            node_res := mut store.load_node(node_id)
             M node_res {
                 Ok(node) => {
                     # Check MVCC visibility
@@ -311,7 +326,7 @@ F mvcc_filtered_search(
     # Caller should check result.results.len() < k
 
     # Perform final search with max oversample
-    actual_k_final := mut ((k as f64) * oversample).ceil() as u64
+    actual_k_final := mut ceil_scaled_k(k, oversample)
     actual_ef_final := mut I (actual_k_final as u32) > ef_search {
         actual_k_final as u32
     } EL {
@@ -328,13 +343,13 @@ F mvcc_filtered_search(
     )?;
 
     # Final visibility filter
-    final_visible := mut Vec.with_capacity(k)
+    final_visible: Vec<SearchResultEntry> := mut Vec.with_capacity(k)
     final_idx := mut 0
     LW final_idx < final_search.results.len() {
         final_entry := mut &final_search.results[final_idx]
         final_node_id := mut final_entry.node_id
 
-        final_node_res := mut store.get_node(final_node_id)
+        final_node_res := mut store.load_node(final_node_id)
         M final_node_res {
             Ok(final_node) => {
                 I is_vector_visible(final_node, snapshot, clog) {
@@ -442,17 +457,17 @@ F is_gc_ready(
 # Returns: Vec of node IDs ready for GC
 F scan_gc_candidates(
     node_ids: &[u64],
-    store: &dyn NodeStore,
+    store: &mut dyn NodeStore,
     low_water_mark: u64,
     clog: &Clog,
 ) -> Vec<u64> {
-    ready_nodes := mut Vec.with_capacity(0)
+    ready_nodes: Vec<u64> := mut Vec.with_capacity(0)
 
     idx := mut 0
     LW idx < node_ids.len() {
         node_id := mut node_ids[idx]
 
-        node_res := mut store.get_node(node_id)
+        node_res := mut store.load_node(node_id)
         M node_res {
             Ok(node) => {
                 I is_gc_ready(node, low_water_mark, clog) {

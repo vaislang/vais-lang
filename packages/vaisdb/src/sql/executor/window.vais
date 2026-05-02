@@ -154,7 +154,7 @@ X WindowExecutor {
         rows: &Vec<Row>,
         partition_exprs: &Vec<Expr>,
     ) -> Result<HashMap<u64, Partition>, VaisError> {
-        partitions := mut HashMap.with_capacity(16)
+        partitions: HashMap<u64, Partition> := mut HashMap.with_capacity(16)
 
         LF row: rows {
             # Evaluate partition key
@@ -171,14 +171,18 @@ X WindowExecutor {
                 group_key_hash(&key_values)
             }
 
-            # Get or create partition
-            I !partitions.contains_key(&hash) {
-                partitions.insert(hash, Partition.new(key_values.clone()))
+            # Get or create partition without relying on panic-style unwrap.
+            M partitions.get_opt(&hash) {
+                Option.Some(partition) => {
+                    partition.rows.push(row.clone())
+                    partitions.insert(hash, partition)
+                },
+                Option.None => {
+                    partition := mut Partition.new(key_values.clone())
+                    partition.rows.push(row.clone())
+                    partitions.insert(hash, partition)
+                },
             }
-            partition := mut partitions.get(&hash)!
-
-            # Add row to partition
-            partition.rows.push(row.clone())
         }
 
         Result.Ok(partitions)
@@ -231,8 +235,7 @@ X WindowExecutor {
     ) -> Result<Vec<SqlValue>, VaisError> {
         all_values := mut Vec.with_capacity(0)
 
-        LF item: partitions {
-            partition := item.1
+        LF partition: partitions.values() {
             partition_values := mut self.compute_partition_window_values(partition, spec)?;
             all_values.extend(partition_values)
         }
@@ -315,13 +318,13 @@ X WindowExecutor {
         values := mut Vec.with_capacity(partition.rows.len())
         current_rank := mut 1i64
         dense_rank := mut 1i64
-        prev_sort_key := mut Option.None
+        prev_sort_key: Option<Vec<SqlValue>> := mut Option.None
 
         LF i: 0..partition.rows.len() {
             row := mut &partition.rows[i]
 
             # Evaluate ORDER BY expressions to get sort key
-            sort_key := mut Vec.with_capacity(0)
+            sort_key: Vec<SqlValue> := mut Vec.with_capacity(0)
             LF order_item: &spec.order_by {
                 val := mut eval_expr(&order_item.expr, row, &self.eval_ctx)?;
                 sort_key.push(val)

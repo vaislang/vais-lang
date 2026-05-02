@@ -44,13 +44,10 @@ F btree_delete(
     leaf_latch := mut LatchGuard.new_write(tree.get_latch_table(), leaf_info.page_id)
 
     removed_tid := mut leaf.delete(key)
-    M removed_tid {
-        None => {
-            leaf_latch.release()
-            pool.unpin_page(leaf_frame, false)
-            R Ok(None)
-        },
-        Some(_) => {},
+    I removed_tid.is_none() != 0 {
+        leaf_latch.release()
+        pool.unpin_page(leaf_frame, false)
+        R Ok(None)
     }
 
     # FPI: leaf page being modified
@@ -221,7 +218,7 @@ F merge_leaves(
 ) -> Result<(), VaisError> {
     # Move all entries from right to left
     LF i: 0..right.entry_count() as u64 {
-        key := mut right.get_key(i).clone()
+        key := mut copy_delete_key(right.get_key(i))
         tid := mut right.entries[i].tid
         left.insert(&key, tid)?;
     }
@@ -280,14 +277,14 @@ F redistribute_from_left(
 ) -> Result<(), VaisError> {
     # Move last entry from left to beginning of right
     last_idx := mut (left.entry_count() - 1) as u64
-    move_key := mut left.get_key(last_idx).clone()
+    move_key := mut copy_delete_key(left.get_key(last_idx))
     move_tid := mut left.entries[last_idx].tid
 
     right.insert(&move_key, move_tid)?;
     left.delete(&move_key)
 
     # Update parent separator: new separator = first key of right
-    new_sep := mut right.get_key(0).clone()
+    new_sep := mut copy_delete_key(right.get_key(0))
     I child_idx > 0 {
         sep_idx := mut child_idx - 1
         child_page := mut parent.entries[sep_idx].child_page
@@ -339,7 +336,7 @@ F redistribute_from_right(
     file_id: u8,
 ) -> Result<(), VaisError> {
     # Move first entry from right to end of left
-    move_key := mut right.get_key(0).clone()
+    move_key := mut copy_delete_key(right.get_key(0))
     move_tid := mut right.entries[0].tid
 
     left.insert(&move_key, move_tid)?;
@@ -347,7 +344,7 @@ F redistribute_from_right(
 
     # Update parent separator: new separator = first key of right (after removal)
     I right.entry_count() > 0 {
-        new_sep := mut right.get_key(0).clone()
+        new_sep := mut copy_delete_key(right.get_key(0))
         # The separator at child_idx points to the right sibling
         I child_idx < parent.entries.len() {
             child_page := mut parent.entries[child_idx].child_page
@@ -439,17 +436,31 @@ F btree_update_tid(
     page_data := mut pool.get_page(frame_id)
     leaf := mut BTreeLeafNode.from_page_data(page_data, tree.page_size)?;
 
-    M leaf.search(key) {
-        Some(idx) => {
-            leaf.entries[idx].tid = new_tid
-            flushed := mut leaf.flush()
-            pool.write_page(frame_id)?;
-            pool.unpin_page(frame_id, true)
-            Ok(true)
-        },
-        None => {
-            pool.unpin_page(frame_id, false)
-            Ok(false)
-        },
+    idx := mut leaf.lower_bound(key)
+    I idx >= leaf.entry_count() as u64 {
+        pool.unpin_page(frame_id, false)
+        R Ok(false)
     }
+
+    found_key := mut leaf.get_key(idx)
+    I !key_equal(found_key, key) {
+        pool.unpin_page(frame_id, false)
+        R Ok(false)
+    }
+
+    leaf.entries[idx].tid = new_tid
+    flushed := mut leaf.flush()
+    pool.write_page(frame_id)?;
+    pool.unpin_page(frame_id, true)
+    Ok(true)
+}
+
+F copy_delete_key(key: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(key.len())
+    i := mut 0
+    LW i < key.len() {
+        result.push(key[i])
+        i += 1
+    }
+    result
 }

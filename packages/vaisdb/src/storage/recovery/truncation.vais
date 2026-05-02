@@ -11,7 +11,6 @@ U std/vec
 U std/sync
 
 U storage/error
-U storage/wal/naming
 U storage/wal/segment
 U storage/wal/lsn
 U storage/constants
@@ -93,18 +92,20 @@ X TruncationManager {
         segments := mut self.find_all_segments()?;
         segments_deleted := mut 0
         segments_archived := mut 0
+        remaining_segments := mut segments.len() as u32
         oldest_remaining := mut safe_segment
 
         # Keep at least min_segments_to_keep
         I (segments.len() as u32) <= self.config.min_segments_to_keep {
+            oldest := mut 0u32
+            I segments.len() > 0 {
+                oldest = segments[0]
+            }
             # guard.drop() # disabled for dev compiler
             R Ok(TruncationResult {
                 segments_deleted: 0,
                 segments_archived: 0,
-                oldest_remaining_segment: M segments.first() {
-                    Some(seg) => seg,
-                    None => 0,
-                },
+                oldest_remaining_segment: oldest,
             })
         }
 
@@ -130,14 +131,21 @@ X TruncationManager {
                 }
             }
 
+            I !should_skip && remaining_segments <= self.config.min_segments_to_keep {
+                should_skip = true
+            }
+
             I !should_skip {
                 # Archive before deletion if configured
                 seg_path := mut self.segment_path(seg_num)
                 M self.config.archive_mode {
                     On => {
                         M &self.config.archive_path {
-                            Some(archive_dir) => {
-                                self.archive_segment(seg_num, archive_dir)?;
+                            Some(target_dir) => {
+                                M self.archive_segment(seg_num, target_dir.clone()) {
+                                    Ok(_) => {},
+                                    Err(e) => { R Err(e) },
+                                }
                                 segments_archived += 1
                             },
                             None => {},
@@ -149,16 +157,19 @@ X TruncationManager {
                 # Delete the segment file
                 remove_file(&seg_path)?;
                 segments_deleted += 1
+                remaining_segments -= 1
             }
             k = k + 1
         }
 
         # Find oldest remaining segment
         found_oldest := mut false
+        oldest_remaining = 0
         m := mut 0u64
         LW m < segments.len() {
             seg_num := segments[m]
-            I !found_oldest && seg_num >= safe_segment {
+            remaining_path := mut self.segment_path(seg_num)
+            I path_exists(&remaining_path) && (!found_oldest || seg_num < oldest_remaining) {
                 oldest_remaining = seg_num
                 found_oldest = true
             }
@@ -174,31 +185,42 @@ X TruncationManager {
     }
 
     # Archive a segment file to the archive directory
-    F archive_segment(self, segment_num: u32, archive_dir: &str) -> Result<(), VaisError> {
-        create_dir_all(archive_dir)?;
+    F archive_segment(self, segment_num: u32, archive_dir: str) -> Result<(), VaisError> {
+        M create_dir_all(&archive_dir) {
+            Ok(_) => {},
+            Err(e) => { R Err(e) },
+        }
         src := mut self.segment_path(segment_num)
         filename := mut WalSegmentHeader.segment_filename(segment_num)
-        dst := mut archive_dir.to_string() + "/" + &filename
-        copy_file(&src, &dst)?;
+        dst := mut archive_dir.clone() + "/" + filename
+        M copy_file(&src, &dst) {
+            Ok(_) => {},
+            Err(e) => { R Err(e) },
+        }
         Ok(())
     }
 
     # Find all WAL segment files, sorted by segment number
     F find_all_segments(self) -> Result<Vec<u32>, VaisError> {
-        entries := mut read_dir(&self.wal_dir)?;
         segments := mut Vec.with_capacity(0)
+        next_segment := mut 1u32
+        missing_run := mut 0u32
+        max_missing_run := mut 64u32
 
-        LF entry: &entries {
-            name := mut entry.file_name()
-            I is_wal_segment_filename(&name) {
-                M parse_wal_segment_number(&name) {
-                    Ok(num) => segments.push(num),
-                    Err(_) => {},
-                }
+        # WAL writer creates canonical numbered segment filenames. Probe those
+        # paths directly so truncation keeps the same discovery contract and
+        # still tolerates front gaps left by previous checkpoint truncation.
+        LW missing_run < max_missing_run {
+            path := mut self.segment_path(next_segment)
+            I path_exists(&path) {
+                segments.push(next_segment)
+                missing_run = 0
+            } EL {
+                missing_run += 1
             }
+            next_segment += 1
         }
 
-        segments.sort()
         Ok(segments)
     }
 
@@ -214,7 +236,8 @@ X TruncationManager {
 
     # Build segment file path
     F segment_path(self, segment_num: u32) -> str {
-        self.wal_dir.clone() + "/" + &WalSegmentHeader.segment_filename(segment_num)
+        filename := mut WalSegmentHeader.segment_filename(segment_num)
+        self.wal_dir.clone() + "/" + filename
     }
 }
 

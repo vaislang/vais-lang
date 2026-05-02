@@ -119,7 +119,7 @@ X GroupCommitManager {
             Async => {
                 # Just mark as done without waiting
                 self.writer.clear_txn(txn_id)
-                # guard.drop() # disabled for dev compiler
+                guard.unlock()
                 R Ok(())
             },
             _ => {},
@@ -136,9 +136,9 @@ X GroupCommitManager {
         should_flush := mut (self.pending.len() as u32) >= self.config.max_batch_size
 
         I should_flush {
-            self.do_flush()?;
-            # guard.drop() # disabled for dev compiler
-            R Ok(())
+            flush_result := mut self.do_flush()
+            guard.unlock()
+            R flush_result
         }
 
         # Wait for timeout or another txn to trigger flush
@@ -147,33 +147,35 @@ X GroupCommitManager {
 
         # After wakeup: check if our LSN has been flushed by another thread
         I self.flushed_lsn >= commit_lsn {
-            # waited.drop() # disabled for dev compiler
+            guard.unlock()
             R Ok(())
         }
 
         # Our LSN not yet flushed — we are the flush leader for this batch
-        self.do_flush()?;
+        flush_result := mut self.do_flush()
 
-        # waited.drop() # disabled for dev compiler
-        Ok(())
+        guard.unlock()
+        flush_result
     }
 
     # Periodic flush (called by background timer or batch trigger)
     F periodic_flush(mut self) -> Result<(), VaisError> {
         guard := mut self.lock.lock()
         I !self.pending.len() == 0 {
-            self.do_flush()?;
+            flush_result := mut self.do_flush()
+            guard.unlock()
+            R flush_result
         }
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
         Ok(())
     }
 
     # Force flush all pending records
     F flush(mut self) -> Result<(), VaisError> {
         guard := mut self.lock.lock()
-        self.do_flush()?;
-        # guard.drop() # disabled for dev compiler
-        Ok(())
+        flush_result := mut self.do_flush()
+        guard.unlock()
+        flush_result
     }
 
     # Get the highest durable LSN
@@ -190,11 +192,18 @@ X GroupCommitManager {
     F close(mut self) -> Result<(), VaisError> {
         guard := mut self.lock.lock()
         I !self.pending.len() == 0 {
-            self.do_flush()?;
+            flush_result := mut self.do_flush()
+            M flush_result {
+                Ok(_) => {},
+                Err(e) => {
+                    guard.unlock()
+                    R Err(e)
+                },
+            }
         }
-        self.writer.close()?;
-        # guard.drop() # disabled for dev compiler
-        Ok(())
+        close_result := mut self.writer.close()
+        guard.unlock()
+        close_result
     }
 
     # --- Private helpers ---

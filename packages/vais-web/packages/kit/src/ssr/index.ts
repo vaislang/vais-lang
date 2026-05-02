@@ -20,5 +20,6 @@ export type {
   SsrRenderRequest,
   SsrRenderResponse,
   SsrServiceConfig,
+  SsrServiceHandle,
 } from "./server-bridge.js";
 export { createSsrService } from "./server-bridge.js";

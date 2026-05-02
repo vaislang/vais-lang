@@ -94,20 +94,21 @@ X CheckpointManager {
         mut self,
         writer: &mut WalWriter,
         pool: &mut BufferPool,
+        meta_file: &File,
         active_txn_ids: &[u64],
     ) -> Result<CheckpointResult, VaisError> {
         guard := mut self.lock.lock()
 
         I self.state.in_progress {
-            # guard.drop() # disabled for dev compiler
+            guard.unlock()
             R Err(err_internal("Checkpoint already in progress"))
         }
         self.state.in_progress = true
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
 
         # Step 1: Write CHECKPOINT_BEGIN with active transaction list
         begin_payload := mut CheckpointBeginPayload {
-            active_txns: active_txn_ids.to_vec(),
+            active_txns: copy_checkpoint_txns(active_txn_ids),
         }
         begin_buf := mut ByteBuffer.with_capacity(8 + active_txn_ids.len() * 8)
         begin_payload.serialize(&begin_buf)
@@ -143,19 +144,22 @@ X CheckpointManager {
         # Step 5.5: Mark all buffer pool pages as needing FPI on next modification
         pool.set_all_needs_fpi()
 
-        # Step 6: Update checkpoint state
+        # Step 6: Update durable meta page checkpoint LSN
+        persist_checkpoint_lsn(meta_file, end_lsn)?;
+
+        # Step 7: Update checkpoint state
         guard2 := mut self.lock.lock()
         self.state.last_checkpoint_lsn = end_lsn
         self.state.last_checkpoint_time = time_micros()
         self.state.checkpoint_count += 1
         self.state.in_progress = false
-        # guard2.drop() # disabled for dev compiler
+        guard2.unlock()
 
         Ok(CheckpointResult {
             begin_lsn,
             end_lsn,
             pages_flushed,
-            active_txns: active_txn_ids.to_vec(),
+            active_txns: copy_checkpoint_txns(active_txn_ids),
         })
     }
 
@@ -197,6 +201,18 @@ X CheckpointManager {
     }
 }
 
+F persist_checkpoint_lsn(meta_file: &File, checkpoint_lsn: u64) -> Result<(), VaisError> {
+    probe := mut meta_file.read_at(0, PAGE_SIZE_8K as u64)?;
+    meta := mut MetaPageHeader.read_from_page(&probe)?;
+    meta.set_checkpoint_lsn(checkpoint_lsn)
+
+    page_buf := mut Vec.with_capacity(meta.page_size as u64)
+    page_buf.resize(meta.page_size as u64, 0u8)
+    meta.write_to_page(&page_buf)
+    meta_file.write_at(0, &page_buf[0..page_buf.len()])?;
+    meta_file.fsync()
+}
+
 # Write a Full Page Image (FPI) for a page
 # Called on first modification to a page after each checkpoint
 F write_fpi(
@@ -209,7 +225,7 @@ F write_fpi(
     payload := mut FpiPayload {
         file_id,
         page_id,
-        page_data: page_data.to_vec(),
+        page_data: copy_checkpoint_bytes(page_data),
     }
     buf := mut ByteBuffer.with_capacity(16 + page_data.len())
     payload.serialize(&buf)
@@ -232,8 +248,9 @@ S FpiTracker {
 
 X FpiTracker {
     F new() -> FpiTracker {
+        pages_with_fpi: Vec<FpiPageId> := mut Vec.with_capacity(0)
         FpiTracker {
-            pages_with_fpi: Vec.with_capacity(0),
+            pages_with_fpi,
             lock: Mutex.new(()),
         }
     }
@@ -245,9 +262,11 @@ X FpiTracker {
             fid := mut page_with_fpi.file_id
             pid := mut page_with_fpi.page_id
             I fid == file_id && pid == page_id {
+                guard.unlock()
                 R true
             }
         }
+        guard.unlock()
         false
     }
 
@@ -256,11 +275,33 @@ X FpiTracker {
         guard := mut self.lock.lock()
         entry := mut FpiPageId { file_id: file_id, page_id: page_id }
         self.pages_with_fpi.push(entry)
+        guard.unlock()
     }
 
     # Clear all FPI tracking (called after each checkpoint)
     F reset(mut self) {
         guard := mut self.lock.lock()
         self.pages_with_fpi.clear()
+        guard.unlock()
     }
+}
+
+F copy_checkpoint_txns(txns: &[u64]) -> Vec<u64> {
+    result: Vec<u64> := mut Vec.with_capacity(txns.len())
+    i := mut 0
+    LW i < txns.len() {
+        result.push(txns[i])
+        i += 1
+    }
+    result
+}
+
+F copy_checkpoint_bytes(data: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(data.len())
+    i := mut 0
+    LW i < data.len() {
+        result.push(data[i])
+        i += 1
+    }
+    result
 }

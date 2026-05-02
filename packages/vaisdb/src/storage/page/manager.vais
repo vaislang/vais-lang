@@ -23,15 +23,13 @@ S PageManager {
     file_ios: Vec<BufferedIO>,
     # Per-file mutexes for thread-safe page writes
     file_locks: Vec<Mutex<()>>,
-    # Format migration callback (if set, called on old-version pages)
-    migration_hook: Option<fn(&Vec<u8>, u8) -> Result<(), VaisError>>,
 }
 
 X PageManager {
     # Create a new PageManager with buffered I/O for all files
     F new(files: Vec<File>, page_size: u32) -> PageManager {
-        file_ios := mut Vec.with_capacity(files.len())
-        file_locks := mut Vec.with_capacity(files.len())
+        file_ios: Vec<BufferedIO> := mut Vec.with_capacity(files.len())
+        file_locks: Vec<Mutex<()>> := mut Vec.with_capacity(files.len())
 
         LF file: files {
             file_ios.push(BufferedIO.new(file, page_size))
@@ -43,13 +41,12 @@ X PageManager {
             io_mode: Buffered,
             file_ios,
             file_locks,
-            migration_hook: None,
         }
     }
 
     F clone(&self) -> PageManager {
-        file_ios := mut Vec.with_capacity(self.file_ios.len())
-        file_locks := mut Vec.with_capacity(self.file_locks.len())
+        file_ios: Vec<BufferedIO> := mut Vec.with_capacity(self.file_ios.len())
+        file_locks: Vec<Mutex<()>> := mut Vec.with_capacity(self.file_locks.len())
 
         LF file_io: &self.file_ios {
             file_ios.push(file_io.clone())
@@ -64,7 +61,6 @@ X PageManager {
             io_mode: self.io_mode,
             file_ios,
             file_locks,
-            migration_hook: self.migration_hook,
         }
     }
 
@@ -115,10 +111,9 @@ X PageManager {
         guard := mut lock.lock()
         file_io := mut &self.file_ios[file_id as u64]
         offset := mut (page_id as u64) * (self.page_size as u64)
-        file_io.get_file().write_vec_at(offset, page_data)?;
-        # guard.drop() # disabled for dev compiler
-
-        Ok(())
+        result := mut file_io.get_file().write_vec_at(offset, page_data)
+        guard.unlock()
+        result
     }
 
     # Write a page and fsync (for critical pages like meta, WAL)
@@ -156,10 +151,17 @@ X PageManager {
         guard := mut lock.lock()
         file_io := mut &self.file_ios[file_id as u64]
         offset := mut (page_id as u64) * (self.page_size as u64)
-        file_io.get_file().write_vec_at(offset, &page_data)?;
-        # guard.drop() # disabled for dev compiler
-
-        Ok(page_data)
+        write_result := mut file_io.get_file().write_vec_at(offset, &page_data)
+        M write_result {
+            Ok(_) => {
+                guard.unlock()
+                Ok(page_data)
+            },
+            Err(e) => {
+                guard.unlock()
+                Err(e)
+            },
+        }
     }
 
     # Read multiple contiguous pages (for read-ahead)
@@ -206,9 +208,9 @@ X PageManager {
         lock := mut &self.file_locks[file_id as u64]
         guard := mut lock.lock()
         file_io := mut &self.file_ios[file_id as u64]
-        file_io.extend(additional_pages)?;
-        # guard.drop() # disabled for dev compiler
-        Ok(())
+        result := mut file_io.extend(additional_pages)
+        guard.unlock()
+        result
     }
 
     # Verify checksum of a page already in memory
@@ -223,16 +225,16 @@ X PageManager {
 
     # Set format migration hook
     F set_migration_hook(mut self, hook: fn(&Vec<u8>, u8) -> Result<(), VaisError>) {
-        self.migration_hook = Some(hook)
+        # Migration hook dispatch is not implemented yet; retain the method
+        # contract for callers without storing an unusable fn pointer.
+        unused_hook_marker := mut 0
     }
 
     # Check if a page needs format migration
     F check_migration(mut self, page_data: &Vec<u8>) -> Result<bool, VaisError> {
         header := mut PageHeader.read_from_page(page_data)?;
         I header.format_version < 1 {
-            I self.migration_hook.is_some() {
-                R Err(err_internal("format migration hook dispatch is not yet supported"))
-            }
+            R Err(err_internal("format migration hook dispatch is not yet supported"))
         }
         Ok(false)
     }

@@ -17,6 +17,8 @@ U storage/page/allocator
 U storage/page/freelist
 U vector/hnsw/types
 U vector/hnsw/insert
+U vector/hnsw/search
+U vector/hnsw/wal
 
 # Vector page body header (16 bytes, follows the 48-byte PageHeader)
 # Each vector data page tracks vectors of a single dimension
@@ -25,7 +27,6 @@ S VectorPageHeader {
     dim: u32,               # Vector dimension (all vectors same dim)
     next_free_offset: u16,  # Offset to next free space in page body
     flags: u16,             # Page-specific flags
-    reserved: [u8; 6],      # Reserved for alignment (16 bytes total)
 }
 
 X VectorPageHeader {
@@ -36,7 +37,6 @@ X VectorPageHeader {
             dim,
             next_free_offset: (PAGE_HEADER_SIZE + 16) as u16,  # After page header + vector page header
             flags: 0,
-            reserved: [0u8; 6],
         }
     }
 
@@ -47,7 +47,7 @@ X VectorPageHeader {
         buf.write_u16_le(self.next_free_offset)
         buf.write_u16_le(self.flags)
         LF i: 0..6 {
-            buf.write_u8(self.reserved[i])
+            buf.write_u8(0)
         }
     }
 
@@ -57,16 +57,14 @@ X VectorPageHeader {
         dim := mut read_i32_le_checked(buf)?;
         next_free_offset := mut read_u16_le_checked(buf)?;
         flags := mut read_u16_le_checked(buf)?;
-        reserved := mut [0u8; 6]
         LF i: 0..6 {
-            reserved[i] = read_u8_checked(buf)?;
+            read_u8_checked(buf)?;
         }
         Ok(VectorPageHeader {
             vector_count,
             dim,
             next_free_offset,
             flags,
-            reserved,
         })
     }
 
@@ -118,7 +116,7 @@ X VectorData {
         VectorData {
             mvcc: MvccTupleMeta.new_insert(txn_id, cmd_id),
             data: vector.to_vec(),
-            overflow_ptr: None,
+            overflow_ptr: Option.None,
         }
     }
 
@@ -131,7 +129,7 @@ X VectorData {
     F serialize_inline(self, buf: &mut ByteBuffer) {
         self.mvcc.serialize(buf)
         LF i: 0..self.data.len() {
-            buf.write_f32_le(self.data[i])
+            buf.write_f32_le(f32_bits(self.data[i]))
         }
     }
 
@@ -144,14 +142,14 @@ X VectorData {
     # Deserialize vector data inline
     F deserialize_inline(buf: &ByteBuffer, dim: u32) -> Result<VectorData, VaisError> {
         mvcc := mut MvccTupleMeta.deserialize(buf)?;
-        data := mut Vec.with_capacity(dim as u64)
+        data: Vec<f32> := mut Vec.with_capacity(dim as u64)
         LF i: 0..dim {
             data.push(get_f32_le_checked(buf)? as f32)
         }
         Ok(VectorData {
             mvcc,
             data,
-            overflow_ptr: None,
+            overflow_ptr: Option.None,
         })
     }
 
@@ -197,7 +195,7 @@ X VectorPage {
         header := mut VectorPageHeader.deserialize(&buf)?;
 
         # Read slot directory
-        slots := mut Vec.with_capacity(header.vector_count as u64)
+        slots: Vec<VectorSlot> := mut Vec.with_capacity(header.vector_count as u64)
         LF i: 0..header.vector_count {
             slots.push(VectorSlot.deserialize(&buf)?)
         }
@@ -403,6 +401,164 @@ X VectorStore {
         Ok((page_id, slot_index))
     }
 
+    # Write vector to storage with VECTOR_DATA_WRITE WAL records emitted before
+    # any buffer frame is mutated.
+    F write_vector_with_wal(
+        mut self,
+        vector: &[f32],
+        txn_id: u64,
+        cmd_id: u32,
+        wal_mgr: &mut HnswWalManager
+    ) -> Result<(u32, u16), VaisError> {
+        I vector.len() != self.dim as u64 {
+            R Err(err_vector_dim_mismatch(vector.len() as u32, self.dim))
+        }
+
+        I self.needs_overflow() {
+            R self.write_vector_overflow_with_wal(vector, txn_id, cmd_id, wal_mgr)
+        }
+
+        page_id := mut self.allocator.allocate_page(FILE_ID_VECTORS, self.bitmap)?;
+        vpage := mut VectorPage.new(page_id, self.dim, self.page_size)
+        slot_index := mut vpage.add_vector(vector, txn_id, cmd_id)?;
+        page_buffer := mut vpage.write_to_buffer(0, txn_id)
+
+        wal_mgr.log_vector_data_write(
+            txn_id,
+            FILE_ID_VECTORS,
+            page_id,
+            0 as u16,
+            &page_buffer
+        )?;
+
+        frame_id := mut self.pool.fetch_page(FILE_ID_VECTORS, page_id)?;
+        frame_data := mut self.pool.get_page_mut(frame_id)
+
+        LF j: 0..page_buffer.len() {
+            frame_data[j] = page_buffer[j]
+        }
+
+        self.pool.unpin_page(frame_id, true)
+
+        Ok((page_id, slot_index))
+    }
+
+    # Write vector using overflow pages with WAL emitted before every page image
+    # reaches the buffer pool.
+    F write_vector_overflow_with_wal(
+        mut self,
+        vector: &[f32],
+        txn_id: u64,
+        cmd_id: u32,
+        wal_mgr: &mut HnswWalManager
+    ) -> Result<(u32, u16), VaisError> {
+        buf := mut ByteBuffer.with_capacity(self.vector_byte_size() as u64);
+        vdata := mut VectorData.new(vector, txn_id, cmd_id);
+        vdata.serialize_inline(&buf);
+        serialized := mut buf.to_vec();
+
+        max_per_page := mut max_data_per_page(self.page_size);
+        num_pages := mut (serialized.len() + max_per_page - 1) / max_per_page;
+
+        I num_pages == 0 {
+            R Err(err_internal("Cannot create overflow chain with zero data"));
+        }
+
+        page_ids := mut self.allocator.allocate_bulk(FILE_ID_VECTORS, num_pages as u32, self.bitmap)?;
+
+        I page_ids.len() < num_pages {
+            R Err(err_internal("Could not allocate enough overflow pages"));
+        }
+
+        overflow_page_id := mut page_ids[0];
+
+        LF i: 0..num_pages {
+            start_offset := mut i * max_per_page;
+            end_offset := mut I start_offset + max_per_page < serialized.len() {
+                start_offset + max_per_page
+            } EL {
+                serialized.len()
+            };
+
+            chunk_data: Vec<u8> := mut Vec.with_capacity(end_offset - start_offset);
+            LF j: start_offset..end_offset {
+                chunk_data.push(serialized[j]);
+            }
+
+            page_id := mut page_ids[i];
+            next_page := mut I i + 1 < num_pages {
+                page_ids[i + 1]
+            } EL {
+                NULL_PAGE
+            };
+
+            page_buffer: Vec<u8> := mut Vec.repeat(0u8, self.page_size as u64 as i64);
+            overflow_page := mut OverflowPage.new(chunk_data);
+            overflow_page.write_to_page(&page_buffer, page_id, next_page, 0, txn_id);
+
+            wal_mgr.log_vector_data_write(
+                txn_id,
+                FILE_ID_VECTORS,
+                page_id,
+                0 as u16,
+                &page_buffer
+            )?;
+
+            frame_id := mut self.pool.fetch_page(FILE_ID_VECTORS, page_id)?;
+            frame_data := mut self.pool.get_page_mut(frame_id);
+
+            LF k: 0..page_buffer.len() {
+                frame_data[k] = page_buffer[k];
+            }
+
+            self.pool.unpin_page(frame_id, true);
+        }
+
+        page_id := mut self.allocator.allocate_page(FILE_ID_VECTORS, self.bitmap)?;
+        vpage := mut VectorPage.new(page_id, self.dim, self.page_size);
+
+        overflow_ptr := mut OverflowPointer {
+            overflow_page_id,
+            overflow_total_len: serialized.len() as u32,
+        };
+
+        offset := mut vpage.header.next_free_offset;
+        buf2 := mut ByteBuffer.wrap(&vpage.page_data);
+        buf2.seek(offset as u64);
+
+        mvcc := mut MvccTupleMeta.new_insert(txn_id, cmd_id);
+        mvcc.serialize(&buf2);
+        overflow_ptr.serialize(&buf2);
+
+        slot := mut VectorSlot {
+            offset,
+            length: 65535,
+        };
+        vpage.slots.push(slot);
+        vpage.header.vector_count += 1;
+        vpage.header.next_free_offset += (MVCC_TUPLE_META_SIZE + 8) as u16;
+
+        page_buffer := mut vpage.write_to_buffer(0, txn_id);
+        wal_mgr.log_vector_data_write(
+            txn_id,
+            FILE_ID_VECTORS,
+            page_id,
+            0 as u16,
+            &page_buffer
+        )?;
+
+        frame_id := mut self.pool.fetch_page(FILE_ID_VECTORS, page_id)?;
+        frame_data := mut self.pool.get_page_mut(frame_id);
+
+        LF n: 0..page_buffer.len() {
+            frame_data[n] = page_buffer[n];
+        }
+
+        self.pool.unpin_page(frame_id, true);
+
+        Ok((page_id, 0 as u16))
+    }
+
     # Write vector using overflow pages
     F write_vector_overflow(
         mut self,
@@ -467,7 +623,7 @@ X VectorStore {
 
         self.pool.unpin_page(frame_id, true)
 
-        Ok((page_id, 0))
+        Ok((page_id, 0 as u16))
     }
 
     # Read vector from storage
@@ -479,7 +635,35 @@ X VectorStore {
         # Load vector page
         vpage := mut VectorPage.load(page_id, page_data)?;
 
-        # Read vector
+        I offset >= vpage.slots.len() as u16 {
+            self.pool.unpin_page(frame_id, false)
+            R Err(err_internal("Slot index out of bounds"))
+        }
+
+        slot := mut &vpage.slots[offset as u64]
+        I slot.is_overflow() {
+            overflow_buf := mut ByteBuffer.wrap_readonly(&vpage.page_data[slot.offset as u64..]);
+            MvccTupleMeta.deserialize(&overflow_buf)?;
+            overflow_ptr := mut OverflowPointer.deserialize(&overflow_buf)?;
+            overflow_page_id := mut overflow_ptr.overflow_page_id;
+            overflow_total_len := mut overflow_ptr.overflow_total_len;
+
+            self.pool.unpin_page(frame_id, false);
+
+            serialized := mut read_overflow_data(
+                overflow_page_id,
+                FILE_ID_VECTORS,
+                self.page_size,
+                overflow_total_len,
+                self.pool,
+            )?;
+            serialized_buf := mut ByteBuffer.wrap_readonly(&serialized);
+            vdata := mut VectorData.deserialize_inline(&serialized_buf, self.dim)?;
+
+            R Ok(vdata.data)
+        }
+
+        # Read inline vector
         result := mut vpage.read_vector(offset)?;
 
         self.pool.unpin_page(frame_id, false)
@@ -562,36 +746,47 @@ F err_vector_page_corrupt(page_id: u32) -> VaisError {
 # ============================================================================
 
 S HnswNodeStore {
-    vector_store: &VectorStore,
+    vector_store: VectorStore,
     nodes: HashMap<u64, HnswNode>,        # node_id -> HnswNode (graph structure)
+    vector_cache: HashMap<u64, Vec<f32>>, # node_id -> raw vector for read-only search
     next_node_id: u64,                     # Monotonically increasing ID allocator
 }
 
 X HnswNodeStore {
-    F new(vector_store: &VectorStore) -> HnswNodeStore {
+    F new(
+        dim: u32,
+        pool: &BufferPool,
+        allocator: &PageAllocator,
+        bitmap: &FreelistBitmap,
+    ) -> HnswNodeStore {
         HnswNodeStore {
-            vector_store,
+            vector_store: VectorStore.new(dim, pool, allocator, bitmap),
             nodes: HashMap.with_capacity(16),
+            vector_cache: HashMap.with_capacity(16),
             next_node_id: 1,
         }
+    }
+
+    F cache_vector(mut self, node_id: u64, vector: &[f32]) {
+        self.vector_cache.insert(node_id, vector.to_vec())
     }
 }
 
 # NodeStore trait implementation for HnswNodeStore
 X HnswNodeStore : NodeStore {
     F load_node(self, node_id: u64) -> Result<HnswNode, VaisError> {
-        M self.nodes.get(&node_id) {
-            Some(node) => Ok(node.clone()),
-            None => Err(err_internal("HNSW node not found")),
+        M self.nodes.get_opt(node_id) {
+            Option.Some(node) => Ok(node.clone()),
+            Option.None => Err(err_internal("HNSW node not found")),
         }
     }
 
     F load_vector(self, node_id: u64) -> Result<Vec<f32>, VaisError> {
-        M self.nodes.get(&node_id) {
-            Some(node) => {
+        M self.nodes.get_opt(node_id) {
+            Option.Some(node) => {
                 self.vector_store.read_vector(node.vector_page_id, node.vector_offset)
             },
-            None => Err(err_internal("HNSW node not found for vector load")),
+            Option.None => Err(err_internal("HNSW node not found for vector load")),
         }
     }
 
@@ -607,9 +802,9 @@ X HnswNodeStore : NodeStore {
     }
 
     F get_file_page(self, node_id: u64) -> Result<(u8, u32), VaisError> {
-        M self.nodes.get(&node_id) {
-            Some(node) => Ok((FILE_ID_VECTORS, node.vector_page_id)),
-            None => Err(err_internal("HNSW node not found for page lookup")),
+        M self.nodes.get_opt(node_id) {
+            Option.Some(node) => Ok((FILE_ID_VECTORS, node.vector_page_id)),
+            Option.None => Err(err_internal("HNSW node not found for page lookup")),
         }
     }
 
@@ -618,5 +813,21 @@ X HnswNodeStore : NodeStore {
             FILE_ID_VECTORS, self.vector_store.bitmap
         )?;
         Ok((FILE_ID_VECTORS, page_id))
+    }
+}
+
+X HnswNodeStore : NodeLookup {
+    F get_node(self, node_id: u64) -> Result<&HnswNode, VaisError> {
+        M self.nodes.get_opt(node_id) {
+            Option.Some(node) => Ok(node),
+            Option.None => Err(err_internal("HNSW node not found")),
+        }
+    }
+
+    F get_vector(self, node_id: u64) -> Result<&[f32], VaisError> {
+        M self.vector_cache.get_opt(node_id) {
+            Option.Some(vector) => Ok(vector),
+            Option.None => Err(err_internal("HNSW vector not cached for search")),
+        }
     }
 }

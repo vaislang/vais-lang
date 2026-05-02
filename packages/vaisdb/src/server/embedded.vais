@@ -12,7 +12,10 @@ U std/vec
 U std/string
 U std/option
 U std/result
+U storage/constants
 U storage/error
+U storage/file
+U storage/page/database
 
 # Configuration for embedded database instance
 S EmbeddedConfig {
@@ -36,31 +39,31 @@ X EmbeddedConfig {
     }
 
     # Builder: set data directory
-    F with_data_dir(mut self, dir: str) -> Self {
+    F with_data_dir(mut self, dir: str) -> EmbeddedConfig {
         self.data_dir = dir
         self
     }
 
     # Builder: set page size (must be called before database creation)
-    F with_page_size(mut self, size: u32) -> Self {
+    F with_page_size(mut self, size: u32) -> EmbeddedConfig {
         self.page_size = size
         self
     }
 
     # Builder: set memory budget (0 = auto)
-    F with_memory_budget(mut self, budget: u64) -> Self {
+    F with_memory_budget(mut self, budget: u64) -> EmbeddedConfig {
         self.memory_budget = budget
         self
     }
 
     # Builder: set WAL sync mode
-    F with_wal_sync_mode(mut self, mode: str) -> Self {
+    F with_wal_sync_mode(mut self, mode: str) -> EmbeddedConfig {
         self.wal_sync_mode = mode
         self
     }
 
     # Builder: set query timeout
-    F with_query_timeout(mut self, timeout_sec: u32) -> Self {
+    F with_query_timeout(mut self, timeout_sec: u32) -> EmbeddedConfig {
         self.query_timeout_sec = timeout_sec
         self
     }
@@ -191,23 +194,35 @@ S EmbeddedDatabase {
     data_dir: str,           # Directory containing .vaisdb files
     is_open: bool,           # Connection state
     config: EmbeddedConfig,  # Configuration
+    database: Database,      # Durable storage handle
 }
 
 X EmbeddedDatabase {
     # Open or create an embedded database
-    # FUTURE(std/file): Implement actual file I/O, directory creation, file locking, storage init
     F open(config: EmbeddedConfig) -> Result<EmbeddedDatabase, VaisError> {
         # Validate configuration
         config.validate()?;
 
-        # Placeholder: set state without actual file operations
-        db := mut EmbeddedDatabase {
-            data_dir: config.data_dir.clone(),
-            is_open: true,
-            config,
+        data_dir := mut config.data_dir.clone()
+        data_file_path := mut data_dir.clone() + "/" + FILE_NAME_DATA
+
+        I path_exists(&data_file_path) {
+            database := mut Database.open(data_dir.clone())?;
+            R Ok(EmbeddedDatabase {
+                data_dir,
+                is_open: true,
+                config,
+                database,
+            })
         }
 
-        R Ok(db)
+        database := mut Database.create(data_dir.clone(), config.page_size)?;
+        Ok(EmbeddedDatabase {
+            data_dir,
+            is_open: true,
+            config,
+            database,
+        })
     }
 
     # Close the database
@@ -216,7 +231,7 @@ X EmbeddedDatabase {
             R Err(err_embedded_not_open())
         }
 
-        # FUTURE(std/file): Flush buffer pool, checkpoint WAL, release file lock, close handles
+        self.database.close()?;
         self.is_open = false
         R Ok(())
     }

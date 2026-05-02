@@ -195,7 +195,7 @@ X FullTextEngine {
         }
 
         # Acquire write lock
-        _guard := mut self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock(txn_id)?;
 
         # Tokenize text
         term_freqs := mut self.tokenizer.tokenize_with_freqs(text)
@@ -288,7 +288,7 @@ X FullTextEngine {
         }
 
         # Acquire write lock
-        _guard := mut self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock(txn_id)?;
 
         # Iterate all dictionary entries and expire postings for this doc_id
         dict_entries := mut self.dict_index.scan_all_terms(self.pool)?;
@@ -366,11 +366,10 @@ X FullTextEngine {
         # Create and execute M executor
         executor := mut FullTextMatchExecutor.new(0, query_text.clone(), top_k)
         executor.execute_search(
-            &self.tokenizer,
+            &self.meta,
+            &self.config,
             &self.dict_index,
             &self.posting_store,
-            &self.bm25_scorer,
-            &self.doc_freq_tracker,
             snapshot,
             clog,
             self.pool,
@@ -437,12 +436,15 @@ X FullTextEngine {
         }
 
         # Execute phrase search
-        searcher := mut PhraseSearcher.new(0)
+        searcher := mut PhraseSearcher.new()
         results := mut searcher.search_phrase(
             &terms,
             &posting_entries_per_term,
             snapshot,
             clog,
+            0u32,
+            self.meta.avg_doc_length,
+            self.meta.total_docs,
         )
 
         # Limit to top_k
@@ -600,13 +602,12 @@ X FullTextEngine {
             R Err(err_fulltext_engine_closed())
         }
 
-        _guard := mut self.lock.write_lock()?;
+        _guard := mut self.lock.write_lock(low_water_mark)?;
 
         compactor := mut PostingListCompactor.new(
             self.config.page_size,
             self.pool,
             self.allocator,
-            self.gcm,
             100,  # max_pages_per_second
         )
 
@@ -620,7 +621,7 @@ X FullTextEngine {
             i += 1
         }
 
-        stats := mut compactor.compact_all(&term_pages, low_water_mark)?;
+        stats := mut compactor.compact_all(&term_pages, low_water_mark, &self.posting_store, self.gcm)?;
 
         Ok(stats)
     }
@@ -646,7 +647,7 @@ X FullTextEngine {
 
     ## Get concurrency stats
     F concurrency_stats(self) -> ConcurrencyStats {
-        self.lock.get_stats()
+        ConcurrencyStats.new()
     }
 
     ## Check if engine is open

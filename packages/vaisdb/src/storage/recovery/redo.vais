@@ -20,6 +20,7 @@ U storage/constants
 U storage/wal/header
 U storage/wal/record_types
 U storage/wal/record_rel
+U storage/wal/record_vector
 U storage/page/heap
 U storage/btree/entry
 U storage/page/tuple
@@ -67,6 +68,7 @@ S RedoDirtyPageEntry {
 # Analysis phase result
 S AnalysisResult {
     txn_table: HashMap<u64, RecoveryTxnEntry>,  # Active Transaction Table
+    txn_entries: Vec<RecoveryTxnEntry>,         # Iteration-safe final txn summary
     dirty_pages: Vec<RedoDirtyPageEntry>,            # Dirty page table
     redo_start_lsn: u64,                         # LSN to start redo from
 }
@@ -89,7 +91,9 @@ X WalRecordIterator {
         }
         offset := mut WAL_SEGMENT_HEADER_SIZE
         I start_lsn != NULL_LSN {
-            offset = lsn_offset(start_lsn)
+            # LSN offsets are logical record offsets inside the segment payload.
+            # Segment files also have a fixed WAL segment header at the front.
+            offset = WAL_SEGMENT_HEADER_SIZE + lsn_offset(start_lsn)
         }
 
         iter := mut WalRecordIterator {
@@ -127,7 +131,7 @@ X WalRecordIterator {
 
             # Check if we're past the end of records in this segment
             seg_end := mut M &self.segment_header {
-                Some(h) => lsn_offset(h.last_lsn) + WAL_RECORD_HEADER_SIZE,  # Approximate
+                Some(h) => WAL_SEGMENT_HEADER_SIZE + lsn_offset(h.last_lsn) + WAL_RECORD_HEADER_SIZE,
                 None => 0u32,
             }
 
@@ -196,9 +200,10 @@ X WalRecordIterator {
 
     # Open a specific WAL segment
     F open_segment(mut self, segment_num: u32) -> Result<bool, VaisError> {
-        path := mut self.wal_dir.clone() + "/" + &WalSegmentHeader.segment_filename(segment_num)
+        filename := mut WalSegmentHeader.segment_filename(segment_num)
+        path := mut self.wal_dir.clone() + "/" + filename
 
-        M File.open(&path, "r") {
+        M File.open(path, "r") {
             Ok(file) => {
                 # Read segment header
                 header_buf := mut Vec.with_capacity(WAL_SEGMENT_HEADER_SIZE as u64)
@@ -222,11 +227,29 @@ X WalRecordIterator {
 
 # Phase 1: ANALYSIS
 # Scan WAL from last checkpoint forward to rebuild ATT and dirty page table
+F recovery_upsert_txn_entry(entries: &mut Vec<RecoveryTxnEntry>, entry: RecoveryTxnEntry) {
+    idx := mut 0u64
+    found := mut false
+    LW idx < entries.len() {
+        current := mut entries[idx]
+        I current.txn_id == entry.txn_id {
+            entries[idx] = entry
+            found = true
+        }
+        idx = idx + 1
+    }
+
+    I !found {
+        entries.push(entry)
+    }
+}
+
 F recovery_analysis(
     wal_dir: &str,
     checkpoint_lsn: u64,
 ) -> Result<AnalysisResult, VaisError> {
     txn_table := mut HashMap.with_capacity(16)
+    txn_entries: Vec<RecoveryTxnEntry> := mut Vec.with_capacity(0)
     dirty_pages: Vec<RedoDirtyPageEntry> := mut Vec.with_capacity(0)
     redo_start_lsn := mut checkpoint_lsn
 
@@ -245,33 +268,48 @@ F recovery_analysis(
         M header.record_type {
             TXN_BEGIN => {
                 # New transaction found
-                txn_table.insert(txn_id, RecoveryTxnEntry.new(txn_id, header.lsn))
+                entry := mut RecoveryTxnEntry.new(txn_id, header.lsn)
+                _ := txn_table.insert(txn_id, entry)
+                recovery_upsert_txn_entry(&mut txn_entries, entry)
+                0
             },
             TXN_COMMIT => {
                 # Mark transaction as committed
-                M txn_table.get(&txn_id) {
+                M txn_table.get_opt(txn_id) {
                     Some(entry) => {
-                        entry.state = Committed
-                        entry.last_lsn = header.lsn
+                        updated := mut entry
+                        updated.state = Committed
+                        updated.last_lsn = header.lsn
+                        _ := txn_table.insert(txn_id, updated)
+                        recovery_upsert_txn_entry(&mut txn_entries, updated)
+                        0
                     },
                     None => {
                         # Transaction started before checkpoint
                         entry := mut RecoveryTxnEntry.new(txn_id, header.lsn)
                         entry.state = Committed
-                        txn_table.insert(txn_id, entry)
+                        _ := txn_table.insert(txn_id, entry)
+                        recovery_upsert_txn_entry(&mut txn_entries, entry)
+                        0
                     },
                 }
             },
             TXN_ABORT => {
-                M txn_table.get(&txn_id) {
+                M txn_table.get_opt(txn_id) {
                     Some(entry) => {
-                        entry.state = Aborted
-                        entry.last_lsn = header.lsn
+                        updated := mut entry
+                        updated.state = Aborted
+                        updated.last_lsn = header.lsn
+                        _ := txn_table.insert(txn_id, updated)
+                        recovery_upsert_txn_entry(&mut txn_entries, updated)
+                        0
                     },
                     None => {
                         entry := mut RecoveryTxnEntry.new(txn_id, header.lsn)
                         entry.state = Aborted
-                        txn_table.insert(txn_id, entry)
+                        _ := txn_table.insert(txn_id, entry)
+                        recovery_upsert_txn_entry(&mut txn_entries, entry)
+                        0
                     },
                 }
             },
@@ -280,43 +318,59 @@ F recovery_analysis(
                 buf := mut ByteBuffer.wrap_readonly(&payload)
                 cp_payload := mut CheckpointBeginPayload.deserialize(&buf)?;
                 LF active_txn: &cp_payload.active_txns {
-                    I !txn_table.contains_key(active_txn) {
-                        txn_table.insert(*active_txn, RecoveryTxnEntry.new(*active_txn, header.lsn))
+                    I !txn_table.contains_key(*active_txn) {
+                        entry := mut RecoveryTxnEntry.new(*active_txn, header.lsn)
+                        _ := txn_table.insert(*active_txn, entry)
+                        recovery_upsert_txn_entry(&mut txn_entries, entry)
                     }
                 }
+                0
             },
             CHECKPOINT_END => {
                 # Update redo start to after this checkpoint
                 redo_start_lsn = header.lsn
+                0
             },
             CLR => {
                 # CLR - update undo_next_lsn for this transaction
                 buf := mut ByteBuffer.wrap_readonly(&payload)
                 clr_payload := mut ClrPayload.deserialize(&buf)?;
-                M txn_table.get(&txn_id) {
+                M txn_table.get_opt(txn_id) {
                     Some(entry) => {
-                        entry.last_lsn = header.lsn
-                        entry.undo_next_lsn = clr_payload.undo_next_lsn
+                        updated := mut entry
+                        updated.last_lsn = header.lsn
+                        updated.undo_next_lsn = clr_payload.undo_next_lsn
+                        _ := txn_table.insert(txn_id, updated)
+                        recovery_upsert_txn_entry(&mut txn_entries, updated)
+                        0
                     },
-                    None => {},
+                    None => 0,
                 }
             },
             _ => {
                 # All other record types: update transaction's last_lsn
                 # and track dirty pages
-                M txn_table.get(&txn_id) {
+                M txn_table.get_opt(txn_id) {
                     Some(entry) => {
-                        entry.last_lsn = header.lsn
+                        updated := mut entry
+                        updated.last_lsn = header.lsn
+                        _ := txn_table.insert(txn_id, updated)
+                        recovery_upsert_txn_entry(&mut txn_entries, updated)
+                        0
                     },
                     None => {
                         I txn_id != 0 {
-                            txn_table.insert(txn_id, RecoveryTxnEntry.new(txn_id, header.lsn))
+                            entry := mut RecoveryTxnEntry.new(txn_id, header.lsn)
+                            _ := txn_table.insert(txn_id, entry)
+                            recovery_upsert_txn_entry(&mut txn_entries, entry)
                         }
+                        0
                     },
                 }
 
                 # Track dirty pages for records that modify pages
                 track_dirty_page(&header, &payload, &mut dirty_pages)
+                0
             },
         }
             }, # end Some(record)
@@ -325,6 +379,7 @@ F recovery_analysis(
 
     Ok(AnalysisResult {
         txn_table,
+        txn_entries,
         dirty_pages,
         redo_start_lsn,
     })
@@ -470,7 +525,18 @@ F redo_fpi(
     lsn: u64,
 ) -> Result<(), VaisError> {
     frame := mut pool.fetch_page(fpi.file_id, fpi.page_id)?;
-    pool.write_page(frame)?;
+    page_data := mut pool.get_page_mut(frame)
+    I fpi.page_data.len() != page_data.len() {
+        pool.unpin_page(frame, false)
+        R Err(err_internal("FPI redo payload size does not match page size"))
+    }
+
+    i := mut 0u64
+    LW i < fpi.page_data.len() {
+        page_data[i] = fpi.page_data[i]
+        i = i + 1
+    }
+    set_page_lsn(page_data, lsn)
     pool.unpin_page(frame, true)
     Ok(())
 }
@@ -723,7 +789,7 @@ F btree_page_delete_key(page_data: &mut [u8], key: &[u8]) -> Result<(), VaisErro
         existing_key_off := mut read_u32_le(page_data, entry_off)
         existing_key_len := mut read_u32_le(page_data, entry_off + 4)
         existing_key := mut &page_data[existing_key_off as u64..(existing_key_off + existing_key_len) as u64]
-        I key == existing_key && found_pos == -1 {
+        I key_equal(key, existing_key) && found_pos == -1 {
             found_pos = i as i32
         }
     }
@@ -879,15 +945,35 @@ F redo_vector_record(
     header: &WalRecordHeader,
     payload: &[u8],
 ) -> Result<(), VaisError> {
+    I header.record_type == VECTOR_DATA_WRITE {
+        buf := mut ByteBuffer.wrap_readonly(payload)
+        p := mut VectorDataWritePayload.deserialize(&buf)?;
+        frame := mut pool.fetch_page(p.file_id, p.page_id)?;
+        page_data := mut pool.get_page_mut(frame)
+        end_offset := mut (p.offset as u64) + p.vector_data.len()
+        I end_offset > page_data.len() as u64 {
+            pool.unpin_page(frame, false)
+            R Err(err_internal("VECTOR_DATA_WRITE redo payload exceeds page bounds"))
+        }
+
+        i := mut 0u64
+        LW i < p.vector_data.len() {
+            page_data[(p.offset as u64) + i] = p.vector_data[i]
+            i = i + 1
+        }
+        set_page_lsn(page_data, header.lsn)
+        pool.unpin_page(frame, true)
+        R Ok(())
+    }
+
     # All vector records follow the common layout: file_id(1) + page_id(4) + ...
     # The engine-specific redo dispatchers (vector/hnsw/wal.vais dispatch_vector_redo)
     # handle logical redo with NodeStore. During crash recovery, we rely on
     # page-level redo: the page was modified by the original operation and the
     # WAL record + page_lsn check in needs_redo() ensures idempotency.
     #
-    # For VECTOR_DATA_WRITE: apply raw data to page at offset
-    # For HNSW_* records: these modify node pages; the page image is restored
-    # by replaying the stored payload onto the page.
+    # For HNSW_* records, this generic recovery path only marks the affected
+    # page LSN. Exact logical replay remains in the vector/HNSW redo handlers.
     I payload.len() >= 5 {
         buf := mut ByteBuffer.wrap_readonly(payload)
         file_id := mut read_u8_checked(buf)?;
@@ -896,31 +982,6 @@ F redo_vector_record(
         # Fetch page and update its LSN to mark redo was applied
         frame := mut pool.fetch_page(file_id, page_id)?;
         page_data := mut pool.get_page_mut(frame)
-
-        # For VECTOR_DATA_WRITE, apply the data at the offset
-        # For other types, the page-level changes are already captured
-        # by the WAL-first write pattern + FPI (if first modification after checkpoint)
-        M header.record_type {
-            36 => {
-                # VECTOR_DATA_WRITE: payload is file_id + page_id + offset(u32) + data
-                I payload.len() > 9 {
-                    offset := mut read_i32_le_checked(buf)?;
-                    data_start := mut 9
-                    LF i: data_start..payload.len() as u64 {
-                        I (offset as u64) + (i - data_start) < page_data.len() as u64 {
-                            page_data[(offset as u64) + (i - data_start)] = payload[i]
-                        }
-                    }
-                }
-            },
-            _ => {
-                # For HNSW node/edge records: the page was modified in-place.
-                # page_lsn check already filtered records that don't need redo.
-                # The payload contains logical info (node_id, neighbors, etc.)
-                # that was applied to the page during original execution.
-                # During recovery without FPI, we trust the page_lsn check.
-            },
-        }
 
         set_page_lsn(page_data, header.lsn)
         pool.unpin_page(frame, true)

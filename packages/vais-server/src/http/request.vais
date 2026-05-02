@@ -34,11 +34,14 @@ X Request {
         }
     }
 
-    # Parse query string from raw_url and populate query_params
-    # Expects raw_url of the form "/path?key=value&key2=value2"
+    # Parse query string from raw_url/path into path + query_params.
     F parse_query_string(mut self) -> Request {
-        qs := request_extract_query_string(self.raw_url)
-        self.query_params = parse_kv_pairs(qs, 38)
+        qpos := str_find_char_or_len(self.raw_url, 63, 0)  # '?'
+        I qpos < self.raw_url.len() {
+            self.path = self.raw_url.substring(0, qpos)
+            query := self.raw_url.substring(qpos + 1, self.raw_url.len())
+            self.query_params = parse_kv_pairs(query, 38)  # '&'
+        }
         self
     }
 
@@ -72,70 +75,36 @@ X Request {
     }
 }
 
-# Extract the query string portion of a URL (after '?')
-F request_extract_query_string(url: str) -> str {
-    req_find_query_start(url, 0)
-}
-
-F req_find_query_start(url: str, i: i64) -> str {
-    c := str_char_at(url, i)
-    I c == 0 { "" }
-    EL I c == 63 {
-        # 63 = '?'
-        str_slice(url, i + 1, str_len(url))
-    }
-    EL { req_find_query_start(url, i + 1) }
-}
-
 # Parse a query/form-encoded string into a Vec<KVPair>
 # separator: ASCII code of the pair separator (38 = '&')
 F parse_kv_pairs(s: str, separator: i64) -> Vec<KVPair> {
-    pairs := Vec.with_capacity(8)
-    I s == "" {
-        R pairs
-    }
-    parse_kv_pairs_rec(s, separator, 0, 0, pairs)
+    pairs := mut Vec.with_capacity(8)
+    parse_kv_pairs_rec(s, separator, 0, pairs)
 }
 
-F parse_kv_pairs_rec(s: str, sep: i64, start: i64, i: i64, pairs: Vec<KVPair>) -> Vec<KVPair> {
-    c := str_char_at(s, i)
-    I c == 0 {
-        # End of string — flush the last segment
-        segment := str_slice(s, start, i)
-        I segment != "" {
-            pair := parse_single_kv(segment)
-            pairs.push(pair)
-        }
-        pairs
-    } EL I c == sep {
-        segment := str_slice(s, start, i)
-        I segment != "" {
-            pair := parse_single_kv(segment)
-            pairs.push(pair)
-        }
-        parse_kv_pairs_rec(s, sep, i + 1, i + 1, pairs)
-    } EL {
-        parse_kv_pairs_rec(s, sep, start, i + 1, pairs)
+F parse_kv_pairs_rec(s: str, separator: i64, start: i64, pairs: Vec<KVPair>) -> Vec<KVPair> {
+    I start >= s.len() { R pairs }
+
+    end := str_find_char_or_len(s, separator, start)
+    I end > start {
+        pairs.push(parse_single_kv(s.substring(start, end)))
     }
+
+    I end >= s.len() { R pairs }
+    parse_kv_pairs_rec(s, separator, end + 1, pairs)
 }
 
 # Parse "key=value" into a KVPair
 F parse_single_kv(segment: str) -> KVPair {
-    eq := req_find_eq(segment, 0)
-    I eq < 0 {
-        KVPair { key: segment, value: "" }
+    eq := str_find_char_or_len(segment, 61, 0)  # '='
+    I eq < segment.len() {
+        KVPair {
+            key: segment.substring(0, eq),
+            value: segment.substring(eq + 1, segment.len()),
+        }
     } EL {
-        k := str_slice(segment, 0, eq)
-        v := str_slice(segment, eq + 1, str_len(segment))
-        KVPair { key: k, value: v }
+        KVPair { key: segment, value: "" }
     }
-}
-
-F req_find_eq(s: str, i: i64) -> i64 {
-    c := str_char_at(s, i)
-    I c == 0 { 0 - 1 }
-    EL I c == 61 { i }
-    EL { req_find_eq(s, i + 1) }
 }
 
 # Look up a key in a Vec<KVPair>; returns value or empty string
@@ -158,7 +127,7 @@ F str_contains_substr(a: str, b: str) -> i64 {
 }
 
 F str_contains_substr_rec(a: str, b: str, i: i64) -> i64 {
-    ca := str_char_at(a, i)
+    ca := a.char_at(i)
     I ca == 0 { 0 }
     EL {
         I str_match_prefix(a, i, b, 0) == 1 { 1 }
@@ -167,130 +136,128 @@ F str_contains_substr_rec(a: str, b: str, i: i64) -> i64 {
 }
 
 F str_match_prefix(a: str, ai: i64, b: str, bi: i64) -> i64 {
-    cb := str_char_at(b, bi)
+    cb := b.char_at(bi)
     I cb == 0 { 1 }
     EL {
-        ca := str_char_at(a, ai)
+        ca := a.char_at(ai)
         I ca != cb { 0 }
         EL { str_match_prefix(a, ai + 1, b, bi + 1) }
     }
 }
 
-# Parse a flat JSON body string into a Vec<KVPair>
-# Expects the form: {"key":"value","key2":"value2"}
-# Returns empty Vec on empty input
+F str_find_char_or_len(s: str, ch: i64, start: i64) -> i64 {
+    c := s.char_at(start)
+    I c == 0 { R s.len() }
+    I c == ch { R start }
+    str_find_char_or_len(s, ch, start + 1)
+}
+
 F parse_json_body(body: str) -> Vec<KVPair> {
-    pairs := Vec.with_capacity(8)
-    I body == "" {
-        R pairs
-    }
-    # Find the opening '{' and start scanning for key-value pairs
-    len := str_len(body)
-    I len < 2 {
-        R pairs
-    }
-    # Skip the leading '{' at index 0 and start from 1
-    parse_json_pairs(body, len, 1, pairs)
+    start := request_skip_ws(body, 0)
+    I body.char_at(start) != 123 { R Vec.with_capacity(0) }  # '{'
+    parse_json_pairs_rec(body, start + 1, Vec.with_capacity(8))
 }
 
-# Recursive driver: advance to the next '"' that starts a key
-F parse_json_pairs(s: str, len: i64, i: i64, pairs: Vec<KVPair>) -> Vec<KVPair> {
-    I i >= len {
-        R pairs
-    }
-    c := str_char_at(s, i)
-    # 34 = '"' — start of a key
-    I c == 34 {
-        key_start := i + 1
-        key_end := json_find_closing_quote(s, len, key_start)
-        I key_end < 0 {
-            R pairs
-        }
-        key := str_slice(s, key_start, key_end)
-        # After the closing quote of the key, find ':' (58)
-        colon := json_find_char(s, len, key_end + 1, 58)
-        I colon < 0 {
-            R pairs
-        }
-        # After ':', find '"' that opens the value
-        val_quote := json_find_char(s, len, colon + 1, 34)
-        I val_quote < 0 {
-            R pairs
-        }
-        val_start := val_quote + 1
-        val_end := json_find_closing_quote(s, len, val_start)
-        I val_end < 0 {
-            R pairs
-        }
-        val := str_slice(s, val_start, val_end)
-        pair := KVPair { key: key, value: val }
-        pairs.push(pair)
-        # Continue scanning after the closing '"' of the value
-        parse_json_pairs(s, len, val_end + 1, pairs)
-    } EL {
-        parse_json_pairs(s, len, i + 1, pairs)
-    }
-}
-
-# Find the closing '"' of a JSON string, starting at position i
-# Returns the index of the closing '"', or -1 if not found
-F json_find_closing_quote(s: str, len: i64, i: i64) -> i64 {
-    I i >= len {
-        0 - 1
-    } EL {
-        c := str_char_at(s, i)
-        # 34 = '"', 92 = '\' (escape)
-        I c == 0 {
-            0 - 1
-        } EL I c == 92 {
-            # Skip the escaped character
-            json_find_closing_quote(s, len, i + 2)
-        } EL I c == 34 {
-            i
-        } EL {
-            json_find_closing_quote(s, len, i + 1)
-        }
-    }
-}
-
-# Find the first occurrence of character code target starting at index i
-# Returns the index, or -1 if not found
-F json_find_char(s: str, len: i64, i: i64, target: i64) -> i64 {
-    I i >= len {
-        0 - 1
-    } EL {
-        c := str_char_at(s, i)
-        I c == 0 {
-            0 - 1
-        } EL I c == target {
-            i
-        } EL {
-            json_find_char(s, len, i + 1, target)
-        }
-    }
-}
-
-# Parse an application/x-www-form-urlencoded body into a Vec<KVPair>
-# Delegates to the existing parse_kv_pairs() with '&' (38) as separator
 F parse_form_body(body: str) -> Vec<KVPair> {
-    parse_kv_pairs(body, 38)
+    parse_kv_pairs(body, 38)  # '&'
 }
 
 # Route body parsing based on Content-Type
 # Returns Ok(Vec<KVPair>) on success, Err(str) on unsupported or malformed input
 F parse_body(content_type: str, body: str) -> Result<Vec<KVPair>, str> {
     I str_contains_substr(content_type, "application/json") {
-        pairs := parse_json_body(body)
-        Ok(pairs)
+        I request_body_is_json_object(body) == 0 {
+            Err("malformed json body")
+        } EL {
+            Ok(parse_json_body(body))
+        }
     } EL I str_contains_substr(content_type, "application/x-www-form-urlencoded") {
-        pairs := parse_form_body(body)
-        Ok(pairs)
+        Ok(parse_form_body(body))
     } EL {
         Err("unsupported content-type")
     }
 }
 
-# External string helpers
-X F str_char_at(s: str, i: i64) -> i64
-X F str_len(s: str) -> i64
-X F str_slice(s: str, start: i64, end: i64) -> str
+F request_body_is_json_object(body: str) -> i64 {
+    start := request_skip_ws(body, 0)
+    I body.char_at(start) == 123 { 1 } EL { 0 }  # '{'
+}
+
+F parse_json_pairs_rec(s: str, i: i64, pairs: Vec<KVPair>) -> Vec<KVPair> {
+    pos := request_skip_ws(s, i)
+    c := s.char_at(pos)
+    I c == 0 { R pairs }
+    I c == 125 { R pairs }  # '}'
+    I c != 34 { R pairs }   # '"'
+
+    key_end := request_json_string_end(s, pos + 1)
+    I key_end >= s.len() { R pairs }
+    key := s.substring(pos + 1, key_end)
+
+    colon := request_skip_ws(s, key_end + 1)
+    I s.char_at(colon) != 58 { R pairs }  # ':'
+
+    value_start := request_skip_ws(s, colon + 1)
+    value_end := request_json_value_end(s, value_start)
+    I value_end <= value_start { R pairs }
+    value := request_json_value_slice(s, value_start, value_end)
+    pairs.push(KVPair { key: key, value: value })
+
+    after := request_skip_ws(s, value_end)
+    I s.char_at(after) == 44 { R parse_json_pairs_rec(s, after + 1, pairs) }  # ','
+    pairs
+}
+
+F request_json_string_end(s: str, i: i64) -> i64 {
+    c := s.char_at(i)
+    I c == 0 { R s.len() }
+    I c == 92 { R request_json_string_end(s, i + 2) }  # '\'
+    I c == 34 { R i }                                  # '"'
+    request_json_string_end(s, i + 1)
+}
+
+F request_json_value_end(s: str, start: i64) -> i64 {
+    c := s.char_at(start)
+    I c == 34 {
+        end := request_json_string_end(s, start + 1)
+        I end >= s.len() { R start }
+        R end + 1
+    }
+    request_json_bare_value_end(s, start)
+}
+
+F request_json_bare_value_end(s: str, i: i64) -> i64 {
+    c := s.char_at(i)
+    I c == 0 { R i }
+    I c == 44 { R i }   # ','
+    I c == 125 { R i }  # '}'
+    request_json_bare_value_end(s, i + 1)
+}
+
+F request_json_value_slice(s: str, start: i64, end: i64) -> str {
+    I s.char_at(start) == 34 {
+        s.substring(start + 1, end - 1)
+    } EL {
+        trimmed_end := request_trim_right_ws(s, start, end)
+        s.substring(start, trimmed_end)
+    }
+}
+
+F request_skip_ws(s: str, i: i64) -> i64 {
+    c := s.char_at(i)
+    I c == 32 || c == 9 || c == 10 || c == 13 {
+        request_skip_ws(s, i + 1)
+    } EL {
+        i
+    }
+}
+
+F request_trim_right_ws(s: str, start: i64, end: i64) -> i64 {
+    I end <= start { R start }
+    c := s.char_at(end - 1)
+    I c == 32 || c == 9 || c == 10 || c == 13 {
+        request_trim_right_ws(s, start, end - 1)
+    } EL {
+        end
+    }
+}
