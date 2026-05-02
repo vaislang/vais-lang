@@ -11,7 +11,7 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=16/16` in
+- `WEB RUNTIME smoke=17/17` in
   `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
@@ -24,7 +24,8 @@ Current promoted surface:
   `packages/kit/__tests__/e2e/vais-web-platform-output-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-production-bundle-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts` and
-  `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts`.
+  `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts` and
+  `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts`.
 - The runtime bridge implementation is
   `packages/kit/src/ssr/server-bridge.ts`.
 
@@ -84,14 +85,25 @@ The current gate also verifies bounded cloud/static browser runtime paths:
 - cross-browser state restoration, hydration event detail, mount metadata,
   marker cleanup, click handling, and no browser console/page errors.
 
+The current gate also verifies a bounded SSR/data-loading production app path:
+
+- a temporary real `app/products/[sku]/page.vaisx` route with `load()` is
+  discovered by `buildRouteTree()` and preserved in the route manifest;
+- prerender skips the SSR data route instead of emitting stale static HTML;
+- local SSR rendering executes `load()` with route params, query data, and
+  cookie context, then serializes the resulting state into the HTML shell;
+- `/__data.json` refreshes the same route through the data endpoint and
+  observes the cookie written by the SSR response;
+- a minified code-split production bundle hydrates the SSR marker in
+  Playwright Chromium, loads its dynamic chunk, handles clicks, and produces no
+  browser console/page errors.
+
 ## Not Certified Yet
 
 These are not product-complete claims:
 
-- a compiled `vais-server` binary forwarding requests into the SSR bridge;
 - production browser/device hydration runtime beyond the promoted local
   Chromium/Firefox/WebKit smoke;
-- SSR/data-loading production application runtime;
 - full dynamic production application runtime;
 - live deployed platform runtime;
 - JS/WASM compiler integration beyond the existing package tests.
@@ -101,7 +113,7 @@ These are not product-complete claims:
 Promote exactly one bounded runtime gate at a time:
 
 1. A live deployed adapter smoke for the next selected target platform.
-2. A production SSR/data-loading app smoke.
+2. Another bounded product surface selected from the root roadmap.
 
 Keep downstream failures classified as product/API drift, compiler regression,
 or unsupported non-Core feature before changing the frozen Core compiler.

@@ -78,14 +78,13 @@ route/hydration jsdom runtime path, bounded static/node adapter generated
 output contracts, a generated Node live-server smoke, generated cloud adapter
 runtime handlers, static client bundle hydration, local Playwright Chromium
 hydration, local generated Vercel/Cloudflare platform output import smoke,
-local tsup production bundle/code-splitting smoke, and local full file-routing
-static production app smoke, and local Chromium/Firefox/WebKit hydration matrix
-smoke are promoted.
-`compiler/scripts/check-integrity.sh` reports them as `WEB RUNTIME smoke=16/16`.
+local tsup production bundle/code-splitting smoke, local full file-routing
+static production app smoke, local Chromium/Firefox/WebKit hydration matrix
+smoke, and local SSR/data-loading production app smoke are promoted.
+`compiler/scripts/check-integrity.sh` reports them as `WEB RUNTIME smoke=17/17`.
 Do not treat live deployed adapters, production browser/device hydration beyond
-the promoted local Chromium/Firefox/WebKit smoke, SSR/data-loading production
-apps, or full dynamic production apps as certified until a new runtime smoke
-promotes that surface.
+the promoted local Chromium/Firefox/WebKit smoke, or full dynamic production
+apps as certified until a new runtime smoke promotes that surface.
 
 ---
 
@@ -127,4 +126,4 @@ vais-server (backend API) ← 같은 모노레포: ../vais-server/
 - **SSR 관련 작업 시**: `../vais-server/ROADMAP.md` 확인 — 서버사이드 연동 인터페이스 중복 방지
 - **Bridge 관련 작업 시**: `packages/kit/__tests__/e2e/vais-server-bridge.test.ts`와 `compiler/scripts/check-integrity.sh`의 `WEB RUNTIME` gate를 같이 갱신
 - **Hydration 관련 작업 시**: `packages/kit/__tests__/e2e/vais-web-route-hydration.test.ts`와 `compiler/scripts/check-integrity.sh`의 `WEB RUNTIME` gate를 같이 갱신
-- **Adapter 관련 작업 시**: `packages/kit/__tests__/e2e/vais-web-adapter-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-node-live.test.ts`, `packages/kit/__tests__/e2e/vais-web-cloud-adapter-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-platform-output-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-production-bundle-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts`, `compiler/scripts/check-integrity.sh`의 `WEB RUNTIME` gate를 같이 갱신
+- **Adapter/SSR data 관련 작업 시**: `packages/kit/__tests__/e2e/vais-web-adapter-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-node-live.test.ts`, `packages/kit/__tests__/e2e/vais-web-cloud-adapter-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-platform-output-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-production-bundle-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts`, `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts`, `compiler/scripts/check-integrity.sh`의 `WEB RUNTIME` gate를 같이 갱신
