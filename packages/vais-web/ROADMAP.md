@@ -1,6 +1,6 @@
 # vais-web Roadmap
 
-> Last Updated: 2026-05-02
+> Last Updated: 2026-05-03
 > Canonical workspace roadmap: `/Users/sswoo/study/projects/vais/ROADMAP.md`
 
 ## Reactivation Status
@@ -11,7 +11,7 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=18/18` in
+- `WEB RUNTIME smoke=19/19` in
   `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
@@ -26,7 +26,8 @@ Current promoted surface:
   `packages/kit/__tests__/e2e/vais-web-file-routing-production-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts` and
-  `packages/kit/__tests__/e2e/vais-web-server-action-production-runtime.test.ts`.
+  `packages/kit/__tests__/e2e/vais-web-server-action-production-runtime.test.ts` and
+  `packages/kit/__tests__/e2e/vais-web-server-action-auth-rate-production-runtime.test.ts`.
 - The runtime bridge implementation is
   `packages/kit/src/ssr/server-bridge.ts`.
 
@@ -117,14 +118,29 @@ The current gate also verifies a bounded server action production runtime path:
   Playwright Chromium, loads its dynamic chunk, and produces no unexpected
   browser console/page errors.
 
+The current gate also verifies a bounded server action auth/rate-limit
+production runtime path:
+
+- a temporary real `app/secure/page.vaisx` route with `action()` is discovered
+  by `buildRouteTree()` and preserved in the route manifest;
+- prerender skips the authenticated server-action route instead of emitting
+  stale static HTML;
+- `handleServerAction()` enforces `authRequired` through non-empty Bearer
+  tokens or a non-empty `vx_session` cookie;
+- unauthenticated action POSTs return `401` with `WWW-Authenticate: Bearer`;
+- `rateLimit: "2/min"` allows two same-client action POSTs and returns `429`
+  on the third request with `Retry-After` and `X-RateLimit-*` headers;
+- a minified code-split production bundle hydrates the secure action form in
+  Playwright Chromium, loads its dynamic chunk, and produces no unexpected
+  browser console/page errors.
+
 ## Not Certified Yet
 
 These are not product-complete claims:
 
 - production browser/device hydration runtime beyond the promoted local
   Chromium/Firefox/WebKit smoke;
-- server action auth-required, rate-limit, file upload, or live deployed action
-  behavior;
+- server action file upload or live deployed action behavior;
 - full dynamic production application runtime;
 - live deployed platform runtime;
 - JS/WASM compiler integration beyond the existing package tests.
