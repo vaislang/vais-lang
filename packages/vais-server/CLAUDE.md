@@ -20,13 +20,13 @@ Key characteristics:
 - **Pure Vais**: no FFI; system I/O via `std/async_http`, `std/http_server`, `std/websocket`
 
 Current reactivation status: `compiler/scripts/check-integrity.sh` reports
-`SERVER RUNTIME smoke=8/8`. The promoted surface covers minimal App/Context,
+`SERVER RUNTIME smoke=13/13`. The promoted surface covers minimal App/Context,
 VaisDB embedded integration, static/dynamic/wildcard router behavior, bounded
-body parsing, symbolic middleware pipeline dispatch, and SSR render/hydrate
-API response contracts. Actual network serving, HTTP forwarding into the Node
-SSR bridge, full JSON validation/escaping, arbitrary middleware instance
-dispatch, and product-complete protocol support are not certified until a
-dedicated runtime smoke promotes them.
+body parsing, symbolic middleware pipeline dispatch, SSR render/hydrate API
+response contracts, compiled SSR forwarding over local loopback HTTP, upstream
+error/status mapping, timeout handling, retry, and retry-budget observability.
+Product-complete protocol support still requires dedicated runtime smokes before
+it is promoted.
 
 ---
 
@@ -351,7 +351,7 @@ vaisdb (native query API) ← 같은 모노레포: ../vaisdb/
 ### Downstream Dependencies
 | Project | Path | 사용하는 인터페이스 |
 |---------|------|-------------------|
-| vais-web | `../vais-web/` | SSR bridge contract: render/hydrate JSON response shape; actual forwarding still deferred |
+| vais-web | `../vais-web/` | SSR bridge contract plus promoted local loopback forwarding surface |
 
 ### 작업 전 체크리스트
 - **새 유틸리티 구현 전**: `../../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std에 이미 있는 기능 재구현 금지

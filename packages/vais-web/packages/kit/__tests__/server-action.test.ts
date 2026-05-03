@@ -244,6 +244,30 @@ describe("validateFormData", () => {
     expect(result.valid).toBe(false);
     expect(Object.keys(result.errors).length).toBe(2);
   });
+
+  it("accepts uploaded files for file fields", () => {
+    const schema: FormSchema = [{ name: "asset", type: "file", required: true }];
+    const file = new File(["hello"], "hello.txt", { type: "text/plain" });
+    const fd = new FormData();
+    fd.append("asset", file);
+
+    const result = validateFormData(fd, schema);
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual({});
+    expect(result.data.asset).toBe(file);
+  });
+
+  it("rejects empty browser file inputs for required file fields", () => {
+    const schema: FormSchema = [{ name: "asset", type: "file", required: true }];
+    const fd = new FormData();
+    fd.append("asset", new File([], ""));
+
+    const result = validateFormData(fd, schema);
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.asset).toBe("asset is required");
+  });
 });
 
 // ---------------------------------------------------------------------------

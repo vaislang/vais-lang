@@ -11,7 +11,7 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=19/19` in
+- `WEB RUNTIME smoke=20/20` in
   `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
@@ -27,7 +27,8 @@ Current promoted surface:
   `packages/kit/__tests__/e2e/vais-web-cross-browser-hydration-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-ssr-data-production-runtime.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-server-action-production-runtime.test.ts` and
-  `packages/kit/__tests__/e2e/vais-web-server-action-auth-rate-production-runtime.test.ts`.
+  `packages/kit/__tests__/e2e/vais-web-server-action-auth-rate-production-runtime.test.ts` and
+  `packages/kit/__tests__/e2e/vais-web-server-action-file-upload-production-runtime.test.ts`.
 - The runtime bridge implementation is
   `packages/kit/src/ssr/server-bridge.ts`.
 
@@ -134,13 +135,30 @@ production runtime path:
   Playwright Chromium, loads its dynamic chunk, and produces no unexpected
   browser console/page errors.
 
+The current gate also verifies a bounded server action file upload production
+runtime path:
+
+- a temporary real `app/upload/page.vaisx` route with `action()` is discovered
+  by `buildRouteTree()` and preserved in the route manifest;
+- prerender skips the upload server-action route instead of emitting stale
+  static HTML;
+- `handleServerAction()` parses multipart form data with a required `file`
+  schema field;
+- enhanced browser submit receives JSON success with uploaded `File`
+  name/type/size/text preserved;
+- plain browser multipart form submit follows a `303` redirect and renders the
+  uploaded file state after navigation;
+- a minified code-split production bundle hydrates the upload action form in
+  Playwright Chromium, loads its dynamic chunk, and produces no unexpected
+  browser console/page errors.
+
 ## Not Certified Yet
 
 These are not product-complete claims:
 
 - production browser/device hydration runtime beyond the promoted local
   Chromium/Firefox/WebKit smoke;
-- server action file upload or live deployed action behavior;
+- live deployed action behavior;
 - full dynamic production application runtime;
 - live deployed platform runtime;
 - JS/WASM compiler integration beyond the existing package tests.

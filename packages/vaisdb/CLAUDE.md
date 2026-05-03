@@ -59,40 +59,27 @@ src/
 ## Roadmap Reference
 
 See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
-Current phase: Phase 15 (2026-04-21). vaisdb 14/14 테스트 standalone codegen 0 errors (strict multi-module 빌드, 각 테스트는 /tmp 캐시 정리 후 force-rebuild 기준).
+Current promoted gate: package codegen `261/261`, runtime smoke `28/28`.
+
+Historical Phase Ω notes and intermediate failure counts are not active work.
+Do not treat old references to partial package counts, old phase names, or old
+compiler issue lists as current blockers. Use the root coordination roadmap and
+`compiler/scripts/check-integrity.sh` as the source of truth.
 
 ## Compiler Setup
-- **Working compiler**: `~/.cargo/bin/vaisc` (canonical install path; override with `VAISC` env var)
-  - ⚠️ `/opt/homebrew/bin/vaisc` (v1.0.0, 2026-03-11)는 multi-line import 미지원 — 사용 금지
-  - `~/.cargo/bin/vaisc` 또는 `/Users/sswoo/study/projects/vais/target/debug/vaisc` 사용
-- **std**: `/tmp/vais-lib/std` → symlink to `/Users/sswoo/study/projects/vais/compiler/std`
-  - 심링크 없으면: `mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/compiler/std /tmp/vais-lib/std`
-- **Strict build command** (검증용): `VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" ~/.cargo/bin/vaisc build <test>.vais --emit-ir -o /tmp/<test>.ll --force-rebuild`
-  - ⚠️ `VAIS_SINGLE_MODULE=1` deprecated — 사용 금지 (StringMap cross-module 에러 유발)
-  - ⚠️ `VAIS_TC_NONFATAL=1` 검증 시 사용 금지 (TC 에러를 경고로 강등하여 거짓 성공 보고 초래)
 
-## Known Compiler Issues (2026-04-21)
-- **Phase 158 strict type coercion**: implicit bool↔i64, int↔float, f32↔f64, str↔i64 금지 — 명시적 `as` 캐스트 필수
-  - `true` → i64: `true as i64`
-  - `x == y` → i64: `(x == y) as i64`
-  - `42` → f64: `42 as f64` 또는 `42.0`
-  - integer widening (i8→i64 등)은 여전히 implicit 허용
-  - 문자열 보간 `"{var}"`는 정상 작동
-  - `x & 1 == 1`은 `(x & 1) == 1`로 괄호 필요 (우선순위)
-- **Phase 184 unambiguous keywords**: 권장 — EN(enum), EL(else), LF(for-each), LW(while). 기존 E/L/W는 하위 호환.
-- `!` operator returns `bool` — bitwise NOT은 `0xFF ^ val`
-- Vec<struct> field access: `v[i].field` 실패 → `tmp := mut v[i]; tmp.field`
-- `str.push_str()`: 미지원 — `s = s + "..."` 사용
-- `&[u8]` ↔ `*u8`: 호환 불가
-- 테스트 연속 빌드 시 Vec<T> 제네릭 인스턴스가 테스트 간에 새는 비결정적 현상 존재 — 테스트 간 `/tmp/*.ll` 정리 후 재빌드하면 clean (compiler 측 process-level 이슈 추정)
+- Canonical aggregate gate:
+  `cd /Users/sswoo/study/projects/vais/compiler && bash scripts/check-integrity.sh`
+- VaisDB runtime gate:
+  `cd /Users/sswoo/study/projects/vais/compiler && cargo test -p vaisc --test e2e --release phase_vaisdb_runtime_smoke -- --nocapture --test-threads=1`
+- Do not use `VAIS_SINGLE_MODULE=1` or `VAIS_TC_NONFATAL=1` for certification;
+  they can hide real cross-module or type-checking failures.
 
-## Resolved Compiler Issues
-- ✅ (2026-04-21, Phase 6.31) `str.as_bytes()` 정식 지원 (8f1c8550)
-- ✅ (2026-04-21, Phase 6.29) atomic Ordering dispatch 완성 (0a5bcc1c)
-- ✅ (2026-04-07) StringMap cross-module generic param — multi-module 빌드로 해결 (SINGLE_MODULE deprecated)
-- ✅ (2026-04-05, Phase 11) Option<Struct>/Result<T,Struct> erasure — heap-alloc + pointer in i64 slot path
-- ✅ (2026-04-05, Phase 10) Vec<&[u8]> slice + Vec<struct> field access generic resolution
-- ✅ (2026-03-24) Pointer auto-deref, Tuple→struct, Move semantics, Enum struct variant TC
+## Current Non-Claims
+
+The promoted smokes do not certify product-complete SQL, full-text execution,
+long-running concurrency, external deployment, or a full crash matrix. Add a
+dedicated runtime smoke before promoting any of those claims.
 
 ## VAIS Ecosystem
 
