@@ -10,93 +10,93 @@
 # distance, storage, search, filter, concurrency, hnsw, quantize
 
 # Distance metrics
-U distance
+use distance
 
 # Vector storage
-U storage
+use storage
 
 # Search functionality
-U search
+use search
 
 # Filtered search
-U filter
+use filter
 
 # Concurrency control
-U concurrency
+use concurrency
 
 # HNSW submodules
-U hnsw/types
-U hnsw/insert
-U hnsw/search
-U hnsw/delete
-U hnsw/layer
-U hnsw/wal
-U hnsw/bulk
+use hnsw/types
+use hnsw/insert
+use hnsw/search
+use hnsw/delete
+use hnsw/layer
+use hnsw/wal
+use hnsw/bulk
 
 # Quantization
-U quantize/mod
+use quantize/mod
 
 # Dependencies
-U std/option
-U std/vec
-U std/string
-U storage/error
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U storage/wal/group_commit
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/constants
-U sql/catalog/manager
-U sql/catalog/schema
-U sql/types
-U sql/executor/mod
+use std/option
+use std/vec
+use std/string
+use storage/error
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use storage/wal/group_commit
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/constants
+use sql/catalog/manager
+use sql/catalog/schema
+use sql/types
+use sql/executor/mod
 
 # ============================================================================
 # Error Codes: EE=02 (vector), CC=10 (module), NNN=001-003
 # ============================================================================
 
-F err_vector_engine_closed() -> VaisError {
+fn err_vector_engine_closed() -> VaisError {
     VaisError.new(
         "VAIS-0210001",
         "Vector engine is not open"
     )
 }
 
-F vec_err_vector_dim_mismatch(expected: u32, actual: u32) -> VaisError {
+fn vec_err_vector_dim_mismatch(expected: u32, actual: u32) -> VaisError {
     VaisError.new(
         "VAIS-0210002",
         "Vector dimension mismatch: expected {expected}, got {actual}"
     )
 }
 
-F err_vector_index_creation_failed(detail: str) -> VaisError {
+fn err_vector_index_creation_failed(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0210003",
         "Failed to create vector index: {detail}"
     )
 }
 
-F err_vector_materialization_unavailable() -> VaisError {
+fn err_vector_materialization_unavailable() -> VaisError {
     VaisError.new(
         "VAIS-0210004",
         "Vector result materialization requires heap row lookup API"
     )
 }
 
-F vector_distance_metric_from_tag(metric: u8) -> DistanceMetric {
+fn vector_distance_metric_from_tag(metric: u8) -> DistanceMetric {
     tag := mut metric as i64
     I tag == DISTANCE_L2 as i64 {
-        R L2
+        return L2
     }
     I tag == DISTANCE_DOT_PRODUCT as i64 {
-        R DotProduct
+        return DotProduct
     }
     Cosine
 }
 
-F write_hnsw_meta_page(
+fn write_hnsw_meta_page(
     pool: &BufferPool,
     meta: &HnswMeta,
     page_id: u32,
@@ -115,7 +115,7 @@ F write_hnsw_meta_page(
 
 # VectorEngine manages a single HNSW index instance
 # Integrates: storage, HNSW graph, quantization, WAL, concurrency, layers
-S VectorEngine {
+struct VectorEngine {
     config: HnswConfig,              # HNSW configuration (M, ef_construction, etc.)
     meta: HnswMeta,                  # Metadata (entry_point, max_layer, node_count)
     store: VectorStore,              # Raw vector data storage
@@ -133,14 +133,14 @@ S VectorEngine {
     gcm: &mut GroupCommitManager,    # Shared group commit manager
 }
 
-X VectorEngine {
+impl VectorEngine {
     # ========================================================================
     # Constructor — Create new vector engine instance
     # ========================================================================
 
     ## Create new VectorEngine instance (does not load from disk)
     ## Call open() to load metadata and upper layers
-    F new(
+    fn new(
         config: HnswConfig,
         index_id: u32,
         pool: &BufferPool,
@@ -150,13 +150,13 @@ X VectorEngine {
     ) -> Result<VectorEngine, VaisError> {
         # Validate configuration
         I config.m == 0 || config.m_max_0 == 0 {
-            R Err(err_hnsw_invalid_config("M and M_max_0 must be > 0"))
+            return Err(err_hnsw_invalid_config("M and M_max_0 must be > 0"))
         }
         I config.ef_construction < config.m {
-            R Err(err_hnsw_invalid_config("ef_construction must be >= M"))
+            return Err(err_hnsw_invalid_config("ef_construction must be >= M"))
         }
         I config.dim == 0 {
-            R Err(err_hnsw_invalid_config("dimension must be > 0"))
+            return Err(err_hnsw_invalid_config("dimension must be > 0"))
         }
 
         # Initialize metadata (empty index)
@@ -195,9 +195,9 @@ X VectorEngine {
     # ========================================================================
 
     ## Open engine: load meta page and upper layers from disk
-    F open(mut self) -> Result<(), VaisError> {
+    fn open(mut self) -> Result<(), VaisError> {
         I self.is_open {
-            R Ok(())
+            return Ok(())
         }
 
         # Load metadata page
@@ -207,7 +207,7 @@ X VectorEngine {
 
         # Validate meta matches config
         I self.meta.dim != self.config.dim {
-            R Err(vec_err_vector_dim_mismatch(self.config.dim, self.meta.dim))
+            return Err(vec_err_vector_dim_mismatch(self.config.dim, self.meta.dim))
         }
 
         # Load upper layers (layer 1+) into memory
@@ -218,9 +218,9 @@ X VectorEngine {
     }
 
     ## Close engine: flush dirty pages, release resources
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         I !self.is_open {
-            R Ok(())
+            return Ok(())
         }
 
         # Flush metadata page
@@ -241,7 +241,7 @@ X VectorEngine {
     # ========================================================================
 
     ## Create new HNSW index: allocate meta page, register in catalog
-    F create_index(
+    fn create_index(
         config: HnswConfig,
         catalog: &mut CatalogManager,
         pool: &mut BufferPool,
@@ -282,7 +282,7 @@ X VectorEngine {
     }
 
     ## Drop index: mark as deleted, release pages
-    F drop_index(
+    fn drop_index(
         mut self,
         catalog: &mut CatalogManager,
         pool: &mut BufferPool,
@@ -291,7 +291,7 @@ X VectorEngine {
         txn_id: u64
     ) -> Result<(), VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Remove from catalog
@@ -312,19 +312,19 @@ X VectorEngine {
 
     ## Insert vector: write to storage, insert into HNSW graph, WAL-log
     ## Returns node_id (unique identifier for this vector)
-    F insert(
+    fn insert(
         mut self,
         vector: &[f32],
         txn_id: u64,
         cmd_id: u32,
     ) -> Result<u64, VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Validate dimension
         I vector.len() != self.config.dim as u64 {
-            R Err(vec_err_vector_dim_mismatch(
+            return Err(vec_err_vector_dim_mismatch(
                 self.config.dim,
                 vector.len() as u32,
             ))
@@ -366,14 +366,14 @@ X VectorEngine {
 
     ## Soft-delete vector: mark as deleted, WAL-log
     ## Actual removal happens during GC
-    F delete(
+    fn delete(
         mut self,
         node_id: u64,
         txn_id: u64,
         cmd_id: u32,
     ) -> Result<(), VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Acquire write lock
@@ -414,7 +414,7 @@ X VectorEngine {
 
     ## MVCC-filtered k-NN search
     ## Returns top-k nearest neighbors visible to the snapshot
-    F search(
+    fn search(
         mut self,
         query: &[f32],
         k: u64,
@@ -423,12 +423,12 @@ X VectorEngine {
         clog: &Clog,
     ) -> Result<SearchResult, VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Validate dimension
         I query.len() != self.config.dim as u64 {
-            R Err(vec_err_vector_dim_mismatch(
+            return Err(vec_err_vector_dim_mismatch(
                 self.config.dim,
                 query.len() as u32,
             ))
@@ -438,7 +438,7 @@ X VectorEngine {
         read_guard := mut self.lock.read_lock()?;
 
         # Use provided ef_search or default
-        ef := M ef_search {
+        ef := match ef_search {
             Option.Some(val) => val,
             Option.None => self.config.ef_search,
         }
@@ -460,7 +460,7 @@ X VectorEngine {
 
     ## Filtered search: combines vector search with SQL WHERE predicate
     ## Uses pre/post/hybrid filter strategy
-    F filtered_search(
+    fn filtered_search(
         mut self,
         table_name: str,
         column_name: str,
@@ -470,23 +470,23 @@ X VectorEngine {
         ctx: &ExecContext,
     ) -> Result<Vec<VectorSearchRow>, VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Validate dimension
         I query.len() != self.config.dim as u64 {
-            R Err(vec_err_vector_dim_mismatch(
+            return Err(vec_err_vector_dim_mismatch(
                 self.config.dim,
                 query.len() as u32,
             ))
         }
 
         # If no predicate, use regular search
-        M predicate {
+        match predicate {
             Option.None => {
                 result := self.search(query, k, Option.None, ctx.snapshot, ctx.clog)?;
                 # Convert SearchResult to VectorSearchRow
-                R self.materialize_search_result(result, ctx)
+                return self.materialize_search_result(result, ctx)
             },
             Option.Some(expr) => {
                 # Use filtered search
@@ -506,7 +506,7 @@ X VectorEngine {
                     filter_predicate,
                     ctx,
                 ).with_config(filter_config)
-                R filtered_search.execute()
+                return filtered_search.execute()
             },
         }
     }
@@ -517,20 +517,20 @@ X VectorEngine {
 
     ## Bulk load vectors: efficient batch insertion
     ## Bypasses WAL if config.bypass_wal = true (requires checkpoint after)
-    F bulk_load(
+    fn bulk_load(
         mut self,
         vectors: &[&[f32]],
         config: BulkLoadConfig,
         txn_id: u64,
     ) -> Result<BulkLoadResult, VaisError> {
         I !self.is_open {
-            R Err(err_vector_engine_closed())
+            return Err(err_vector_engine_closed())
         }
 
         # Validate all vectors have same dimension
         LF vec: vectors {
             I vec.len() != self.config.dim as u64 {
-                R Err(vec_err_vector_dim_mismatch(
+                return Err(vec_err_vector_dim_mismatch(
                     self.config.dim,
                     vec.len() as u32,
                 ))
@@ -554,7 +554,7 @@ X VectorEngine {
                     txn_id,
                     i as u32
                 )?
-            } EL {
+            } else {
                 self.store.write_vector_with_wal(
                     vector,
                     txn_id,
@@ -585,7 +585,7 @@ X VectorEngine {
                 &self.distance_computer,
                 txn_id
             )?;
-        } EL {
+        } else {
             self.meta = bulk_insert_stored_vectors_with_wal(
                 &loader.config,
                 vectors,
@@ -613,17 +613,17 @@ X VectorEngine {
     # ========================================================================
 
     ## Get current metadata (snapshot)
-    F get_meta(self) -> &HnswMeta {
+    fn get_meta(self) -> &HnswMeta {
         &self.meta
     }
 
     ## Get current node count
-    F node_count(self) -> u64 {
+    fn node_count(self) -> u64 {
         self.meta.total_nodes
     }
 
     ## Check if engine is open
-    F is_open(self) -> bool {
+    fn is_open(self) -> bool {
         self.is_open
     }
 
@@ -633,7 +633,7 @@ X VectorEngine {
 
     # Convert SearchResult to materialized VectorSearchRow
     # Fetches full row data from heap pages
-    F materialize_search_result(
+    fn materialize_search_result(
         self,
         result: SearchResult,
         ctx: &ExecContext,
@@ -641,7 +641,7 @@ X VectorEngine {
         rows := mut Vec.with_capacity(0)
 
         I result.results.len() > 0 {
-            R Err(err_vector_materialization_unavailable())
+            return Err(err_vector_materialization_unavailable())
         }
 
         Ok(rows)

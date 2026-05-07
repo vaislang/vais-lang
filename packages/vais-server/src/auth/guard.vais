@@ -2,17 +2,17 @@
 # Provides route-level authentication and role-based access control.
 # Integrates with the middleware pipeline via before() / after() hooks.
 
-U std/string
-U std/vec
-U core/context
-U middleware/pipeline
-U auth/jwt
+use std/string
+use std/vec
+use core/context
+use middleware/pipeline
+use auth/jwt
 
 # ============================================================================
 # GuardResult — outcome of an authorization check
 # ============================================================================
 
-EN GuardResult {
+enum GuardResult {
     Allowed,
     Denied,
 }
@@ -21,17 +21,17 @@ EN GuardResult {
 # GuardDenialReason — why access was denied
 # ============================================================================
 
-S GuardDenialReason {
+struct GuardDenialReason {
     code:    u16,
     message: str,
 }
 
-X GuardDenialReason {
-    F unauthorized(message: str) -> GuardDenialReason {
+impl GuardDenialReason {
+    fn unauthorized(message: str) -> GuardDenialReason {
         GuardDenialReason { code: 401, message: message }
     }
 
-    F forbidden(message: str) -> GuardDenialReason {
+    fn forbidden(message: str) -> GuardDenialReason {
         GuardDenialReason { code: 403, message: message }
     }
 }
@@ -40,15 +40,15 @@ X GuardDenialReason {
 # AuthGuard — stateful middleware; holds JWT config and required roles
 # ============================================================================
 
-S AuthGuard {
+struct AuthGuard {
     jwt_config:     JwtConfig,
     required_roles: Vec<str>,   # Empty = no role requirement; just auth check
     enabled:        bool,
 }
 
-X AuthGuard {
+impl AuthGuard {
     # Create a guard that only requires a valid JWT (no role restriction).
-    F new(jwt_config: JwtConfig) -> AuthGuard {
+    fn new(jwt_config: JwtConfig) -> AuthGuard {
         AuthGuard {
             jwt_config: jwt_config,
             required_roles: Vec.new(),
@@ -57,7 +57,7 @@ X AuthGuard {
     }
 
     # Create a guard that also enforces role membership.
-    F with_roles(jwt_config: JwtConfig, roles: Vec<str>) -> AuthGuard {
+    fn with_roles(jwt_config: JwtConfig, roles: Vec<str>) -> AuthGuard {
         AuthGuard {
             jwt_config: jwt_config,
             required_roles: roles,
@@ -66,7 +66,7 @@ X AuthGuard {
     }
 
     # Disabled guard — always passes (useful for public routes in a group).
-    F open() -> AuthGuard {
+    fn open() -> AuthGuard {
         AuthGuard {
             jwt_config:     JwtConfig.default(),
             required_roles: Vec.new(),
@@ -80,35 +80,35 @@ X AuthGuard {
 
     # before — extract and verify the bearer token; enforce roles if configured.
     # Short-circuits with 401/403 when the check fails.
-    F before(self, ctx: Context) -> BeforeResult {
+    fn before(self, ctx: Context) -> BeforeResult {
         I !self.enabled {
-            R BeforeResult.next()
+            return BeforeResult.next()
         }
 
         result := require_auth(ctx, self.jwt_config)
-        M result {
+        match result {
             Denied => {
                 res := guard_deny_response(ctx, 401, "Unauthorized: missing or invalid token")
-                R BeforeResult.respond(res)
+                return BeforeResult.respond(res)
             },
             Allowed => {
                 I self.required_roles.len() == 0 {
-                    R BeforeResult.next()
+                    return BeforeResult.next()
                 }
 
                 token := guard_extract_bearer(ctx)
                 claims_result := verify_token(token, self.jwt_config)
-                M claims_result {
+                match claims_result {
                     Err(_) => {
                         res := guard_deny_response(ctx, 401, "Unauthorized: token verification failed")
-                        R BeforeResult.respond(res)
+                        return BeforeResult.respond(res)
                     },
                     Ok(claims) => {
                         role_result := require_roles(claims.roles, self.required_roles)
-                        M role_result {
+                        match role_result {
                             Denied => {
                                 res := guard_deny_response(ctx, 403, "Forbidden: insufficient role")
-                                R BeforeResult.respond(res)
+                                return BeforeResult.respond(res)
                             },
                             Allowed => {
                                 BeforeResult.next()
@@ -121,7 +121,7 @@ X AuthGuard {
     }
 
     # after — no-op; auth checks are complete after before()
-    F after(self, ctx: Context, response: Response) -> Response {
+    fn after(self, ctx: Context, response: Response) -> Response {
         response
     }
 }
@@ -132,34 +132,34 @@ X AuthGuard {
 
 # Check that the request carries a valid JWT bearer token.
 # Returns GuardResult.Allowed or GuardResult.Denied.
-F require_auth(ctx: Context, config: JwtConfig) -> GuardResult {
+fn require_auth(ctx: Context, config: JwtConfig) -> GuardResult {
     token := guard_extract_bearer(ctx)
     I token == "" {
-        R GuardResult.Denied
+        return GuardResult.Denied
     }
 
     result := verify_token(token, config)
-    M result {
+    match result {
         Err(_) => GuardResult.Denied,
         Ok(_)  => GuardResult.Allowed,
     }
 }
 
 # Check that the claims roles contain at least one of the required roles.
-F require_roles(claim_roles: Vec<str>, required: Vec<str>) -> GuardResult {
+fn require_roles(claim_roles: Vec<str>, required: Vec<str>) -> GuardResult {
     I required.len() == 0 {
-        R GuardResult.Allowed
+        return GuardResult.Allowed
     }
     I guard_has_any_role(claim_roles, required, 0) {
-        R GuardResult.Allowed
+        return GuardResult.Allowed
     }
     GuardResult.Denied
 }
 
 # Convenience: check whether the context carries a valid auth token.
-F is_authenticated(ctx: Context, config: JwtConfig) -> bool {
+fn is_authenticated(ctx: Context, config: JwtConfig) -> bool {
     result := require_auth(ctx, config)
-    M result {
+    match result {
         Allowed => true,
         Denied  => false,
     }
@@ -167,13 +167,13 @@ F is_authenticated(ctx: Context, config: JwtConfig) -> bool {
 
 # Extract the authenticated user's subject claim from the context token.
 # Returns "" when the token is absent or invalid.
-F get_user_id(ctx: Context, config: JwtConfig) -> str {
+fn get_user_id(ctx: Context, config: JwtConfig) -> str {
     token := guard_extract_bearer(ctx)
     I token == "" {
-        R ""
+        return ""
     }
     result := verify_token(token, config)
-    M result {
+    match result {
         Err(_)     => "",
         Ok(claims) => claims.sub,
     }
@@ -185,49 +185,49 @@ F get_user_id(ctx: Context, config: JwtConfig) -> str {
 
 # Extract the bearer token from the Authorization header stored in ctx.state.
 # Convention: ctx.state = "Bearer <token>" (set by the dispatcher before calling before()).
-F guard_extract_bearer(ctx: Context) -> str {
+fn guard_extract_bearer(ctx: Context) -> str {
     raw := ctx.state
     I raw == "" {
-        R ""
+        return ""
     }
     prefix := "Bearer "
     I guard_starts_with(raw, prefix) {
         str_slice(raw, 7, str_len(raw))
-    } EL {
+    } else {
         ""
     }
 }
 
 # Check whether s starts with prefix (character-by-character).
-F guard_starts_with(s: str, prefix: str) -> bool {
+fn guard_starts_with(s: str, prefix: str) -> bool {
     plen := str_len(prefix)
     slen := str_len(s)
-    I plen > slen { R false }
+    I plen > slen { return false }
     guard_starts_with_rec(s, prefix, plen, 0)
 }
 
-F guard_starts_with_rec(s: str, prefix: str, plen: i64, i: i64) -> bool {
-    I i >= plen { R true }
-    I str_char_at(s, i) != str_char_at(prefix, i) { R false }
+fn guard_starts_with_rec(s: str, prefix: str, plen: i64, i: i64) -> bool {
+    I i >= plen { return true }
+    I str_char_at(s, i) != str_char_at(prefix, i) { return false }
     guard_starts_with_rec(s, prefix, plen, i + 1)
 }
 
 # Check whether claim_roles contains any element in required.
-F guard_has_any_role(claim_roles: Vec<str>, required: Vec<str>, i: i64) -> bool {
-    I i >= required.len() { R false }
+fn guard_has_any_role(claim_roles: Vec<str>, required: Vec<str>, i: i64) -> bool {
+    I i >= required.len() { return false }
     role := required.get(i)
-    I guard_vec_contains(claim_roles, role, 0) { R true }
+    I guard_vec_contains(claim_roles, role, 0) { return true }
     guard_has_any_role(claim_roles, required, i + 1)
 }
 
-F guard_vec_contains(roles: Vec<str>, target: str, i: i64) -> bool {
-    I i >= roles.len() { R false }
-    I roles.get(i) == target { R true }
+fn guard_vec_contains(roles: Vec<str>, target: str, i: i64) -> bool {
+    I i >= roles.len() { return false }
+    I roles.get(i) == target { return true }
     guard_vec_contains(roles, target, i + 1)
 }
 
 # Build a 401 or 403 JSON response.
-F guard_deny_response(ctx: Context, status: u16, message: str) -> Response {
+fn guard_deny_response(ctx: Context, status: u16, message: str) -> Response {
     body := "{\"error\": \"" + message + "\"}"
     Response {
         status: status,
@@ -242,6 +242,6 @@ F guard_deny_response(ctx: Context, status: u16, message: str) -> Response {
 # External runtime stubs
 # ============================================================================
 
-X F str_len(s: str) -> i64
-X F str_slice(s: str, start: i64, end: i64) -> str
-X F str_char_at(s: str, i: i64) -> str
+impl fn str_len(s: str) -> i64
+impl fn str_slice(s: str, start: i64, end: i64) -> str
+impl fn str_char_at(s: str, i: i64) -> str

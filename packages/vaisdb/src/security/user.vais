@@ -5,24 +5,24 @@
 # WAL-first: all mutations write WAL before modifying catalog
 # Error codes: EE=09 (security), CC=06 (auth), CC=02 (constraint)
 
-U std/bytes.{ByteBuffer};
-U std/time.{unix_timestamp};
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError, err_internal};
-U storage/constants.{INVALID_TXN_ID};
-U storage/buffer/pool.{BufferPool};
-U storage/wal/group_commit.{GroupCommitManager};
-U storage/wal/record_types.{
+use std/bytes.{ByteBuffer};
+use std/time.{unix_timestamp};
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError, err_internal};
+use storage/constants.{INVALID_TXN_ID};
+use storage/buffer/pool.{BufferPool};
+use storage/wal/group_commit.{GroupCommitManager};
+use storage/wal/record_types.{
     SECURITY_USER_CREATE, SECURITY_USER_ALTER, SECURITY_USER_DROP
 };
-U storage/hash.{fnv1a_hash};
-U sql/catalog/manager.{CatalogManager};
-U sql/catalog/schema.{UserCatalogEntry};
-U sql/parser/ast.{CreateUserStmt, AlterUserStmt};
-U security/types.{
+use storage/hash.{fnv1a_hash};
+use sql/catalog/manager.{CatalogManager};
+use sql/catalog/schema.{UserCatalogEntry};
+use sql/parser/ast.{CreateUserStmt, AlterUserStmt};
+use security/types.{
     SecurityConfig, SecurityMeta, UserInfo, SessionContext,
     SYSTEM_USER_ID, SUPERUSER_ROLE_ID, PUBLIC_ROLE_ID,
     INVALID_USER_ID, ENGINE_TAG_SECURITY,
@@ -40,14 +40,14 @@ U security/types.{
 # UserManager — Manages user accounts
 # ============================================================================
 
-S UserManager {
+struct UserManager {
     users: HashMap<Str, UserInfo>,         # In-memory cache: username -> UserInfo
     users_by_id: HashMap<u64, Str>,        # Reverse index: user_id -> username
 }
 
-X UserManager {
+impl UserManager {
     # Create a new empty user manager
-    F new() -> UserManager {
+    fn new() -> UserManager {
         UserManager {
             users: HashMap.new(),
             users_by_id: HashMap.new(),
@@ -56,7 +56,7 @@ X UserManager {
 
     # Initialize with built-in system entries loaded from catalog
     # Called at engine startup after CatalogManager.load_from_disk()
-    F load_from_catalog(catalog: &CatalogManager, config: &SecurityConfig) -> UserManager {
+    fn load_from_catalog(catalog: &CatalogManager, config: &SecurityConfig) -> UserManager {
         mgr := mut UserManager.new();
 
         # Load all user catalog entries and reconstruct UserInfo in-memory
@@ -90,7 +90,7 @@ X UserManager {
 
     # Execute CREATE USER statement
     # Steps: validate -> hash password -> allocate ID -> write WAL -> update catalog -> cache
-    F execute_create_user(
+    fn execute_create_user(
         mut self,
         stmt: &CreateUserStmt,
         meta: &mut SecurityMeta,
@@ -104,7 +104,7 @@ X UserManager {
     ) -> Result<u64, VaisError> {
         # 1. Permission check: only superusers can create users
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Validate username format
@@ -112,7 +112,7 @@ X UserManager {
 
         # 3. Check for duplicate
         I self.users.contains_key(&stmt.username) != 0 {
-            R Err(err_user_already_exists(&stmt.username));
+            return Err(err_user_already_exists(&stmt.username));
         }
 
         # 4. Validate password strength
@@ -126,11 +126,11 @@ X UserManager {
         user_id := mut meta.alloc_user_id();
 
         # 7. Determine user properties from statement options
-        is_superuser := mut M &stmt.is_superuser {
+        is_superuser := mut match &stmt.is_superuser {
             Some(v) => *v,
             None => false,
         };
-        can_login := mut M &stmt.can_login {
+        can_login := mut match &stmt.can_login {
             Some(v) => *v,
             None => true,  # Users can login by default
         };
@@ -149,7 +149,7 @@ X UserManager {
         );
 
         # 9. Apply connection limit if specified
-        M &stmt.connection_limit {
+        match &stmt.connection_limit {
             Some(limit) => {
                 user_info.connection_limit = *limit as u32;
             },
@@ -161,12 +161,12 @@ X UserManager {
         LW j < stmt.in_roles.len() {
             role_name := mut &stmt.in_roles[j];
             # Look up role ID from catalog
-            M catalog.get_role(role_name) {
+            match catalog.get_role(role_name) {
                 Some(role_entry) => {
                     user_info.add_role(role_entry.role_id)?;
                 },
                 None => {
-                    R Err(err_role_not_found(role_name));
+                    return Err(err_role_not_found(role_name));
                 },
             };
             j = j + 1;
@@ -202,7 +202,7 @@ X UserManager {
 
     # Execute ALTER USER statement
     # Supports: SET PASSWORD, RENAME, SUPERUSER/NOSUPERUSER, LOGIN/NOLOGIN, LOCK/UNLOCK
-    F execute_alter_user(
+    fn execute_alter_user(
         mut self,
         stmt: &AlterUserStmt,
         meta: &mut SecurityMeta,
@@ -218,7 +218,7 @@ X UserManager {
         #    non-superusers can only change their own password
         is_self_alter := mut session.username == stmt.username;
         I !session.is_superuser && !is_self_alter {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Non-superuser can only SET PASSWORD on themselves
@@ -229,18 +229,18 @@ X UserManager {
                 || stmt.is_locked.is_some()
                 || stmt.connection_limit.is_some();
             I has_non_password_changes != 0 {
-                R Err(err_privilege_superuser_required());
+                return Err(err_privilege_superuser_required());
             }
         }
 
         # 3. Look up existing user
-        user_info := mut M self.users.get_mut(&stmt.username) {
+        user_info := mut match self.users.get_mut(&stmt.username) {
             Some(u) => u,
-            None => { R Err(err_user_not_found(&stmt.username)); },
+            None => { return Err(err_user_not_found(&stmt.username)); },
         };
 
         # 4. Apply password change
-        M &stmt.password {
+        match &stmt.password {
             Some(new_pw) => {
                 validate_password(new_pw, config)?;
                 salt := mut generate_salt(ARGON2_SALT_LENGTH);
@@ -253,24 +253,24 @@ X UserManager {
         };
 
         # 5. Apply superuser change
-        M &stmt.is_superuser {
+        match &stmt.is_superuser {
             Some(v) => { user_info.is_superuser = *v; },
             None => {},
         };
 
         # 6. Apply login change
-        M &stmt.can_login {
+        match &stmt.can_login {
             Some(v) => { user_info.can_login = *v; },
             None => {},
         };
 
         # 7. Apply lock/unlock
-        M &stmt.is_locked {
+        match &stmt.is_locked {
             Some(locked) => {
                 I *locked {
                     user_info.is_locked = true;
                     user_info.locked_at = unix_timestamp();
-                } EL {
+                } else {
                     user_info.unlock();
                 }
             },
@@ -278,7 +278,7 @@ X UserManager {
         };
 
         # 8. Apply connection limit
-        M &stmt.connection_limit {
+        match &stmt.connection_limit {
             Some(limit) => {
                 user_info.connection_limit = *limit as u32;
             },
@@ -293,11 +293,11 @@ X UserManager {
         gcm.write_record(txn_id, SECURITY_USER_ALTER, ENGINE_TAG_SECURITY, &wal_payload)?;
 
         # 11. Handle RENAME TO (must update catalog + caches)
-        M &stmt.rename_to {
+        match &stmt.rename_to {
             Some(new_name) => {
                 validate_username(new_name)?;
                 I self.users.contains_key(new_name) != 0 {
-                    R Err(err_user_already_exists(new_name));
+                    return Err(err_user_already_exists(new_name));
                 }
 
                 # Update catalog: unregister old name, register new name
@@ -337,7 +337,7 @@ X UserManager {
     # ========================================================================
 
     # Execute DROP USER [IF EXISTS] [CASCADE]
-    F execute_drop_user(
+    fn execute_drop_user(
         mut self,
         username: &Str,
         if_exists: bool,
@@ -352,21 +352,21 @@ X UserManager {
     ) -> Result<(), VaisError> {
         # 1. Permission check
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Prevent dropping system user
-        M self.users.get(username) {
+        match self.users.get(username) {
             Some(user) => {
                 I user.user_id == SYSTEM_USER_ID {
-                    R Err(err_internal("Cannot drop system user"));
+                    return Err(err_internal("Cannot drop system user"));
                 }
             },
             None => {
                 I if_exists {
-                    R Ok(());
+                    return Ok(());
                 }
-                R Err(err_user_not_found(username));
+                return Err(err_user_not_found(username));
             },
         };
 
@@ -384,7 +384,7 @@ X UserManager {
         catalog.unregister_user(username, pool, gcm, txn_id)?;
 
         # 6. Remove from in-memory caches
-        M self.users.remove(username) {
+        match self.users.remove(username) {
             Some(removed) => {
                 self.users_by_id.remove(&removed.user_id);
                 meta.user_count = meta.user_count - 1;
@@ -401,15 +401,15 @@ X UserManager {
 
     # Authenticate a user by username and password
     # Returns user_id on success, error on failure
-    F authenticate(
+    fn authenticate(
         mut self,
         username: &Str,
         password: &Str,
         config: &SecurityConfig,
     ) -> Result<u64, VaisError> {
-        user_info := mut M self.users.get_mut(username) {
+        user_info := mut match self.users.get_mut(username) {
             Some(u) => u,
-            None => { R Err(err_auth_failed(username)); },
+            None => { return Err(err_auth_failed(username)); },
         };
 
         # Check if account is locked
@@ -417,19 +417,19 @@ X UserManager {
             # Check if lockout has expired
             I user_info.is_lockout_expired(config.lockout_duration_seconds) {
                 user_info.unlock();
-            } EL {
-                R Err(err_auth_account_locked(username));
+            } else {
+                return Err(err_auth_account_locked(username));
             }
         }
 
         # Check if login is allowed
         I !user_info.can_login {
-            R Err(err_auth_failed(username));
+            return Err(err_auth_failed(username));
         }
 
         # Check password expiry
         I user_info.is_password_expired(config.password_expiry_days) {
-            R Err(err_auth_password_expired(username));
+            return Err(err_auth_password_expired(username));
         }
 
         # Verify password
@@ -437,7 +437,7 @@ X UserManager {
         I computed_hash != user_info.password_hash {
             # Record failed attempt
             user_info.record_failed_login(config.max_failed_login_attempts);
-            R Err(err_auth_failed(username));
+            return Err(err_auth_failed(username));
         }
 
         # Success
@@ -446,15 +446,15 @@ X UserManager {
     }
 
     # Build a SessionContext for an authenticated user
-    F build_session(
+    fn build_session(
         self,
         username: &Str,
         client_addr: Str,
         database_name: Str,
     ) -> Result<SessionContext, VaisError> {
-        user_info := mut M self.users.get(username) {
+        user_info := mut match self.users.get(username) {
             Some(u) => u,
-            None => { R Err(err_user_not_found(username)); },
+            None => { return Err(err_user_not_found(username)); },
         };
 
         ctx := mut SessionContext.new(
@@ -476,32 +476,32 @@ X UserManager {
     # ========================================================================
 
     # Get user info by username
-    F get_user(self, username: &Str) -> Option<&UserInfo> {
+    fn get_user(self, username: &Str) -> Option<&UserInfo> {
         self.users.get(username)
     }
 
     # Get mutable user info
-    F get_user_mut(mut self, username: &Str) -> Option<&mut UserInfo> {
+    fn get_user_mut(mut self, username: &Str) -> Option<&mut UserInfo> {
         self.users.get_mut(username)
     }
 
     # Get username by user_id
-    F get_username(self, user_id: u64) -> Option<&Str> {
+    fn get_username(self, user_id: u64) -> Option<&Str> {
         self.users_by_id.get(&user_id)
     }
 
     # Check if a user exists
-    F user_exists(self, username: &Str) -> bool {
+    fn user_exists(self, username: &Str) -> bool {
         self.users.contains_key(username)
     }
 
     # Get count of registered users
-    F user_count(self) -> u64 {
+    fn user_count(self) -> u64 {
         self.users.len()
     }
 
     # List all active usernames
-    F all_usernames(self) -> Vec<Str> {
+    fn all_usernames(self) -> Vec<Str> {
         names := mut Vec.new();
         keys: Vec<Str> := self.users.keys();
         i := mut 0u64;
@@ -513,27 +513,27 @@ X UserManager {
     }
 
     # Add a role to a user (used by GrantManager for GRANT ROLE ... TO user)
-    F add_role_to_user(
+    fn add_role_to_user(
         mut self,
         username: &Str,
         role_id: u64,
     ) -> Result<(), VaisError> {
-        user_info := mut M self.users.get_mut(username) {
+        user_info := mut match self.users.get_mut(username) {
             Some(u) => u,
-            None => { R Err(err_user_not_found(username)); },
+            None => { return Err(err_user_not_found(username)); },
         };
         user_info.add_role(role_id)
     }
 
     # Remove a role from a user
-    F remove_role_from_user(
+    fn remove_role_from_user(
         mut self,
         username: &Str,
         role_id: u64,
     ) -> Result<bool, VaisError> {
-        user_info := mut M self.users.get_mut(username) {
+        user_info := mut match self.users.get_mut(username) {
             Some(u) => u,
-            None => { R Err(err_user_not_found(username)); },
+            None => { return Err(err_user_not_found(username)); },
         };
         Ok(user_info.remove_role(role_id))
     }
@@ -545,7 +545,7 @@ X UserManager {
 
 # Generate a cryptographic salt using FNV-1a hash of timestamp + counter
 # (In production, use OS entropy source via C FFI)
-F generate_salt(length: u32) -> Vec<u8> {
+fn generate_salt(length: u32) -> Vec<u8> {
     salt := mut Vec.with_capacity(length as u64);
     timestamp := mut unix_timestamp() as u64;
     counter := mut 0u64;
@@ -577,7 +577,7 @@ F generate_salt(length: u32) -> Vec<u8> {
 # Hash password with SHA-256-like salted hash using FNV-1a
 # (Placeholder: real argon2 requires C FFI)
 # Format: iterate FNV-1a 10000 times over (salt + password + iteration)
-F hash_password_sha256(password: &Str, salt: &Vec<u8>) -> Str {
+fn hash_password_sha256(password: &Str, salt: &Vec<u8>) -> Str {
     pw_len := mut password.len();
 
     # Iterative hashing (key stretching)
@@ -609,13 +609,13 @@ F hash_password_sha256(password: &Str, salt: &Vec<u8>) -> Str {
 }
 
 # Verify a password against a stored hash
-F verify_password(password: &Str, salt: &Vec<u8>, stored_hash: &Str) -> bool {
+fn verify_password(password: &Str, salt: &Vec<u8>, stored_hash: &Str) -> bool {
     computed := mut hash_password_sha256(password, salt);
     computed == *stored_hash
 }
 
 # Convert u64 to 16-char hex string
-F u64_to_hex(value: u64) -> Str {
+fn u64_to_hex(value: u64) -> Str {
     hex_chars := mut "0123456789abcdef";
     result := mut String.with_capacity(16);
     shift := mut 60i32;

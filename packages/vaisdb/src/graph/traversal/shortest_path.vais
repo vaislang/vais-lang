@@ -4,37 +4,37 @@
 # MVCC-consistent traversal using snapshot-isolated edge visibility
 # Returns path as sequence of node IDs and edge IDs with total distance
 
-U std/vec
-U std/option
-U storage/error
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/buffer/pool
-U graph/types
-U graph/node/storage
-U graph/edge/adj
-U graph/visibility
-U graph/traversal/bfs
+use std/vec
+use std/option
+use storage/error
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/buffer/pool
+use graph/types
+use graph/node/storage
+use graph/edge/adj
+use graph/visibility
+use graph/traversal/bfs
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=05 (shortest path / cycle)
 # ============================================================================
 
-F err_path_invalid_node(node_id: u64) -> VaisError {
+fn err_path_invalid_node(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0305001",
         "Path finding: invalid node ID {node_id}"
     )
 }
 
-F err_path_no_path(start: u64, end: u64) -> VaisError {
+fn err_path_no_path(start: u64, end: u64) -> VaisError {
     VaisError.new(
         "VAIS-0305002",
         "No path exists from node {start} to node {end}"
     )
 }
 
-F err_path_invalid_direction(direction: u8) -> VaisError {
+fn err_path_invalid_direction(direction: u8) -> VaisError {
     VaisError.new(
         "VAIS-0305003",
         "Invalid path finding direction: {direction}"
@@ -45,15 +45,15 @@ F err_path_invalid_direction(direction: u8) -> VaisError {
 # PathResult — Result of shortest path query
 # ============================================================================
 
-S PathResult {
+struct PathResult {
     path: Vec<u64>,      # Sequence of node IDs from start to end (inclusive)
     edges: Vec<u64>,     # Sequence of edge IDs connecting the nodes
     distance: u32,       # Total distance (number of edges)
 }
 
-X PathResult {
-    F new(path: Vec<u64>, edges: Vec<u64>) -> PathResult {
-        distance := mut I path.len() > 0 { (path.len() - 1) as u32 } EL { 0 }
+impl PathResult {
+    fn new(path: Vec<u64>, edges: Vec<u64>) -> PathResult {
+        distance := mut I path.len() > 0 { (path.len() - 1) as u32 } else { 0 }
         PathResult {
             path,
             edges,
@@ -61,7 +61,7 @@ X PathResult {
         }
     }
 
-    F empty() -> PathResult {
+    fn empty() -> PathResult {
         PathResult {
             path: Vec.with_capacity(0),
             edges: Vec.with_capacity(0),
@@ -74,15 +74,15 @@ X PathResult {
 # ShortestPathFinder — BFS-based unweighted shortest path algorithm
 # ============================================================================
 
-S ShortestPathFinder {
+struct ShortestPathFinder {
     pool: &BufferPool,
     node_store: &NodeStore,
     snapshot: Snapshot,
     clog: &Clog,
 }
 
-X ShortestPathFinder {
-    F new(
+impl ShortestPathFinder {
+    fn new(
         pool: &BufferPool,
         node_store: &NodeStore,
         snapshot: Snapshot,
@@ -99,7 +99,7 @@ X ShortestPathFinder {
     # Find shortest path from start to end node
     # Returns None if no path exists, Some(PathResult) otherwise
     # Uses BFS which guarantees shortest path for unweighted graphs
-    F find_shortest_path(
+    fn find_shortest_path(
         self,
         start: u64,
         end: u64,
@@ -108,24 +108,24 @@ X ShortestPathFinder {
     ) -> Result<Option<PathResult>, VaisError> {
         # Validate input
         I start == INVALID_NODE_ID {
-            R Err(err_path_invalid_node(start))
+            return Err(err_path_invalid_node(start))
         }
         I end == INVALID_NODE_ID {
-            R Err(err_path_invalid_node(end))
+            return Err(err_path_invalid_node(end))
         }
 
         # Validate direction
         I config.direction != DIRECTION_OUTGOING &&
            config.direction != DIRECTION_INCOMING &&
            config.direction != DIRECTION_BOTH {
-            R Err(err_path_invalid_direction(config.direction))
+            return Err(err_path_invalid_direction(config.direction))
         }
 
         # Special case: start == end
         I start == end {
             path := mut Vec.with_capacity(0)
             path.push(start)
-            R Ok(Some(PathResult.new(path, Vec.with_capacity(0))))
+            return Ok(Some(PathResult.new(path, Vec.with_capacity(0))))
         }
 
         # BFS queue: (current_node, parent_index, edge_id_to_reach)
@@ -163,7 +163,7 @@ X ShortestPathFinder {
                 I current_node == end {
                     end_index = Some(current_index)
                     path_found = true
-                } EL {
+                } else {
                     # Look up node to get adjacency page IDs
                     node := mut self.node_store.read_node(current_node)?;
 
@@ -203,7 +203,7 @@ X ShortestPathFinder {
         }
 
         # Reconstruct path if end was reached
-        M end_index {
+        match end_index {
             Some(idx) => {
                 path_result := mut ShortestPathFinder.reconstruct_path(&visited, idx)
                 Ok(Some(path_result))
@@ -213,11 +213,11 @@ X ShortestPathFinder {
     }
 
     # Helper: find index of node in visited list
-    F find_visited_index(visited: &Vec<VisitedEntry>, node_id: u64) -> u64 {
+    fn find_visited_index(visited: &Vec<VisitedEntry>, node_id: u64) -> u64 {
         i := mut 0
         LW i < visited.len() {
             I visited[i].node_id == node_id {
-                R i
+                return i
             }
             i += 1
         }
@@ -225,7 +225,7 @@ X ShortestPathFinder {
     }
 
     # Helper: compute depth of a node by walking back to root
-    F compute_depth(visited: &Vec<VisitedEntry>, index: u64) -> u32 {
+    fn compute_depth(visited: &Vec<VisitedEntry>, index: u64) -> u32 {
         depth := mut 0
         current := mut index
         LW current != 0 && visited[current].parent_id != 0 {
@@ -236,11 +236,11 @@ X ShortestPathFinder {
     }
 
     # Helper: check if node is already visited
-    F is_visited(visited: &Vec<VisitedEntry>, node_id: u64) -> bool {
+    fn is_visited(visited: &Vec<VisitedEntry>, node_id: u64) -> bool {
         i := mut 0
         LW i < visited.len() {
             I visited[i].node_id == node_id {
-                R true
+                return true
             }
             i += 1
         }
@@ -248,7 +248,7 @@ X ShortestPathFinder {
     }
 
     # Helper: reconstruct path from visited list
-    F reconstruct_path(visited: &Vec<VisitedEntry>, end_index: u64) -> PathResult {
+    fn reconstruct_path(visited: &Vec<VisitedEntry>, end_index: u64) -> PathResult {
         path := mut Vec.with_capacity(0)
         edges := mut Vec.with_capacity(0)
 
@@ -263,7 +263,7 @@ X ShortestPathFinder {
 
             I visited[current].parent_id == 0 || current == 0 {
                 at_start = true
-            } EL {
+            } else {
                 current = visited[current].parent_id
             }
         }
@@ -276,11 +276,11 @@ X ShortestPathFinder {
     }
 
     # Helper: reverse a vector in place
-    F reverse_vec<T>(vec: &mut Vec<T>) {
+    fn reverse_vec<T>(vec: &mut Vec<T>) {
         i := mut 0
         j := mut vec.len()
         I j == 0 {
-            R
+            return
         }
         j -= 1
 
@@ -289,14 +289,14 @@ X ShortestPathFinder {
             i += 1
             I j > 0 {
                 j -= 1
-            } EL {
+            } else {
                 i = j;  # Force loop exit
             }
         }
     }
 
     # Helper: process adjacency entries and expand BFS frontier
-    F process_adj_entries(
+    fn process_adj_entries(
         self,
         entries: &Vec<AdjEntry>,
         current_node: u64,

@@ -5,15 +5,15 @@
 # Key rotation: background re-encryption with no downtime
 # Error codes: EE=09 (security), CC=08 (encryption)
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError};
-U storage/constants.{PAGE_HEADER_SIZE};
-U storage/hash.{fnv1a_hash, fnv1a_hash_bytes};
-U security/types.{
+use std/bytes.{ByteBuffer};
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError};
+use storage/constants.{PAGE_HEADER_SIZE};
+use storage/hash.{fnv1a_hash, fnv1a_hash_bytes};
+use security/types.{
     SecurityConfig, SecurityMeta, EncryptionKeyInfo,
     ENCRYPT_ALGO_NONE, ENCRYPT_ALGO_AES_256_CTR, ENCRYPT_ALGO_AES_256_GCM,
     KDF_PBKDF2, KDF_HKDF,
@@ -36,7 +36,7 @@ U security/types.{
 # - Uses XOR-based stream cipher as AES-256-CTR placeholder
 #   (real AES requires C FFI to libcrypto)
 
-S PageEncryptor {
+struct PageEncryptor {
     active_key_id: u32,
     keys: HashMap<u32, EncryptionKey>,     # key_id -> key material
     algorithm: u8,                          # ENCRYPT_ALGO_* constant
@@ -44,15 +44,15 @@ S PageEncryptor {
 }
 
 # Encryption key material (in-memory only)
-S EncryptionKey {
+struct EncryptionKey {
     key_id: u32,
     key_data: Vec<u8>,                     # 32 bytes for AES-256
     info: EncryptionKeyInfo,               # Metadata
 }
 
-X PageEncryptor {
+impl PageEncryptor {
     # Create a new disabled encryptor (no encryption)
-    F disabled() -> PageEncryptor {
+    fn disabled() -> PageEncryptor {
         PageEncryptor {
             active_key_id: 0,
             keys: HashMap.new(),
@@ -62,13 +62,13 @@ X PageEncryptor {
     }
 
     # Create a new encryptor with a given key
-    F new(algorithm: u8, key_data: Vec<u8>) -> Result<PageEncryptor, VaisError> {
+    fn new(algorithm: u8, key_data: Vec<u8>) -> Result<PageEncryptor, VaisError> {
         I algorithm == ENCRYPT_ALGO_NONE {
-            R Ok(PageEncryptor.disabled());
+            return Ok(PageEncryptor.disabled());
         }
 
         I key_data.len() != 32 {
-            R Err(err_invalid_encryption_config("Key must be exactly 32 bytes for AES-256"));
+            return Err(err_invalid_encryption_config("Key must be exactly 32 bytes for AES-256"));
         }
 
         key_hash := mut fnv1a_hash_bytes(&key_data);
@@ -93,21 +93,21 @@ X PageEncryptor {
     # Encrypt a page in-place (skip header, encrypt data portion)
     # page_data: mutable reference to full page buffer (header + data)
     # page_id: used as nonce component
-    F encrypt_page(self, page_data: &mut Vec<u8>, page_id: u32) -> Result<(), VaisError> {
+    fn encrypt_page(self, page_data: &mut Vec<u8>, page_id: u32) -> Result<(), VaisError> {
         I !self.enabled {
-            R Ok(());
+            return Ok(());
         }
 
-        key := mut M self.keys.get(&self.active_key_id) {
+        key := mut match self.keys.get(&self.active_key_id) {
             Some(k) => k,
-            None => { R Err(err_encryption_key_not_set()); },
+            None => { return Err(err_encryption_key_not_set()); },
         };
 
         # Generate keystream and XOR with data portion (after header)
         header_size := mut PAGE_HEADER_SIZE as u64;
         data_len := mut page_data.len();
         I data_len <= header_size {
-            R Ok(());  # No data to encrypt
+            return Ok(());  # No data to encrypt
         }
 
         # XOR-based stream cipher (placeholder for AES-256-CTR)
@@ -127,20 +127,20 @@ X PageEncryptor {
 
     # Decrypt a page in-place
     # For CTR mode, decryption is identical to encryption (XOR is its own inverse)
-    F decrypt_page(self, page_data: &mut Vec<u8>, page_id: u32, key_id: u32) -> Result<(), VaisError> {
+    fn decrypt_page(self, page_data: &mut Vec<u8>, page_id: u32, key_id: u32) -> Result<(), VaisError> {
         I !self.enabled {
-            R Ok(());
+            return Ok(());
         }
 
-        key := mut M self.keys.get(&key_id) {
+        key := mut match self.keys.get(&key_id) {
             Some(k) => k,
-            None => { R Err(err_decryption_failed("Key not found for key_id")); },
+            None => { return Err(err_decryption_failed("Key not found for key_id")); },
         };
 
         header_size := mut PAGE_HEADER_SIZE as u64;
         data_len := mut page_data.len();
         I data_len <= header_size {
-            R Ok(());
+            return Ok(());
         }
 
         # XOR decryption (same as encryption for CTR mode)
@@ -159,19 +159,19 @@ X PageEncryptor {
     }
 
     # Get active key ID (for writing to page header)
-    F active_key_id(self) -> u32 {
+    fn active_key_id(self) -> u32 {
         self.active_key_id
     }
 
     # Check if encryption is enabled
-    F is_enabled(self) -> bool {
+    fn is_enabled(self) -> bool {
         self.enabled
     }
 
     # Add a new key (for key rotation)
-    F add_key(mut self, key_id: u32, key_data: Vec<u8>) -> Result<(), VaisError> {
+    fn add_key(mut self, key_id: u32, key_data: Vec<u8>) -> Result<(), VaisError> {
         I key_data.len() != 32 {
-            R Err(err_invalid_encryption_config("Key must be 32 bytes"));
+            return Err(err_invalid_encryption_config("Key must be 32 bytes"));
         }
         key_hash := mut fnv1a_hash_bytes(&key_data);
         key_info := mut EncryptionKeyInfo.new(key_id, self.algorithm, KDF_HKDF, key_hash);
@@ -185,9 +185,9 @@ X PageEncryptor {
     }
 
     # Set active key (after rotation completes)
-    F set_active_key(mut self, key_id: u32) -> Result<(), VaisError> {
+    fn set_active_key(mut self, key_id: u32) -> Result<(), VaisError> {
         I !self.keys.contains_key(&key_id) {
-            R Err(err_encryption_key_not_set());
+            return Err(err_encryption_key_not_set());
         }
         self.active_key_id = key_id;
         Ok(())
@@ -204,26 +204,26 @@ X PageEncryptor {
 # - Only the payload portion is encrypted
 # - Uses the same key as PageEncryptor
 
-S WalEncryptor {
+struct WalEncryptor {
     encryptor: &PageEncryptor,
 }
 
-X WalEncryptor {
-    F new(encryptor: &PageEncryptor) -> WalEncryptor {
+impl WalEncryptor {
+    fn new(encryptor: &PageEncryptor) -> WalEncryptor {
         WalEncryptor { encryptor }
     }
 
     # Encrypt WAL record payload
     # lsn: used as nonce component (unique per record)
-    F encrypt_payload(self, payload: &mut Vec<u8>, lsn: u64) -> Result<(), VaisError> {
+    fn encrypt_payload(self, payload: &mut Vec<u8>, lsn: u64) -> Result<(), VaisError> {
         I !self.encryptor.is_enabled() {
-            R Ok(());
+            return Ok(());
         }
 
         key_id := mut self.encryptor.active_key_id;
-        key := mut M self.encryptor.keys.get(&key_id) {
+        key := mut match self.encryptor.keys.get(&key_id) {
             Some(k) => k,
-            None => { R Err(err_encryption_key_not_set()); },
+            None => { return Err(err_encryption_key_not_set()); },
         };
 
         # Use LSN as nonce for WAL records
@@ -244,14 +244,14 @@ X WalEncryptor {
     }
 
     # Decrypt WAL record payload
-    F decrypt_payload(self, payload: &mut Vec<u8>, lsn: u64, key_id: u32) -> Result<(), VaisError> {
+    fn decrypt_payload(self, payload: &mut Vec<u8>, lsn: u64, key_id: u32) -> Result<(), VaisError> {
         I !self.encryptor.is_enabled() {
-            R Ok(());
+            return Ok(());
         }
 
-        key := mut M self.encryptor.keys.get(&key_id) {
+        key := mut match self.encryptor.keys.get(&key_id) {
             Some(k) => k,
-            None => { R Err(err_decryption_failed("WAL key not found")); },
+            None => { return Err(err_decryption_failed("WAL key not found")); },
         };
 
         nonce_buf := mut ByteBuffer.with_capacity(12);
@@ -275,15 +275,15 @@ X WalEncryptor {
 # KeyManager — Key loading, rotation, and KMS interface
 # ============================================================================
 
-S KeyManager {
+struct KeyManager {
     encryptor: PageEncryptor,
     rotation_status: u8,                   # KEY_ROTATION_* constant
     rotation_progress: f64,                # 0.0 to 1.0
 }
 
-X KeyManager {
+impl KeyManager {
     # Create with no encryption
-    F disabled() -> KeyManager {
+    fn disabled() -> KeyManager {
         KeyManager {
             encryptor: PageEncryptor.disabled(),
             rotation_status: KEY_ROTATION_IDLE,
@@ -292,7 +292,7 @@ X KeyManager {
     }
 
     # Create with a key from config/KMS
-    F from_key(algorithm: u8, key_data: Vec<u8>) -> Result<KeyManager, VaisError> {
+    fn from_key(algorithm: u8, key_data: Vec<u8>) -> Result<KeyManager, VaisError> {
         encryptor := mut PageEncryptor.new(algorithm, key_data)?;
         Ok(KeyManager {
             encryptor,
@@ -302,29 +302,29 @@ X KeyManager {
     }
 
     # Get reference to page encryptor
-    F page_encryptor(self) -> &PageEncryptor {
+    fn page_encryptor(self) -> &PageEncryptor {
         &self.encryptor
     }
 
     # Get mutable reference
-    F page_encryptor_mut(mut self) -> &mut PageEncryptor {
+    fn page_encryptor_mut(mut self) -> &mut PageEncryptor {
         &self.encryptor
     }
 
     # Create a WAL encryptor referencing this key manager's page encryptor
-    F wal_encryptor(self) -> WalEncryptor {
+    fn wal_encryptor(self) -> WalEncryptor {
         WalEncryptor.new(&self.encryptor)
     }
 
     # Start key rotation: add new key, begin background re-encryption
-    F begin_key_rotation(
+    fn begin_key_rotation(
         mut self,
         new_key_id: u32,
         new_key_data: Vec<u8>,
         meta: &mut SecurityMeta,
     ) -> Result<(), VaisError> {
         I self.rotation_status == KEY_ROTATION_IN_PROGRESS {
-            R Err(err_key_rotation_in_progress());
+            return Err(err_key_rotation_in_progress());
         }
 
         # Add the new key
@@ -344,35 +344,35 @@ X KeyManager {
     }
 
     # Update rotation progress (called during background re-encryption)
-    F update_rotation_progress(mut self, progress: f64) {
+    fn update_rotation_progress(mut self, progress: f64) {
         self.rotation_progress = progress;
     }
 
     # Complete key rotation
-    F complete_key_rotation(mut self, meta: &mut SecurityMeta) {
+    fn complete_key_rotation(mut self, meta: &mut SecurityMeta) {
         self.rotation_status = KEY_ROTATION_COMPLETE;
         self.rotation_progress = 1.0;
         meta.key_rotation_status = KEY_ROTATION_COMPLETE;
     }
 
     # Fail key rotation
-    F fail_key_rotation(mut self, meta: &mut SecurityMeta) {
+    fn fail_key_rotation(mut self, meta: &mut SecurityMeta) {
         self.rotation_status = KEY_ROTATION_FAILED;
         meta.key_rotation_status = KEY_ROTATION_FAILED;
     }
 
     # Get rotation status
-    F rotation_status(self) -> u8 {
+    fn rotation_status(self) -> u8 {
         self.rotation_status
     }
 
     # Get rotation progress
-    F rotation_progress(self) -> f64 {
+    fn rotation_progress(self) -> f64 {
         self.rotation_progress
     }
 
     # Check if encryption is active
-    F is_encrypted(self) -> bool {
+    fn is_encrypted(self) -> bool {
         self.encryptor.is_enabled()
     }
 }
@@ -381,15 +381,15 @@ X KeyManager {
 # KeyRotator — Background re-encryption worker
 # ============================================================================
 
-S KeyRotator {
+struct KeyRotator {
     old_key_id: u32,
     new_key_id: u32,
     total_pages: u64,
     pages_processed: u64,
 }
 
-X KeyRotator {
-    F new(old_key_id: u32, new_key_id: u32, total_pages: u64) -> KeyRotator {
+impl KeyRotator {
+    fn new(old_key_id: u32, new_key_id: u32, total_pages: u64) -> KeyRotator {
         KeyRotator {
             old_key_id,
             new_key_id,
@@ -401,7 +401,7 @@ X KeyRotator {
     # Process a batch of pages for re-encryption
     # Returns number of pages processed in this batch
     # page_ids: pages to re-encrypt in this batch
-    F process_batch(
+    fn process_batch(
         mut self,
         key_mgr: &KeyManager,
         page_ids: &Vec<u32>,
@@ -430,15 +430,15 @@ X KeyRotator {
     }
 
     # Get progress as fraction
-    F progress(self) -> f64 {
+    fn progress(self) -> f64 {
         I self.total_pages == 0 {
-            R 1.0;
+            return 1.0;
         }
         self.pages_processed as f64 / self.total_pages as f64
     }
 
     # Check if rotation is complete
-    F is_complete(self) -> bool {
+    fn is_complete(self) -> bool {
         self.pages_processed >= self.total_pages
     }
 }
@@ -448,7 +448,7 @@ X KeyRotator {
 # ============================================================================
 
 # Build nonce from page_id and key_id (12 bytes for CTR mode)
-F build_nonce(page_id: u32, key_id: u32) -> Vec<u8> {
+fn build_nonce(page_id: u32, key_id: u32) -> Vec<u8> {
     buf := mut ByteBuffer.with_capacity(12);
     buf.write_i32_le(page_id);
     buf.write_i32_le(key_id);
@@ -459,7 +459,7 @@ F build_nonce(page_id: u32, key_id: u32) -> Vec<u8> {
 # Generate a keystream of given length using FNV-1a-based PRNG
 # (Placeholder for AES-256-CTR keystream generation via C FFI)
 # This is cryptographically weak - production would use OpenSSL/libcrypto
-F generate_keystream(key: &Vec<u8>, nonce: &Vec<u8>, length: u32) -> Vec<u8> {
+fn generate_keystream(key: &Vec<u8>, nonce: &Vec<u8>, length: u32) -> Vec<u8> {
     stream := mut Vec.with_capacity(length as u64);
     block_counter := mut 0u32;
 

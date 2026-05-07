@@ -10,14 +10,14 @@
 # - More selective pre-filter → higher ef_search to compensate for reduced candidate pool
 # - Formula: ef_search_adjusted = ef_search_default / sqrt(selectivity)
 
-U storage/error.{VaisError};
-U sql/parser/ast.{Expr, BinOp};
-U sql/planner/mod.{estimate_selectivity};
-U planner/types.{
+use storage/error.{VaisError};
+use sql/parser/ast.{Expr, BinOp};
+use sql/planner/mod.{estimate_selectivity};
+use planner/types.{
     HybridPlanNode, HybridCost, VectorScanParams,
     err_hybrid_plan_failed
 };
-U planner/cost_model.{VectorIndexStats, estimate_vector_scan_cost};
+use planner/cost_model.{VectorIndexStats, estimate_vector_scan_cost};
 
 # ============================================================================
 # Error Codes: EE=00 (common/planner), CC=08 (planner), DD=20 (vector_plan)
@@ -25,7 +25,7 @@ U planner/cost_model.{VectorIndexStats, estimate_vector_scan_cost};
 
 C ERR_CODE_VECTOR_PLAN_FAILED: Str = "VAIS-0008020";
 
-F err_vector_plan_failed(reason: Str) -> VaisError {
+fn err_vector_plan_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_VECTOR_PLAN_FAILED, "Vector plan build failed: {reason}")
 }
 
@@ -49,7 +49,7 @@ C OVERSAMPLE_FACTOR_BASE: f64 = 2.0;
 # Classify predicates into pre-filter (table-local) and post-filter (cross-table/residual)
 # Pre-filter: predicates referencing only columns in the target table
 # Post-filter: predicates referencing columns from other tables or complex expressions
-F classify_predicates(
+fn classify_predicates(
     where_clause: &Expr,
     table_name: &Str,
 ) -> (Option<Expr>, Option<Expr>) {
@@ -58,7 +58,7 @@ F classify_predicates(
 
     # For now, I the predicate is simple (doesn't contain subqueries or complex expressions),
     # classify it as pre-filter; otherwise, post-filter
-    M where_clause {
+    match where_clause {
         Expr.BinaryOp { .. } => {
             # Simple binary op: can be pre-filter
             (Some(where_clause.clone()), None)
@@ -91,20 +91,20 @@ F classify_predicates(
 # ============================================================================
 
 # Determine optimal filter strategy based on selectivity
-EN FilterStrategy {
+enum FilterStrategy {
     PreFilter,           # Scan bitmap first, then HNSW on matching IDs
     PostFilter,          # HNSW first, then apply filter to candidates
     Hybrid { oversample_factor: f64 },  # Pre-filter + oversample ef_search
 }
 
-F select_filter_strategy(selectivity: f64) -> FilterStrategy {
+fn select_filter_strategy(selectivity: f64) -> FilterStrategy {
     I selectivity < THRESHOLD_PRE_FILTER {
         # Very selective: pre-filter is cheap
         FilterStrategy.PreFilter
-    } EL I selectivity > THRESHOLD_POST_FILTER {
+    } else I selectivity > THRESHOLD_POST_FILTER {
         # Not selective: pre-filter is expensive, skip it
         FilterStrategy.PostFilter
-    } EL {
+    } else {
         # Moderately selective: hybrid approach with oversampling
         # Oversample more for lower selectivity
         oversample := mut OVERSAMPLE_FACTOR_BASE / selectivity.sqrt();
@@ -117,11 +117,11 @@ F select_filter_strategy(selectivity: f64) -> FilterStrategy {
 # ============================================================================
 
 # Adjust ef_search based on filter strategy
-F adjust_ef_search(
+fn adjust_ef_search(
     default_ef_search: u32,
     strategy: &FilterStrategy,
 ) -> u32 {
-    M strategy {
+    match strategy {
         FilterStrategy.PreFilter => {
             # Pre-filter: no adjustment needed (bitmap already reduces candidate pool)
             default_ef_search
@@ -137,7 +137,7 @@ F adjust_ef_search(
             max_ef := mut default_ef_search * 4;
             I adjusted > max_ef {
                 max_ef
-            } EL {
+            } else {
                 adjusted
             }
         },
@@ -157,19 +157,19 @@ F adjust_ef_search(
 #
 # Returns:
 # - HybridPlanNode.VectorScan with computed HybridCost and optimal filter placement
-F build_vector_plan(
+fn build_vector_plan(
     params: VectorScanParams,
     stats: &VectorIndexStats,
     where_clause: Option<Expr>,
 ) -> Result<HybridPlanNode, VaisError> {
     # Step 1: Classify predicates (if present)
-    (pre_filter_expr, post_filter_expr) := mut M &where_clause {
+    (pre_filter_expr, post_filter_expr) := mut match &where_clause {
         Some(expr) => classify_predicates(expr, &params.table_name),
         None => (None, None),
     };
 
     # Step 2: Estimate selectivity of pre-filter
-    selectivity := mut M &pre_filter_expr {
+    selectivity := mut match &pre_filter_expr {
         Some(expr) => estimate_selectivity(expr),
         None => 1.0,  # No filter: selectivity = 1.0 (all rows)
     };
@@ -178,14 +178,14 @@ F build_vector_plan(
     strategy := mut select_filter_strategy(selectivity);
 
     # Step 4: Adjust ef_search based on strategy
-    ef_search_default := mut M params.ef_search {
+    ef_search_default := mut match params.ef_search {
         Some(ef) => ef,
         None => stats.ef_search_default,
     };
     ef_search_adjusted := mut adjust_ef_search(ef_search_default, &strategy);
 
     # Step 5: Build VectorScanParams with filter placement
-    final_params := mut M strategy {
+    final_params := mut match strategy {
         FilterStrategy.PreFilter => {
             # Place filter as pre-filter
             VectorScanParams {
@@ -252,7 +252,7 @@ F build_vector_plan(
 # ============================================================================
 
 # Build a VectorScan plan node with an alias (for subquery or JOIN)
-F build_vector_plan_with_alias(
+fn build_vector_plan_with_alias(
     params: VectorScanParams,
     stats: &VectorIndexStats,
     where_clause: Option<Expr>,
@@ -261,7 +261,7 @@ F build_vector_plan_with_alias(
     node := mut build_vector_plan(params.clone(), stats, where_clause)?;
 
     # Unwrap and re-wrap with alias
-    M node {
+    match node {
         HybridPlanNode.VectorScan { params, cost, .. } => {
             Ok(HybridPlanNode.VectorScan {
                 params,

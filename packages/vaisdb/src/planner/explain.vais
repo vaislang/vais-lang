@@ -3,10 +3,10 @@
 # Provides EXPLAIN and EXPLAIN ANALYZE commands for hybrid query plans.
 # Supports both text (indented tree) and JSON output formats.
 
-U storage/error.{VaisError};
-U sql/parser/ast.{Expr, JoinType, OrderByItem};
-U sql/planner/mod.{PlanNode, ProjectColumn, AggregateSpec};
-U planner/types.{
+use storage/error.{VaisError};
+use sql/parser/ast.{Expr, JoinType, OrderByItem};
+use sql/planner/mod.{PlanNode, ProjectColumn, AggregateSpec};
+use planner/types.{
     HybridPlanNode, HybridCost, EngineType, FusionMethod,
     VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
     FullTextSearchMode, HybridExecStats, err_hybrid_plan_failed
@@ -16,18 +16,18 @@ U planner/types.{
 # ExplainFormat - Output format for EXPLAIN
 # ============================================================================
 
-EN ExplainFormat = Text | Json;
+enum ExplainFormat = Text | Json;
 
 # ============================================================================
 # ExplainOptions - Configuration for EXPLAIN command
 # ============================================================================
 
-S ExplainOptions { analyze: bool, # Execute plan and collect runtime stats
+struct ExplainOptions { analyze: bool, # Execute plan and collect runtime stats
     verbose: bool, # Show additional detail (predicates, cost breakdown)
     format: ExplainFormat }
 
-X ExplainOptions {
-    F default() -> ExplainOptions {
+impl ExplainOptions {
+    fn default() -> ExplainOptions {
         ExplainOptions { analyze: false, verbose: false, format: ExplainFormat.Text }
     }
 }
@@ -36,15 +36,15 @@ X ExplainOptions {
 # explain_plan - Main entry point for EXPLAIN
 # ============================================================================
 
-partial F explain_plan(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
-    M options.format { ExplainFormat.Text => explain_plan_text(plan, options, 0), ExplainFormat.Json => explain_plan_json(plan, options) }
+partial fn explain_plan(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
+    match options.format { ExplainFormat.Text => explain_plan_text(plan, options, 0), ExplainFormat.Json => explain_plan_json(plan, options) }
 }
 
 # ============================================================================
 # Text Format Implementation
 # ============================================================================
 
-partial F explain_plan_text(
+partial fn explain_plan_text(
     plan: &HybridPlanNode,
     options: &ExplainOptions,
     indent_level: u32,
@@ -79,7 +79,7 @@ partial F explain_plan_text(
     }
 
     # Recursively format children
-    M plan {
+    match plan {
         HybridPlanNode.ScoreFusion { left, right, .. } => {
             left_output := mut explain_plan_text(left, options, indent_level + 1)?;
             right_output := mut explain_plan_text(right, options, indent_level + 1)?;
@@ -120,7 +120,7 @@ partial F explain_plan_text(
     Ok(output)
 }
 
-F create_indent(level: u32) -> Str {
+fn create_indent(level: u32) -> Str {
     indent := mut Str.new();
     LF _: 0..level {
         indent = indent + "  ";
@@ -131,8 +131,8 @@ F create_indent(level: u32) -> Str {
     indent
 }
 
-partial F format_node_description(plan: &HybridPlanNode) -> Str {
-    M plan {
+partial fn format_node_description(plan: &HybridPlanNode) -> Str {
+    match plan {
         HybridPlanNode.SqlPlan { plan, .. } => {
             format_sql_plan_node(plan)
         },
@@ -191,8 +191,8 @@ partial F format_node_description(plan: &HybridPlanNode) -> Str {
         },
         HybridPlanNode.HybridLimit { limit, offset, .. } => {
             desc := mut Str.from("HybridLimit (");
-            M limit { Some(l) => desc = desc + &format_u64(*l), None => desc = desc + "ALL" }
-            M offset {
+            match limit { Some(l) => desc = desc + &format_u64(*l), None => desc = desc + "ALL" }
+            match offset {
                 Some(o) => {
                     I *o > 0 {
                         desc = desc + " offset ";
@@ -215,14 +215,14 @@ partial F format_node_description(plan: &HybridPlanNode) -> Str {
     }
 }
 
-F format_sql_plan_node(node: &PlanNode) -> Str {
+fn format_sql_plan_node(node: &PlanNode) -> Str {
     # Simplified SQL plan node formatting
     # In practice, would recursively format the SQL PlanNode tree
     Str.from("SqlPlan")
 }
 
-F format_fusion_method(method: &FusionMethod) -> Str {
-    M method {
+fn format_fusion_method(method: &FusionMethod) -> Str {
+    match method {
         FusionMethod.WeightedSum { weight_a, weight_b } => {
             s := mut Str.from("WeightedSum(a=");
             s = s + &format_f64(*weight_a, 2);
@@ -240,11 +240,11 @@ F format_fusion_method(method: &FusionMethod) -> Str {
     }
 }
 
-F format_join_type(join_type: &JoinType) -> Str {
-    M join_type { JoinType.Inner => Str.from("INNER"), JoinType.Left => Str.from("LEFT"), JoinType.Right => Str.from("RIGHT"), JoinType.Full => Str.from("FULL"), JoinType.Cross => Str.from("CROSS") }
+fn format_join_type(join_type: &JoinType) -> Str {
+    match join_type { JoinType.Inner => Str.from("INNER"), JoinType.Left => Str.from("LEFT"), JoinType.Right => Str.from("RIGHT"), JoinType.Full => Str.from("FULL"), JoinType.Cross => Str.from("CROSS") }
 }
 
-F format_cost_range(cost: &HybridCost, row_est: u64) -> Str {
+fn format_cost_range(cost: &HybridCost, row_est: u64) -> Str {
     s := mut Str.from("(cost=");
     s = s + &format_f64(cost.total_io_cost + cost.total_cpu_cost, 2);
     s = s + "..";
@@ -255,7 +255,7 @@ F format_cost_range(cost: &HybridCost, row_est: u64) -> Str {
     s
 }
 
-F format_verbose_info(plan: &HybridPlanNode, indent_level: u32) -> Str {
+fn format_verbose_info(plan: &HybridPlanNode, indent_level: u32) -> Str {
     output := mut Str.new();
     cost := mut plan.get_cost();
     indent := mut create_verbose_indent(indent_level);
@@ -281,7 +281,7 @@ F format_verbose_info(plan: &HybridPlanNode, indent_level: u32) -> Str {
     }
 
     # Node-specific details
-    M plan {
+    match plan {
         HybridPlanNode.VectorScan { params, .. } => {
             output = output + &indent;
             output = output + "top_k: ";
@@ -317,7 +317,7 @@ F format_verbose_info(plan: &HybridPlanNode, indent_level: u32) -> Str {
     output
 }
 
-F create_verbose_indent(level: u32) -> Str {
+fn create_verbose_indent(level: u32) -> Str {
     indent := mut Str.new();
     LF _: 0..level {
         indent = indent + "  ";
@@ -326,11 +326,11 @@ F create_verbose_indent(level: u32) -> Str {
     indent
 }
 
-F format_engine_type(engine: &EngineType) -> Str {
-    M engine { EngineType.Sql => Str.from("SQL"), EngineType.Vector => Str.from("Vector"), EngineType.Graph => Str.from("Graph"), EngineType.FullText => Str.from("FullText"), EngineType.Hybrid => Str.from("Hybrid") }
+fn format_engine_type(engine: &EngineType) -> Str {
+    match engine { EngineType.Sql => Str.from("SQL"), EngineType.Vector => Str.from("Vector"), EngineType.Graph => Str.from("Graph"), EngineType.FullText => Str.from("FullText"), EngineType.Hybrid => Str.from("Hybrid") }
 }
 
-F format_engine_breakdown(cost: &HybridCost) -> Str {
+fn format_engine_breakdown(cost: &HybridCost) -> Str {
     s := mut Str.new();
     parts: Vec<Str> := mut Vec.new();
 
@@ -383,8 +383,8 @@ F format_engine_breakdown(cost: &HybridCost) -> Str {
     s
 }
 
-F format_fulltext_mode(mode: &FullTextSearchMode) -> Str {
-    M mode {
+fn format_fulltext_mode(mode: &FullTextSearchMode) -> Str {
+    match mode {
         FullTextSearchMode.Simple => Str.from("Simple"),
         FullTextSearchMode.Phrase { slop } => {
             s := mut Str.from("Phrase(slop=");
@@ -396,13 +396,13 @@ F format_fulltext_mode(mode: &FullTextSearchMode) -> Str {
     }
 }
 
-F format_expr(expr: &Expr) -> Str {
+fn format_expr(expr: &Expr) -> Str {
     # Simplified expression formatting
     # In practice, would recursively format the full expression tree
     Str.from("<expr>")
 }
 
-F format_actual_stats(stats: &HybridExecStats) -> Str {
+fn format_actual_stats(stats: &HybridExecStats) -> Str {
     s := mut Str.from(" (actual rows=");
     s = s + &format_u64(stats.rows_produced);
     s = s + " time=";
@@ -415,14 +415,14 @@ F format_actual_stats(stats: &HybridExecStats) -> Str {
 # JSON Format Implementation
 # ============================================================================
 
-F explain_plan_json(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
+fn explain_plan_json(plan: &HybridPlanNode, options: &ExplainOptions) -> Result<Str, VaisError> {
     json := mut Str.from("{\n");
     json = json + &format_plan_node_json(plan, options, 1);
     json = json + "\n}";
     Ok(json)
 }
 
-F format_plan_node_json(
+fn format_plan_node_json(
     plan: &HybridPlanNode,
     options: &ExplainOptions,
     indent_level: u32,
@@ -477,7 +477,7 @@ F format_plan_node_json(
     json
 }
 
-F create_json_indent(level: u32) -> Str {
+fn create_json_indent(level: u32) -> Str {
     indent := mut Str.new();
     LF _: 0..level {
         indent = indent + "  ";
@@ -485,8 +485,8 @@ F create_json_indent(level: u32) -> Str {
     indent
 }
 
-F format_node_type(plan: &HybridPlanNode) -> Str {
-    M plan {
+fn format_node_type(plan: &HybridPlanNode) -> Str {
+    match plan {
         HybridPlanNode.SqlPlan { .. } => Str.from("SqlPlan"),
         HybridPlanNode.VectorScan { .. } => Str.from("VectorScan"),
         HybridPlanNode.GraphTraverse { .. } => Str.from("GraphTraverse"),
@@ -501,7 +501,7 @@ F format_node_type(plan: &HybridPlanNode) -> Str {
     }
 }
 
-F format_cost_json(cost: &HybridCost, indent_level: u32) -> Str {
+fn format_cost_json(cost: &HybridCost, indent_level: u32) -> Str {
     json := mut Str.new();
     indent := mut create_json_indent(indent_level);
 
@@ -570,10 +570,10 @@ F format_cost_json(cost: &HybridCost, indent_level: u32) -> Str {
     json
 }
 
-F get_plan_children(plan: &HybridPlanNode) -> Vec<&HybridPlanNode> {
+fn get_plan_children(plan: &HybridPlanNode) -> Vec<&HybridPlanNode> {
     children := mut Vec.new();
 
-    M plan {
+    match plan {
         HybridPlanNode.ScoreFusion { left, right, .. } => {
             children.push(left.as_ref());
             children.push(right.as_ref());
@@ -607,15 +607,15 @@ F get_plan_children(plan: &HybridPlanNode) -> Vec<&HybridPlanNode> {
 # Formatting Helpers
 # ============================================================================
 
-F digit_str(d: u32) -> Str {
-    M d { 0 => Str.from("0"), 1 => Str.from("1"), 2 => Str.from("2"), 3 => Str.from("3"), 4 => Str.from("4"), 5 => Str.from("5"), 6 => Str.from("6"), 7 => Str.from("7"), 8 => Str.from("8"), _ => Str.from("9") }
+fn digit_str(d: u32) -> Str {
+    match d { 0 => Str.from("0"), 1 => Str.from("1"), 2 => Str.from("2"), 3 => Str.from("3"), 4 => Str.from("4"), 5 => Str.from("5"), 6 => Str.from("6"), 7 => Str.from("7"), 8 => Str.from("8"), _ => Str.from("9") }
 }
 
-F format_u32(n: u32) -> Str {
+fn format_u32(n: u32) -> Str {
     s := mut Str.new();
     I n == 0 {
         s = s + "0";
-        R s;
+        return s;
     }
 
     digits: Vec<u32> := mut Vec.new();
@@ -634,11 +634,11 @@ F format_u32(n: u32) -> Str {
     s
 }
 
-F format_u64(n: u64) -> Str {
+fn format_u64(n: u64) -> Str {
     s := mut Str.new();
     I n == 0 {
         s = s + "0";
-        R s;
+        return s;
     }
 
     digits: Vec<u32> := mut Vec.new();
@@ -657,7 +657,7 @@ F format_u64(n: u64) -> Str {
     s
 }
 
-F format_f64(f: f64, precision: u32) -> Str {
+fn format_f64(f: f64, precision: u32) -> Str {
     # Simplified float formatting.
     # NOTE: we use string interpolation here instead of `.push_str()` because
     # the per-module codegen path occasionally fails to resolve `push_str`
@@ -666,7 +666,7 @@ F format_f64(f: f64, precision: u32) -> Str {
 
     I f < 0.0 {
         pos := mut format_f64(-f, precision);
-        R "-{pos}";
+        return "-{pos}";
     }
 
     integer_part := mut f.floor() as u64;
@@ -675,7 +675,7 @@ F format_f64(f: f64, precision: u32) -> Str {
     int_str := mut format_u64(integer_part);
 
     I precision == 0 {
-        R int_str;
+        return int_str;
     }
 
     frac_str := mut Str.new();
@@ -694,7 +694,7 @@ F format_f64(f: f64, precision: u32) -> Str {
 # ============================================================================
 
 # Format hybrid cost for display
-F format_hybrid_cost(cost: &HybridCost) -> Str {
+fn format_hybrid_cost(cost: &HybridCost) -> Str {
     s := mut Str.from("Total: IO=");
     s = s + &format_f64(cost.total_io_cost, 2);
     s = s + " CPU=";
@@ -707,6 +707,6 @@ F format_hybrid_cost(cost: &HybridCost) -> Str {
 }
 
 # Format per-engine cost breakdown for display
-F format_hybrid_cost_breakdown(cost: &HybridCost) -> Str {
+fn format_hybrid_cost_breakdown(cost: &HybridCost) -> Str {
     format_engine_breakdown(cost)
 }

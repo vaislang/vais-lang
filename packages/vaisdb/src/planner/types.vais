@@ -10,9 +10,9 @@
 # - CrossEngineJoin: join SQL rows with engine results (vector → graph, etc.)
 # - SqlPlan: delegate to existing SQL PlanNode
 
-U storage/error.{VaisError};
-U sql/parser/ast.{Expr, JoinType, OrderByItem, SelectQuery};
-U sql/planner/mod.{PlanNode, CostEstimate, ProjectColumn, AggregateSpec, WindowSpec};
+use storage/error.{VaisError};
+use sql/parser/ast.{Expr, JoinType, OrderByItem, SelectQuery};
+use sql/planner/mod.{PlanNode, CostEstimate, ProjectColumn, AggregateSpec, WindowSpec};
 
 # ============================================================================
 # Error Codes: EE=00 (common/planner), CC=08 (planner)
@@ -24,23 +24,23 @@ C ERR_CODE_HYBRID_ENGINE_MISMATCH: Str = "VAIS-0008003";
 C ERR_CODE_HYBRID_UNSUPPORTED_COMBO: Str = "VAIS-0008004";
 C ERR_CODE_HYBRID_SCORE_FUSION_INVALID: Str = "VAIS-0008005";
 
-F err_hybrid_plan_failed(reason: Str) -> VaisError {
+fn err_hybrid_plan_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_HYBRID_PLAN_FAILED, "Hybrid plan failed: {reason}")
 }
 
-F err_hybrid_cost_failed(reason: Str) -> VaisError {
+fn err_hybrid_cost_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_HYBRID_COST_FAILED, "Hybrid cost estimation failed: {reason}")
 }
 
-F err_hybrid_engine_mismatch(reason: Str) -> VaisError {
+fn err_hybrid_engine_mismatch(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_HYBRID_ENGINE_MISMATCH, "Engine mismatch: {reason}")
 }
 
-F err_hybrid_unsupported_combo(reason: Str) -> VaisError {
+fn err_hybrid_unsupported_combo(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_HYBRID_UNSUPPORTED_COMBO, "Unsupported engine combination: {reason}")
 }
 
-F err_hybrid_score_fusion_invalid(reason: Str) -> VaisError {
+fn err_hybrid_score_fusion_invalid(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_HYBRID_SCORE_FUSION_INVALID, "Invalid score fusion config: {reason}")
 }
 
@@ -49,11 +49,11 @@ F err_hybrid_score_fusion_invalid(reason: Str) -> VaisError {
 # ============================================================================
 
 # Identifies which engine a plan node belongs to
-EN EngineType = Sql | Vector | Graph | FullText | Hybrid;
+enum EngineType = Sql | Vector | Graph | FullText | Hybrid;
 
-X EngineType {
-    F name(self) -> Str {
-        M self {
+impl EngineType {
+    fn name(self) -> Str {
+        match self {
             EngineType.Sql => "sql".to_string(),
             EngineType.Vector => "vector".to_string(),
             EngineType.Graph => "graph".to_string(),
@@ -69,7 +69,7 @@ X EngineType {
 
 # Extended cost estimate with per-engine breakdown
 # Used by EXPLAIN ANALYZE to show "80% graph, 15% vector, 5% SQL"
-S HybridCost {
+struct HybridCost {
     # Aggregate cost (sum of all engines)
     total_io_cost: f64,
     total_cpu_cost: f64,
@@ -94,8 +94,8 @@ S HybridCost {
     fulltext_posting_length: u64, # Avg posting list length
 }
 
-X HybridCost {
-    F new() -> HybridCost {
+impl HybridCost {
+    fn new() -> HybridCost {
         HybridCost {
             total_io_cost: 0.0,
             total_cpu_cost: 0.0,
@@ -118,12 +118,12 @@ X HybridCost {
     }
 
     # Total weighted cost (I/O × 1.0 + CPU × 0.1), compatible with SQL CostEstimate
-    F total(self) -> f64 {
+    fn total(self) -> f64 {
         self.total_io_cost * 1.0 + self.total_cpu_cost * 0.1
     }
 
     # Add another HybridCost (for composing sub-plan costs)
-    F add(self, other: &HybridCost) -> HybridCost {
+    fn add(self, other: &HybridCost) -> HybridCost {
         HybridCost {
             total_io_cost: self.total_io_cost + other.total_io_cost,
             total_cpu_cost: self.total_cpu_cost + other.total_cpu_cost,
@@ -137,16 +137,16 @@ X HybridCost {
             graph_cpu_cost: self.graph_cpu_cost + other.graph_cpu_cost,
             fulltext_io_cost: self.fulltext_io_cost + other.fulltext_io_cost,
             fulltext_cpu_cost: self.fulltext_cpu_cost + other.fulltext_cpu_cost,
-            vector_dimension: I self.vector_dimension > 0 { self.vector_dimension } EL { other.vector_dimension },
-            vector_ef_search: I self.vector_ef_search > 0 { self.vector_ef_search } EL { other.vector_ef_search },
-            graph_avg_degree: I self.graph_avg_degree > 0.0 { self.graph_avg_degree } EL { other.graph_avg_degree },
-            graph_max_depth: I self.graph_max_depth > 0 { self.graph_max_depth } EL { other.graph_max_depth },
-            fulltext_posting_length: I self.fulltext_posting_length > 0 { self.fulltext_posting_length } EL { other.fulltext_posting_length },
+            vector_dimension: I self.vector_dimension > 0 { self.vector_dimension } else { other.vector_dimension },
+            vector_ef_search: I self.vector_ef_search > 0 { self.vector_ef_search } else { other.vector_ef_search },
+            graph_avg_degree: I self.graph_avg_degree > 0.0 { self.graph_avg_degree } else { other.graph_avg_degree },
+            graph_max_depth: I self.graph_max_depth > 0 { self.graph_max_depth } else { other.graph_max_depth },
+            fulltext_posting_length: I self.fulltext_posting_length > 0 { self.fulltext_posting_length } else { other.fulltext_posting_length },
         }
     }
 
     # Convert from SQL CostEstimate (for wrapping existing SQL plan costs)
-    F from_sql_cost(cost: &CostEstimate) -> HybridCost {
+    fn from_sql_cost(cost: &CostEstimate) -> HybridCost {
         HybridCost {
             total_io_cost: cost.io_cost,
             total_cpu_cost: cost.cpu_cost,
@@ -169,10 +169,10 @@ X HybridCost {
     }
 
     # Per-engine cost percentage for EXPLAIN ANALYZE breakdown
-    F engine_breakdown(self) -> Vec<EngineBreakdown> {
+    fn engine_breakdown(self) -> Vec<EngineBreakdown> {
         total := mut self.total();
         I total <= 0.0 {
-            R Vec.new();
+            return Vec.new();
         }
 
         result: Vec<EngineBreakdown> := mut Vec.new();
@@ -216,15 +216,15 @@ X HybridCost {
         # Sort by percentage descending
         result.sort_by(|a: &EngineBreakdown, b: &EngineBreakdown| {
             I b.percentage > a.percentage { 1 }
-            EL I b.percentage < a.percentage { -1 }
-            EL { 0 }
+            else I b.percentage < a.percentage { -1 }
+            else { 0 }
         });
         result
     }
 }
 
 # Single engine's cost share
-S EngineBreakdown {
+struct EngineBreakdown {
     engine: EngineType,
     cost: f64,
     percentage: f64,
@@ -235,7 +235,7 @@ S EngineBreakdown {
 # ============================================================================
 
 # How to combine scores from multiple engines
-EN FusionMethod {
+enum FusionMethod {
     # Combined score = weight_a * norm_a + weight_b * norm_b
     WeightedSum { weight_a: f64, weight_b: f64 },
 
@@ -243,12 +243,12 @@ EN FusionMethod {
     ReciprocalRankFusion { k: u32 },
 }
 
-X FusionMethod {
-    F default_weighted() -> FusionMethod {
+impl FusionMethod {
+    fn default_weighted() -> FusionMethod {
         FusionMethod.WeightedSum { weight_a: 0.5, weight_b: 0.5 }
     }
 
-    F default_rrf() -> FusionMethod {
+    fn default_rrf() -> FusionMethod {
         FusionMethod.ReciprocalRankFusion { k: 60 }
     }
 }
@@ -257,7 +257,7 @@ X FusionMethod {
 # Vector Scan Parameters (for HybridPlanNode.VectorScan)
 # ============================================================================
 
-S VectorScanParams {
+struct VectorScanParams {
     table_name: Str,
     column_name: Str,
     query_vector_expr: Expr,   # Expression that evaluates to query vector (literal or parameter)
@@ -267,8 +267,8 @@ S VectorScanParams {
     post_filter: Option<Expr>, # Residual filter after vector search
 }
 
-X VectorScanParams {
-    F new(table_name: Str, column_name: Str, query_vector_expr: Expr, top_k: u32) -> VectorScanParams {
+impl VectorScanParams {
+    fn new(table_name: Str, column_name: Str, query_vector_expr: Expr, top_k: u32) -> VectorScanParams {
         VectorScanParams {
             table_name,
             column_name,
@@ -280,17 +280,17 @@ X VectorScanParams {
         }
     }
 
-    F with_ef_search(mut self, ef: u32) -> Self {
+    fn with_ef_search(mut self, ef: u32) -> Self {
         self.ef_search = Some(ef);
         self
     }
 
-    F with_pre_filter(mut self, filter: Expr) -> Self {
+    fn with_pre_filter(mut self, filter: Expr) -> Self {
         self.pre_filter = Some(filter);
         self
     }
 
-    F with_post_filter(mut self, filter: Expr) -> Self {
+    fn with_post_filter(mut self, filter: Expr) -> Self {
         self.post_filter = Some(filter);
         self
     }
@@ -304,7 +304,7 @@ C DIRECTION_OUTGOING: u8 = 0;
 C DIRECTION_INCOMING: u8 = 1;
 C DIRECTION_BOTH: u8 = 2;
 
-S GraphTraverseNodeParams {
+struct GraphTraverseNodeParams {
     start_node_expr: Expr,             # Expression evaluating to start node ID
     max_depth: u32,                     # 0 = unlimited
     direction: u8,                      # OUTGOING, INCOMING, BOTH
@@ -314,8 +314,8 @@ S GraphTraverseNodeParams {
     filter: Option<Expr>,               # SQL WHERE pushed into traversal filter
 }
 
-X GraphTraverseNodeParams {
-    F new(start_node_expr: Expr, max_depth: u32) -> GraphTraverseNodeParams {
+impl GraphTraverseNodeParams {
+    fn new(start_node_expr: Expr, max_depth: u32) -> GraphTraverseNodeParams {
         GraphTraverseNodeParams {
             start_node_expr,
             max_depth,
@@ -328,27 +328,27 @@ X GraphTraverseNodeParams {
     }
 
     # Builder pattern: takes self by value, returns Self
-    F with_direction(mut self, direction: u8) -> GraphTraverseNodeParams {
+    fn with_direction(mut self, direction: u8) -> GraphTraverseNodeParams {
         self.direction = direction;
         self
     }
 
-    F with_edge_filter(mut self, types: Vec<Str>) -> GraphTraverseNodeParams {
+    fn with_edge_filter(mut self, types: Vec<Str>) -> GraphTraverseNodeParams {
         self.edge_type_filter = Some(types);
         self
     }
 
-    F with_paths(mut self) -> GraphTraverseNodeParams {
+    fn with_paths(mut self) -> GraphTraverseNodeParams {
         self.return_paths = true;
         self
     }
 
-    F with_dfs(mut self) -> Self {
+    fn with_dfs(mut self) -> Self {
         self.use_dfs = true;
         self
     }
 
-    F with_filter(mut self, filter: Expr) -> Self {
+    fn with_filter(mut self, filter: Expr) -> Self {
         self.filter = Some(filter);
         self
     }
@@ -358,13 +358,13 @@ X GraphTraverseNodeParams {
 # FullText Scan Parameters (for HybridPlanNode.FullTextScan)
 # ============================================================================
 
-EN FullTextSearchMode {
+enum FullTextSearchMode {
     Simple,             # Basic BM25 term matching
     Phrase { slop: u32 },   # Position-aware phrase matching
     Boolean,            # AND/OR/NOT operators
 }
 
-S FullTextScanParams {
+struct FullTextScanParams {
     table_name: Str,
     column_name: Str,
     query_text_expr: Expr,  # Expression evaluating to search query string
@@ -373,8 +373,8 @@ S FullTextScanParams {
     filter: Option<Expr>,   # SQL WHERE pushed into full-text filter
 }
 
-X FullTextScanParams {
-    F new(table_name: Str, column_name: Str, query_text_expr: Expr, top_k: u32) -> FullTextScanParams {
+impl FullTextScanParams {
+    fn new(table_name: Str, column_name: Str, query_text_expr: Expr, top_k: u32) -> FullTextScanParams {
         FullTextScanParams {
             table_name,
             column_name,
@@ -385,12 +385,12 @@ X FullTextScanParams {
         }
     }
 
-    F with_mode(mut self, mode: FullTextSearchMode) -> Self {
+    fn with_mode(mut self, mode: FullTextSearchMode) -> Self {
         self.search_mode = mode;
         self
     }
 
-    F with_filter(mut self, filter: Expr) -> Self {
+    fn with_filter(mut self, filter: Expr) -> Self {
         self.filter = Some(filter);
         self
     }
@@ -401,7 +401,7 @@ X FullTextScanParams {
 # ============================================================================
 
 # The core plan tree node for hybrid queries spanning multiple engines
-EN HybridPlanNode =
+enum HybridPlanNode =
     # Delegate to existing SQL planner's PlanNode
     SqlPlan { plan: PlanNode, cost: HybridCost } |
 
@@ -454,10 +454,10 @@ EN HybridPlanNode =
         cost: HybridCost,
     };
 
-X HybridPlanNode {
+impl HybridPlanNode {
     # Get the cost of this plan node
-    F get_cost(self) -> &HybridCost {
-        M self {
+    fn get_cost(self) -> &HybridCost {
+        match self {
             HybridPlanNode.SqlPlan { cost, .. } => cost,
             HybridPlanNode.VectorScan { cost, .. } => cost,
             HybridPlanNode.GraphTraverse { cost, .. } => cost,
@@ -473,8 +473,8 @@ X HybridPlanNode {
     }
 
     # Get the engine type of this plan node
-    F engine_type(self) -> EngineType {
-        M self {
+    fn engine_type(self) -> EngineType {
+        match self {
             HybridPlanNode.SqlPlan { .. } => EngineType.Sql,
             HybridPlanNode.VectorScan { .. } => EngineType.Vector,
             HybridPlanNode.GraphTraverse { .. } => EngineType.Graph,
@@ -490,13 +490,13 @@ X HybridPlanNode {
     }
 
     # Get estimated output row count
-    F row_estimate(self) -> u64 {
+    fn row_estimate(self) -> u64 {
         self.get_cost().row_estimate
     }
 
     # Check I this plan involves multiple engines
-    F is_hybrid(self) -> bool {
-        M self {
+    fn is_hybrid(self) -> bool {
+        match self {
             HybridPlanNode.ScoreFusion { .. } => true,
             HybridPlanNode.CrossEngineJoin { left, right, .. } => {
                 left.engine_type() != right.engine_type()
@@ -516,7 +516,7 @@ X HybridPlanNode {
 # ============================================================================
 
 # Detected engine usage in a query
-S QueryProfile {
+struct QueryProfile {
     uses_sql: bool,
     uses_vector: bool,
     uses_graph: bool,
@@ -527,8 +527,8 @@ S QueryProfile {
     sql_tables: Vec<Str>,              # Regular SQL tables referenced
 }
 
-X QueryProfile {
-    F new() -> QueryProfile {
+impl QueryProfile {
+    fn new() -> QueryProfile {
         QueryProfile {
             uses_sql: false,
             uses_vector: false,
@@ -542,7 +542,7 @@ X QueryProfile {
     }
 
     # Count of engines involved
-    F engine_count(self) -> u32 {
+    fn engine_count(self) -> u32 {
         count := mut 0u32;
         I self.uses_sql { count += 1; }
         I self.uses_vector { count += 1; }
@@ -552,17 +552,17 @@ X QueryProfile {
     }
 
     # Whether this is a single-engine query (can use fast path)
-    F is_single_engine(self) -> bool {
+    fn is_single_engine(self) -> bool {
         self.engine_count() == 1
     }
 
     # Whether this is a pure SQL query (no engine functions)
-    F is_pure_sql(self) -> bool {
+    fn is_pure_sql(self) -> bool {
         self.uses_sql && !self.uses_vector && !self.uses_graph && !self.uses_fulltext
     }
 
     # Whether this requires cross-engine score fusion
-    F needs_score_fusion(self) -> bool {
+    fn needs_score_fusion(self) -> bool {
         engine_count := mut 0u32;
         I self.uses_vector { engine_count += 1; }
         I self.uses_fulltext { engine_count += 1; }
@@ -574,7 +574,7 @@ X QueryProfile {
 # Hybrid Execution Stats — For EXPLAIN ANALYZE
 # ============================================================================
 
-S HybridExecStats {
+struct HybridExecStats {
     engine: EngineType,
     rows_produced: u64,
     rows_scanned: u64,
@@ -584,8 +584,8 @@ S HybridExecStats {
     children: Vec<HybridExecStats>,
 }
 
-X HybridExecStats {
-    F new(engine: EngineType) -> HybridExecStats {
+impl HybridExecStats {
+    fn new(engine: EngineType) -> HybridExecStats {
         HybridExecStats {
             engine,
             rows_produced: 0,
@@ -597,7 +597,7 @@ X HybridExecStats {
         }
     }
 
-    F total_elapsed_us(self) -> u64 {
+    fn total_elapsed_us(self) -> u64 {
         total := mut self.elapsed_us;
         LF child: self.children {
             total += child.total_elapsed_us();

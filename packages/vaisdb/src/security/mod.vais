@@ -20,41 +20,41 @@
 # Error codes: EE=09 (security engine), WAL types: 0x60-0x65
 # ENGINE_TAG_SECURITY = 0x06
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
-U storage/buffer/pool.{BufferPool};
-U storage/wal/group_commit.{GroupCommitManager};
-U sql/catalog/manager.{CatalogManager};
-U sql/parser/ast.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use storage/error.{VaisError};
+use storage/buffer/pool.{BufferPool};
+use storage/wal/group_commit.{GroupCommitManager};
+use sql/catalog/manager.{CatalogManager};
+use sql/parser/ast.{
     CreateUserStmt, AlterUserStmt, CreateRoleStmt,
     GrantStmt, RevokeStmt, CreatePolicyStmt,
 };
-U security/types.{
+use security/types.{
     SecurityConfig, SecurityMeta, SessionContext,
     UserInfo, RoleInfo, GrantEntry, PolicyEntry,
     AuditEntry, EncryptionKeyInfo, PrivilegeCheck,
     AUDIT_RESULT_SUCCESS, AUDIT_RESULT_FAILURE, AUDIT_RESULT_DENIED,
     err_security_engine_closed,
 };
-U security/user.{UserManager};
-U security/role.{RoleManager};
-U security/grant.{GrantManager};
-U security/privilege.{PrivilegeChecker};
-U security/policy.{PolicyEngine};
-U security/rls.{RlsEvaluator};
-U security/encryption.{KeyManager, PageEncryptor, WalEncryptor};
-U security/tls.{TlsManager, TlsConfig, TlsConnection};
-U security/audit.{AuditLogger};
-U security/wal.{SecurityWalManager};
-U security/sanitizer.{InputSanitizer, ErrorSanitizer};
+use security/user.{UserManager};
+use security/role.{RoleManager};
+use security/grant.{GrantManager};
+use security/privilege.{PrivilegeChecker};
+use security/policy.{PolicyEngine};
+use security/rls.{RlsEvaluator};
+use security/encryption.{KeyManager, PageEncryptor, WalEncryptor};
+use security/tls.{TlsManager, TlsConfig, TlsConnection};
+use security/audit.{AuditLogger};
+use security/wal.{SecurityWalManager};
+use security/sanitizer.{InputSanitizer, ErrorSanitizer};
 
 # ============================================================================
 # SecurityEngine — Main facade for all security operations
 # ============================================================================
 
-S SecurityEngine {
+struct SecurityEngine {
     config: SecurityConfig,
     meta: SecurityMeta,
     user_mgr: UserManager,
@@ -69,9 +69,9 @@ S SecurityEngine {
     initialized: bool,
 }
 
-X SecurityEngine {
+impl SecurityEngine {
     ## Create a new security engine (not yet initialized)
-    F new(page_size: u32) -> SecurityEngine {
+    fn new(page_size: u32) -> SecurityEngine {
         config := mut SecurityConfig.default(page_size);
         meta := mut SecurityMeta.new(page_size);
         SecurityEngine {
@@ -92,7 +92,7 @@ X SecurityEngine {
 
     ## Initialize (open) the security engine
     ## Loads user/role/grant/policy data from the catalog
-    F open(
+    fn open(
         mut self,
         catalog: &CatalogManager,
         config: SecurityConfig,
@@ -108,7 +108,7 @@ X SecurityEngine {
         self.policy_engine = PolicyEngine.load_from_catalog(catalog);
 
         # Initialize encryption
-        M encryption_key {
+        match encryption_key {
             Some(key_data) => {
                 self.key_mgr = KeyManager.from_key(self.config.encrypt_algo, key_data)?;
             },
@@ -128,7 +128,7 @@ X SecurityEngine {
     }
 
     ## Shutdown the security engine
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         # Verify audit log integrity before shutdown
         I self.audit_logger.is_enabled() {
             self.audit_logger.verify_chain()?;
@@ -142,7 +142,7 @@ X SecurityEngine {
     # ========================================================================
 
     ## Authenticate a user and return a SessionContext
-    F authenticate(
+    fn authenticate(
         mut self,
         username: &Str,
         password: &Str,
@@ -152,7 +152,7 @@ X SecurityEngine {
         self.require_initialized()?;
 
         # Authenticate credentials
-        user_id := mut M self.user_mgr.authenticate(username, password, &self.config) {
+        user_id := mut match self.user_mgr.authenticate(username, password, &self.config) {
             Ok(id) => {
                 # Log successful auth
                 system_ctx := mut SessionContext.system();
@@ -171,7 +171,7 @@ X SecurityEngine {
                     &"Login failed",
                     AUDIT_RESULT_FAILURE,
                 )?;
-                R Err(e);
+                return Err(e);
             },
         };
 
@@ -190,7 +190,7 @@ X SecurityEngine {
     # ========================================================================
 
     ## Check if session has a table-level privilege
-    F check_privilege(
+    fn check_privilege(
         self,
         session: &SessionContext,
         table_name: &Str,
@@ -202,7 +202,7 @@ X SecurityEngine {
     }
 
     ## Check if session has a column-level privilege
-    F check_column_privilege(
+    fn check_column_privilege(
         self,
         session: &SessionContext,
         table_name: &Str,
@@ -219,20 +219,20 @@ X SecurityEngine {
     # ========================================================================
 
     ## Apply RLS to a SQL scan -- returns additional WHERE clause
-    F apply_rls(
+    fn apply_rls(
         self,
         table_name: &Str,
         session: &SessionContext,
     ) -> Option<Str> {
         I !self.initialized || !self.config.enable_rls {
-            R None;
+            return None;
         }
         evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
         evaluator.apply_rls_to_scan(table_name, session)
     }
 
     # Apply RLS to vector search results
-    F apply_rls_to_vector(
+    fn apply_rls_to_vector(
         self,
         table_name: &Str,
         results: &Vec<(u64, f32)>,
@@ -240,14 +240,14 @@ X SecurityEngine {
         session: &SessionContext,
     ) -> Vec<(u64, f32)> {
         I !self.initialized || !self.config.enable_rls {
-            R results.clone();
+            return results.clone();
         }
         evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
         evaluator.apply_rls_to_vector_search(table_name, results, row_tenant_ids, session)
     }
 
     # Apply RLS to graph traversal
-    F apply_rls_to_graph(
+    fn apply_rls_to_graph(
         self,
         table_name: &Str,
         edge_tenant_ids: &Vec<u64>,
@@ -260,7 +260,7 @@ X SecurityEngine {
                 mask.push(true);
                 i = i + 1;
             }
-            R mask;
+            return mask;
         }
         evaluator := mut RlsEvaluator.new(&self.policy_engine, self.config.enable_rls);
         evaluator.apply_rls_to_graph_traverse(table_name, edge_tenant_ids, session)
@@ -271,22 +271,22 @@ X SecurityEngine {
     # ========================================================================
 
     # Encrypt a page
-    F encrypt_page(self, page_data: &mut Vec<u8>, page_id: u32) -> Result<(), VaisError> {
+    fn encrypt_page(self, page_data: &mut Vec<u8>, page_id: u32) -> Result<(), VaisError> {
         self.key_mgr.page_encryptor().encrypt_page(page_data, page_id)
     }
 
     # Decrypt a page
-    F decrypt_page(self, page_data: &mut Vec<u8>, page_id: u32, key_id: u32) -> Result<(), VaisError> {
+    fn decrypt_page(self, page_data: &mut Vec<u8>, page_id: u32, key_id: u32) -> Result<(), VaisError> {
         self.key_mgr.page_encryptor().decrypt_page(page_data, page_id, key_id)
     }
 
     # Check if encryption is enabled
-    F is_encrypted(self) -> bool {
+    fn is_encrypted(self) -> bool {
         self.key_mgr.is_encrypted()
     }
 
     # Get active encryption key ID
-    F active_key_id(self) -> u32 {
+    fn active_key_id(self) -> u32 {
         self.key_mgr.page_encryptor().active_key_id()
     }
 
@@ -295,7 +295,7 @@ X SecurityEngine {
     # ========================================================================
 
     # Log an audit event
-    F log_audit(
+    fn log_audit(
         mut self,
         session: &SessionContext,
         event_type: u8,
@@ -305,7 +305,7 @@ X SecurityEngine {
         detail: &Str,
     ) -> Result<(), VaisError> {
         I !self.initialized {
-            R Ok(());
+            return Ok(());
         }
         self.audit_logger.append_entry(
             &self.meta, session, event_type, result,
@@ -318,7 +318,7 @@ X SecurityEngine {
     # ========================================================================
 
     # Execute CREATE USER
-    F execute_create_user(
+    fn execute_create_user(
         mut self,
         stmt: &CreateUserStmt,
         session: &SessionContext,
@@ -336,7 +336,7 @@ X SecurityEngine {
     }
 
     # Execute ALTER USER
-    F execute_alter_user(
+    fn execute_alter_user(
         mut self,
         stmt: &AlterUserStmt,
         session: &SessionContext,
@@ -354,7 +354,7 @@ X SecurityEngine {
     }
 
     # Execute DROP USER
-    F execute_drop_user(
+    fn execute_drop_user(
         mut self,
         username: &Str,
         if_exists: bool,
@@ -374,7 +374,7 @@ X SecurityEngine {
     }
 
     # Execute CREATE ROLE
-    F execute_create_role(
+    fn execute_create_role(
         mut self,
         stmt: &CreateRoleStmt,
         session: &SessionContext,
@@ -391,7 +391,7 @@ X SecurityEngine {
     }
 
     # Execute DROP ROLE
-    F execute_drop_role(
+    fn execute_drop_role(
         mut self,
         role_name: &Str,
         if_exists: bool,
@@ -411,7 +411,7 @@ X SecurityEngine {
     }
 
     # Execute GRANT
-    F execute_grant(
+    fn execute_grant(
         mut self,
         stmt: &GrantStmt,
         session: &SessionContext,
@@ -430,7 +430,7 @@ X SecurityEngine {
     }
 
     # Execute REVOKE
-    F execute_revoke(
+    fn execute_revoke(
         mut self,
         stmt: &RevokeStmt,
         session: &SessionContext,
@@ -449,7 +449,7 @@ X SecurityEngine {
     }
 
     # Execute CREATE POLICY
-    F execute_create_policy(
+    fn execute_create_policy(
         mut self,
         stmt: &CreatePolicyStmt,
         session: &SessionContext,
@@ -466,7 +466,7 @@ X SecurityEngine {
     }
 
     # Execute DROP POLICY
-    F execute_drop_policy(
+    fn execute_drop_policy(
         mut self,
         policy_name: &Str,
         table_name: &Str,
@@ -490,17 +490,17 @@ X SecurityEngine {
     # ========================================================================
 
     # Validate a SQL identifier
-    F validate_identifier(self, name: &Str) -> Result<(), VaisError> {
+    fn validate_identifier(self, name: &Str) -> Result<(), VaisError> {
         self.input_sanitizer.validate_identifier(name)
     }
 
     # Escape a string literal
-    F escape_string(self, value: &Str) -> Str {
+    fn escape_string(self, value: &Str) -> Str {
         self.input_sanitizer.escape_string_literal(value)
     }
 
     # Sanitize error for client
-    F sanitize_error(self, err: &VaisError) -> VaisError {
+    fn sanitize_error(self, err: &VaisError) -> VaisError {
         self.error_sanitizer.sanitize_error(err)
     }
 
@@ -509,12 +509,12 @@ X SecurityEngine {
     # ========================================================================
 
     # Get TLS manager reference
-    F tls_manager(self) -> &TlsManager {
+    fn tls_manager(self) -> &TlsManager {
         &self.tls_mgr
     }
 
     # Check if TLS is enabled
-    F is_tls_enabled(self) -> bool {
+    fn is_tls_enabled(self) -> bool {
         self.tls_mgr.is_enabled()
     }
 
@@ -522,11 +522,11 @@ X SecurityEngine {
     # Metadata Access
     # ========================================================================
 
-    F get_meta(self) -> &SecurityMeta {
+    fn get_meta(self) -> &SecurityMeta {
         &self.meta
     }
 
-    F get_config(self) -> &SecurityConfig {
+    fn get_config(self) -> &SecurityConfig {
         &self.config
     }
 
@@ -534,9 +534,9 @@ X SecurityEngine {
     # Internal Helpers
     # ========================================================================
 
-    F require_initialized(self) -> Result<(), VaisError> {
+    fn require_initialized(self) -> Result<(), VaisError> {
         I !self.initialized {
-            R Err(err_security_engine_closed());
+            return Err(err_security_engine_closed());
         }
         Ok(())
     }

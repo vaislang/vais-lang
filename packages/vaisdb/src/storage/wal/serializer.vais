@@ -2,31 +2,31 @@
 # Unified serialization/deserialization for all WAL record types
 # Based on Stage 2: WAL Design
 
-U storage/error
-U storage/wal/header
-U storage/wal/record_types
-U storage/wal/record_rel
-U storage/wal/record_vector
-U storage/wal/record_graph
-U storage/wal/record_fulltext
-U storage/checksum
-U storage/constants
-U storage/bytes
+use storage/error
+use storage/wal/header
+use storage/wal/record_types
+use storage/wal/record_rel
+use storage/wal/record_vector
+use storage/wal/record_graph
+use storage/wal/record_fulltext
+use storage/checksum
+use storage/constants
+use storage/bytes
 
 # WalRecord - Full WAL record (header + payload)
-S WalRecord {
+struct WalRecord {
     header: WalRecordHeader,
     payload: Vec<u8>,       # Serialized payload (varies by record_type)
 }
 
-X WalRecord {
+impl WalRecord {
     # Create a new WAL record with payload
-    F new(header: WalRecordHeader, payload: Vec<u8>) -> WalRecord {
+    fn new(header: WalRecordHeader, payload: Vec<u8>) -> WalRecord {
         WalRecord { header, payload }
     }
 
     # Serialize full record to bytes (header + payload)
-    F to_bytes(self) -> Vec<u8> {
+    fn to_bytes(self) -> Vec<u8> {
         buf := mut ByteBuffer.with_capacity(self.header.record_length as u64)
         self.header.serialize(&mut buf)
         buf.write_bytes(self.payload.as_ptr(), self.payload.len() as i64)
@@ -34,7 +34,7 @@ X WalRecord {
     }
 
     # Deserialize full record from bytes
-    F from_bytes(data: &[u8]) -> Result<WalRecord, VaisError> {
+    fn from_bytes(data: &[u8]) -> Result<WalRecord, VaisError> {
         buf := mut ByteBuffer.from_slice(data)
         header := mut WalRecordHeader.deserialize(&buf)?;
 
@@ -48,13 +48,13 @@ X WalRecord {
     }
 
     # Verify checksum
-    F verify_checksum(self) -> bool {
+    fn verify_checksum(self) -> bool {
         full_record := mut self.to_bytes()
         self.header.verify_checksum(&full_record)
     }
 
     # Compute and update checksum
-    F compute_checksum(mut self) {
+    fn compute_checksum(mut self) {
         full_record := mut self.to_bytes()
         self.header.set_checksum(&full_record)
     }
@@ -64,12 +64,12 @@ X WalRecord {
 # WalRecordSerializer - Unified serializer for header + payload
 # ============================================================================
 
-S WalRecordSerializer {}
+struct WalRecordSerializer {}
 
-X WalRecordSerializer {
+impl WalRecordSerializer {
     # Serialize a complete WAL record (header + payload + checksum)
     # Returns the full serialized record ready to write to WAL
-    F serialize_record(header: &WalRecordHeader, payload: &[u8]) -> Vec<u8> {
+    fn serialize_record(header: &WalRecordHeader, payload: &[u8]) -> Vec<u8> {
         # Allocate buffer for header + payload
         total_len := mut (WAL_RECORD_HEADER_SIZE as u64) + payload.len()
         buf := mut ByteBuffer.with_capacity(total_len)
@@ -97,10 +97,10 @@ X WalRecordSerializer {
 
     # Deserialize a complete WAL record, splitting into header and payload
     # Verifies checksum before returning
-    F deserialize_record(data: &[u8]) -> Result<(WalRecordHeader, Vec<u8>), VaisError> {
+    fn deserialize_record(data: &[u8]) -> Result<(WalRecordHeader, Vec<u8>), VaisError> {
         # Minimum size check
         I data.len() < (WAL_RECORD_HEADER_SIZE as u64) {
-            R Err(err_wal_corruption(0))
+            return Err(err_wal_corruption(0))
         }
 
         # Parse header
@@ -109,12 +109,12 @@ X WalRecordSerializer {
 
         # Verify record length matches data length
         I (header.record_length as u64) != data.len() {
-            R Err(err_wal_corruption(header.lsn))
+            return Err(err_wal_corruption(header.lsn))
         }
 
         # Verify checksum
         I !header.verify_checksum(data) {
-            R Err(err_wal_corruption(header.lsn))
+            return Err(err_wal_corruption(header.lsn))
         }
 
         # Extract payload (everything after header)
@@ -127,8 +127,8 @@ X WalRecordSerializer {
     }
 
     # Get human-readable name for a record type (for logging/debugging)
-    F record_type_name(record_type: u8) -> str {
-        M record_type {
+    fn record_type_name(record_type: u8) -> str {
+        match record_type {
             # Meta records (0-15)
             TXN_BEGIN => "TXN_BEGIN",
             TXN_COMMIT => "TXN_COMMIT",

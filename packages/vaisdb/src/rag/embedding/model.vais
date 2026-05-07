@@ -2,12 +2,12 @@
 # Tracks embedding models, versions, and prevents mixed-model vectors
 # Each vector index is bound to a specific model version
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
-U rag/types.{
+use std/bytes.{ByteBuffer};
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use storage/error.{VaisError};
+use rag/types.{
     DISTANCE_COSINE, DISTANCE_L2, DISTANCE_DOT_PRODUCT,
     err_rag_model_not_found, err_rag_model_version_mismatch,
     err_rag_dimension_mismatch, err_rag_invalid_embedding_config
@@ -17,7 +17,7 @@ U rag/types.{
 # EmbeddingModelInfo — Metadata for a registered embedding model
 # ============================================================================
 
-S EmbeddingModelInfo {
+struct EmbeddingModelInfo {
     model_id: u32,              # Unique identifier within this database
     model_name: Str,            # e.g., "openai:text-embedding-3-small"
     model_version: u32,         # Incremented on model change
@@ -29,9 +29,9 @@ S EmbeddingModelInfo {
     created_at: i64,            # Registration timestamp
 }
 
-X EmbeddingModelInfo {
+impl EmbeddingModelInfo {
     ## Create a precomputed model entry (no external API needed)
-    F precomputed(model_id: u32, dimensions: u32, distance: u8) -> EmbeddingModelInfo {
+    fn precomputed(model_id: u32, dimensions: u32, distance: u8) -> EmbeddingModelInfo {
         EmbeddingModelInfo {
             model_id,
             model_name: "precomputed",
@@ -46,7 +46,7 @@ X EmbeddingModelInfo {
     }
 
     ## Create an external API model entry
-    F external(
+    fn external(
         model_id: u32,
         name: Str,
         dimensions: u32,
@@ -68,21 +68,21 @@ X EmbeddingModelInfo {
     }
 
     ## Validate that a vector matches this model's expected dimensions
-    F validate_vector(self, vector: &Vec<f32>) -> Result<(), VaisError> {
+    fn validate_vector(self, vector: &Vec<f32>) -> Result<(), VaisError> {
         I vector.len() as u32 != self.dimensions {
-            R Err(err_rag_dimension_mismatch(self.dimensions, vector.len() as u32));
+            return Err(err_rag_dimension_mismatch(self.dimensions, vector.len() as u32));
         }
         Ok(())
     }
 
     ## Check if this model requires external API for embedding
-    F requires_api(self) -> bool {
+    fn requires_api(self) -> bool {
         self.provider != "precomputed" && self.provider != "local"
     }
 
     ## Distance metric name for display
-    F distance_name(self) -> Str {
-        M self.distance_metric {
+    fn distance_name(self) -> Str {
+        match self.distance_metric {
             0 => "cosine",
             1 => "l2",
             2 => "dot_product",
@@ -91,19 +91,19 @@ X EmbeddingModelInfo {
     }
 
     ## Serialize fixed metadata (32 bytes, excluding variable-length strings)
-    F serialize_meta(self, buf: &mut ByteBuffer) {
+    fn serialize_meta(self, buf: &mut ByteBuffer) {
         buf.write_i32_le(self.model_id);
         buf.write_i32_le(self.model_version);
         buf.write_i32_le(self.dimensions);
         buf.write_u8(self.distance_metric);
-        buf.write_u8(I self.is_active { 1 } EL { 0 });
+        buf.write_u8(I self.is_active { 1 } else { 0 });
         buf.write_u16_le(0);  # reserved
         buf.write_i64_le(self.created_at);
         buf.write_i64_le(0);  # reserved for future
     }
 
     ## Deserialize fixed metadata (32 bytes)
-    F deserialize_meta(buf: &ByteBuffer) -> Result<EmbeddingModelInfo, VaisError> {
+    fn deserialize_meta(buf: &ByteBuffer) -> Result<EmbeddingModelInfo, VaisError> {
         model_id := mut buf.get_u32_le()?;
         model_version := mut buf.get_u32_le()?;
         dimensions := mut buf.get_u32_le()?;
@@ -124,13 +124,13 @@ X EmbeddingModelInfo {
 # EmbeddingModelRegistry — Manage registered models
 # ============================================================================
 
-S EmbeddingModelRegistry {
+struct EmbeddingModelRegistry {
     models: Vec<EmbeddingModelInfo>,
     next_model_id: u32,
 }
 
-X EmbeddingModelRegistry {
-    F new() -> EmbeddingModelRegistry {
+impl EmbeddingModelRegistry {
+    fn new() -> EmbeddingModelRegistry {
         EmbeddingModelRegistry {
             models: Vec.new(),
             next_model_id: 1,
@@ -138,14 +138,14 @@ X EmbeddingModelRegistry {
     }
 
     ## Register a new embedding model
-    F register_model(mut self, name: Str, dimensions: u32, distance: u8,
+    fn register_model(mut self, name: Str, dimensions: u32, distance: u8,
                      provider: Str, endpoint: Str) -> Result<u32, VaisError> {
         # Validate dimensions
         I dimensions == 0 {
-            R Err(err_rag_invalid_embedding_config("Dimensions must be > 0"));
+            return Err(err_rag_invalid_embedding_config("Dimensions must be > 0"));
         }
         I distance > DISTANCE_DOT_PRODUCT {
-            R Err(err_rag_invalid_embedding_config("Invalid distance metric"));
+            return Err(err_rag_invalid_embedding_config("Invalid distance metric"));
         }
 
         model_id := mut self.next_model_id;
@@ -175,12 +175,12 @@ X EmbeddingModelRegistry {
     }
 
     ## Get the currently active model
-    F get_active_model(self) -> Option<&EmbeddingModelInfo> {
+    fn get_active_model(self) -> Option<&EmbeddingModelInfo> {
         i := mut 0u32;
         LW i < self.models.len() as u32 {
             model := mut self.models.get(i as u64);
             I model.is_active {
-                R Some(model);
+                return Some(model);
             }
             i = i + 1;
         }
@@ -188,12 +188,12 @@ X EmbeddingModelRegistry {
     }
 
     ## Get model by ID
-    F get_model(self, model_id: u32) -> Option<&EmbeddingModelInfo> {
+    fn get_model(self, model_id: u32) -> Option<&EmbeddingModelInfo> {
         i := mut 0u32;
         LW i < self.models.len() as u32 {
             model := mut self.models.get(i as u64);
             I model.model_id == model_id {
-                R Some(model);
+                return Some(model);
             }
             i = i + 1;
         }
@@ -201,12 +201,12 @@ X EmbeddingModelRegistry {
     }
 
     ## Get model by name
-    F get_model_by_name(self, name: &Str) -> Option<&EmbeddingModelInfo> {
+    fn get_model_by_name(self, name: &Str) -> Option<&EmbeddingModelInfo> {
         i := mut 0u32;
         LW i < self.models.len() as u32 {
             model := mut self.models.get(i as u64);
             I model.model_name == *name {
-                R Some(model);
+                return Some(model);
             }
             i = i + 1;
         }
@@ -214,20 +214,20 @@ X EmbeddingModelRegistry {
     }
 
     ## Check if a vector is compatible with the given model
-    F validate_compatibility(self, model_id: u32, vector: &Vec<f32>) -> Result<(), VaisError> {
-        M self.get_model(model_id) {
+    fn validate_compatibility(self, model_id: u32, vector: &Vec<f32>) -> Result<(), VaisError> {
+        match self.get_model(model_id) {
             Some(model) => model.validate_vector(vector),
             None => Err(err_rag_model_not_found(&"unknown")),
         }
     }
 
     ## Check version compatibility between index model and current model
-    F check_version(self, index_model_id: u32, index_model_version: u32) -> Result<(), VaisError> {
-        M self.get_model(index_model_id) {
+    fn check_version(self, index_model_id: u32, index_model_version: u32) -> Result<(), VaisError> {
+        match self.get_model(index_model_id) {
             Some(model) => {
                 I model.model_version != index_model_version {
                     Err(err_rag_model_version_mismatch(model.model_version, index_model_version))
-                } EL {
+                } else {
                     Ok(())
                 }
             },
@@ -236,13 +236,13 @@ X EmbeddingModelRegistry {
     }
 
     ## Increment model version (for model change + reindex)
-    F bump_version(mut self, model_id: u32) -> Result<u32, VaisError> {
+    fn bump_version(mut self, model_id: u32) -> Result<u32, VaisError> {
         i := mut 0u32;
         LW i < self.models.len() as u32 {
             model := mut self.models.get_mut(i as u64);
             I model.model_id == model_id {
                 model.model_version = model.model_version + 1;
-                R Ok(model.model_version);
+                return Ok(model.model_version);
             }
             i = i + 1;
         }
@@ -250,7 +250,7 @@ X EmbeddingModelRegistry {
     }
 
     ## Set active model (deactivate others)
-    F set_active(mut self, model_id: u32) -> Result<(), VaisError> {
+    fn set_active(mut self, model_id: u32) -> Result<(), VaisError> {
         found := mut false;
         i := mut 0u32;
         LW i < self.models.len() as u32 {
@@ -258,19 +258,19 @@ X EmbeddingModelRegistry {
             I model.model_id == model_id {
                 model.is_active = true;
                 found = true;
-            } EL {
+            } else {
                 model.is_active = false;
             }
             i = i + 1;
         }
         I !found {
-            R Err(err_rag_model_not_found(&"unknown"));
+            return Err(err_rag_model_not_found(&"unknown"));
         }
         Ok(())
     }
 
     ## Get total registered models
-    F model_count(self) -> u32 {
+    fn model_count(self) -> u32 {
         self.models.len() as u32
     }
 }

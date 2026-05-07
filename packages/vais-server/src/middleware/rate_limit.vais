@@ -2,23 +2,23 @@
 # Limits requests per IP address within a sliding window.
 # Returns 429 Too Many Requests when the limit is exceeded.
 
-U std/vec
-U std/string
-U core/context
-U middleware/pipeline
+use std/vec
+use std/string
+use core/context
+use middleware/pipeline
 
 # ============================================================================
 # RateLimitEntry — per-IP request counter and window start
 # ============================================================================
 
-S RateLimitEntry {
+struct RateLimitEntry {
     ip:          str,
     count:       i64,
     window_start: i64,   # Unix ms timestamp of window start
 }
 
-X RateLimitEntry {
-    F new(ip: str, start_ms: i64) -> RateLimitEntry {
+impl RateLimitEntry {
+    fn new(ip: str, start_ms: i64) -> RateLimitEntry {
         RateLimitEntry {
             ip:           ip,
             count:        1,
@@ -31,21 +31,21 @@ X RateLimitEntry {
 # RateLimitConfig
 # ============================================================================
 
-S RateLimitConfig {
+struct RateLimitConfig {
     max_requests: i64,   # Maximum number of requests allowed per window
     window_ms:    i64,   # Window size in milliseconds
 }
 
-X RateLimitConfig {
+impl RateLimitConfig {
     # Default: 100 requests per 60 seconds
-    F default() -> RateLimitConfig {
+    fn default() -> RateLimitConfig {
         RateLimitConfig {
             max_requests: 100,
             window_ms:    60000,
         }
     }
 
-    F new(max_requests: i64, window_ms: i64) -> RateLimitConfig {
+    fn new(max_requests: i64, window_ms: i64) -> RateLimitConfig {
         RateLimitConfig {
             max_requests: max_requests,
             window_ms:    window_ms,
@@ -57,31 +57,31 @@ X RateLimitConfig {
 # RateLimitStore — in-memory store of per-IP entries
 # ============================================================================
 
-S RateLimitStore {
+struct RateLimitStore {
     entries: Vec<RateLimitEntry>,
 }
 
-X RateLimitStore {
-    F new() -> RateLimitStore {
+impl RateLimitStore {
+    fn new() -> RateLimitStore {
         RateLimitStore { entries: Vec.with_capacity(256) }
     }
 
     # Check and update the count for the given IP.
     # Returns the current count after incrementing (1 = first request in window).
     # Expired windows are reset automatically.
-    F check_and_increment(mut self, ip: str, now_ms: i64, window_ms: i64) -> i64 {
+    fn check_and_increment(mut self, ip: str, now_ms: i64, window_ms: i64) -> i64 {
         store_check(self.entries, ip, now_ms, window_ms, 0)
     }
 }
 
 # Recursive search over entries: update in-place or append new entry.
 # Returns updated count for the IP.
-F store_check(entries: Vec<RateLimitEntry>, ip: str, now_ms: i64, window_ms: i64, i: i64) -> i64 {
+fn store_check(entries: Vec<RateLimitEntry>, ip: str, now_ms: i64, window_ms: i64, i: i64) -> i64 {
     I i >= entries.len() {
         # IP not found — first request; append a new entry
         entry := RateLimitEntry.new(ip, now_ms)
         entries.push(entry)
-        R 1
+        return 1
     }
 
     e := entries.get(i)
@@ -91,13 +91,13 @@ F store_check(entries: Vec<RateLimitEntry>, ip: str, now_ms: i64, window_ms: i64
             # Window expired — reset
             e.window_start = now_ms
             e.count        = 1
-            R 1
-        } EL {
+            return 1
+        } else {
             # Within window — increment
             e.count = e.count + 1
-            R e.count
+            return e.count
         }
-    } EL {
+    } else {
         store_check(entries, ip, now_ms, window_ms, i + 1)
     }
 }
@@ -106,27 +106,27 @@ F store_check(entries: Vec<RateLimitEntry>, ip: str, now_ms: i64, window_ms: i64
 # RateLimitMiddleware
 # ============================================================================
 
-S RateLimitMiddleware {
+struct RateLimitMiddleware {
     config: RateLimitConfig,
     store:  RateLimitStore,
 }
 
-X RateLimitMiddleware {
-    F new(config: RateLimitConfig) -> RateLimitMiddleware {
+impl RateLimitMiddleware {
+    fn new(config: RateLimitConfig) -> RateLimitMiddleware {
         RateLimitMiddleware {
             config: config,
             store:  RateLimitStore.new(),
         }
     }
 
-    F default() -> RateLimitMiddleware {
+    fn default() -> RateLimitMiddleware {
         RateLimitMiddleware.new(RateLimitConfig.default())
     }
 
     # -------------------------------------------------------------------------
     # before — enforce the rate limit; short-circuit with 429 if exceeded
     # -------------------------------------------------------------------------
-    F before(mut self, ctx: Context) -> BeforeResult {
+    fn before(mut self, ctx: Context) -> BeforeResult {
         ip     := rate_limit_extract_ip(ctx)
         now_ms := current_time_ms()
 
@@ -146,7 +146,7 @@ X RateLimitMiddleware {
                 headers:      limited_ctx2.response_headers,
                 redirect_url: "",
             }
-            R BeforeResult.respond(res)
+            return BeforeResult.respond(res)
         }
 
         # Attach rate-limit informational headers even on allowed requests
@@ -158,7 +158,7 @@ X RateLimitMiddleware {
     }
 
     # after — no-op
-    F after(self, ctx: Context, response: Response) -> Response {
+    fn after(self, ctx: Context, response: Response) -> Response {
         response
     }
 }
@@ -170,26 +170,26 @@ X RateLimitMiddleware {
 # Extract client IP from context.
 # Convention: the runtime stores the remote address in ctx.state when available.
 # Fall back to "unknown" if not present.
-F rate_limit_extract_ip(ctx: Context) -> str {
-    I ctx.state == "" { "unknown" } EL { ctx.state }
+fn rate_limit_extract_ip(ctx: Context) -> str {
+    I ctx.state == "" { "unknown" } else { ctx.state }
 }
 
 # i64 -> str for non-negative integers
-F i64_to_str(n: i64) -> str {
-    I n == 0 { R "0" }
-    I n < 0  { R "-" + i64_to_str(0 - n) }
+fn i64_to_str(n: i64) -> str {
+    I n == 0 { return "0" }
+    I n < 0  { return "-" + i64_to_str(0 - n) }
     i64_to_str_rec(n, "")
 }
 
-F i64_to_str_rec(n: i64, acc: str) -> str {
-    I n == 0 { R acc }
+fn i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { return acc }
     digit := n % 10
     ch := digit_char(digit)
     i64_to_str_rec(n / 10, ch + acc)
 }
 
-F digit_char(d: i64) -> str {
-    M d {
+fn digit_char(d: i64) -> str {
+    match d {
         0 => "0",
         1 => "1",
         2 => "2",
@@ -205,4 +205,4 @@ F digit_char(d: i64) -> str {
 }
 
 # External runtime function
-X F current_time_ms() -> i64
+impl fn current_time_ms() -> i64

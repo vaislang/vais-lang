@@ -4,18 +4,18 @@
 # - null_bitmap: ceil(col_count/8) bytes, bit=1 means NULL
 # - value_data: for each non-NULL column, serialized SqlValue data (no type tag, schema knows types)
 
-U storage/bytes
-U storage/error
-U sql/types
+use storage/bytes
+use storage/error
+use sql/types
 
-X F __strlen(s: str) -> i64
+impl fn __strlen(s: str) -> i64
 
 # A row is an ordered list of SQL values corresponding to a table schema
-S Row {
+struct Row {
     values: Vec<SqlValue>,
 }
 
-F zero_bytes(len: u64) -> Vec<u8> {
+fn zero_bytes(len: u64) -> Vec<u8> {
     bytes: Vec<u8> := mut Vec.with_capacity(len)
     LF _: 0..len {
         bytes.push(0u8)
@@ -23,14 +23,14 @@ F zero_bytes(len: u64) -> Vec<u8> {
     bytes
 }
 
-X Row {
+impl Row {
     # Create a new row from a vector of values
-    F new(values: Vec<SqlValue>) -> Row {
+    fn new(values: Vec<SqlValue>) -> Row {
         Row { values }
     }
 
     # Create an empty row with given column count, all NULLs
-    F null_row(col_count: u64) -> Row {
+    fn null_row(col_count: u64) -> Row {
         values: Vec<SqlValue> := mut Vec.with_capacity(col_count)
         LF _: 0..col_count {
             values.push(Null)
@@ -39,27 +39,27 @@ X Row {
     }
 
     # Get value at column index
-    F get(self, idx: u64) -> &SqlValue {
+    fn get(self, idx: u64) -> &SqlValue {
         self.values[idx]
     }
 
     # Get an owned copy of a value at column index.
-    F get_owned(self, idx: u64) -> SqlValue {
+    fn get_owned(self, idx: u64) -> SqlValue {
         self.values[idx].clone()
     }
 
     # Set value at column index
-    F set(mut self, idx: u64, val: SqlValue) {
+    fn set(mut self, idx: u64, val: SqlValue) {
         self.values[idx] = val.clone()
     }
 
     # Get number of columns
-    F column_count(self) -> u64 {
+    fn column_count(self) -> u64 {
         self.values.len()
     }
 
     # Calculate the null bitmap size in bytes
-    F null_bitmap_size(col_count: u64) -> u64 {
+    fn null_bitmap_size(col_count: u64) -> u64 {
         (col_count + 7) / 8
     }
 
@@ -67,7 +67,7 @@ X Row {
     # Format: [null_bitmap: ceil(N/8) bytes][value_data for each non-null column]
     # Each bit in bitmap: bit i set (1) means column i is NULL
     # Value data uses type-specific encoding without type tags (schema provides types)
-    F encode(&self, schema: &[SqlType]) -> Vec<u8> {
+    fn encode(&self, schema: &[SqlType]) -> Vec<u8> {
         col_count := mut self.values.len()
         bitmap_size := mut Row.null_bitmap_size(col_count)
 
@@ -102,7 +102,7 @@ X Row {
             tag := mut load_i64(val_ptr)
             I tag != 0 {
                 payload := mut load_i64(val_ptr + 8)
-                M schema[i] {
+                match schema[i] {
                     Int => { buf.write_i64_le(payload) },
                     Float => { buf.write_i64_le(payload) },
                     Bool => { buf.write_u8(payload) },
@@ -138,7 +138,7 @@ X Row {
     }
 
     # Decode row from bytes using schema
-    F decode(data: &[u8], schema: &[SqlType]) -> Result<Row, VaisError> {
+    fn decode(data: &[u8], schema: &[SqlType]) -> Result<Row, VaisError> {
         col_count := mut schema.len()
         bitmap_size := mut Row.null_bitmap_size(col_count)
         buf := mut ByteBuffer.wrap_readonly(data)
@@ -159,7 +159,7 @@ X Row {
 
             I is_null {
                 values.push(Null)
-            } EL {
+            } else {
                 st := schema[i]
                 val := mut decode_value(&buf, st)?;
                 values.push(val)
@@ -170,7 +170,7 @@ X Row {
     }
 
     # Calculate encoded size in bytes without actually encoding
-    F encoded_size(&self, schema: &[SqlType]) -> u32 {
+    fn encoded_size(&self, schema: &[SqlType]) -> u32 {
         col_count := mut self.values.len()
         size := mut Row.null_bitmap_size(col_count) as u32
 
@@ -184,7 +184,7 @@ X Row {
             tag := mut load_i64(val_ptr)
             I tag != 0 {
                 # Use schema type to determine size directly
-                M schema[i] {
+                match schema[i] {
                     Int => { size += 8 },
                     Float => { size += 8 },
                     Bool => { size += 1 },
@@ -231,25 +231,25 @@ X Row {
 # DATE:      4 bytes (i32 LE)
 # TIMESTAMP: 8 bytes (i64 LE)
 # VECTOR:    u32 dim + dim*4 bytes (f32 LE each)
-F encode_value(buf: &ByteBuffer, val: &SqlValue, sql_type: &SqlType) {
-    M sql_type {
+fn encode_value(buf: &ByteBuffer, val: &SqlValue, sql_type: &SqlType) {
+    match sql_type {
         Int => {
-            M val { SqlValue.IntVal { v } => buf.write_i64_le(v), _ => {} }
+            match val { SqlValue.IntVal { v } => buf.write_i64_le(v), _ => {} }
         },
         Float => {
-            M val { SqlValue.FloatVal { v } => buf.write_f64_le(f64_bits(v)), _ => {} }
+            match val { SqlValue.FloatVal { v } => buf.write_f64_le(f64_bits(v)), _ => {} }
         },
         Bool => {
-            M val { SqlValue.BoolVal { v } => buf.write_u8(I v { 1 } EL { 0 }), _ => {} }
+            match val { SqlValue.BoolVal { v } => buf.write_u8(I v { 1 } else { 0 }), _ => {} }
         },
         Varchar { .. } => {
-            M val { SqlValue.StringVal { v } => buf.write_str(v), _ => {} }
+            match val { SqlValue.StringVal { v } => buf.write_str(v), _ => {} }
         },
         Text => {
-            M val { SqlValue.StringVal { v } => buf.write_str(v), _ => {} }
+            match val { SqlValue.StringVal { v } => buf.write_str(v), _ => {} }
         },
         Blob => {
-            M val {
+            match val {
                 SqlValue.BlobVal { v } => {
                     buf.write_i32_le(v.len() as u32)
                     i := mut 0
@@ -262,13 +262,13 @@ F encode_value(buf: &ByteBuffer, val: &SqlValue, sql_type: &SqlType) {
             }
         },
         Date => {
-            M val { SqlValue.DateVal { v } => buf.write_i32_le(v as i64), _ => {} }
+            match val { SqlValue.DateVal { v } => buf.write_i32_le(v as i64), _ => {} }
         },
         Timestamp => {
-            M val { SqlValue.TimestampVal { v } => buf.write_i64_le(v), _ => {} }
+            match val { SqlValue.TimestampVal { v } => buf.write_i64_le(v), _ => {} }
         },
         Vector { .. } => {
-            M val {
+            match val {
                 SqlValue.VectorVal { v } => {
                     buf.write_i32_le(v.len() as u32)
                     LF f: v {
@@ -282,8 +282,8 @@ F encode_value(buf: &ByteBuffer, val: &SqlValue, sql_type: &SqlType) {
 }
 
 # Decode a single value using schema type (no type tag in data)
-F decode_value(buf: &ByteBuffer, sql_type: &SqlType) -> Result<SqlValue, VaisError> {
-    M sql_type {
+fn decode_value(buf: &ByteBuffer, sql_type: &SqlType) -> Result<SqlValue, VaisError> {
+    match sql_type {
         Int => {
             v := mut read_i64_le_checked(buf)?;
             Ok(SqlValue.IntVal { v })
@@ -329,25 +329,25 @@ F decode_value(buf: &ByteBuffer, sql_type: &SqlType) -> Result<SqlValue, VaisErr
 
 # Calculate encoded byte size for a single non-null value
 # Uses schema type to determine encoding format
-F value_encoded_size(val: &SqlValue, sql_type: &SqlType) -> u32 {
-    M sql_type {
+fn value_encoded_size(val: &SqlValue, sql_type: &SqlType) -> u32 {
+    match sql_type {
         Int => 8,
         Float => 8,
         Bool => 1,
         Varchar { .. } => {
-            M val {
+            match val {
                 SqlValue.StringVal { v } => 4 + v.len() as u32,
                 _ => 4,
             }
         },
         Text => {
-            M val {
+            match val {
                 SqlValue.StringVal { v } => 4 + v.len() as u32,
                 _ => 4,
             }
         },
         Blob => {
-            M val {
+            match val {
                 SqlValue.BlobVal { v } => 4 + v.len() as u32,
                 _ => 4,
             }
@@ -355,7 +355,7 @@ F value_encoded_size(val: &SqlValue, sql_type: &SqlType) -> u32 {
         Date => 4,
         Timestamp => 8,
         Vector { .. } => {
-            M val {
+            match val {
                 SqlValue.VectorVal { v } => 4 + (v.len() as u32) * 4,
                 _ => 4,
             }

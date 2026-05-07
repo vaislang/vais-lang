@@ -8,39 +8,39 @@
 # - VE-02-03-005: MVCC filter failed (snapshot or CLOG error)
 # - VE-02-03-006: Insufficient visible results after max retries
 
-U std/result
-U std/vec
+use std/result
+use std/vec
 # U std/string.String;  # Removed: str is builtin
-U storage/error
-U vector/hnsw/types
-U vector/hnsw/search
-U vector/distance
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/txn/visibility
-U storage/constants
-U storage/wal/record_types
-U storage/wal/record_vector
+use storage/error
+use vector/hnsw/types
+use vector/hnsw/search
+use vector/distance
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/txn/visibility
+use storage/constants
+use storage/wal/record_types
+use storage/wal/record_vector
 
 # ============================================================================
 # Error Constructors
 # ============================================================================
 
-F err_delete_failed(node_id: u64, detail: str) -> VaisError {
+fn err_delete_failed(node_id: u64, detail: str) -> VaisError {
     VaisError.new(
         "VE-02-03-004",
         "Failed to delete HNSW node {node_id}: {detail}",
     )
 }
 
-F err_mvcc_filter_failed(detail: str) -> VaisError {
+fn err_mvcc_filter_failed(detail: str) -> VaisError {
     VaisError.new(
         "VE-02-03-005",
         "MVCC post-filter failed: {detail}",
     )
 }
 
-F err_insufficient_results(k: u64, found: u64) -> VaisError {
+fn err_insufficient_results(k: u64, found: u64) -> VaisError {
     VaisError.new(
         "VE-02-03-006",
         "Insufficient visible results after max retries: requested {k}, found {found}",
@@ -57,7 +57,7 @@ F err_insufficient_results(k: u64, found: u64) -> VaisError {
 # Returns:
 # - true if node is visible to this snapshot
 # - false if node is deleted, aborted, or not yet committed
-F is_vector_visible(
+fn is_vector_visible(
     node: &HnswNode,
     snapshot: &Snapshot,
     clog: &Clog,
@@ -100,7 +100,7 @@ F is_vector_visible(
 # - page_id: HNSW meta page ID
 #
 # Returns: Vec of layers affected (for potential neighbor cleanup)
-F hnsw_delete(
+fn hnsw_delete(
     node_id: u64,
     mut meta: &mut HnswMeta,
     store: &mut dyn NodeStore,
@@ -111,16 +111,16 @@ F hnsw_delete(
 ) -> Result<Vec<u8>, VaisError> {
     # Step 1: Retrieve node
     I node_id == INVALID_NODE_ID {
-        R Err(err_delete_failed(
+        return Err(err_delete_failed(
             node_id,
             "Invalid node ID",
         ))
     }
 
     node_res := mut store.load_node(node_id)
-    node := mut M node_res {
+    node := mut match node_res {
         Ok(n) => n,
-        Err(e) => { R Err(err_delete_failed(
+        Err(e) => { return Err(err_delete_failed(
             node_id,
             "Node not found in store",
         )) },
@@ -128,7 +128,7 @@ F hnsw_delete(
 
     # Step 2: Validate not already deleted
     I node.is_deleted {
-        R Err(err_delete_failed(
+        return Err(err_delete_failed(
             node_id,
             "Node already deleted",
         ))
@@ -181,9 +181,9 @@ F hnsw_delete(
 # - 10% deleted → oversample ≈ 1.67
 # - 30% deleted → oversample ≈ 2.14
 # - 50% deleted → oversample = 3.0
-F calculate_oversample_factor(meta: &HnswMeta) -> f64 {
+fn calculate_oversample_factor(meta: &HnswMeta) -> f64 {
     I meta.total_nodes == 0 {
-        R 2.0
+        return 2.0
     }
 
     invisible_ratio := mut (meta.total_deleted as f64) / (meta.total_nodes as f64)
@@ -198,12 +198,12 @@ F calculate_oversample_factor(meta: &HnswMeta) -> f64 {
     # Return max of base oversample (2.0) and adaptive factor
     I adaptive_factor > 2.0 {
         adaptive_factor
-    } EL {
+    } else {
         2.0
     }
 }
 
-F ceil_scaled_k(k: u64, factor: f64) -> u64 {
+fn ceil_scaled_k(k: u64, factor: f64) -> u64 {
     scaled := mut (k as f64) * factor
     whole := mut scaled as u64
     I (whole as f64) < scaled {
@@ -211,7 +211,7 @@ F ceil_scaled_k(k: u64, factor: f64) -> u64 {
     }
     I whole == 0 {
         1
-    } EL {
+    } else {
         whole
     }
 }
@@ -240,7 +240,7 @@ F ceil_scaled_k(k: u64, factor: f64) -> u64 {
 # - clog: CLOG for transaction status
 #
 # Returns: SearchResult with up to k visible neighbors
-F mvcc_filtered_search(
+fn mvcc_filtered_search(
     query: &[f32],
     k: u64,
     ef_search: u32,
@@ -262,7 +262,7 @@ F mvcc_filtered_search(
         actual_k := mut ceil_scaled_k(k, oversample)
         actual_ef := mut I (actual_k as u32) > ef_search {
             actual_k as u32
-        } EL {
+        } else {
             ef_search
         }
 
@@ -285,7 +285,7 @@ F mvcc_filtered_search(
 
             # Get node and check visibility
             node_res := mut store.load_node(node_id)
-            M node_res {
+            match node_res {
                 Ok(node) => {
                     # Check MVCC visibility
                     I is_vector_visible(node, snapshot, clog) {
@@ -313,7 +313,7 @@ F mvcc_filtered_search(
             final_result.nodes_visited = search_result.nodes_visited
             final_result.distance_computations = search_result.distance_computations
 
-            R Ok(final_result)
+            return Ok(final_result)
         }
 
         # Insufficient results - double oversample and retry
@@ -329,7 +329,7 @@ F mvcc_filtered_search(
     actual_k_final := mut ceil_scaled_k(k, oversample)
     actual_ef_final := mut I (actual_k_final as u32) > ef_search {
         actual_k_final as u32
-    } EL {
+    } else {
         ef_search
     }
 
@@ -350,7 +350,7 @@ F mvcc_filtered_search(
         final_node_id := mut final_entry.node_id
 
         final_node_res := mut store.load_node(final_node_id)
-        M final_node_res {
+        match final_node_res {
             Ok(final_node) => {
                 I is_vector_visible(final_node, snapshot, clog) {
                     final_visible.push(SearchResultEntry.new(
@@ -399,35 +399,35 @@ F mvcc_filtered_search(
 # - clog: CLOG for checking transaction status
 #
 # Returns: true if node is ready for physical removal
-F is_gc_ready(
+fn is_gc_ready(
     node: &HnswNode,
     low_water_mark: u64,
     clog: &Clog,
 ) -> bool {
     # Must be soft-deleted
     I !node.is_deleted {
-        R false
+        return false
     }
 
     # txn_id_expire must be valid
     I node.txn_id_expire == INVALID_TXN_ID {
-        R false
+        return false
     }
 
     # Check if deleting transaction was aborted (not GC-ready if aborted)
     I is_aborted_fast(node.txn_id_expire, clog) {
-        R false
+        return false
     }
 
     # Check if deleting transaction is committed
     I !clog.is_committed(node.txn_id_expire) {
-        R false
+        return false
     }
 
     # Check if deletion is before low water mark
     # If txn_id_expire < low_water_mark, no active txn can see this node
     I node.txn_id_expire < low_water_mark {
-        R true
+        return true
     }
 
     false
@@ -455,7 +455,7 @@ F is_gc_ready(
 # - clog: CLOG for transaction status
 #
 # Returns: Vec of node IDs ready for GC
-F scan_gc_candidates(
+fn scan_gc_candidates(
     node_ids: &[u64],
     store: &mut dyn NodeStore,
     low_water_mark: u64,
@@ -468,7 +468,7 @@ F scan_gc_candidates(
         node_id := mut node_ids[idx]
 
         node_res := mut store.load_node(node_id)
-        M node_res {
+        match node_res {
             Ok(node) => {
                 I is_gc_ready(node, low_water_mark, clog) {
                     ready_nodes.push(node_id)

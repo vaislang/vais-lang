@@ -2,31 +2,31 @@
 # Per-connection state, session config, prepared statements, connection pool
 # Error codes: EE=06 (server), CC=03 (connection pool), CC=08 (connection)
 
-U std/vec
-U std/string
-U std/option
-U std/sync
-U std/hashmap
-U storage/error
-U server/types
-U server/config
+use std/vec
+use std/string
+use std/option
+use std/sync
+use std/hashmap
+use storage/error
+use server/types
+use server/config
 
 # ============================================================================
 # Connection ID Generator
 # ============================================================================
 
-S ConnectionIdGen {
+struct ConnectionIdGen {
     next_id: AtomicI64,
 }
 
-X ConnectionIdGen {
-    F new() -> ConnectionIdGen {
+impl ConnectionIdGen {
+    fn new() -> ConnectionIdGen {
         ConnectionIdGen {
             next_id: AtomicI64.new(1),
         }
     }
 
-    F next(mut self) -> u64 {
+    fn next(mut self) -> u64 {
         self.next_id.fetch_add(1)
     }
 }
@@ -35,7 +35,7 @@ X ConnectionIdGen {
 # Connection — Per-connection state
 # ============================================================================
 
-S Connection {
+struct Connection {
     id: u64,
     state: ConnectionState,
     txn_state: TransactionState,
@@ -50,8 +50,8 @@ S Connection {
     last_active_at: u64,   # timestamp
 }
 
-X Connection {
-    F new(id: u64, user: str, database: str) -> Connection {
+impl Connection {
+    fn new(id: u64, user: str, database: str) -> Connection {
         Connection {
             id,
             state: New,
@@ -68,39 +68,39 @@ X Connection {
         }
     }
 
-    F with_application_name(mut self, name: str) -> Connection {
+    fn with_application_name(mut self, name: str) -> Connection {
         self.application_name = name
         self
     }
 
-    F with_timestamp(mut self, ts: u64) -> Connection {
+    fn with_timestamp(mut self, ts: u64) -> Connection {
         self.created_at = ts
         self.last_active_at = ts
         self
     }
 
     # State transitions
-    F set_state(mut self, new_state: ConnectionState) -> Result<(), VaisError> {
+    fn set_state(mut self, new_state: ConnectionState) -> Result<(), VaisError> {
         # Validate transition
         valid := mut false
 
-        M &self.state {
+        match &self.state {
             New => {
-                M &new_state {
+                match &new_state {
                     Authenticating => { valid = true; },
                     Closing => { valid = true; },
                     _ => {},
                 }
             },
             Authenticating => {
-                M &new_state {
+                match &new_state {
                     Ready => { valid = true; },
                     Closing => { valid = true; },
                     _ => {},
                 }
             },
             Ready => {
-                M &new_state {
+                match &new_state {
                     InQuery => { valid = true; },
                     InTransaction => { valid = true; },
                     CopyIn => { valid = true; },
@@ -110,7 +110,7 @@ X Connection {
                 }
             },
             InQuery => {
-                M &new_state {
+                match &new_state {
                     Ready => { valid = true; },
                     InTransaction => { valid = true; },
                     Closing => { valid = true; },
@@ -118,7 +118,7 @@ X Connection {
                 }
             },
             InTransaction => {
-                M &new_state {
+                match &new_state {
                     InQuery => { valid = true; },
                     Ready => { valid = true; },
                     Closing => { valid = true; },
@@ -126,14 +126,14 @@ X Connection {
                 }
             },
             CopyIn => {
-                M &new_state {
+                match &new_state {
                     Ready => { valid = true; },
                     Closing => { valid = true; },
                     _ => {},
                 }
             },
             CopyOut => {
-                M &new_state {
+                match &new_state {
                     Ready => { valid = true; },
                     Closing => { valid = true; },
                     _ => {},
@@ -145,7 +145,7 @@ X Connection {
         }
 
         I !valid {
-            R Err(err_invalid_state(
+            return Err(err_invalid_state(
                 state_name(&self.state),
                 state_name(&new_state),
             ))
@@ -155,36 +155,36 @@ X Connection {
         Ok(())
     }
 
-    F get_state(self) -> &ConnectionState {
+    fn get_state(self) -> &ConnectionState {
         &self.state
     }
 
-    F get_txn_state(self) -> &TransactionState {
+    fn get_txn_state(self) -> &TransactionState {
         &self.txn_state
     }
 
     # Transaction management
-    F begin_transaction(mut self, txn_id: u64) {
+    fn begin_transaction(mut self, txn_id: u64) {
         self.txn_state = InBlock
         self.current_txn_id = Some(txn_id)
     }
 
-    F commit_transaction(mut self) {
+    fn commit_transaction(mut self) {
         self.txn_state = Idle
         self.current_txn_id = None
     }
 
-    F rollback_transaction(mut self) {
+    fn rollback_transaction(mut self) {
         self.txn_state = Idle
         self.current_txn_id = None
     }
 
-    F mark_txn_failed(mut self) {
+    fn mark_txn_failed(mut self) {
         self.txn_state = Failed
     }
 
-    F is_in_transaction(self) -> bool {
-        M &self.txn_state {
+    fn is_in_transaction(self) -> bool {
+        match &self.txn_state {
             InBlock => true,
             Failed => true,
             _ => false,
@@ -192,116 +192,116 @@ X Connection {
     }
 
     # Prepared statement management
-    F add_prepared_stmt(mut self, stmt: PreparedStmtInfo) {
+    fn add_prepared_stmt(mut self, stmt: PreparedStmtInfo) {
         self.prepared_stmts.insert(stmt.name.clone(), stmt)
     }
 
-    F get_prepared_stmt(self, name: &str) -> Result<&PreparedStmtInfo, VaisError> {
-        M self.prepared_stmts.get(name) {
+    fn get_prepared_stmt(self, name: &str) -> Result<&PreparedStmtInfo, VaisError> {
+        match self.prepared_stmts.get(name) {
             Some(stmt) => Ok(stmt),
             None => Err(err_prepared_stmt_not_found(name.clone())),
         }
     }
 
-    F remove_prepared_stmt(mut self, name: &str) -> Result<(), VaisError> {
-        M self.prepared_stmts.remove(name) {
+    fn remove_prepared_stmt(mut self, name: &str) -> Result<(), VaisError> {
+        match self.prepared_stmts.remove(name) {
             Some(_) => Ok(()),
             None => Err(err_prepared_stmt_not_found(name.clone())),
         }
     }
 
-    F has_prepared_stmt(self, name: &str) -> bool {
+    fn has_prepared_stmt(self, name: &str) -> bool {
         self.prepared_stmts.contains_key(name)
     }
 
     # Portal management
-    F add_portal(mut self, portal: PortalInfo) {
+    fn add_portal(mut self, portal: PortalInfo) {
         self.portals.insert(portal.name.clone(), portal)
     }
 
-    F get_portal(self, name: &str) -> Result<&PortalInfo, VaisError> {
-        M self.portals.get(name) {
+    fn get_portal(self, name: &str) -> Result<&PortalInfo, VaisError> {
+        match self.portals.get(name) {
             Some(portal) => Ok(portal),
             None => Err(err_portal_not_found(name.clone())),
         }
     }
 
-    F remove_portal(mut self, name: &str) -> Result<(), VaisError> {
-        M self.portals.remove(name) {
+    fn remove_portal(mut self, name: &str) -> Result<(), VaisError> {
+        match self.portals.remove(name) {
             Some(_) => Ok(()),
             None => Err(err_portal_not_found(name.clone())),
         }
     }
 
     # Clear all portals (done on Sync)
-    F clear_portals(mut self) {
+    fn clear_portals(mut self) {
         self.portals.clear()
     }
 
     # Session config
-    F get_session_config(self) -> &SessionConfig {
+    fn get_session_config(self) -> &SessionConfig {
         &self.session_config
     }
 
-    F get_session_config_mut(mut self) -> &mut SessionConfig {
+    fn get_session_config_mut(mut self) -> &mut SessionConfig {
         &self.session_config
     }
 
     # Activity tracking
-    F touch(mut self, timestamp: u64) {
+    fn touch(mut self, timestamp: u64) {
         self.last_active_at = timestamp
     }
 
-    F idle_duration(self, now: u64) -> u64 {
+    fn idle_duration(self, now: u64) -> u64 {
         I now > self.last_active_at {
             now - self.last_active_at
-        } EL {
+        } else {
             0
         }
     }
 
-    F get_id(self) -> u64 {
+    fn get_id(self) -> u64 {
         self.id
     }
 
-    F get_user(self) -> &str {
+    fn get_user(self) -> &str {
         &self.user
     }
 
-    F get_database(self) -> &str {
+    fn get_database(self) -> &str {
         &self.database
     }
 }
 
 # Portal: a bound prepared statement ready for execution
-S PortalInfo {
+struct PortalInfo {
     name: str,
     stmt_name: str,
     param_values: Vec<ParamValue>,
 }
 
-X PortalInfo {
-    F new(name: str, stmt_name: str, param_values: Vec<ParamValue>) -> PortalInfo {
+impl PortalInfo {
+    fn new(name: str, stmt_name: str, param_values: Vec<ParamValue>) -> PortalInfo {
         PortalInfo { name, stmt_name, param_values }
     }
 }
 
 # Import ParamValue for portal
-U server/types
+use server/types
 
 # ============================================================================
 # ConnectionPool — Server-side connection management
 # ============================================================================
 
-S ConnectionPool {
+struct ConnectionPool {
     connections: Mutex<HashMap<u64, Connection>>,
     id_gen: ConnectionIdGen,
     max_connections: u32,
     active_count: AtomicI64,
 }
 
-X ConnectionPool {
-    F new(max_connections: u32) -> ConnectionPool {
+impl ConnectionPool {
+    fn new(max_connections: u32) -> ConnectionPool {
         ConnectionPool {
             connections: Mutex.new(HashMap.with_capacity(16)),
             id_gen: ConnectionIdGen.new(),
@@ -310,16 +310,16 @@ X ConnectionPool {
         }
     }
 
-    F from_config(config: &ServerConfig) -> ConnectionPool {
+    fn from_config(config: &ServerConfig) -> ConnectionPool {
         ConnectionPool.new(config.max_connections)
     }
 
     # Create a new connection and add it to the pool.
     # Returns the connection ID, or error if max connections exceeded.
-    F create_connection(mut self, user: str, database: str, timestamp: u64) -> Result<u64, VaisError> {
+    fn create_connection(mut self, user: str, database: str, timestamp: u64) -> Result<u64, VaisError> {
         current := mut self.active_count.load()
         I current >= self.max_connections as u64 {
-            R Err(err_max_connections(self.max_connections))
+            return Err(err_max_connections(self.max_connections))
         }
 
         id := mut self.id_gen.next()
@@ -334,7 +334,7 @@ X ConnectionPool {
     }
 
     # Remove a connection from the pool
-    F remove_connection(mut self, conn_id: u64) -> Option<Connection> {
+    fn remove_connection(mut self, conn_id: u64) -> Option<Connection> {
         guard := mut self.connections.lock()
         removed := mut guard.remove_opt(&conn_id)
         I removed.is_some() != 0 {
@@ -344,50 +344,50 @@ X ConnectionPool {
     }
 
     # Get current active connection count
-    F active_count(self) -> u64 {
+    fn active_count(self) -> u64 {
         self.active_count.load()
     }
 
     # Check if pool has capacity for another connection
-    F has_capacity(self) -> bool {
+    fn has_capacity(self) -> bool {
         self.active_count.load() < self.max_connections as u64
     }
 
     # Execute a function with a locked reference to a connection.
     # Returns error if connection not found.
-    F with_connection<T>(
+    fn with_connection<T>(
         mut self,
         conn_id: u64,
         f: fn(&mut Connection) -> T,
     ) -> Result<T, VaisError> {
         guard := mut self.connections.lock()
-        M guard.get_mut(&conn_id) {
+        match guard.get_mut(&conn_id) {
             Some(conn) => Ok(f(conn)),
             None => Err(err_connection_closed()),
         }
     }
 
     # Execute a read-only function with a connection reference
-    F with_connection_ref<T>(
+    fn with_connection_ref<T>(
         self,
         conn_id: u64,
         f: fn(&Connection) -> T,
     ) -> Result<T, VaisError> {
         guard := mut self.connections.lock()
-        M guard.get(&conn_id) {
+        match guard.get(&conn_id) {
             Some(conn) => Ok(f(conn)),
             None => Err(err_connection_closed()),
         }
     }
 
     # Get connection IDs for monitoring
-    F connection_ids(self) -> Vec<u64> {
+    fn connection_ids(self) -> Vec<u64> {
         # FUTURE: implement with HashMap iteration when codegen supports it
         Vec.with_capacity(0)
     }
 
     # Find idle connections exceeding timeout (for cleanup)
-    F find_idle_connections(self, now: u64, idle_timeout_sec: u32) -> Vec<u64> {
+    fn find_idle_connections(self, now: u64, idle_timeout_sec: u32) -> Vec<u64> {
         # FUTURE: implement with HashMap iteration when codegen supports it
         Vec.with_capacity(0)
     }
@@ -397,7 +397,7 @@ X ConnectionPool {
 # ConnectionStats — Monitoring info
 # ============================================================================
 
-S ConnectionStats {
+struct ConnectionStats {
     conn_id: u64,
     user: str,
     database: str,
@@ -406,8 +406,8 @@ S ConnectionStats {
     idle_seconds: u64,
 }
 
-X ConnectionStats {
-    F from_connection(conn: &Connection, now: u64) -> ConnectionStats {
+impl ConnectionStats {
+    fn from_connection(conn: &Connection, now: u64) -> ConnectionStats {
         ConnectionStats {
             conn_id: conn.id,
             user: conn.user.clone(),
@@ -423,8 +423,8 @@ X ConnectionStats {
 # Helper: State names for debugging/monitoring
 # ============================================================================
 
-F state_name(state: &ConnectionState) -> str {
-    M state {
+fn state_name(state: &ConnectionState) -> str {
+    match state {
         New => "new",
         Authenticating => "authenticating",
         Ready => "ready",
@@ -436,8 +436,8 @@ F state_name(state: &ConnectionState) -> str {
     }
 }
 
-F txn_state_name(state: &TransactionState) -> str {
-    M state {
+fn txn_state_name(state: &TransactionState) -> str {
+    match state {
         Idle => "idle",
         InBlock => "in_block",
         Failed => "failed",

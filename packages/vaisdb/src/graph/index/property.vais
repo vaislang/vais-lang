@@ -3,38 +3,38 @@
 # Key format: encode_u16_be(prop_key_id) + encoded_value + encode_u64_be(entity_id) → TID
 # Supports both point lookups and range scans on property values
 
-U std/vec
-U storage/bytes
-U storage/constants
-U storage/error
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U storage/btree/tree
-U storage/btree/insert
-U storage/btree/delete
-U storage/btree/search
-U storage/btree/key
-U storage/btree/cursor
-U storage/wal/group_commit
-U graph/types
+use std/vec
+use storage/bytes
+use storage/constants
+use storage/error
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use storage/btree/tree
+use storage/btree/insert
+use storage/btree/delete
+use storage/btree/search
+use storage/btree/key
+use storage/btree/cursor
+use storage/wal/group_commit
+use graph/types
 
 # Error codes: EE=03 (graph), CC=07 (property index)
-F err_property_index_corrupt(prop_key_id: u16) -> VaisError {
+fn err_property_index_corrupt(prop_key_id: u16) -> VaisError {
     VaisError.new(
         "VAIS-0307001",
         "Property index corrupted for prop_key_id {prop_key_id}"
     )
 }
 
-F err_property_index_unsupported_type(prop_type: u8) -> VaisError {
+fn err_property_index_unsupported_type(prop_type: u8) -> VaisError {
     VaisError.new(
         "VAIS-0307002",
         "Unsupported property type for indexing: {prop_type}"
     )
 }
 
-F err_property_index_full() -> VaisError {
+fn err_property_index_full() -> VaisError {
     VaisError.new(
         "VAIS-0307003",
         "Property index is full"
@@ -45,13 +45,13 @@ F err_property_index_full() -> VaisError {
 # PropertyIndex — B+Tree wrapper for property-based entity lookup
 # ============================================================================
 
-S PropertyIndex {
+struct PropertyIndex {
     tree: BTree,
 }
 
-X PropertyIndex {
+impl PropertyIndex {
     # Create new property index with given root page
-    F new(root_page_id: u32, file_id: u8, page_size: u32) -> PropertyIndex {
+    fn new(root_page_id: u32, file_id: u8, page_size: u32) -> PropertyIndex {
         PropertyIndex {
             tree: BTree.new(root_page_id, file_id, page_size),
         }
@@ -59,7 +59,7 @@ X PropertyIndex {
 
     # Insert a property for an entity (node or edge)
     # Key: [prop_key_id (u16 BE)][encoded_value][entity_id (u64 BE)] → TID (dummy)
-    F insert_property(
+    fn insert_property(
         mut self,
         entity_id: u64,
         prop_key_id: u16,
@@ -80,13 +80,13 @@ X PropertyIndex {
         I !inserted {
             # Key already exists, this is fine (idempotent)
             Ok(())
-        } EL {
+        } else {
             Ok(())
         }
     }
 
     # Remove a property from an entity
-    F remove_property(
+    fn remove_property(
         mut self,
         entity_id: u64,
         prop_key_id: u16,
@@ -105,7 +105,7 @@ X PropertyIndex {
 
     # Lookup all entities with a specific property value
     # Returns vector of entity_ids
-    F lookup_by_property(
+    fn lookup_by_property(
         self,
         prop_key_id: u16,
         value: &PropertyValue,
@@ -127,7 +127,7 @@ X PropertyIndex {
         i := mut 0
         LW i < entries.len() {
             key := mut &entries[i].0
-            M PropertyIndex.decode_property_key(key) {
+            match PropertyIndex.decode_property_key(key) {
                 Some((decoded_prop_key_id, _value, entity_id)) => {
                     I decoded_prop_key_id == prop_key_id {
                         results.push(entity_id)
@@ -145,7 +145,7 @@ X PropertyIndex {
 
     # Range scan on property values
     # Returns all entities where min_value <= property_value <= max_value
-    F range_scan(
+    fn range_scan(
         self,
         prop_key_id: u16,
         min_value: &PropertyValue,
@@ -171,7 +171,7 @@ X PropertyIndex {
         i := mut 0
         LW i < entries.len() {
             key := mut &entries[i].0
-            M PropertyIndex.decode_property_key(key) {
+            match PropertyIndex.decode_property_key(key) {
                 Some((decoded_prop_key_id, _value, entity_id)) => {
                     I decoded_prop_key_id == prop_key_id {
                         results.push(entity_id)
@@ -188,7 +188,7 @@ X PropertyIndex {
     }
 
     # Encode composite key: [prop_key_id (u16 BE)][encoded_value][entity_id (u64 BE)]
-    F encode_property_key(
+    fn encode_property_key(
         prop_key_id: u16,
         value: &PropertyValue,
         entity_id: u64,
@@ -198,7 +198,7 @@ X PropertyIndex {
     }
 
     # Internal: encode with pre-encoded value bytes
-    F encode_property_key_internal(
+    fn encode_property_key_internal(
         prop_key_id: u16,
         value_bytes: &[u8],
         entity_id: u64,
@@ -229,7 +229,7 @@ X PropertyIndex {
     }
 
     # Encode property prefix key for range scan: [prop_key_id (u16 BE)][encoded_value]
-    F encode_property_prefix(prop_key_id: u16, value_bytes: &[u8]) -> Vec<u8> {
+    fn encode_property_prefix(prop_key_id: u16, value_bytes: &[u8]) -> Vec<u8> {
         capacity := mut 2 + value_bytes.len()
         key := mut Vec.with_capacity(capacity)
 
@@ -249,11 +249,11 @@ X PropertyIndex {
 
     # Encode property value for index key
     # Format: [type_byte][encoded_value]
-    F encode_property_value(value: &PropertyValue) -> Result<Vec<u8>, VaisError> {
+    fn encode_property_value(value: &PropertyValue) -> Result<Vec<u8>, VaisError> {
         encoded := mut Vec.with_capacity(0)
         encoded.push(value.prop_type)
 
-        M value.prop_type {
+        match value.prop_type {
             PROP_TYPE_NULL => {
                 # No additional bytes for null
             },
@@ -273,7 +273,7 @@ X PropertyIndex {
                 flipped := mut I (bits & (1u64 << 63)) != 0 {
                     # Negative: flip all bits
                     ~bits
-                } EL {
+                } else {
                     # Positive: flip sign bit only
                     bits ^ (1u64 << 63)
                 }
@@ -302,7 +302,7 @@ X PropertyIndex {
             },
             PROP_TYPE_BOOL => {
                 # Boolean: 0 or 1
-                encoded.push(I value.bool_val { 1 } EL { 0 })
+                encoded.push(I value.bool_val { 1 } else { 0 })
             },
             PROP_TYPE_BYTES => {
                 # Not typically indexed, but support it with length prefix
@@ -317,7 +317,7 @@ X PropertyIndex {
                 }
             },
             _ => {
-                R Err(err_property_index_unsupported_type(value.prop_type))
+                return Err(err_property_index_unsupported_type(value.prop_type))
             },
         }
 
@@ -326,9 +326,9 @@ X PropertyIndex {
 
     # Decode property key back to (prop_key_id, value_bytes, entity_id)
     # Note: value_bytes is the raw encoded value, not fully decoded PropertyValue
-    F decode_property_key(key: &[u8]) -> Option<(u16, Vec<u8>, u64)> {
+    fn decode_property_key(key: &[u8]) -> Option<(u16, Vec<u8>, u64)> {
         I key.len() < 11 {  # Minimum: 2 (prop_key_id) + 1 (type) + 8 (entity_id)
-            R None
+            return None
         }
 
         # Decode prop_key_id (u16 BE)
@@ -353,11 +353,11 @@ X PropertyIndex {
     }
 
     # Get underlying B+Tree (for advanced operations)
-    F get_tree(self) -> &BTree {
+    fn get_tree(self) -> &BTree {
         &self.tree
     }
 
-    F get_tree_mut(mut self) -> &mut BTree {
+    fn get_tree_mut(mut self) -> &mut BTree {
         &self.tree
     }
 }

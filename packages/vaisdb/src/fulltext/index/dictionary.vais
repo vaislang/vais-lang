@@ -3,29 +3,29 @@
 # Key format: encode_u64_be(term_hash) → posting_head_page
 # Maintains DictEntry metadata for each term
 
-U std/vec
-U std/string
-U storage/bytes
-U std/option
-U storage/constants
-U storage/error
-U storage/buffer/pool
-U storage/page/allocator
-U storage/btree/tree
-U storage/btree/insert
-U storage/btree/delete
-U storage/btree/search
-U storage/btree/key
-U storage/btree/cursor
-U storage/wal/group_commit
-U fulltext/types
-U storage/hash
+use std/vec
+use std/string
+use storage/bytes
+use std/option
+use storage/constants
+use storage/error
+use storage/buffer/pool
+use storage/page/allocator
+use storage/btree/tree
+use storage/btree/insert
+use storage/btree/delete
+use storage/btree/search
+use storage/btree/key
+use storage/btree/cursor
+use storage/wal/group_commit
+use fulltext/types
+use storage/hash
 
 # ============================================================================
 # Error codes: EE=04 (fulltext), CC=06 (dictionary index)
 # ============================================================================
 
-F err_dict_index_corrupt(term_hash: u64) -> VaisError {
+fn err_dict_index_corrupt(term_hash: u64) -> VaisError {
     VaisError.new(
         "VAIS-0406001",
         "Dictionary index corrupted for term_hash {term_hash}"
@@ -36,14 +36,14 @@ F err_dict_index_corrupt(term_hash: u64) -> VaisError {
 # DictionaryIndex — B+Tree wrapper for term-to-posting-list mapping
 # ============================================================================
 
-S DictionaryIndex {
+struct DictionaryIndex {
     tree: BTree,
     entries: Vec<DictEntry>,   # In-memory dictionary cache
 }
 
-X DictionaryIndex {
+impl DictionaryIndex {
     # Create new dictionary index with given root page
-    F new(root_page_id: u32, page_size: u32) -> DictionaryIndex {
+    fn new(root_page_id: u32, page_size: u32) -> DictionaryIndex {
         DictionaryIndex {
             tree: BTree.new(root_page_id, FILE_ID_FULLTEXT, page_size),
             entries: Vec.with_capacity(0),
@@ -52,7 +52,7 @@ X DictionaryIndex {
 
     # Insert a new term into the dictionary
     # WAL logging is done by the caller (FullTextWalManager)
-    F insert_term(
+    fn insert_term(
         mut self,
         term: &str,
         posting_head_page: u32,
@@ -75,7 +75,7 @@ X DictionaryIndex {
 
     # Delete a term from the dictionary
     # WAL logging is done by the caller (FullTextWalManager)
-    F delete_term(
+    fn delete_term(
         mut self,
         term: &str,
         txn_id: u64,
@@ -95,7 +95,7 @@ X DictionaryIndex {
             I self.entries[i].term_hash == term_hash {
                 self.entries.remove(i)
                 removed = true
-            } EL {
+            } else {
                 i += 1
             }
         }
@@ -104,7 +104,7 @@ X DictionaryIndex {
     }
 
     # Look up a term by hash, returning its DictEntry
-    F lookup_term(
+    fn lookup_term(
         self,
         term: &str,
         pool: &mut BufferPool,
@@ -115,14 +115,14 @@ X DictionaryIndex {
         i := mut 0
         LW i < self.entries.len() {
             I self.entries[i].term_hash == term_hash && self.entries[i].term == *term {
-                R Ok(Some(self.entries[i].clone()))
+                return Ok(Some(self.entries[i].clone()))
             }
             i += 1
         }
 
         # Fall back to B+Tree lookup
         key := mut DictionaryIndex.encode_term_key(term_hash)
-        __mv1 := self.tree.search(&key, pool)?; M __mv1 {
+        __mv1 := self.tree.search(&key, pool)?; match __mv1 {
             Some(posting_head_page) => {
                 entry := mut DictEntry.new(term.clone(), term_hash, posting_head_page)
                 Ok(Some(entry))
@@ -132,7 +132,7 @@ X DictionaryIndex {
     }
 
     # Look up a term by hash directly
-    F lookup_by_hash(
+    fn lookup_by_hash(
         self,
         term_hash: u64,
         pool: &mut BufferPool,
@@ -141,7 +141,7 @@ X DictionaryIndex {
         i := mut 0
         LW i < self.entries.len() {
             I self.entries[i].term_hash == term_hash {
-                R Ok(Some(self.entries[i].posting_head_page))
+                return Ok(Some(self.entries[i].posting_head_page))
             }
             i += 1
         }
@@ -152,7 +152,7 @@ X DictionaryIndex {
     }
 
     # Update the posting head page for a term
-    F update_posting_head(
+    fn update_posting_head(
         mut self,
         term_hash: u64,
         new_posting_head: u32,
@@ -173,7 +173,7 @@ X DictionaryIndex {
             I self.entries[i].term_hash == term_hash {
                 self.entries[i].posting_head_page = new_posting_head
                 updated = true
-            } EL {
+            } else {
                 i += 1
             }
         }
@@ -182,7 +182,7 @@ X DictionaryIndex {
     }
 
     # Update DictEntry statistics (doc_freq, total_term_freq)
-    F update_entry_stats(
+    fn update_entry_stats(
         mut self,
         term_hash: u64,
         delta_doc_freq: i32,
@@ -194,38 +194,38 @@ X DictionaryIndex {
             I self.entries[i].term_hash == term_hash {
                 I delta_doc_freq > 0 {
                     self.entries[i].doc_freq += delta_doc_freq as u32
-                } EL I delta_doc_freq < 0 {
+                } else I delta_doc_freq < 0 {
                     abs := mut (-delta_doc_freq) as u32
                     I self.entries[i].doc_freq >= abs {
                         self.entries[i].doc_freq -= abs
-                    } EL {
+                    } else {
                         self.entries[i].doc_freq = 0
                     }
                 }
                 I delta_term_freq > 0 {
                     self.entries[i].total_term_freq += delta_term_freq as u64
-                } EL I delta_term_freq < 0 {
+                } else I delta_term_freq < 0 {
                     abs := mut (-delta_term_freq) as u64
                     I self.entries[i].total_term_freq >= abs {
                         self.entries[i].total_term_freq -= abs
-                    } EL {
+                    } else {
                         self.entries[i].total_term_freq = 0
                     }
                 }
                 found = true
-            } EL {
+            } else {
                 i += 1
             }
         }
     }
 
     # Scan all terms in dictionary (full scan of B+Tree)
-    F scan_all_terms(
+    fn scan_all_terms(
         self,
         pool: &mut BufferPool,
     ) -> Result<Vec<DictEntry>, VaisError> {
         I !self.entries.len() == 0 {
-            R Ok(self.entries.clone())
+            return Ok(self.entries.clone())
         }
 
         # Fall back to B+Tree full scan (NYI — BTree has no full_scan yet).
@@ -249,17 +249,17 @@ X DictionaryIndex {
     }
 
     # Get total number of terms in dictionary
-    F term_count(self) -> u64 {
+    fn term_count(self) -> u64 {
         self.entries.len()
     }
 
     # Clear in-memory cache
-    F clear_cache(mut self) {
+    fn clear_cache(mut self) {
         self.entries.clear()
     }
 
     # Load all entries from B+Tree into cache
-    F load_cache(
+    fn load_cache(
         mut self,
         pool: &mut BufferPool,
     ) -> Result<(), VaisError> {
@@ -272,14 +272,14 @@ X DictionaryIndex {
     # ========================================================================
 
     # Encode term hash as big-endian u64 key for B+Tree ordering
-    F encode_term_key(term_hash: u64) -> Vec<u8> {
+    fn encode_term_key(term_hash: u64) -> Vec<u8> {
         encode_u64_key(term_hash)
     }
 
     # Decode term hash from big-endian u64 key
-    F decode_term_key(key: &[u8]) -> u64 {
+    fn decode_term_key(key: &[u8]) -> u64 {
         I key.len() < 8 {
-            R 0
+            return 0
         }
         hash := mut 0
         hash |= (key[0] as u64) << 56
@@ -294,11 +294,11 @@ X DictionaryIndex {
     }
 
     # Get underlying B+Tree
-    F get_tree(self) -> &BTree {
+    fn get_tree(self) -> &BTree {
         &self.tree
     }
 
-    F get_tree_mut(mut self) -> &mut BTree {
+    fn get_tree_mut(mut self) -> &mut BTree {
         &self.tree
     }
 }

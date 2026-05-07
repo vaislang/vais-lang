@@ -5,20 +5,20 @@
 # Supports permissive (OR) and restrictive (AND) policy types
 # Error codes: EE=09 (security), CC=02 (constraint), CC=10 (not found)
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError, err_internal};
-U storage/constants.{INVALID_TXN_ID};
-U storage/buffer/pool.{BufferPool};
-U storage/wal/group_commit.{GroupCommitManager};
-U storage/wal/record_types.{SECURITY_GRANT_CHANGE};
-U sql/catalog/manager.{CatalogManager};
-U sql/catalog/schema.{PolicyCatalogEntry};
-U sql/parser/ast.{CreatePolicyStmt, PolicyCmdScope, PolicyType};
-U security/types.{
+use std/bytes.{ByteBuffer};
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError, err_internal};
+use storage/constants.{INVALID_TXN_ID};
+use storage/buffer/pool.{BufferPool};
+use storage/wal/group_commit.{GroupCommitManager};
+use storage/wal/record_types.{SECURITY_GRANT_CHANGE};
+use sql/catalog/manager.{CatalogManager};
+use sql/catalog/schema.{PolicyCatalogEntry};
+use sql/parser/ast.{CreatePolicyStmt, PolicyCmdScope, PolicyType};
+use security/types.{
     SecurityMeta, PolicyEntry, SessionContext,
     ENGINE_TAG_SECURITY,
     POLICY_TYPE_PERMISSIVE, POLICY_TYPE_RESTRICTIVE,
@@ -32,20 +32,20 @@ U security/types.{
 # PolicyEngine — Manages RLS policy definitions
 # ============================================================================
 
-S PolicyEngine {
+struct PolicyEngine {
     # Policies indexed by table_name for fast lookup
     policies_by_table: HashMap<Str, Vec<PolicyEntry>>,
 }
 
-X PolicyEngine {
-    F new() -> PolicyEngine {
+impl PolicyEngine {
+    fn new() -> PolicyEngine {
         PolicyEngine {
             policies_by_table: HashMap.new(),
         }
     }
 
     # Load policies from catalog at startup
-    F load_from_catalog(catalog: &CatalogManager) -> PolicyEngine {
+    fn load_from_catalog(catalog: &CatalogManager) -> PolicyEngine {
         engine := mut PolicyEngine.new();
 
         cat_policies := mut catalog.all_policies();
@@ -65,7 +65,7 @@ X PolicyEngine {
                 0,   # cmd_id
             );
 
-            M engine.policies_by_table.get_mut(&entry.table_name) {
+            match engine.policies_by_table.get_mut(&entry.table_name) {
                 Some(list) => {
                     list.push(policy);
                 },
@@ -86,7 +86,7 @@ X PolicyEngine {
     # Execute CREATE POLICY
     # ========================================================================
 
-    F execute_create_policy(
+    fn execute_create_policy(
         mut self,
         stmt: &CreatePolicyStmt,
         meta: &mut SecurityMeta,
@@ -99,16 +99,16 @@ X PolicyEngine {
     ) -> Result<u64, VaisError> {
         # 1. Permission check (only superusers/table owners can create policies)
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Check for duplicate policy on same table
-        M self.policies_by_table.get(&stmt.table_name) {
+        match self.policies_by_table.get(&stmt.table_name) {
             Some(policies) => {
                 i := mut 0u64;
                 LW i < policies.len() {
                     I policies[i].policy_name == stmt.policy_name && policies[i].is_active() {
-                        R Err(err_policy_already_exists(&stmt.policy_name));
+                        return Err(err_policy_already_exists(&stmt.policy_name));
                     }
                     i = i + 1;
                 }
@@ -117,26 +117,26 @@ X PolicyEngine {
         };
 
         # 3. Validate policy expression (basic syntax check)
-        using_expr := mut M &stmt.using_expr {
+        using_expr := mut match &stmt.using_expr {
             Some(expr) => expr.clone(),
             None => "",
         };
-        check_expr := mut M &stmt.check_expr {
+        check_expr := mut match &stmt.check_expr {
             Some(expr) => expr.clone(),
             None => "",
         };
 
         I using_expr.len() == 0 && check_expr.len() == 0 {
-            R Err(err_invalid_policy_expr("Policy must have USING or WITH CHECK expression"));
+            return Err(err_invalid_policy_expr("Policy must have USING or WITH CHECK expression"));
         }
 
         # 4. Convert AST types to constants
-        policy_type := mut M &stmt.policy_type {
+        policy_type := mut match &stmt.policy_type {
             PolicyType.Permissive => POLICY_TYPE_PERMISSIVE,
             PolicyType.Restrictive => POLICY_TYPE_RESTRICTIVE,
         };
 
-        cmd_scope := mut M &stmt.cmd_scope {
+        cmd_scope := mut match &stmt.cmd_scope {
             PolicyCmdScope.All => POLICY_CMD_ALL,
             PolicyCmdScope.Select => POLICY_CMD_SELECT,
             PolicyCmdScope.Insert => POLICY_CMD_INSERT,
@@ -144,7 +144,7 @@ X PolicyEngine {
             PolicyCmdScope.Delete => POLICY_CMD_DELETE,
         };
 
-        role_name := mut M &stmt.role_name {
+        role_name := mut match &stmt.role_name {
             Some(r) => r.clone(),
             None => "",  # Applies to all roles
         };
@@ -182,7 +182,7 @@ X PolicyEngine {
 
         # 9. Update in-memory cache
         meta.policy_count = meta.policy_count + 1;
-        M self.policies_by_table.get_mut(&stmt.table_name) {
+        match self.policies_by_table.get_mut(&stmt.table_name) {
             Some(list) => {
                 list.push(policy);
             },
@@ -200,7 +200,7 @@ X PolicyEngine {
     # Execute DROP POLICY
     # ========================================================================
 
-    F execute_drop_policy(
+    fn execute_drop_policy(
         mut self,
         policy_name: &Str,
         table_name: &Str,
@@ -215,11 +215,11 @@ X PolicyEngine {
     ) -> Result<(), VaisError> {
         # 1. Permission check
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Find and remove the policy
-        M self.policies_by_table.get_mut(table_name) {
+        match self.policies_by_table.get_mut(table_name) {
             Some(policies) => {
                 found_idx := mut -1i64;
                 i := mut 0u64;
@@ -232,9 +232,9 @@ X PolicyEngine {
 
                 I found_idx < 0 {
                     I if_exists {
-                        R Ok(());
+                        return Ok(());
                     }
-                    R Err(err_policy_not_found(policy_name));
+                    return Err(err_policy_not_found(policy_name));
                 }
 
                 # 3. Write WAL
@@ -253,9 +253,9 @@ X PolicyEngine {
             },
             None => {
                 I if_exists {
-                    R Ok(());
+                    return Ok(());
                 }
-                R Err(err_policy_not_found(policy_name));
+                return Err(err_policy_not_found(policy_name));
             },
         };
 
@@ -268,7 +268,7 @@ X PolicyEngine {
 
     # Get all applicable policies for a table/command/role combination
     # Returns the USING expression as a WHERE clause fragment
-    F evaluate_policy(
+    fn evaluate_policy(
         self,
         table_name: &Str,
         cmd_type: u8,
@@ -276,10 +276,10 @@ X PolicyEngine {
     ) -> Option<Str> {
         # Superuser bypasses RLS
         I session.is_superuser {
-            R None;
+            return None;
         }
 
-        M self.policies_by_table.get(table_name) {
+        match self.policies_by_table.get(table_name) {
             Some(policies) => {
                 permissive_exprs := mut Vec.new();
                 restrictive_exprs := mut Vec.new();
@@ -293,7 +293,7 @@ X PolicyEngine {
                             I p.using_expr.len() > 0 {
                                 I p.is_permissive() {
                                     permissive_exprs.push(p.using_expr.clone());
-                                } EL {
+                                } else {
                                     restrictive_exprs.push(p.using_expr.clone());
                                 }
                             }
@@ -304,7 +304,7 @@ X PolicyEngine {
 
                 # No policies = no restriction
                 I permissive_exprs.len() == 0 && restrictive_exprs.len() == 0 {
-                    R None;
+                    return None;
                 }
 
                 # Combine: (permissive1 OR permissive2 OR ...) AND restrictive1 AND restrictive2 AND ...
@@ -349,9 +349,9 @@ X PolicyEngine {
     # ========================================================================
 
     # Get all policies for a table
-    F get_policies_for_table(self, table_name: &Str) -> Vec<&PolicyEntry> {
+    fn get_policies_for_table(self, table_name: &Str) -> Vec<&PolicyEntry> {
         result := mut Vec.new();
-        M self.policies_by_table.get(table_name) {
+        match self.policies_by_table.get(table_name) {
             Some(policies) => {
                 i := mut 0u64;
                 LW i < policies.len() {
@@ -367,13 +367,13 @@ X PolicyEngine {
     }
 
     # Check if a table has any RLS policies
-    F has_policies(self, table_name: &Str) -> bool {
-        M self.policies_by_table.get(table_name) {
+    fn has_policies(self, table_name: &Str) -> bool {
+        match self.policies_by_table.get(table_name) {
             Some(policies) => {
                 i := mut 0u64;
                 LW i < policies.len() {
                     I policies[i].is_active() {
-                        R true;
+                        return true;
                     }
                     i = i + 1;
                 }
@@ -384,12 +384,12 @@ X PolicyEngine {
     }
 
     # Get total policy count
-    F policy_count(self) -> u64 {
+    fn policy_count(self) -> u64 {
         count := mut 0u64;
         keys := mut self.policies_by_table.keys();
         i := mut 0u64;
         LW i < keys.len() {
-            M self.policies_by_table.get(&keys.get(i as i64)) {
+            match self.policies_by_table.get(&keys.get(i as i64)) {
                 Some(policies) => { count = count + policies.len(); },
                 None => {},
             }

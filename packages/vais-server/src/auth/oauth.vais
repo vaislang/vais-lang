@@ -2,14 +2,14 @@
 # Supports Google, GitHub, and custom providers.
 # get_authorization_url → redirect user → exchange_code → OAuthToken
 
-U std/string
-U std/vec
+use std/string
+use std/vec
 
 # ============================================================================
 # OAuthProvider — supported identity providers
 # ============================================================================
 
-EN OAuthProvider {
+enum OAuthProvider {
     Google,
     Github,
     Custom,
@@ -19,7 +19,7 @@ EN OAuthProvider {
 # OAuthConfig — per-provider registration parameters
 # ============================================================================
 
-S OAuthConfig {
+struct OAuthConfig {
     provider:      OAuthProvider,
     client_id:     str,
     client_secret: str,
@@ -29,9 +29,9 @@ S OAuthConfig {
     scopes:        Vec<str>,
 }
 
-X OAuthConfig {
+impl OAuthConfig {
     # Google OAuth 2.0 defaults
-    F google(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+    fn google(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
         scopes := Vec.new()
         scopes.push("openid")
         scopes.push("email")
@@ -49,7 +49,7 @@ X OAuthConfig {
     }
 
     # GitHub OAuth 2.0 defaults
-    F github(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+    fn github(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
         scopes := Vec.new()
         scopes.push("read:user")
         scopes.push("user:email")
@@ -66,7 +66,7 @@ X OAuthConfig {
     }
 
     # Custom provider
-    F custom(client_id: str, client_secret: str, redirect_uri: str,
+    fn custom(client_id: str, client_secret: str, redirect_uri: str,
              authorize_url: str, token_url: str) -> OAuthConfig {
         OAuthConfig {
             provider:      OAuthProvider.Custom,
@@ -84,7 +84,7 @@ X OAuthConfig {
 # OAuthToken — token response from the provider's token endpoint
 # ============================================================================
 
-S OAuthToken {
+struct OAuthToken {
     access_token:  str,
     token_type:    str,
     expires_in:    i64,
@@ -92,14 +92,14 @@ S OAuthToken {
     scope:         str,
 }
 
-X OAuthToken {
-    F new(access_token: str, token_type: str, expires_in: i64,
+impl OAuthToken {
+    fn new(access_token: str, token_type: str, expires_in: i64,
           refresh_token: str, scope: str) -> OAuthToken {
         OAuthToken { access_token: access_token, token_type: token_type, expires_in: expires_in, refresh_token: refresh_token, scope: scope }
     }
 
     # Check if this token carries a refresh token
-    F has_refresh(self) -> bool {
+    fn has_refresh(self) -> bool {
         self.refresh_token != ""
     }
 }
@@ -108,20 +108,20 @@ X OAuthToken {
 # OAuthStateParam — CSRF protection state included in the authorization URL
 # ============================================================================
 
-S OAuthStateParam {
+struct OAuthStateParam {
     value: str,
 }
 
-X OAuthStateParam {
+impl OAuthStateParam {
     # Generate a random-looking state value from the current timestamp.
     # FUTURE: replace with cryptographic random bytes.
-    F generate() -> OAuthStateParam {
+    fn generate() -> OAuthStateParam {
         t     := current_time_ms()
         state := "state_" + i64_to_str(t)
         OAuthStateParam { value: state }
     }
 
-    F from(value: str) -> OAuthStateParam {
+    fn from(value: str) -> OAuthStateParam {
         OAuthStateParam { value }
     }
 }
@@ -132,7 +132,7 @@ X OAuthStateParam {
 
 # Build the URL to which the user should be redirected to begin OAuth.
 # A CSRF state parameter is automatically appended.
-F get_authorization_url(config: OAuthConfig) -> str {
+fn get_authorization_url(config: OAuthConfig) -> str {
     state      := OAuthStateParam.generate()
     scope_str  := oauth_join_scopes(config.scopes, 0, "")
 
@@ -144,14 +144,14 @@ F get_authorization_url(config: OAuthConfig) -> str {
 
     I scope_str != "" {
         url + "&scope=" + scope_str
-    } EL {
+    } else {
         url
     }
 }
 
 # Build the authorization URL with an explicit state value (useful for tests
 # or when the caller manages state externally).
-F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
+fn get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
     scope_str := oauth_join_scopes(config.scopes, 0, "")
 
     url := config.authorize_url
@@ -162,7 +162,7 @@ F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
 
     I scope_str != "" {
         url + "&scope=" + scope_str
-    } EL {
+    } else {
         url
     }
 }
@@ -170,15 +170,15 @@ F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
 # Exchange an authorization code for an OAuthToken.
 # In production this would issue an HTTP POST to config.token_url.
 # FUTURE(std/http_client): perform the real network request.
-F exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
+fn exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
     I code == "" {
-        R Err(VaisError.new(400, "Authorization code is empty"))
+        return Err(VaisError.new(400, "Authorization code is empty"))
     }
     I config.client_id == "" {
-        R Err(VaisError.new(500, "OAuth client_id is not configured"))
+        return Err(VaisError.new(500, "OAuth client_id is not configured"))
     }
     I config.client_secret == "" {
-        R Err(VaisError.new(500, "OAuth client_secret is not configured"))
+        return Err(VaisError.new(500, "OAuth client_secret is not configured"))
     }
 
     # Simulate a successful token exchange.
@@ -201,12 +201,12 @@ F exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError>
 }
 
 # Validate that a state parameter returned by the provider matches the expected value.
-F validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
+fn validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
     I returned == "" {
-        R Err(VaisError.new(400, "Missing OAuth state parameter"))
+        return Err(VaisError.new(400, "Missing OAuth state parameter"))
     }
     I returned != expected {
-        R Err(VaisError.new(400, "OAuth state mismatch — possible CSRF attack"))
+        return Err(VaisError.new(400, "OAuth state mismatch — possible CSRF attack"))
     }
     Ok(true)
 }
@@ -216,12 +216,12 @@ F validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
 # ============================================================================
 
 # Join Vec<str> scopes with space separator (OAuth convention).
-F oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
-    I i >= scopes.len() { R acc }
+fn oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
+    I i >= scopes.len() { return acc }
     s := scopes.get(i)
     I acc == "" {
         oauth_join_scopes(scopes, i + 1, s)
-    } EL {
+    } else {
         oauth_join_scopes(scopes, i + 1, acc + " " + s)
     }
 }
@@ -230,21 +230,21 @@ F oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
 # Numeric utilities
 # ============================================================================
 
-F i64_to_str(n: i64) -> str {
-    I n == 0 { R "0" }
-    I n < 0  { R "-" + i64_to_str(0 - n) }
+fn i64_to_str(n: i64) -> str {
+    I n == 0 { return "0" }
+    I n < 0  { return "-" + i64_to_str(0 - n) }
     i64_to_str_rec(n, "")
 }
 
-F i64_to_str_rec(n: i64, acc: str) -> str {
-    I n == 0 { R acc }
+fn i64_to_str_rec(n: i64, acc: str) -> str {
+    I n == 0 { return acc }
     digit := n % 10
     ch    := digit_char(digit)
     i64_to_str_rec(n / 10, ch + acc)
 }
 
-F digit_char(d: i64) -> str {
-    M d {
+fn digit_char(d: i64) -> str {
+    match d {
         0 => "0",
         1 => "1",
         2 => "2",
@@ -263,4 +263,4 @@ F digit_char(d: i64) -> str {
 # External runtime stubs
 # ============================================================================
 
-X F current_time_ms() -> i64
+impl fn current_time_ms() -> i64

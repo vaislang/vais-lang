@@ -1,32 +1,32 @@
 # src/fulltext/search/match_fn.vais
 # Volcano-style iterator for FULLTEXT_MATCH() SQL function
 
-U std/vec
-U std/string
-U std/option
-U storage/error
-U storage/buffer/pool
-U storage/txn/snapshot
-U storage/txn/clog
-U fulltext/types
-U storage/hash
-U fulltext/tokenizer
-U fulltext/index/dictionary
-U fulltext/index/posting
-U fulltext/search/bm25
-U fulltext/visibility
+use std/vec
+use std/string
+use std/option
+use storage/error
+use storage/buffer/pool
+use storage/txn/snapshot
+use storage/txn/clog
+use fulltext/types
+use storage/hash
+use fulltext/tokenizer
+use fulltext/index/dictionary
+use fulltext/index/posting
+use fulltext/search/bm25
+use fulltext/visibility
 
 # Result structure for a single full-text match
-S FullTextMatchResult {
+struct FullTextMatchResult {
     doc_id: u64,
     score: f64,
     table_id: u32,
     row_tid: u32,
 }
 
-X FullTextMatchResult {
+impl FullTextMatchResult {
     # Create a new M result
-    F new(doc_id: u64, score: f64, table_id: u32, row_tid: u32) -> FullTextMatchResult {
+    fn new(doc_id: u64, score: f64, table_id: u32, row_tid: u32) -> FullTextMatchResult {
         FullTextMatchResult {
             doc_id,
             score,
@@ -36,7 +36,7 @@ X FullTextMatchResult {
     }
 
     # Clone the result
-    F clone(self) -> FullTextMatchResult {
+    fn clone(self) -> FullTextMatchResult {
         FullTextMatchResult {
             doc_id: self.doc_id,
             score: self.score,
@@ -47,7 +47,7 @@ X FullTextMatchResult {
 }
 
 # Volcano-style executor for FULLTEXT_MATCH(column, query_text, top_k)
-S FullTextMatchExecutor {
+struct FullTextMatchExecutor {
     index_id: u32,
     query_text: str,
     top_k: u32,
@@ -56,9 +56,9 @@ S FullTextMatchExecutor {
     is_open: bool,
 }
 
-X FullTextMatchExecutor {
+impl FullTextMatchExecutor {
     # Create a new full-text M executor
-    F new(index_id: u32, query_text: str, top_k: u32) -> FullTextMatchExecutor {
+    fn new(index_id: u32, query_text: str, top_k: u32) -> FullTextMatchExecutor {
         FullTextMatchExecutor {
             index_id,
             query_text,
@@ -78,7 +78,7 @@ X FullTextMatchExecutor {
     # 5. Score with BM25
     # 6. Sort by score descending
     # 7. Return top_k results
-    F execute_search(
+    fn execute_search(
         mut self,
         meta: &FullTextMeta,
         config: &FullTextConfig,
@@ -95,7 +95,7 @@ X FullTextMatchExecutor {
         I query_terms.len() == 0 {
             # No terms to search, return empty results
             self.results = Vec.with_capacity(0)
-            R Ok(())
+            return Ok(())
         }
 
         # Step 2 & 3: Lookup posting lists and collect candidates
@@ -106,10 +106,10 @@ X FullTextMatchExecutor {
             term := mut term_freq_info.term.clone()
 
             # Lookup term in dictionary
-            M dict_index.lookup_term(&term, pool) {
+            match dict_index.lookup_term(&term, pool) {
                 Ok(Some(dict_entry)) => {
                     # Read posting list
-                    M posting_store.read_all_entries(dict_entry.posting_head_page) {
+                    match posting_store.read_all_entries(dict_entry.posting_head_page) {
                         Ok(postings) => {
                             # Step 4: Filter by visibility (post-filter strategy)
                             visible_postings := mut filter_visible_postings(&postings, snapshot, clog)
@@ -129,7 +129,7 @@ X FullTextMatchExecutor {
                             }
                         },
                         Err(e) => {
-                            R Err(e)
+                            return Err(e)
                         },
                     }
                 },
@@ -137,7 +137,7 @@ X FullTextMatchExecutor {
                     # Term not found, skip
                 },
                 Err(e) => {
-                    R Err(e)
+                    return Err(e)
                 },
             }
         }
@@ -179,7 +179,7 @@ X FullTextMatchExecutor {
                 curr_score := candidates[sj].3
                 I prev_score >= curr_score {
                     sj = 0  # stop
-                } EL {
+                } else {
                     tmp := candidates[sj]
                     candidates[sj] = candidates[sj - 1]
                     candidates[sj - 1] = tmp
@@ -192,7 +192,7 @@ X FullTextMatchExecutor {
         # Step 7: Take top_k results
         top_k_count := mut I candidates.len() < self.top_k as u64 {
             candidates.len()
-        } EL {
+        } else {
             self.top_k as u64
         }
 
@@ -211,15 +211,15 @@ X FullTextMatchExecutor {
     }
 
     # Volcano interface: open the iterator
-    F open(mut self) {
+    fn open(mut self) {
         self.cursor = 0
         self.is_open = true
     }
 
     # Volcano interface: get next result
-    F next(mut self) -> Option<FullTextMatchResult> {
+    fn next(mut self) -> Option<FullTextMatchResult> {
         I !self.is_open || self.cursor >= self.results.len() {
-            R None
+            return None
         }
         result := mut self.results[self.cursor].clone()
         self.cursor += 1
@@ -227,35 +227,35 @@ X FullTextMatchExecutor {
     }
 
     # Volcano interface: close the iterator
-    F close(mut self) {
+    fn close(mut self) {
         self.is_open = false
     }
 
     # Get the current cursor position
-    F cursor_position(self) -> u64 {
+    fn cursor_position(self) -> u64 {
         self.cursor
     }
 
     # Get total number of results
-    F result_count(self) -> u64 {
+    fn result_count(self) -> u64 {
         self.results.len()
     }
 
     # Check if iterator is open
-    F is_open(self) -> bool {
+    fn is_open(self) -> bool {
         self.is_open
     }
 }
 
 # Simplified scoring for multi-term queries
 # Aggregates scores across all query terms for each document
-S MultiTermScorer {
+struct MultiTermScorer {
     config: FullTextConfig,
 }
 
-X MultiTermScorer {
+impl MultiTermScorer {
     # Create a new multi-term scorer
-    F new(config: FullTextConfig) -> MultiTermScorer {
+    fn new(config: FullTextConfig) -> MultiTermScorer {
         MultiTermScorer {
             config,
         }
@@ -263,7 +263,7 @@ X MultiTermScorer {
 
     # Score a document against multiple query terms
     # Returns aggregated BM25 score (sum of individual term scores)
-    F score_document(
+    fn score_document(
         &self,
         doc_id: u64,
         term_postings: &Vec<(str, Vec<PostingEntry>)>,

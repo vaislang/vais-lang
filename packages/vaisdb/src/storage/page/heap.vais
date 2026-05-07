@@ -2,39 +2,39 @@
 # Slot directory grows → from top, tuple data grows ← from bottom
 # Based on Stage 1 Section 7
 
-U storage/bytes
-U std/vec
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/page/slot
-U storage/page/tuple
-U storage/page/mvcc
-U storage/checksum
+use storage/bytes
+use std/vec
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/page/slot
+use storage/page/tuple
+use storage/page/mvcc
+use storage/checksum
 
-S LiveTupleEntry {
+struct LiveTupleEntry {
     slot_index: u16,
     tuple: Tuple,
 }
 
-X LiveTupleEntry {
-    F new(slot_index: u16, tuple: Tuple) -> LiveTupleEntry {
+impl LiveTupleEntry {
+    fn new(slot_index: u16, tuple: Tuple) -> LiveTupleEntry {
         LiveTupleEntry { slot_index, tuple }
     }
 }
 
 # HeapPage manages a slotted page for storing tuples
-S HeapPage {
+struct HeapPage {
     page_size: u32,
     header: PageHeader,
     slots: Vec<HeapPageSlot>,
     data: Vec<u8>,             # Full page data buffer
 }
 
-X HeapPage {
+impl HeapPage {
     # Create a new empty heap page
-    F new(page_id: u32, page_size: u32) -> HeapPage {
+    fn new(page_id: u32, page_size: u32) -> HeapPage {
         header := mut PageHeader.new(page_id, PAGE_TYPE_DATA, ENGINE_TAG_SQL)
         header.free_space_offset = PAGE_HEADER_SIZE as u16
         header.item_count = 0
@@ -52,7 +52,7 @@ X HeapPage {
     }
 
     # Load a heap page from raw page data
-    F from_page_data(page_data: &[u8], page_size: u32) -> Result<HeapPage, VaisError> {
+    fn from_page_data(page_data: &[u8], page_size: u32) -> Result<HeapPage, VaisError> {
         header := mut PageHeader.read_from_page(page_data)?;
 
         # Read slot directory
@@ -73,32 +73,32 @@ X HeapPage {
     }
 
     # Calculate available free space for new tuples
-    F free_space(self) -> u32 {
+    fn free_space(self) -> u32 {
         slot_dir_end := mut PAGE_HEADER_SIZE + (self.header.item_count as u32) * SLOT_ENTRY_SIZE
         lowest_tuple := mut self.find_lowest_tuple_offset()
 
         I lowest_tuple <= slot_dir_end {
             0
-        } EL {
+        } else {
             lowest_tuple - slot_dir_end
         }
     }
 
     # Calculate free space accounting for a new slot entry
-    F free_space_for_insert(self) -> u32 {
+    fn free_space_for_insert(self) -> u32 {
         new_slot_dir_end := mut PAGE_HEADER_SIZE + ((self.header.item_count as u32) + 1) * SLOT_ENTRY_SIZE
         lowest_tuple := mut self.find_lowest_tuple_offset()
 
         I lowest_tuple <= new_slot_dir_end {
             0
-        } EL {
+        } else {
             lowest_tuple - new_slot_dir_end
         }
     }
 
     # Insert a tuple into the page
     # Returns slot index on success
-    F insert_tuple(mut self, tuple: &Tuple) -> Result<u16, VaisError> {
+    fn insert_tuple(mut self, tuple: &Tuple) -> Result<u16, VaisError> {
         tuple_size := mut tuple.on_page_size()
 
         # Check if there's space (need slot entry + tuple data)
@@ -109,10 +109,10 @@ X HeapPage {
                 self.compact()?;
                 available_after := mut self.free_space_for_insert()
                 I tuple_size > available_after {
-                    R Err(err_page_full(self.header.page_id, tuple_size))
+                    return Err(err_page_full(self.header.page_id, tuple_size))
                 }
-            } EL {
-                R Err(err_page_full(self.header.page_id, tuple_size))
+            } else {
+                return Err(err_page_full(self.header.page_id, tuple_size))
             }
         }
 
@@ -139,14 +139,14 @@ X HeapPage {
     }
 
     # Read a tuple from a slot
-    F read_tuple(self, slot_index: u16) -> Result<Tuple, VaisError> {
+    fn read_tuple(self, slot_index: u16) -> Result<Tuple, VaisError> {
         I slot_index >= self.header.item_count {
-            R Err(err_internal("Slot index out of range"))
+            return Err(err_internal("Slot index out of range"))
         }
 
         slot := mut &self.slots[slot_index as u64]
         I slot.is_dead() {
-            R Err(err_internal("Slot is dead/unused"))
+            return Err(err_internal("Slot is dead/unused"))
         }
 
         Tuple.read_from(&self.data, slot.tuple_off as u64, slot.tuple_len as u64)
@@ -154,14 +154,14 @@ X HeapPage {
 
     # Mark a tuple as deleted (set MVCC txn_id_expire)
     # Does NOT remove the tuple - just marks it for GC
-    F delete_tuple(mut self, slot_index: u16, txn_id: u64, cmd_id: u32) -> Result<(), VaisError> {
+    fn delete_tuple(mut self, slot_index: u16, txn_id: u64, cmd_id: u32) -> Result<(), VaisError> {
         I slot_index >= self.header.item_count {
-            R Err(err_internal("Slot index out of range"))
+            return Err(err_internal("Slot index out of range"))
         }
 
         slot := mut &self.slots[slot_index as u64]
         I slot.is_dead() {
-            R Err(err_internal("Cannot delete dead slot"))
+            return Err(err_internal("Cannot delete dead slot"))
         }
 
         # Read MVCC metadata, update txn_id_expire
@@ -178,9 +178,9 @@ X HeapPage {
     }
 
     # Mark a slot as dead after GC determines tuple is invisible to all snapshots
-    F mark_slot_dead(mut self, slot_index: u16) -> Result<(), VaisError> {
+    fn mark_slot_dead(mut self, slot_index: u16) -> Result<(), VaisError> {
         I slot_index >= self.header.item_count {
-            R Err(err_internal("Slot index out of range"))
+            return Err(err_internal("Slot index out of range"))
         }
 
         dead_slot := mut HeapPageSlot.dead()
@@ -196,7 +196,7 @@ X HeapPage {
     }
 
     # Compact page: defragment by moving live tuples to be contiguous
-    F compact(mut self) -> Result<(), VaisError> {
+    fn compact(mut self) -> Result<(), VaisError> {
         source_data: Vec<u8> := mut self.data.clone()
         write_pos := mut self.page_size
         remaining := mut self.live_count()
@@ -223,7 +223,7 @@ X HeapPage {
             }
 
             I !found {
-                R Err(err_internal("Heap compaction lost track of live tuples"))
+                return Err(err_internal("Heap compaction lost track of live tuples"))
             }
 
             write_pos -= found_len as u32
@@ -256,31 +256,31 @@ X HeapPage {
     }
 
     # Flush page: serialize header + compute checksum
-    F flush(mut self) -> &Vec<u8> {
+    fn flush(mut self) -> &Vec<u8> {
         # Write header to data buffer
         self.header.write_to_page_vec(&self.data)
         # Update checksum
         PageHeader.update_checksum_vec(&self.data);
-        R &self.data
+        return &self.data
     }
 
     # Get page header reference
-    F get_header(self) -> &PageHeader {
+    fn get_header(self) -> &PageHeader {
         &self.header
     }
 
     # Get mutable header
-    F get_header_mut(mut self) -> &mut PageHeader {
+    fn get_header_mut(mut self) -> &mut PageHeader {
         &self.header
     }
 
     # Get item count (number of slots, including dead)
-    F item_count(self) -> u16 {
+    fn item_count(self) -> u16 {
         self.header.item_count
     }
 
     # Count live (non-dead) tuples
-    F live_count(self) -> u16 {
+    fn live_count(self) -> u16 {
         count := mut 0
         LF i: 0..self.slots.len() {
             I self.slots[i].is_live() {
@@ -291,17 +291,17 @@ X HeapPage {
     }
 
     # Count dead tuples
-    F dead_count(self) -> u16 {
+    fn dead_count(self) -> u16 {
         self.header.item_count - self.live_count()
     }
 
     # Get raw page data
-    F as_bytes(self) -> &Vec<u8> {
+    fn as_bytes(self) -> &Vec<u8> {
         &self.data
     }
 
     # Helper: find the lowest tuple offset (closest to slot directory)
-    F find_lowest_tuple_offset(self) -> u32 {
+    fn find_lowest_tuple_offset(self) -> u32 {
         lowest := mut self.page_size
         LF i: 0..self.slots.len() {
             slot := mut &self.slots[i]
@@ -313,14 +313,14 @@ X HeapPage {
     }
 
     # Update MVCC metadata for a tuple (used during UPDATE operations)
-    F update_mvcc(mut self, slot_index: u16, mvcc: &MvccTupleMeta) -> Result<(), VaisError> {
+    fn update_mvcc(mut self, slot_index: u16, mvcc: &MvccTupleMeta) -> Result<(), VaisError> {
         I slot_index >= self.header.item_count {
-            R Err(err_internal("Slot index out of range"))
+            return Err(err_internal("Slot index out of range"))
         }
 
         slot := mut &self.slots[slot_index as u64]
         I slot.is_dead() {
-            R Err(err_internal("Cannot update dead slot MVCC"))
+            return Err(err_internal("Cannot update dead slot MVCC"))
         }
 
         mvcc_offset := mut slot.tuple_off as u64
@@ -332,7 +332,7 @@ X HeapPage {
     }
 
     # Iterate over all live tuples.
-    F iter_live(self) -> Vec<LiveTupleEntry> {
+    fn iter_live(self) -> Vec<LiveTupleEntry> {
         results: Vec<LiveTupleEntry> := mut Vec.with_capacity(0)
         LF i: 0..self.slots.len() {
             slot := mut &self.slots[i]
@@ -348,7 +348,7 @@ X HeapPage {
     }
 }
 
-F copy_heap_bytes(data: &[u8]) -> Vec<u8> {
+fn copy_heap_bytes(data: &[u8]) -> Vec<u8> {
     result: Vec<u8> := mut Vec.with_capacity(data.len())
     i := mut 0
     LW i < data.len() {

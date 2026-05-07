@@ -2,28 +2,28 @@
 # Insert key-TID pairs with automatic page split detection
 # Follows the descent-then-split approach from Stage 1 Section 9
 
-U storage/constants
-U storage/error
-U storage/buffer/pool
-U storage/btree/tree
-U storage/btree/node
-U storage/btree/entry
-U storage/wal/group_commit
-U storage/btree/wal_integration
-U storage/recovery/checkpoint
-U storage/btree/latch
-U storage/page/header
-U storage/page/flags
+use storage/constants
+use storage/error
+use storage/buffer/pool
+use storage/btree/tree
+use storage/btree/node
+use storage/btree/entry
+use storage/wal/group_commit
+use storage/btree/wal_integration
+use storage/recovery/checkpoint
+use storage/btree/latch
+use storage/page/header
+use storage/page/flags
 
 # Result of an insert that may need to propagate upward
-EN InsertResult {
+enum InsertResult {
     Done,
     NeedsSplit(Vec<u8>, u32),
 }
 
 # Insert a key-TID pair into the B+Tree
 # Returns Ok(true) if inserted, Ok(false) if key already exists (duplicate)
-F btree_insert(
+fn btree_insert(
     tree: &mut BTree,
     key: &[u8],
     tid: u32,
@@ -34,7 +34,7 @@ F btree_insert(
     # Check for duplicate key first
     existing := mut tree.search(key, pool)?;
     I existing.is_some() != 0 {
-        R Ok(false);
+        return Ok(false);
     }
 
     # Collect the path from root to leaf (for potential splits)
@@ -66,7 +66,7 @@ F btree_insert(
         leaf_latch.release()
         pool.unpin_page(leaf_frame, true)
         tree.inc_entries()
-        R Ok(true)
+        return Ok(true)
     }
 
     # Leaf is full, need to split
@@ -74,20 +74,20 @@ F btree_insert(
     split_result := mut split_leaf(tree, &leaf, key, tid, txn_id, gcm, leaf_frame, pool)?;
 
     # Propagate split up through internal nodes, then clean up the leaf pin/latch
-    R finish_insert_after_split(
+    return finish_insert_after_split(
         tree, &path, split_result, txn_id, gcm, pool, &mut leaf_latch, leaf_frame
     )
 }
 
 # Path entry recording the descent through the tree
-S PathEntry {
+struct PathEntry {
     page_id: u32,
     index: u64,     # Which child slot was followed (for internal nodes)
 }
 
 # Collect the path from root to the target leaf
 # Uses read latch crabbing: acquire child latch, then release parent
-F collect_insert_path(
+fn collect_insert_path(
     tree: &BTree,
     key: &[u8],
     pool: &mut BufferPool,
@@ -108,7 +108,7 @@ F collect_insert_path(
         child_index := mut find_child_index(&internal, key)
         next_page := mut I child_index == 0 {
             internal.leftmost_child
-        } EL {
+        } else {
             internal.entries[child_index - 1].child_page
         }
 
@@ -116,7 +116,7 @@ F collect_insert_path(
         pool.unpin_page(frame_id, false)
 
         # Release parent latch — child is safe once we descend
-        M parent_guard {
+        match parent_guard {
             Some(pg) => {
                 pg.release();
             },
@@ -128,7 +128,7 @@ F collect_insert_path(
     }
 
     # Release the last internal node latch before latching the leaf
-    M parent_guard {
+    match parent_guard {
         Some(pg) => {
             pg.release();
         },
@@ -142,14 +142,14 @@ F collect_insert_path(
 }
 
 # Find the child index for descent (0 = leftmost_child, N = entries[N-1].child_page)
-F find_child_index(internal: &BTreeInternalNode, key: &[u8]) -> u64 {
+fn find_child_index(internal: &BTreeInternalNode, key: &[u8]) -> u64 {
     lo := mut 0
     hi := mut internal.entries.len()
 
     LW lo < hi {
         mid := mut lo + (hi - lo) / 2
         mid_key := mut internal.get_key(mid)
-        M compare_keys(key, mid_key) {
+        match compare_keys(key, mid_key) {
             Less => { hi = mid; },
             Equal | Greater => { lo = mid + 1; },
         }
@@ -157,7 +157,7 @@ F find_child_index(internal: &BTreeInternalNode, key: &[u8]) -> u64 {
     lo
 }
 
-F propagate_insert_split(
+fn propagate_insert_split(
     tree: &mut BTree,
     path: &[PathEntry],
     split_result: InsertResult,
@@ -165,16 +165,16 @@ F propagate_insert_split(
     gcm: &mut GroupCommitManager,
     pool: &mut BufferPool,
 ) -> Result<(), VaisError> {
-    M split_result {
-        Done => { R Ok(()) },
+    match split_result {
+        Done => { return Ok(()) },
         NeedsSplit(separator, new_page_id) => {
-            R propagate_split(tree, path, separator, new_page_id, txn_id, gcm, pool)
+            return propagate_split(tree, path, separator, new_page_id, txn_id, gcm, pool)
         },
     }
     Ok(())
 }
 
-F finish_insert_after_split(
+fn finish_insert_after_split(
     tree: &mut BTree,
     path: &[PathEntry],
     split_result: InsertResult,
@@ -188,13 +188,13 @@ F finish_insert_after_split(
     leaf_latch.release()
     pool.unpin_page(leaf_frame, true)
 
-    M propagate_result {
+    match propagate_result {
         Ok(_) => {
             tree.inc_entries()
-            R Ok(true)
+            return Ok(true)
         },
         Err(e) => {
-            R Err(e)
+            return Err(e)
         },
     }
     Ok(true)
@@ -202,7 +202,7 @@ F finish_insert_after_split(
 
 # Split a leaf node and insert the new key
 # Returns the split result to propagate upward
-F split_leaf(
+fn split_leaf(
     tree: &BTree,
     leaf: &BTreeLeafNode,
     key: &[u8],
@@ -312,7 +312,7 @@ F split_leaf(
 }
 
 # Propagate a split upward through the internal nodes
-F propagate_split(
+fn propagate_split(
     tree: &mut BTree,
     path: &[PathEntry],
     separator: Vec<u8>,
@@ -349,7 +349,7 @@ F propagate_split(
             pool.write_page(parent_frame)?;
             parent_latch.release()
             pool.unpin_page(parent_frame, true)
-            R Ok(())
+            return Ok(())
         }
 
         # Parent is full, need to split internal node
@@ -371,13 +371,13 @@ F propagate_split(
 }
 
 # Result of splitting an internal node
-S InternalSplitResult {
+struct InternalSplitResult {
     separator: Vec<u8>,
     new_page_id: u32,
 }
 
 # Split an internal node
-F split_internal(
+fn split_internal(
     tree: &BTree,
     internal: &BTreeInternalNode,
     new_key: &[u8],
@@ -397,7 +397,7 @@ F split_internal(
     inserted := mut false
     LF i: 0..internal.entry_count() as u64 {
         entry_key := mut copy_insert_bytes(internal.get_key(i))
-        insert_before := mut M compare_keys(new_key, &entry_key) {
+        insert_before := mut match compare_keys(new_key, &entry_key) {
             KeyCmp.Less => true,
             _ => false,
         }
@@ -463,7 +463,7 @@ F split_internal(
 }
 
 # Create a new root node when the old root splits
-F create_new_root(
+fn create_new_root(
     tree: &mut BTree,
     separator: &[u8],
     left_child: u32,
@@ -510,7 +510,7 @@ F create_new_root(
     Ok(())
 }
 
-F u32_to_le_bytes(value: u32) -> Vec<u8> {
+fn u32_to_le_bytes(value: u32) -> Vec<u8> {
     bytes: Vec<u8> := mut Vec.with_capacity(4)
     bytes.push((value & 255) as u8)
     bytes.push(((value >> 8) & 255) as u8)
@@ -519,7 +519,7 @@ F u32_to_le_bytes(value: u32) -> Vec<u8> {
     bytes
 }
 
-F copy_insert_bytes(data: &[u8]) -> Vec<u8> {
+fn copy_insert_bytes(data: &[u8]) -> Vec<u8> {
     result: Vec<u8> := mut Vec.with_capacity(data.len())
     i := mut 0
     LW i < data.len() {

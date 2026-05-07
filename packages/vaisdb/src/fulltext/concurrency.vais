@@ -3,9 +3,9 @@
 # Single-writer + multiple-reader lock management for inverted index
 # Pattern matches vector/concurrency.vais design
 
-U std/sync
-U storage/error
-U fulltext/types
+use std/sync
+use storage/error
+use fulltext/types
 
 # Error codes: EE=04 (fulltext), CC=07 (concurrency)
 # Error code strings: EE=04 (fulltext), CC=07 (concurrency)
@@ -23,15 +23,15 @@ U fulltext/types
 # - Write queue ensures FIFO ordering for mutations
 # - Active reader/writer counts for observability
 # - Read path is lock-free via snapshot isolation (MVCC handles consistency)
-S FullTextLock {
+struct FullTextLock {
     rw_lock: RwLock<()>,               # Main read-write lock
     active_readers: AtomicI64,     # Count of active readers
     active_writer: AtomicI64,      # Current writer txn_id (0 = none)
 }
 
-X FullTextLock {
+impl FullTextLock {
     # Create new lock manager
-    F new() -> FullTextLock {
+    fn new() -> FullTextLock {
         FullTextLock {
             rw_lock: RwLock.new(()),
             active_readers: AtomicI64.new(0),
@@ -41,7 +41,7 @@ X FullTextLock {
 
     # Acquire read lock for concurrent searches
     # Returns guard that auto-releases on drop
-    F read_lock(self) -> Result<FullTextReadGuard, VaisError> {
+    fn read_lock(self) -> Result<FullTextReadGuard, VaisError> {
         # Acquire read portion of RwLock<()>
         guard := mut self.rw_lock.read()
 
@@ -56,7 +56,7 @@ X FullTextLock {
 
     # Acquire write lock for mutations (insert/delete)
     # Serializes writers through the underlying RwLock.
-    F write_lock(self, txn_id: u64) -> Result<FullTextWriteGuard, VaisError> {
+    fn write_lock(self, txn_id: u64) -> Result<FullTextWriteGuard, VaisError> {
         # Acquire exclusive write lock
         guard := mut self.rw_lock.write()
 
@@ -72,27 +72,27 @@ X FullTextLock {
 
     # Try to acquire write lock without blocking
     # Returns None if lock unavailable, Some(guard) if acquired
-    F try_write_lock(self, txn_id: u64) -> Result<Option<FullTextWriteGuard>, VaisError> {
+    fn try_write_lock(self, txn_id: u64) -> Result<Option<FullTextWriteGuard>, VaisError> {
         Ok(Option.None)
     }
 
     # Get count of active readers
-    F active_reader_count(self) -> u64 {
+    fn active_reader_count(self) -> u64 {
         self.active_readers.load()
     }
 
     # Check if there's an active writer
-    F has_active_writer(self) -> bool {
+    fn has_active_writer(self) -> bool {
         self.active_writer.load() != 0
     }
 
     # Internal: decrement reader count
-    F decrement_readers(self) {
+    fn decrement_readers(self) {
         self.active_readers.fetch_sub(1)
     }
 
     # Internal: clear active writer and remove from queue
-    partial F release_writer(self, txn_id: u64) {
+    partial fn release_writer(self, txn_id: u64) {
         self.active_writer.store(0)
     }
 }
@@ -102,26 +102,26 @@ X FullTextLock {
 ###############################################################################
 
 # Read lock guard - automatically releases read lock on drop
-S FullTextReadGuard {
+struct FullTextReadGuard {
     lock: &FullTextLock,
     _guard: RwLockReadGuard<()>,
 }
 
-X FullTextReadGuard {
-    F drop(mut self) {
+impl FullTextReadGuard {
+    fn drop(mut self) {
         self.lock.decrement_readers()
     }
 }
 
 # Write lock guard - automatically releases write lock on drop
-S FullTextWriteGuard {
+struct FullTextWriteGuard {
     lock: &FullTextLock,
     txn_id: u64,
     _guard: RwLockWriteGuard<()>,
 }
 
-X FullTextWriteGuard {
-    F drop(mut self) {
+impl FullTextWriteGuard {
+    fn drop(mut self) {
         self.lock.release_writer(self.txn_id)
     }
 }
@@ -131,7 +131,7 @@ X FullTextWriteGuard {
 ###############################################################################
 
 # Concurrency statistics for observability
-S ConcurrencyStats {
+struct ConcurrencyStats {
     total_reads: AtomicI64,            # Total read operations
     total_writes: AtomicI64,           # Total write operations
     write_wait_total_us: AtomicI64,    # Total time spent waiting for write lock (microseconds)
@@ -139,8 +139,8 @@ S ConcurrencyStats {
     write_conflicts: AtomicI64,        # Number of write conflicts
 }
 
-X ConcurrencyStats {
-    F new() -> ConcurrencyStats {
+impl ConcurrencyStats {
+    fn new() -> ConcurrencyStats {
         ConcurrencyStats {
             total_reads: AtomicI64.new(0),
             total_writes: AtomicI64.new(0),
@@ -151,7 +151,7 @@ X ConcurrencyStats {
     }
 
     # Record a read operation
-    F record_read(self, concurrent_readers: u64) {
+    fn record_read(self, concurrent_readers: u64) {
         self.total_reads.fetch_add(1)
 
         # Update max concurrent readers
@@ -163,28 +163,28 @@ X ConcurrencyStats {
     }
 
     # Record a write operation
-    F record_write(self, wait_time_us: u64) {
+    fn record_write(self, wait_time_us: u64) {
         self.total_writes.fetch_add(1)
         self.write_wait_total_us.fetch_add(wait_time_us)
     }
 
     # Record a write conflict
-    F record_conflict(self) {
+    fn record_conflict(self) {
         self.write_conflicts.fetch_add(1)
     }
 
     # Get average write wait time in microseconds
-    F avg_write_wait_us(self) -> f64 {
+    fn avg_write_wait_us(self) -> f64 {
         total_writes := mut self.total_writes.load()
         I total_writes == 0 {
-            R 0.0
+            return 0.0
         }
         total_wait := mut self.write_wait_total_us.load()
         (total_wait as f64) / (total_writes as f64)
     }
 
     # Get statistics snapshot
-    F snapshot(self) -> ConcurrencyStatsSnapshot {
+    fn snapshot(self) -> ConcurrencyStatsSnapshot {
         ConcurrencyStatsSnapshot {
             total_reads: self.total_reads.load(),
             total_writes: self.total_writes.load(),
@@ -196,7 +196,7 @@ X ConcurrencyStats {
 }
 
 # Non-atomic snapshot of concurrency stats
-S ConcurrencyStatsSnapshot {
+struct ConcurrencyStatsSnapshot {
     total_reads: u64,
     total_writes: u64,
     avg_write_wait_us: f64,
@@ -210,15 +210,15 @@ S ConcurrencyStatsSnapshot {
 # - Write operations (insert/delete) acquire write lock
 # - Meta is protected by separate RwLock<()> for independent access
 # - Stats track performance metrics
-S ConcurrentFullTextIndex {
+struct ConcurrentFullTextIndex {
     lock: FullTextLock,
     meta: RwLock<FullTextMeta>,
     stats: ConcurrencyStats,
 }
 
-X ConcurrentFullTextIndex {
+impl ConcurrentFullTextIndex {
     # Create new concurrent full-text index
-    F new(meta: FullTextMeta) -> ConcurrentFullTextIndex {
+    fn new(meta: FullTextMeta) -> ConcurrentFullTextIndex {
         ConcurrentFullTextIndex {
             lock: FullTextLock.new(),
             meta: RwLock.new(meta),
@@ -229,7 +229,7 @@ X ConcurrentFullTextIndex {
     # Perform concurrent search (acquires read lock)
     # Note: Actual search implementation delegated to FullTextIndex
     # This is just the concurrency wrapper
-    F search(
+    fn search(
         self,
         query: &str,
         limit: u64,
@@ -248,7 +248,7 @@ X ConcurrentFullTextIndex {
 
     # Perform concurrent insert (acquires write lock)
     # Serializes with other writes via write queue
-    F insert(
+    fn insert(
         mut self,
         txn_id: u64,
         doc_id: u64,
@@ -269,7 +269,7 @@ X ConcurrentFullTextIndex {
     }
 
     # Perform concurrent delete (acquires write lock)
-    F delete(
+    fn delete(
         mut self,
         txn_id: u64,
         doc_id: u64,
@@ -290,7 +290,7 @@ X ConcurrentFullTextIndex {
 
     # Try non-blocking insert
     # Returns Ok(true) if insert succeeded, Ok(false) if lock unavailable
-    F try_insert(
+    fn try_insert(
         mut self,
         txn_id: u64,
         doc_id: u64,
@@ -299,7 +299,7 @@ X ConcurrentFullTextIndex {
         # Try to acquire write lock without blocking
         guard := mut self.lock.try_write_lock(txn_id)?;
 
-        M guard {
+        match guard {
             Some(_g) => {
                 # Lock acquired, perform insert
                 self.stats.record_write(0)
@@ -315,7 +315,7 @@ X ConcurrentFullTextIndex {
     }
 
     # Get metadata snapshot (acquires read lock on meta)
-    F get_meta(self) -> Result<FullTextMeta, VaisError> {
+    fn get_meta(self) -> Result<FullTextMeta, VaisError> {
         Ok(self.meta.get_inner().clone())
     }
 
@@ -324,17 +324,17 @@ X ConcurrentFullTextIndex {
     # 나중에 trait dispatch가 필요하면 MetaUpdater trait 도입.
 
     # Get concurrency statistics snapshot
-    F stats(self) -> ConcurrencyStatsSnapshot {
+    fn stats(self) -> ConcurrencyStatsSnapshot {
         self.stats.snapshot()
     }
 
     # Get active reader count
-    F active_readers(self) -> u64 {
+    fn active_readers(self) -> u64 {
         self.lock.active_reader_count()
     }
 
     # Check if write is in progress
-    F has_active_writer(self) -> bool {
+    fn has_active_writer(self) -> bool {
         self.lock.has_active_writer()
     }
 }

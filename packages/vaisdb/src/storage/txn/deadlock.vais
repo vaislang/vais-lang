@@ -2,29 +2,29 @@
 # Wait-for graph based deadlock detection
 # Based on Stage 3 Section 8: Deadlock scenario
 
-U std/sync
+use std/sync
 
 # Wait edge: waiter transaction is waiting for holder transaction.
-S WaitEdge {
+struct WaitEdge {
     waiter: u64,
     holder: u64,
 }
 
-F deadlock_empty_txn_vec() -> Vec<u64> {
+fn deadlock_empty_txn_vec() -> Vec<u64> {
     result: Vec<u64> := mut Vec.with_capacity(0)
     result
 }
 
-F deadlock_empty_edge_vec() -> Vec<WaitEdge> {
+fn deadlock_empty_edge_vec() -> Vec<WaitEdge> {
     result: Vec<WaitEdge> := mut Vec.with_capacity(0)
     result
 }
 
-F deadlock_vec_contains(items: &mut Vec<u64>, txn_id: u64) -> bool {
+fn deadlock_vec_contains(items: &mut Vec<u64>, txn_id: u64) -> bool {
     i := mut 0
     LW i < items.len() {
         I items[i] == txn_id {
-            R true
+            return true
         }
         i += 1
     }
@@ -34,15 +34,15 @@ F deadlock_vec_contains(items: &mut Vec<u64>, txn_id: u64) -> bool {
 # Wait-for graph for deadlock detection.
 # Internally this uses an explicit edge list instead of HashMap<u64, Vec<u64>>
 # so the source contract does not depend on nested generic value inference.
-S WaitForGraph {
+struct WaitForGraph {
     edges: Vec<WaitEdge>,
     node_list: Vec<u64>,  # Parallel list of all waiter node IDs for iteration
     lock: Mutex<()>,
 }
 
-X WaitForGraph {
+impl WaitForGraph {
     # Create an empty wait-for graph
-    F new() -> WaitForGraph {
+    fn new() -> WaitForGraph {
         WaitForGraph {
             edges: deadlock_empty_edge_vec(),
             node_list: deadlock_empty_txn_vec(),
@@ -52,7 +52,7 @@ X WaitForGraph {
 
     # Add a wait edge: waiter is waiting for holder
     # Called when a transaction blocks waiting for another's lock
-    F add_wait(mut self, waiter: u64, holder: u64) {
+    fn add_wait(mut self, waiter: u64, holder: u64) {
         guard := mut self.lock.lock()
 
         found_edge := mut false
@@ -77,7 +77,7 @@ X WaitForGraph {
     }
 
     # Remove all edges for a transaction (when it commits/aborts)
-    F remove_txn(mut self, txn_id: u64) {
+    fn remove_txn(mut self, txn_id: u64) {
         guard := mut self.lock.lock()
 
         new_edges := mut deadlock_empty_edge_vec()
@@ -109,7 +109,7 @@ X WaitForGraph {
     # Detect if there's a cycle in the wait-for graph
     # Returns Some(victim_txn_id) if cycle detected, None otherwise
     # The victim is chosen as the youngest transaction on the detected back-edge
-    F has_cycle(self) -> Option<u64> {
+    fn has_cycle(self) -> Option<u64> {
         guard := mut self.lock.lock()
 
         visited := mut deadlock_empty_txn_vec()
@@ -119,10 +119,10 @@ X WaitForGraph {
         LW ni < self.node_list.len() {
             start_txn := self.node_list[ni]
             I !deadlock_vec_contains(&mut visited, start_txn) {
-                M self.detect_cycle_dfs(start_txn, &mut visited, &mut rec_stack) {
+                match self.detect_cycle_dfs(start_txn, &mut visited, &mut rec_stack) {
                     Some(victim) => {
                         # guard.drop() # disabled for dev compiler
-                        R Some(victim)
+                        return Some(victim)
                     },
                     None => {},
                 }
@@ -136,7 +136,7 @@ X WaitForGraph {
 
     # DFS-based cycle detection.
     # Returns Some(victim_txn_id) if cycle found, None otherwise.
-    F detect_cycle_dfs(
+    fn detect_cycle_dfs(
         self,
         node: u64,
         visited: &mut Vec<u64>,
@@ -155,16 +155,16 @@ X WaitForGraph {
             I edge.waiter == node {
                 neighbor := edge.holder
                 I !deadlock_vec_contains(visited, neighbor) {
-                    M self.detect_cycle_dfs(neighbor, visited, rec_stack) {
-                        Some(victim) => { R Some(victim); },
+                    match self.detect_cycle_dfs(neighbor, visited, rec_stack) {
+                        Some(victim) => { return Some(victim); },
                         None => {},
                     }
-                } EL I deadlock_vec_contains(rec_stack, neighbor) {
+                } else I deadlock_vec_contains(rec_stack, neighbor) {
                     victim := mut node
                     I neighbor > victim {
                         victim = neighbor
                     }
-                    R Some(victim)
+                    return Some(victim)
                 }
             }
             ei += 1
@@ -177,7 +177,7 @@ X WaitForGraph {
             I !removed && rec_stack[ri] == node {
                 rec_stack.remove(ri)
                 removed = true
-            } EL {
+            } else {
                 ri += 1
             }
         }
@@ -187,7 +187,7 @@ X WaitForGraph {
 
     # Detect cycle from a specific starting node (simpler version)
     # Returns true if cycle found starting from this node
-    F detect_cycle_from(self, start: u64) -> bool {
+    fn detect_cycle_from(self, start: u64) -> bool {
         guard := mut self.lock.lock()
         visited := mut deadlock_empty_txn_vec()
         rec_stack := mut deadlock_empty_txn_vec()
@@ -199,7 +199,7 @@ X WaitForGraph {
     }
 
     # Get all transactions a given transaction is waiting for
-    F get_waiting_for(self, txn_id: u64) -> Vec<u64> {
+    fn get_waiting_for(self, txn_id: u64) -> Vec<u64> {
         guard := mut self.lock.lock()
         result := mut deadlock_empty_txn_vec()
 
@@ -217,7 +217,7 @@ X WaitForGraph {
     }
 
     # Get all transactions waiting for a given transaction
-    F get_waiters(self, txn_id: u64) -> Vec<u64> {
+    fn get_waiters(self, txn_id: u64) -> Vec<u64> {
         guard := mut self.lock.lock()
         waiters := mut deadlock_empty_txn_vec()
 
@@ -235,7 +235,7 @@ X WaitForGraph {
     }
 
     # Get number of edges in the graph (for debugging)
-    F edge_count(self) -> u64 {
+    fn edge_count(self) -> u64 {
         guard := mut self.lock.lock()
         count := mut self.edges.len() as u64
         # guard.drop() # disabled for dev compiler
@@ -243,7 +243,7 @@ X WaitForGraph {
     }
 
     # Get number of transactions in the graph
-    F node_count(self) -> u64 {
+    fn node_count(self) -> u64 {
         guard := mut self.lock.lock()
         count := mut self.node_list.len() as u64
         # guard.drop() # disabled for dev compiler
@@ -251,7 +251,7 @@ X WaitForGraph {
     }
 
     # Clear the entire graph (for testing)
-    F clear(mut self) {
+    fn clear(mut self) {
         guard := mut self.lock.lock()
         self.edges = deadlock_empty_edge_vec()
         self.node_list = deadlock_empty_txn_vec()

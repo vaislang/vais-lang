@@ -3,26 +3,26 @@
 # Used by WHERE clause filtering, SELECT list projection, and other contexts
 # Supports NULL propagation per SQL 3-valued logic
 
-U storage/error
-U sql/types
-U sql/row
-U sql/parser/ast
+use storage/error
+use sql/types
+use sql/row
+use sql/parser/ast
 
-X F __strlen(s: str) -> i64
+impl fn __strlen(s: str) -> i64
 
 # ============================================================================
 # Column Binding — maps column references to row positions
 # ============================================================================
 
-S ColumnBinding {
+struct ColumnBinding {
     table: Option<str>,
     column: str,
     index: u64,          # Position in the row's values array
     data_type: SqlType,
 }
 
-X ColumnBinding {
-    F new(column: str, index: u64, data_type: SqlType) -> ColumnBinding {
+impl ColumnBinding {
+    fn new(column: str, index: u64, data_type: SqlType) -> ColumnBinding {
         ColumnBinding {
             table: Option.None,
             column,
@@ -31,7 +31,7 @@ X ColumnBinding {
         }
     }
 
-    F with_table(table: str, column: str, index: u64, data_type: SqlType) -> ColumnBinding {
+    fn with_table(table: str, column: str, index: u64, data_type: SqlType) -> ColumnBinding {
         ColumnBinding {
             table: Option.Some(table),
             column,
@@ -45,32 +45,32 @@ X ColumnBinding {
 # EvalContext — bindings available during expression evaluation
 # ============================================================================
 
-S EvalContext {
+struct EvalContext {
     bindings: Vec<ColumnBinding>,
 }
 
-X EvalContext {
-    F new() -> EvalContext {
+impl EvalContext {
+    fn new() -> EvalContext {
         EvalContext {
             bindings: Vec.with_capacity(0),
         }
     }
 
-    F add_binding(mut self, binding: ColumnBinding) {
+    fn add_binding(mut self, binding: ColumnBinding) {
         self.bindings.push(binding)
     }
 
     # Resolve a column reference to a row index
     # Handles both qualified (table.column) and unqualified (column) references
-    F resolve(self, table: &Option<str>, column: &str) -> Result<u64, VaisError> {
-        M table {
+    fn resolve(self, table: &Option<str>, column: &str) -> Result<u64, VaisError> {
+        match table {
             Some(tbl) => {
                 # Qualified reference: M both table and column
                 LF b: &self.bindings {
-                    M &b.table {
+                    match &b.table {
                         Some(bt) => {
                             I bt == tbl && &b.column == column {
-                                R Ok(b.index)
+                                return Ok(b.index)
                             }
                         },
                         None => {},
@@ -90,21 +90,21 @@ X EvalContext {
                     I &b.column == column {
                         I found {
                             ambiguous = true;
-                        } EL {
+                        } else {
                             found = true;
                             found_idx = b.index;
                         }
                     }
                 }
                 I ambiguous {
-                    R Err(VaisError.new(
+                    return Err(VaisError.new(
                         "VAIS-0101001",
                         "Column reference is ambiguous"
                     ))
                 }
                 I found {
                     Ok(found_idx)
-                } EL {
+                } else {
                     Err(VaisError.new(
                         "VAIS-0110002",
                         "Column not found"
@@ -115,7 +115,7 @@ X EvalContext {
     }
 
     # Build context from a table's column list
-    F from_columns(table_name: &str, columns: &[ColumnInfo]) -> EvalContext {
+    fn from_columns(table_name: &str, columns: &[ColumnInfo]) -> EvalContext {
         ctx := mut EvalContext.new()
         LF i: 0..columns.len() {
             col := mut &columns[i]
@@ -130,15 +130,15 @@ X EvalContext {
     }
 }
 
-U sql/catalog/schema
+use sql/catalog/schema
 
 # ============================================================================
 # Expression Evaluation — main entry point
 # ============================================================================
 
 # Evaluate an expression against a row, returning a SqlValue
-F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisError> {
-    M expr {
+fn eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisError> {
+    match expr {
         # Literal value
         Literal { value } => {
             Ok(value.clone())
@@ -183,7 +183,7 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
             result := mut val.between(&low_val, &high_val)
             I *negated {
                 Ok(result.not_bool())
-            } EL {
+            } else {
                 Ok(result)
             }
         },
@@ -199,7 +199,7 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
             result := mut val.in_list(list_vals.as_slice())
             I *negated {
                 Ok(result.not_bool())
-            } EL {
+            } else {
                 Ok(result)
             }
         },
@@ -213,7 +213,7 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
             result := mut val.like_match(&pat)
             I *negated {
                 Ok(result.not_bool())
-            } EL {
+            } else {
                 Ok(result)
             }
         },
@@ -244,17 +244,17 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 
             # NULL propagation
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
 
             ls := mut lv.to_string()
             rs := mut rv.to_string()
             # Remove surrounding quotes from to_string output for StringVal
-            left_str := mut M &lv {
+            left_str := mut match &lv {
                 SqlValue.StringVal { v } => v.clone(),
                 _ => ls,
             }
-            right_str := mut M &rv {
+            right_str := mut match &rv {
                 SqlValue.StringVal { v } => v.clone(),
                 _ => rs,
             }
@@ -296,7 +296,7 @@ F eval_expr(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<SqlValue, VaisE
 # Binary Operation Evaluation
 # ============================================================================
 
-F eval_binary_op(
+fn eval_binary_op(
     left: Expr,
     op: &BinOp,
     right: Expr,
@@ -306,7 +306,7 @@ F eval_binary_op(
     lv := mut eval_expr(&left, row, ctx)?;
     rv := mut eval_expr(&right, row, ctx)?;
 
-    M op {
+    match op {
         # Arithmetic
         Add => lv.add(&rv),
         Sub => lv.sub(&rv),
@@ -315,12 +315,12 @@ F eval_binary_op(
         Mod => {
             # NULL propagation
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
-            M (&lv, &rv) {
+            match (&lv, &rv) {
                 (SqlValue.IntVal { v: a }, SqlValue.IntVal { v: b }) => {
                     I *b == 0 {
-                        R Err(VaisError.new("VAIS-0109003", "Division by zero"))
+                        return Err(VaisError.new("VAIS-0109003", "Division by zero"))
                     }
                     Ok(SqlValue.IntVal { v: *a % *b })
                 },
@@ -336,28 +336,28 @@ F eval_binary_op(
         },
         Lt => {
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
             cmp := mut lv.compare(&rv)?;
             Ok(SqlValue.BoolVal { v: cmp < 0 })
         },
         Gt => {
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
             cmp := mut lv.compare(&rv)?;
             Ok(SqlValue.BoolVal { v: cmp > 0 })
         },
         Le => {
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
             cmp := mut lv.compare(&rv)?;
             Ok(SqlValue.BoolVal { v: cmp <= 0 })
         },
         Ge => {
             I lv.is_null() || rv.is_null() {
-                R Ok(Null)
+                return Ok(Null)
             }
             cmp := mut lv.compare(&rv)?;
             Ok(SqlValue.BoolVal { v: cmp >= 0 })
@@ -373,7 +373,7 @@ F eval_binary_op(
 # Unary Operation Evaluation
 # ============================================================================
 
-F eval_unary_op(
+fn eval_unary_op(
     op: &UnaryOp,
     operand: Expr,
     row: &Row,
@@ -381,7 +381,7 @@ F eval_unary_op(
 ) -> Result<SqlValue, VaisError> {
     val := mut eval_expr(&operand, row, ctx)?;
 
-    M op {
+    match op {
         Neg => val.negate(),
         Not => Ok(val.not_bool()),
     }
@@ -391,14 +391,14 @@ F eval_unary_op(
 # CASE WHEN Evaluation
 # ============================================================================
 
-F eval_case(
+fn eval_case(
     operand: &Option<Box<Expr>>,
     when_clauses: &[WhenClause],
     else_result: &Option<Box<Expr>>,
     row: &Row,
     ctx: &EvalContext,
 ) -> Result<SqlValue, VaisError> {
-    M operand {
+    match operand {
         Some(op_expr) => {
             # Simple CASE: CASE expr WHEN val THEN result ...
             op_expr_value := mut **op_expr
@@ -406,9 +406,9 @@ F eval_case(
             LF wc: when_clauses {
                 when_val := mut eval_expr(&wc.condition, row, ctx)?;
                 eq := mut op_val.equals(&when_val)
-                M eq {
+                match eq {
                     SqlValue.BoolVal { v: true } => {
-                        R eval_expr(&wc.result, row, ctx)
+                        return eval_expr(&wc.result, row, ctx)
                     },
                     _ => {},
                 }
@@ -418,9 +418,9 @@ F eval_case(
             # Searched CASE: CASE WHEN condition THEN result ...
             LF wc: when_clauses {
                 cond := mut eval_expr(&wc.condition, row, ctx)?;
-                M cond {
+                match cond {
                     SqlValue.BoolVal { v: true } => {
-                        R eval_expr(&wc.result, row, ctx)
+                        return eval_expr(&wc.result, row, ctx)
                     },
                     _ => {},
                 }
@@ -429,7 +429,7 @@ F eval_case(
     }
 
     # No WHEN clause matched — return ELSE or NULL
-    M else_result {
+    match else_result {
         Some(else_expr) => {
             else_expr_value := mut **else_expr
             eval_expr(&else_expr_value, row, ctx)
@@ -442,7 +442,7 @@ F eval_case(
 # Scalar Function Evaluation
 # ============================================================================
 
-F eval_scalar_function(
+fn eval_scalar_function(
     name: &str,
     args: &[Expr],
     row: &Row,
@@ -450,13 +450,13 @@ F eval_scalar_function(
 ) -> Result<SqlValue, VaisError> {
     upper_name := mut name.to_uppercase()
 
-    M upper_name.as_str() {
+    match upper_name.as_str() {
         "COALESCE" => {
             # COALESCE(a, b, c, ...) returns first non-NULL
             LF arg: args {
                 val := mut eval_expr(arg, row, ctx)?;
                 I !val.is_null() {
-                    R Ok(val)
+                    return Ok(val)
                 }
             }
             Ok(Null)
@@ -465,11 +465,11 @@ F eval_scalar_function(
         "NULLIF" => {
             # NULLIF(a, b) returns NULL if a = b, else a
             I args.len() != 2 {
-                R Err(VaisError.new("VAIS-0101002", "NULLIF requires exactly 2 arguments"))
+                return Err(VaisError.new("VAIS-0101002", "NULLIF requires exactly 2 arguments"))
             }
             a := mut eval_expr(&args[0], row, ctx)?;
             b := mut eval_expr(&args[1], row, ctx)?;
-            M a.equals(&b) {
+            match a.equals(&b) {
                 SqlValue.BoolVal { v: true } => Ok(Null),
                 _ => Ok(a),
             }
@@ -477,24 +477,24 @@ F eval_scalar_function(
 
         "ABS" => {
             I args.len() != 1 {
-                R Err(VaisError.new("VAIS-0101002", "ABS requires exactly 1 argument"))
+                return Err(VaisError.new("VAIS-0101002", "ABS requires exactly 1 argument"))
             }
             val := mut eval_expr(&args[0], row, ctx)?;
-            I val.is_null() { R Ok(Null); }
-            M val {
-                SqlValue.IntVal { v } => Ok(SqlValue.IntVal { v: I v < 0 { -v } EL { v } }),
-                SqlValue.FloatVal { v } => Ok(SqlValue.FloatVal { v: I v < 0.0 { -v } EL { v } }),
+            I val.is_null() { return Ok(Null); }
+            match val {
+                SqlValue.IntVal { v } => Ok(SqlValue.IntVal { v: I v < 0 { -v } else { v } }),
+                SqlValue.FloatVal { v } => Ok(SqlValue.FloatVal { v: I v < 0.0 { -v } else { v } }),
                 _ => Err(err_type_mismatch("numeric", val.get_type().name())),
             }
         },
 
         "UPPER" => {
             I args.len() != 1 {
-                R Err(VaisError.new("VAIS-0101002", "UPPER requires exactly 1 argument"))
+                return Err(VaisError.new("VAIS-0101002", "UPPER requires exactly 1 argument"))
             }
             val := mut eval_expr(&args[0], row, ctx)?;
-            I val.is_null() { R Ok(Null); }
-            M val {
+            I val.is_null() { return Ok(Null); }
+            match val {
                 SqlValue.StringVal { v } => Ok(SqlValue.StringVal { v: v.to_uppercase() }),
                 _ => Err(err_type_mismatch("string", val.get_type().name())),
             }
@@ -502,11 +502,11 @@ F eval_scalar_function(
 
         "LOWER" => {
             I args.len() != 1 {
-                R Err(VaisError.new("VAIS-0101002", "LOWER requires exactly 1 argument"))
+                return Err(VaisError.new("VAIS-0101002", "LOWER requires exactly 1 argument"))
             }
             val := mut eval_expr(&args[0], row, ctx)?;
-            I val.is_null() { R Ok(Null); }
-            M val {
+            I val.is_null() { return Ok(Null); }
+            match val {
                 SqlValue.StringVal { v } => Ok(SqlValue.StringVal { v: v.to_lowercase() }),
                 _ => Err(err_type_mismatch("string", val.get_type().name())),
             }
@@ -514,11 +514,11 @@ F eval_scalar_function(
 
         "LENGTH" => {
             I args.len() != 1 {
-                R Err(VaisError.new("VAIS-0101002", "LENGTH requires exactly 1 argument"))
+                return Err(VaisError.new("VAIS-0101002", "LENGTH requires exactly 1 argument"))
             }
             val := mut eval_expr(&args[0], row, ctx)?;
-            I val.is_null() { R Ok(Null); }
-            M val {
+            I val.is_null() { return Ok(Null); }
+            match val {
                 SqlValue.StringVal { v } => Ok(SqlValue.IntVal { v: v.len() as i64 }),
                 SqlValue.BlobVal { v } => Ok(SqlValue.IntVal { v: v.len() as i64 }),
                 _ => Err(err_type_mismatch("string or blob", val.get_type().name())),
@@ -527,33 +527,33 @@ F eval_scalar_function(
 
         "SUBSTR" | "SUBSTRING" => {
             I args.len() < 2 || args.len() > 3 {
-                R Err(VaisError.new("VAIS-0101002", "SUBSTR requires 2 or 3 arguments"))
+                return Err(VaisError.new("VAIS-0101002", "SUBSTR requires 2 or 3 arguments"))
             }
             val := mut eval_expr(&args[0], row, ctx)?;
             start := mut eval_expr(&args[1], row, ctx)?;
-            I val.is_null() || start.is_null() { R Ok(Null); }
+            I val.is_null() || start.is_null() { return Ok(Null); }
 
-            M (&val, &start) {
+            match (&val, &start) {
                 (SqlValue.StringVal { v: s }, SqlValue.IntVal { v: pos }) => {
                     # SQL SUBSTR is 1-based
-                    start_idx := mut I *pos < 1 { 0u64 } EL { (*pos - 1) as u64 }
+                    start_idx := mut I *pos < 1 { 0u64 } else { (*pos - 1) as u64 }
                     # Use byte length as char count approximation (ASCII SQL identifiers)
                     chars := mut s.as_bytes()
                     I start_idx >= chars.len() {
-                        R Ok(SqlValue.StringVal { v: "" })
+                        return Ok(SqlValue.StringVal { v: "" })
                     }
 
                     end_idx := mut I args.len() == 3 {
                         len_val := mut eval_expr(&args[2], row, ctx)?;
-                        I len_val.is_null() { R Ok(Null); }
-                        M len_val {
+                        I len_val.is_null() { return Ok(Null); }
+                        match len_val {
                             SqlValue.IntVal { v: l } => {
-                                end := mut start_idx + (I l < 0 { 0u64 } EL { l as u64 })
-                                I end > chars.len() { chars.len() } EL { end }
+                                end := mut start_idx + (I l < 0 { 0u64 } else { l as u64 })
+                                I end > chars.len() { chars.len() } else { end }
                             },
                             _ => chars.len(),
                         }
-                    } EL {
+                    } else {
                         chars.len()
                     }
 
@@ -580,9 +580,9 @@ F eval_scalar_function(
 
 # Evaluate an expression and interpret the result as a boolean
 # NULL is treated as false (for WHERE clause semantics)
-F eval_predicate(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<bool, VaisError> {
+fn eval_predicate(expr: &Expr, row: &Row, ctx: &EvalContext) -> Result<bool, VaisError> {
     val := mut eval_expr(expr, row, ctx)?;
-    M val {
+    match val {
         SqlValue.BoolVal { v } => Ok(v),
         Null => Ok(false),  # NULL in WHERE -> false
         _ => Err(VaisError.new(

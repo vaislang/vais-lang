@@ -4,24 +4,24 @@
 # Edge metadata (src, dst, type, MVCC) is stored in AdjEntry within adjacency pages.
 # This module stores only the variable-size property data for edges/nodes.
 
-U storage/bytes
-U std/vec
-U std/option
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U graph/types
+use storage/bytes
+use std/vec
+use std/option
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use graph/types
 
 # ============================================================================
 # PropertyPage — Stores properties for a single entity (node or edge)
 # Layout: [PageHeader 48B] [PropPageHeader 16B] [PropertyMap bytes...]
 # ============================================================================
 
-S PropertyPageHeader {
+struct PropertyPageHeader {
     entity_type: u8,        # 0=node, 1=edge
     entity_id: u64,         # Node ID or Edge ID
     prop_count: u16,        # Number of properties
@@ -29,8 +29,8 @@ S PropertyPageHeader {
     reserved: u8,
 }
 
-X PropertyPageHeader {
-    F new(entity_type: u8, entity_id: u64) -> PropertyPageHeader {
+impl PropertyPageHeader {
+    fn new(entity_type: u8, entity_id: u64) -> PropertyPageHeader {
         PropertyPageHeader {
             entity_type,
             entity_id,
@@ -41,7 +41,7 @@ X PropertyPageHeader {
     }
 
     # Serialize (16 bytes)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(self.entity_type)
         buf.write_i64_le(self.entity_id)
         buf.write_u16_le(self.prop_count)
@@ -50,7 +50,7 @@ X PropertyPageHeader {
     }
 
     # Deserialize (16 bytes)
-    F deserialize(buf: &ByteBuffer) -> Result<PropertyPageHeader, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PropertyPageHeader, VaisError> {
         Ok(PropertyPageHeader {
             entity_type: read_u8_checked(buf)?,
             entity_id: read_i64_le_checked(buf)?,
@@ -65,15 +65,15 @@ X PropertyPageHeader {
 # PropertyStore — High-level property storage interface
 # ============================================================================
 
-S PropertyStore {
+struct PropertyStore {
     pool: &BufferPool,
     allocator: &PageAllocator,
     bitmap: &FreelistBitmap,
     page_size: u32,
 }
 
-X PropertyStore {
-    F new(
+impl PropertyStore {
+    fn new(
         pool: &BufferPool,
         allocator: &PageAllocator,
         bitmap: &FreelistBitmap,
@@ -83,7 +83,7 @@ X PropertyStore {
     }
 
     # Write properties for an entity, returns property page ID
-    F write_properties(
+    fn write_properties(
         mut self,
         entity_type: u8,
         entity_id: u64,
@@ -91,7 +91,7 @@ X PropertyStore {
         txn_id: u64
     ) -> Result<u32, VaisError> {
         I props.len() == 0 {
-            R Ok(NULL_PAGE)
+            return Ok(NULL_PAGE)
         }
 
         # Serialize properties
@@ -126,7 +126,7 @@ X PropertyStore {
         # Write property data
         available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE
         I (prop_bytes.len() as u32) > available {
-            R Err(err_graph_page_full(page_id))
+            return Err(err_graph_page_full(page_id))
         }
         i := mut 0
         LW i < prop_bytes.len() {
@@ -151,9 +151,9 @@ X PropertyStore {
     }
 
     # Read properties for an entity
-    F read_properties(self, page_id: u32) -> Result<PropertyMap, VaisError> {
+    fn read_properties(self, page_id: u32) -> Result<PropertyMap, VaisError> {
         I page_id == NULL_PAGE {
-            R Ok(PropertyMap.new())
+            return Ok(PropertyMap.new())
         }
 
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
@@ -163,7 +163,7 @@ X PropertyStore {
         header := mut PageHeader.read_from_page(page_data)?;
         I header.page_type != PAGE_TYPE_GRAPH_PROPERTY {
             self.pool.unpin_page(frame_id, false)
-            R Err(err_internal("Expected GRAPH_PROPERTY page type"))
+            return Err(err_internal("Expected GRAPH_PROPERTY page type"))
         }
 
         # Read property page header
@@ -178,14 +178,14 @@ X PropertyStore {
     }
 
     # Update properties for an entity (in-place if fits)
-    F update_properties(
+    fn update_properties(
         mut self,
         page_id: u32,
         props: &PropertyMap,
         txn_id: u64
     ) -> Result<(), VaisError> {
         I page_id == NULL_PAGE {
-            R Err(err_internal("Cannot update properties on NULL page"))
+            return Err(err_internal("Cannot update properties on NULL page"))
         }
 
         frame_id := mut self.pool.fetch_page(FILE_ID_GRAPH, page_id)?;
@@ -204,7 +204,7 @@ X PropertyStore {
         available := mut self.page_size - PAGE_HEADER_SIZE - PROP_PAGE_HEADER_SIZE
         I (prop_bytes.len() as u32) > available {
             self.pool.unpin_page(frame_id, false)
-            R Err(err_graph_page_full(page_id))
+            return Err(err_graph_page_full(page_id))
         }
 
         # Rewrite property data
@@ -235,9 +235,9 @@ X PropertyStore {
     }
 
     # Delete properties (free the page)
-    F delete_properties(mut self, page_id: u32) -> Result<(), VaisError> {
+    fn delete_properties(mut self, page_id: u32) -> Result<(), VaisError> {
         I page_id == NULL_PAGE {
-            R Ok(())
+            return Ok(())
         }
         self.allocator.deallocate_page(FILE_ID_GRAPH, page_id, self.bitmap)?;
         Ok(())

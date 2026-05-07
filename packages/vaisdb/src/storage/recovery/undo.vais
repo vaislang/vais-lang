@@ -10,33 +10,33 @@
 # CLR ensures idempotent recovery:
 # If crash during undo, CLR's undo_next_lsn skips already-undone records
 
-U storage/bytes
-U std/hashmap
+use storage/bytes
+use std/hashmap
 
-U storage/error
-U storage/constants
-U storage/wal/header
-U storage/wal/record_types
-U storage/wal/record_rel
-U storage/page/heap
-U storage/page/tuple
-U storage/page/mvcc
-U storage/btree/entry
-U storage/page/header
-U storage/wal/writer
-U storage/wal/lsn
-U storage/buffer/pool
-U storage/recovery/redo
+use storage/error
+use storage/constants
+use storage/wal/header
+use storage/wal/record_types
+use storage/wal/record_rel
+use storage/page/heap
+use storage/page/tuple
+use storage/page/mvcc
+use storage/btree/entry
+use storage/page/header
+use storage/wal/writer
+use storage/wal/lsn
+use storage/buffer/pool
+use storage/recovery/redo
 
 # Undo result
-S UndoResult {
+struct UndoResult {
     txns_undone: u32,          # Number of transactions undone
     records_undone: u64,       # Total CLR records written
 }
 
 # Phase 3: UNDO
 # Undo all uncommitted transactions by walking their prev_lsn chains backward
-F recovery_undo(
+fn recovery_undo(
     wal_dir: &str,
     analysis: &AnalysisResult,
     writer: &mut WalWriter,
@@ -52,7 +52,7 @@ F recovery_undo(
     ei: i64 := mut 0
     LW ei < analysis.txn_entries.len() as i64 {
         entry := analysis.txn_entries[ei]
-        M entry.state {
+        match entry.state {
             Active => {
                 start_lsn := mut entry.last_lsn
                 I entry.undo_next_lsn != NULL_LSN {
@@ -66,7 +66,7 @@ F recovery_undo(
     }
 
     I active_txns.len() == 0 {
-        R Ok(UndoResult { txns_undone: 0, records_undone: 0 })
+        return Ok(UndoResult { txns_undone: 0, records_undone: 0 })
     }
 
     # Sort by last_lsn descending (process most recent first — inline insertion sort)
@@ -109,7 +109,7 @@ F recovery_undo(
 }
 
 # Undo a single transaction by walking its prev_lsn chain backward
-F undo_single_transaction(
+fn undo_single_transaction(
     wal_dir: &str,
     txn_id: u64,
     start_lsn: u64,
@@ -130,7 +130,7 @@ F undo_single_transaction(
             buf := mut ByteBuffer.wrap_readonly(&payload)
             clr := mut ClrPayload.deserialize(&buf)?;
             current_lsn = clr.undo_next_lsn
-        } EL {
+        } else {
             # Determine the next LSN to undo (prev_lsn of current record)
             next_undo_lsn := mut header.prev_lsn
 
@@ -151,16 +151,16 @@ F undo_single_transaction(
 }
 
 # Read a WAL record at a specific LSN
-F read_record_at_lsn(
+fn read_record_at_lsn(
     wal_dir: &str,
     lsn: u64,
 ) -> Result<WalRecord, VaisError> {
     iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), lsn)?;
-    __mv1 := iter.next()?; M __mv1 {
+    __mv1 := iter.next()?; match __mv1 {
         Some(record) => {
             I record.header.lsn == lsn {
                 Ok(record)
-            } EL {
+            } else {
                 Err(err_internal("WAL record at expected LSN not found"))
             }
         },
@@ -170,7 +170,7 @@ F read_record_at_lsn(
 
 # Undo a single WAL record and write a CLR
 # Returns true if undo was performed, false if record type doesn't need undo
-F undo_single_record(
+fn undo_single_record(
     header: &WalRecordHeader,
     payload: &[u8],
     txn_id: u64,
@@ -183,7 +183,7 @@ F undo_single_record(
     file_id := mut page_info.file_id
     page_id := mut page_info.page_id
 
-    M header.record_type {
+    match header.record_type {
         TUPLE_INSERT => {
             # Undo insert: mark tuple as deleted
             undo_tuple_insert(pool, payload)?;
@@ -222,7 +222,7 @@ F undo_single_record(
         },
         _ => {
             # Record type doesn't need undo (CLR, TXN_BEGIN, etc.)
-            R Ok(false)
+            return Ok(false)
         },
     }
 
@@ -241,25 +241,25 @@ F undo_single_record(
 }
 
 # Extracted page info from WAL payload
-S ExtractedPageInfo {
+struct ExtractedPageInfo {
     file_id: u8,
     page_id: u32,
 }
 
 # Extract file_id and page_id from a WAL record payload
-F extract_page_info(payload: &[u8]) -> ExtractedPageInfo {
+fn extract_page_info(payload: &[u8]) -> ExtractedPageInfo {
     I payload.len() >= 5 {
         buf := mut ByteBuffer.wrap_readonly(payload)
-        M read_u8_checked(buf) {
+        match read_u8_checked(buf) {
             Ok(file_id) => {
-                M read_i32_le_checked(buf) {
+                match read_i32_le_checked(buf) {
                     Ok(page_id) => ExtractedPageInfo { file_id, page_id: page_id as u32 },
                     Err(_) => ExtractedPageInfo { file_id: 0, page_id: 0 },
                 }
             },
             Err(_) => ExtractedPageInfo { file_id: 0, page_id: 0 },
         }
-    } EL {
+    } else {
         ExtractedPageInfo { file_id: 0, page_id: 0 }
     }
 }
@@ -269,7 +269,7 @@ F extract_page_info(payload: &[u8]) -> ExtractedPageInfo {
 
 # Undo TUPLE_INSERT: mark the inserted tuple's slot as dead (tombstone)
 # This effectively removes the tuple from the page so it won't be visible
-F undo_tuple_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_tuple_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut TupleInsertPayload.deserialize(&buf)?;
 
@@ -292,7 +292,7 @@ F undo_tuple_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 
 # Undo TUPLE_DELETE: restore the deleted tuple by clearing its txn_id_expire
 # The old tuple data is stored in the WAL record for restoration
-F undo_tuple_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_tuple_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut TupleDeletePayload.deserialize(&buf)?;
 
@@ -319,7 +319,7 @@ F undo_tuple_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 
 # Undo TUPLE_UPDATE: restore old tuple values
 # The WAL record contains both old and new tuple data
-F undo_tuple_update(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_tuple_update(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut TupleUpdatePayload.deserialize(&buf)?;
 
@@ -353,7 +353,7 @@ F undo_tuple_update(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 }
 
 # Undo BTREE_INSERT: remove the key that was inserted
-F undo_btree_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_btree_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut BtreeInsertPayload.deserialize(&buf)?;
 
@@ -368,7 +368,7 @@ F undo_btree_insert(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 }
 
 # Undo BTREE_DELETE: re-insert the deleted key
-F undo_btree_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_btree_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut BtreeDeletePayload.deserialize(&buf)?;
 
@@ -384,7 +384,7 @@ F undo_btree_delete(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErr
 
 # Undo BTREE_SPLIT: merge the split pages back together
 # This is the reverse of a split: move entries from new_page back to original
-F undo_btree_split(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_btree_split(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut BtreeSplitPayload.deserialize(&buf)?;
 
@@ -409,7 +409,7 @@ F undo_btree_split(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErro
 
 # Undo BTREE_MERGE: re-split the merged page
 # This is the reverse of a merge: split entries back into two pages
-F undo_btree_merge(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_btree_merge(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     p := mut BtreeMergePayload.deserialize(&buf)?;
 
@@ -448,7 +448,7 @@ F undo_btree_merge(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisErro
     Ok(())
 }
 
-F undo_page_alloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_page_alloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     file_id := mut read_u8_checked(buf)?;
     page_id := mut read_i32_le_checked(buf)?;
@@ -456,7 +456,7 @@ F undo_page_alloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError
     Ok(())
 }
 
-F undo_page_dealloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
+fn undo_page_dealloc(pool: &mut BufferPool, payload: &[u8]) -> Result<(), VaisError> {
     buf := mut ByteBuffer.wrap_readonly(payload)
     file_id := mut read_u8_checked(buf)?;
     page_id := mut read_i32_le_checked(buf)?;

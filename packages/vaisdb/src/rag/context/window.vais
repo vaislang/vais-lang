@@ -3,11 +3,11 @@
 # Uses chunk graph (NEXT_CHUNK edges) and document hierarchy for expansion
 # Respects max_context_tokens limit
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
-U rag/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use storage/error.{VaisError};
+use rag/types.{
     ChunkInfo, RagSearchResult, ScoredChunk,
     EDGE_TYPE_NEXT_CHUNK, EDGE_TYPE_SAME_SECTION,
     MAX_HIERARCHY_DEPTH, err_rag_chunk_not_found
@@ -17,7 +17,7 @@ U rag/types.{
 # ContextWindow — Expanded context around a chunk
 # ============================================================================
 
-S ContextWindow {
+struct ContextWindow {
     center_chunk_id: u64,           # The originally retrieved chunk
     chunks_before: Vec<u64>,        # Chunk IDs before center (ordered)
     chunks_after: Vec<u64>,         # Chunk IDs after center (ordered)
@@ -25,8 +25,8 @@ S ContextWindow {
     expansion_level: u8,            # 0=chunk only, 1=neighbors, 2=section, 3=document
 }
 
-X ContextWindow {
-    F new(center_chunk_id: u64) -> ContextWindow {
+impl ContextWindow {
+    fn new(center_chunk_id: u64) -> ContextWindow {
         ContextWindow {
             center_chunk_id,
             chunks_before: Vec.new(),
@@ -37,19 +37,19 @@ X ContextWindow {
     }
 
     ## Add a chunk before the center
-    F add_before(&mut self, chunk_id: u64, tokens: u32) {
+    fn add_before(&mut self, chunk_id: u64, tokens: u32) {
         self.chunks_before.push(chunk_id);
         self.total_tokens = self.total_tokens + tokens;
     }
 
     ## Add a chunk after the center
-    F add_after(&mut self, chunk_id: u64, tokens: u32) {
+    fn add_after(&mut self, chunk_id: u64, tokens: u32) {
         self.chunks_after.push(chunk_id);
         self.total_tokens = self.total_tokens + tokens;
     }
 
     ## Get all chunk IDs in order (before + center + after)
-    F all_chunk_ids(self) -> Vec<u64> {
+    fn all_chunk_ids(self) -> Vec<u64> {
         result := mut Vec.new();
 
         # Add chunks before (in order)
@@ -73,7 +73,7 @@ X ContextWindow {
     }
 
     ## Check if adding more would exceed token budget
-    F can_expand(self, additional_tokens: u32, max_tokens: u32) -> bool {
+    fn can_expand(self, additional_tokens: u32, max_tokens: u32) -> bool {
         self.total_tokens + additional_tokens <= max_tokens
     }
 }
@@ -82,14 +82,14 @@ X ContextWindow {
 # ContextExpander — Builds context windows from chunk graph
 # ============================================================================
 
-S ContextExpander {
+struct ContextExpander {
     max_context_tokens: u32,        # Maximum tokens for expanded context
     max_neighbors: u32,             # Max chunks to include before/after
     expansion_strategy: u8,         # 0=greedy(neighbors first), 1=balanced(equal before/after)
 }
 
-X ContextExpander {
-    F new(max_tokens: u32) -> ContextExpander {
+impl ContextExpander {
+    fn new(max_tokens: u32) -> ContextExpander {
         ContextExpander {
             max_context_tokens: max_tokens,
             max_neighbors: 3,
@@ -97,14 +97,14 @@ X ContextExpander {
         }
     }
 
-    F default() -> ContextExpander {
+    fn default() -> ContextExpander {
         ContextExpander.new(2048)
     }
 
     ## Expand context for a single chunk using its graph neighbors
     ## next_chunk_edges: pairs of (src, dst) from NEXT_CHUNK edges for this doc
     ## chunk_tokens: map chunk_id -> token_count
-    F expand_chunk(
+    fn expand_chunk(
         &self,
         chunk_id: u64,
         chunk_tokens: u32,
@@ -120,14 +120,14 @@ X ContextExpander {
             current_id := mut chunk_id;
             before_count := mut 0u32;
             LW before_count < self.max_neighbors {
-                M find_prev_chunk(current_id, next_chunk_edges) {
+                match find_prev_chunk(current_id, next_chunk_edges) {
                     Some(prev_id) => {
                         prev_tokens := mut get_tokens(prev_id, chunk_token_map);
                         I window.can_expand(prev_tokens, self.max_context_tokens) {
                             window.add_before(prev_id, prev_tokens);
                             current_id = prev_id;
                             before_count = before_count + 1;
-                        } EL {
+                        } else {
                             before_count = self.max_neighbors; # Stop
                         }
                     },
@@ -141,14 +141,14 @@ X ContextExpander {
             current_fwd := mut chunk_id;
             after_count := mut 0u32;
             LW after_count < self.max_neighbors {
-                M find_next_chunk(current_fwd, next_chunk_edges) {
+                match find_next_chunk(current_fwd, next_chunk_edges) {
                     Some(next_id) => {
                         next_tokens := mut get_tokens(next_id, chunk_token_map);
                         I window.can_expand(next_tokens, self.max_context_tokens) {
                             window.add_after(next_id, next_tokens);
                             current_fwd = next_id;
                             after_count = after_count + 1;
-                        } EL {
+                        } else {
                             after_count = self.max_neighbors; # Stop
                         }
                     },
@@ -157,7 +157,7 @@ X ContextExpander {
                     },
                 }
             }
-        } EL {
+        } else {
             # Balanced strategy: alternate before/after
             current_before := mut chunk_id;
             current_after := mut chunk_id;
@@ -168,7 +168,7 @@ X ContextExpander {
             LW total_added < self.max_neighbors * 2 {
                 # Try adding before
                 I before_count < self.max_neighbors {
-                    M find_prev_chunk(current_before, next_chunk_edges) {
+                    match find_prev_chunk(current_before, next_chunk_edges) {
                         Some(prev_id) => {
                             prev_tokens := mut get_tokens(prev_id, chunk_token_map);
                             I window.can_expand(prev_tokens, self.max_context_tokens) {
@@ -176,7 +176,7 @@ X ContextExpander {
                                 current_before = prev_id;
                                 before_count = before_count + 1;
                                 total_added = total_added + 1;
-                            } EL {
+                            } else {
                                 before_count = self.max_neighbors; # Stop before
                             }
                         },
@@ -188,7 +188,7 @@ X ContextExpander {
 
                 # Try adding after
                 I after_count < self.max_neighbors {
-                    M find_next_chunk(current_after, next_chunk_edges) {
+                    match find_next_chunk(current_after, next_chunk_edges) {
                         Some(next_id) => {
                             next_tokens := mut get_tokens(next_id, chunk_token_map);
                             I window.can_expand(next_tokens, self.max_context_tokens) {
@@ -196,7 +196,7 @@ X ContextExpander {
                                 current_after = next_id;
                                 after_count = after_count + 1;
                                 total_added = total_added + 1;
-                            } EL {
+                            } else {
                                 after_count = self.max_neighbors; # Stop after
                             }
                         },
@@ -218,7 +218,7 @@ X ContextExpander {
     }
 
     ## Expand context for multiple chunks (batch), deduplicating overlapping windows
-    F expand_batch(
+    fn expand_batch(
         &self,
         chunk_ids: &Vec<u64>,
         chunk_token_counts: &Vec<u32>,
@@ -242,9 +242,9 @@ X ContextExpander {
     }
 
     ## Merge overlapping context windows
-    F merge_overlapping(windows: &Vec<ContextWindow>) -> Vec<ContextWindow> {
+    fn merge_overlapping(windows: &Vec<ContextWindow>) -> Vec<ContextWindow> {
         I windows.len() == 0 {
-            R Vec.new();
+            return Vec.new();
         }
 
         merged := mut Vec.new();
@@ -311,12 +311,12 @@ X ContextExpander {
 }
 
 # Helper: find previous chunk in NEXT_CHUNK edges
-F find_prev_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
+fn find_prev_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
     i := mut 0u32;
     LW i < edges.len() as u32 {
         edge := mut edges.get(i as u64);
         I edge.1 == chunk_id {
-            R Some(edge.0);
+            return Some(edge.0);
         }
         i = i + 1;
     }
@@ -324,12 +324,12 @@ F find_prev_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
 }
 
 # Helper: find next chunk in NEXT_CHUNK edges
-F find_next_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
+fn find_next_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
     i := mut 0u32;
     LW i < edges.len() as u32 {
         edge := mut edges.get(i as u64);
         I edge.0 == chunk_id {
-            R Some(edge.1);
+            return Some(edge.1);
         }
         i = i + 1;
     }
@@ -337,12 +337,12 @@ F find_next_chunk(chunk_id: u64, edges: &Vec<(u64, u64)>) -> Option<u64> {
 }
 
 # Helper: get token count from map
-F get_tokens(chunk_id: u64, token_map: &Vec<(u64, u32)>) -> u32 {
+fn get_tokens(chunk_id: u64, token_map: &Vec<(u64, u32)>) -> u32 {
     i := mut 0u32;
     LW i < token_map.len() as u32 {
         entry := mut token_map.get(i as u64);
         I entry.0 == chunk_id {
-            R entry.1;
+            return entry.1;
         }
         i = i + 1;
     }

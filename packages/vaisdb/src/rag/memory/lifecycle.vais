@@ -3,17 +3,17 @@
 # importance-based consolidation, and garbage collection
 # Runs periodically as background maintenance
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
-U rag/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use storage/error.{VaisError};
+use rag/types.{
     MEMORY_TYPE_EPISODIC, MEMORY_TYPE_SEMANTIC,
     MEMORY_TYPE_PROCEDURAL, MEMORY_TYPE_WORKING,
     DEFAULT_TTL_WORKING,
     err_rag_engine_closed
 };
-U rag/memory/types.{MemoryEntry, MemoryConfig};
+use rag/memory/types.{MemoryEntry, MemoryConfig};
 
 # ============================================================================
 # LifecycleAction — Actions to be taken by the lifecycle manager
@@ -24,15 +24,15 @@ C ACTION_EVICT: u8 = 1;            # Working memory eviction
 C ACTION_CONSOLIDATE: u8 = 2;      # Promote working → semantic
 C ACTION_DECAY: u8 = 3;            # Apply importance decay
 
-S LifecycleAction {
+struct LifecycleAction {
     action_type: u8,
     memory_id: u64,
     reason: Str,
 }
 
-X LifecycleAction {
+impl LifecycleAction {
     ## Create a new lifecycle action
-    F new(action_type: u8, memory_id: u64, reason: Str) -> LifecycleAction {
+    fn new(action_type: u8, memory_id: u64, reason: Str) -> LifecycleAction {
         LifecycleAction {
             action_type: action_type,
             memory_id: memory_id,
@@ -41,8 +41,8 @@ X LifecycleAction {
     }
 
     ## Get action type as string
-    F action_name(self) -> Str {
-        M self.action_type {
+    fn action_name(self) -> Str {
+        match self.action_type {
             0 => "EXPIRE",
             1 => "EVICT",
             2 => "CONSOLIDATE",
@@ -56,7 +56,7 @@ X LifecycleAction {
 # LifecycleStats — Statistics from a lifecycle run
 # ============================================================================
 
-S LifecycleStats {
+struct LifecycleStats {
     expired_count: u32,
     evicted_count: u32,
     consolidated_count: u32,
@@ -65,9 +65,9 @@ S LifecycleStats {
     run_time_us: u64,
 }
 
-X LifecycleStats {
+impl LifecycleStats {
     ## Create empty lifecycle stats
-    F new() -> LifecycleStats {
+    fn new() -> LifecycleStats {
         LifecycleStats {
             expired_count: 0,
             evicted_count: 0,
@@ -79,13 +79,13 @@ X LifecycleStats {
     }
 
     ## Get total actions taken
-    F total_actions(self) -> u32 {
+    fn total_actions(self) -> u32 {
         self.expired_count + self.evicted_count +
         self.consolidated_count + self.decayed_count
     }
 
     ## Format stats as human-readable string
-    F format(self) -> Str {
+    fn format(self) -> Str {
         "LifecycleStats {{ scanned: {self.total_scanned}, expired: {self.expired_count}, evicted: {self.evicted_count}, consolidated: {self.consolidated_count}, decayed: {self.decayed_count}, time_us: {self.run_time_us} }}"
     }
 }
@@ -94,15 +94,15 @@ X LifecycleStats {
 # MemoryLifecycleManager — Runs lifecycle maintenance
 # ============================================================================
 
-S MemoryLifecycleManager {
+struct MemoryLifecycleManager {
     config: MemoryConfig,
     last_run_at: i64,
     run_interval_seconds: u64,      # How often to run (default 300 = 5 min)
 }
 
-X MemoryLifecycleManager {
+impl MemoryLifecycleManager {
     ## Create a new lifecycle manager
-    F new(config: MemoryConfig) -> MemoryLifecycleManager {
+    fn new(config: MemoryConfig) -> MemoryLifecycleManager {
         MemoryLifecycleManager {
             config: config,
             last_run_at: 0,
@@ -111,18 +111,18 @@ X MemoryLifecycleManager {
     }
 
     ## Check if lifecycle maintenance should run
-    F should_run(self, current_time: i64) -> bool {
+    fn should_run(self, current_time: i64) -> bool {
         (current_time - self.last_run_at) as u64 >= self.run_interval_seconds
     }
 
     ## Set run interval
-    F set_run_interval(mut self, interval_seconds: u64) {
+    fn set_run_interval(mut self, interval_seconds: u64) {
         self.run_interval_seconds = interval_seconds;
     }
 
     ## Run full lifecycle pass on memories
     ## Returns actions to be executed by the caller
-    F run(mut self, memories: &Vec<MemoryEntry>,
+    fn run(mut self, memories: &Vec<MemoryEntry>,
           current_time: i64) -> (Vec<LifecycleAction>, LifecycleStats) {
         stats := mut LifecycleStats.new();
         stats.total_scanned = memories.len() as u32;
@@ -175,7 +175,7 @@ X MemoryLifecycleManager {
     }
 
     ## Find TTL-expired memories
-    F find_expired(self, memories: &Vec<MemoryEntry>,
+    fn find_expired(self, memories: &Vec<MemoryEntry>,
                    current_time: i64) -> Vec<LifecycleAction> {
         actions := mut Vec.new();
 
@@ -186,7 +186,7 @@ X MemoryLifecycleManager {
             # Check if memory has expired based on TTL
             I entry.ttl_seconds > 0 {
                 age_diff := mut current_time - entry.created_at;
-                age := mut I age_diff > 0 { age_diff as u64 } EL { 0 };
+                age := mut I age_diff > 0 { age_diff as u64 } else { 0 };
                 I age > entry.ttl_seconds {
                     action := mut LifecycleAction.new(
                         ACTION_EXPIRE,
@@ -204,7 +204,7 @@ X MemoryLifecycleManager {
     }
 
     ## Find working memories to evict (oldest/lowest importance beyond limit)
-    F find_eviction_candidates(self, memories: &Vec<MemoryEntry>,
+    fn find_eviction_candidates(self, memories: &Vec<MemoryEntry>,
                                current_time: i64) -> Vec<LifecycleAction> {
         actions := mut Vec.new();
 
@@ -221,7 +221,7 @@ X MemoryLifecycleManager {
 
         # If below limit, no eviction needed
         I working_count <= self.config.max_working_memory_entries {
-            R actions;
+            return actions;
         }
 
         # Need to evict (working_count - limit) entries
@@ -234,7 +234,7 @@ X MemoryLifecycleManager {
             entry := mut memories.get(i as u64);
             I entry.memory_type == MEMORY_TYPE_WORKING {
                 age_diff := mut current_time - entry.created_at;
-                age := mut I age_diff > 0 { age_diff as u64 } EL { 0 };
+                age := mut I age_diff > 0 { age_diff as u64 } else { 0 };
                 candidates.push((entry.memory_id, entry.importance, age));
             }
             i = i + 1;
@@ -260,7 +260,7 @@ X MemoryLifecycleManager {
     }
 
     ## Find working memories suitable for consolidation to semantic
-    F find_consolidation_candidates(self, memories: &Vec<MemoryEntry>,
+    fn find_consolidation_candidates(self, memories: &Vec<MemoryEntry>,
                                      current_time: i64) -> Vec<LifecycleAction> {
         actions := mut Vec.new();
 
@@ -275,7 +275,7 @@ X MemoryLifecycleManager {
                 # 2. Accessed multiple times (> 3)
                 # 3. Not too old (< 1 hour)
                 age_diff := mut current_time - entry.created_at;
-                age := mut I age_diff > 0 { age_diff as u64 } EL { 0 };
+                age := mut I age_diff > 0 { age_diff as u64 } else { 0 };
 
                 I entry.importance > 0.8 &&
                    entry.access_count > 3 &&
@@ -296,7 +296,7 @@ X MemoryLifecycleManager {
     }
 
     ## Compute decay actions for all memories
-    F compute_decay(self, memories: &Vec<MemoryEntry>,
+    fn compute_decay(self, memories: &Vec<MemoryEntry>,
                     current_time: i64) -> Vec<LifecycleAction> {
         actions := mut Vec.new();
 
@@ -309,7 +309,7 @@ X MemoryLifecycleManager {
 
             # Apply decay based on time since last access
             tsa_diff := mut current_time - entry.last_accessed;
-            time_since_access := mut I tsa_diff > 0 { tsa_diff as u64 } EL { 0 };
+            time_since_access := mut I tsa_diff > 0 { tsa_diff as u64 } else { 0 };
 
             # Decay if not accessed for more than 1 hour and importance > 0.1
             I time_since_access > 3600 && entry.importance > 0.1 {
@@ -328,17 +328,17 @@ X MemoryLifecycleManager {
     }
 
     ## Get config reference
-    F config(self) -> &MemoryConfig {
+    fn config(self) -> &MemoryConfig {
         &self.config
     }
 
     ## Get last run time
-    F last_run(self) -> i64 {
+    fn last_run(self) -> i64 {
         self.last_run_at
     }
 
     ## Reset last run time (for testing)
-    F reset_last_run(mut self) {
+    fn reset_last_run(mut self) {
         self.last_run_at = 0;
     }
 }
@@ -351,26 +351,26 @@ X MemoryLifecycleManager {
 
 ## Compare two candidates: returns true if a should come before b
 ## (lower importance first; same importance → higher age first)
-F evict_compare_before(
+fn evict_compare_before(
     candidates: &Vec<(u64, f64, u64)>, idx_a: u32, idx_b: u32
 ) -> bool {
     a := mut candidates.get(idx_a as u64);
     b := mut candidates.get(idx_b as u64);
     I a.1 < b.1 {
-        R true;
+        return true;
     }
     I a.1 > b.1 {
-        R false;
+        return false;
     }
     # Same importance — older (higher age) comes first
     a.2 >= b.2
 }
 
 ## Bottom-up merge sort on eviction candidates via index permutation
-F sort_eviction_candidates(candidates: &mut Vec<(u64, f64, u64)>) {
+fn sort_eviction_candidates(candidates: &mut Vec<(u64, f64, u64)>) {
     n := mut candidates.len() as u32;
     I n <= 1 {
-        R;
+        return;
     }
 
     # Build index + aux arrays
@@ -403,7 +403,7 @@ F sort_eviction_candidates(candidates: &mut Vec<(u64, f64, u64)>) {
                         *indices.get(ri as u64))) {
                     aux.set(k as u64, *indices.get(li as u64));
                     li = li + 1;
-                } EL {
+                } else {
                     aux.set(k as u64, *indices.get(ri as u64));
                     ri = ri + 1;
                 }
@@ -437,7 +437,7 @@ F sort_eviction_candidates(candidates: &mut Vec<(u64, f64, u64)>) {
                 I next == ci {
                     visited.set(j as u64, true);
                     done = true;
-                } EL {
+                } else {
                     candidates.swap(j as u64, next as u64);
                     visited.set(j as u64, true);
                     j = next;

@@ -12,14 +12,14 @@
 #     Sort (2 keys) (cost=10.00..12.00, rows=100..100, time=1.5ms)
 #       SeqScan on users (cost=5.00..8.00, rows=1000..950, time=5.1ms)
 
-U storage/error
-U std/time.{unix_timestamp};
-U sql/parser/ast
-U sql/planner/mod
-U sql/executor/mod
-U sql/catalog/manager
-U sql/row
-U sql/types
+use storage/error
+use std/time.{unix_timestamp};
+use sql/parser/ast
+use sql/planner/mod
+use sql/executor/mod
+use sql/catalog/manager
+use sql/row
+use sql/types
 
 # ============================================================================
 # Error Code Constants (EE=01 SQL Engine, CC=10 Explain)
@@ -33,21 +33,21 @@ C ERR_CODE_EXPLAIN_ANALYZE_FAILED: str = "VAIS-E0110003"
 # Error Constructors
 # ============================================================================
 
-F err_explain_not_select() -> VaisError {
+fn err_explain_not_select() -> VaisError {
     VaisError.new(
         ERR_CODE_EXPLAIN_NOT_SELECT,
         "EXPLAIN target is not a SELECT statement"
     )
 }
 
-F err_explain_plan_failed(reason: str) -> VaisError {
+fn err_explain_plan_failed(reason: str) -> VaisError {
     VaisError.new(
         ERR_CODE_EXPLAIN_PLAN_FAILED,
         "Plan build failed L EXPLAIN: {reason}"
     )
 }
 
-F err_explain_analyze_failed(reason: str) -> VaisError {
+fn err_explain_analyze_failed(reason: str) -> VaisError {
     VaisError.new(
         ERR_CODE_EXPLAIN_ANALYZE_FAILED,
         "EXPLAIN ANALYZE execution failed: {reason}"
@@ -60,26 +60,26 @@ F err_explain_analyze_failed(reason: str) -> VaisError {
 
 # Result of an EXPLAIN or EXPLAIN ANALYZE command
 # Contains rows where each row is a single StringVal line of the plan
-S ExplainResult {
+struct ExplainResult {
     rows: Vec<Row>,
 }
 
-X ExplainResult {
-    F new() -> ExplainResult {
+impl ExplainResult {
+    fn new() -> ExplainResult {
         ExplainResult {
             rows: Vec.with_capacity(0),
         }
     }
 
     # Add a line to the explain output
-    F add_line(mut self, line: str) {
+    fn add_line(mut self, line: str) {
         values := mut Vec.with_capacity(0)
         values.push(SqlValue.StringVal { v: line })
         self.rows.push(Row.new(values))
     }
 
     # Get all output rows
-    F get_rows(self) -> &[Row] {
+    fn get_rows(self) -> &[Row] {
         self.rows.as_slice()
     }
 }
@@ -90,19 +90,19 @@ X ExplainResult {
 
 # Execute an EXPLAIN or EXPLAIN ANALYZE statement
 # Returns ExplainResult containing formatted plan output
-F execute_explain(stmt: &Statement, analyze: bool, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
+fn execute_explain(stmt: &Statement, analyze: bool, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
     # Extract the inner SELECT query
-    query := mut M stmt {
+    query := mut match stmt {
         Select { query } => query,
         _ => {
-            R Err(err_explain_not_select())
+            return Err(err_explain_not_select())
         },
     }
 
     I analyze {
         # EXPLAIN ANALYZE: execute the query and collect actual statistics
         execute_explain_analyze(query, ctx)
-    } EL {
+    } else {
         # EXPLAIN: show estimated plan only
         execute_explain_plan(query, ctx)
     }
@@ -113,20 +113,20 @@ F execute_explain(stmt: &Statement, analyze: bool, ctx: &ExecContext) -> Result<
 # ============================================================================
 
 # Show the estimated execution plan without actually running the query
-F execute_explain_plan(query: &SelectQuery, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
+fn execute_explain_plan(query: &SelectQuery, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
     # Build the plan
-    plan := mut M build_plan(query, ctx.catalog) {
+    plan := mut match build_plan(query, ctx.catalog) {
         Ok(p) => p,
         Err(e) => {
-            R Err(err_explain_plan_failed(e.message))
+            return Err(err_explain_plan_failed(e.message))
         },
     }
 
     # Estimate cost
-    cost := mut M estimate_cost(&plan, ctx.catalog) {
+    cost := mut match estimate_cost(&plan, ctx.catalog) {
         Ok(c) => c,
         Err(e) => {
-            R Err(err_explain_plan_failed(e.message))
+            return Err(err_explain_plan_failed(e.message))
         },
     }
 
@@ -138,7 +138,7 @@ F execute_explain_plan(query: &SelectQuery, ctx: &ExecContext) -> Result<Explain
 }
 
 # Recursively format a plan node with estimated costs
-F format_explain_node(
+fn format_explain_node(
     node: &PlanNode,
     cost: &CostEstimate,
     indent: u64,
@@ -152,14 +152,14 @@ F format_explain_node(
         i = i + 1
     }
 
-    M node {
+    match node {
         SeqScan { table, alias, filter } => {
             line := mut "{prefix}SeqScan on {table}"
-            M alias {
+            match alias {
                 Some(a) => { line = "{line} as {a}"; },
                 None => {},
             }
-            M filter {
+            match filter {
                 Some(_) => { line = "{line} (with filter)"; },
                 None => {},
             }
@@ -169,7 +169,7 @@ F format_explain_node(
 
         IndexScan { table, index, residual, .. } => {
             line := mut "{prefix}IndexScan on {table} using {index}"
-            M residual {
+            match residual {
                 Some(_) => { line = "{line} (with residual)"; },
                 None => {},
             }
@@ -239,11 +239,11 @@ F format_explain_node(
 
         Limit { input, limit, offset } => {
             line := mut "{prefix}Limit"
-            M limit {
+            match limit {
                 Some(lim) => { line = "{line} {lim}"; },
                 None => {},
             }
-            M offset {
+            match offset {
                 Some(off) => { line = "{line} offset {off}"; },
                 None => {},
             }
@@ -292,12 +292,12 @@ F format_explain_node(
 # ============================================================================
 
 # Execute the query and show actual runtime statistics alongside estimates
-F execute_explain_analyze(query: &SelectQuery, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
+fn execute_explain_analyze(query: &SelectQuery, ctx: &ExecContext) -> Result<ExplainResult, VaisError> {
     # Build the plan
-    plan := mut M build_plan(query, ctx.catalog) {
+    plan := mut match build_plan(query, ctx.catalog) {
         Ok(p) => p,
         Err(e) => {
-            R Err(err_explain_analyze_failed(e.message))
+            return Err(err_explain_analyze_failed(e.message))
         },
     }
 
@@ -305,10 +305,10 @@ F execute_explain_analyze(query: &SelectQuery, ctx: &ExecContext) -> Result<Expl
     collector := mut AnalyzeCollector.new()
 
     # Execute the plan and collect statistics
-    M execute_and_collect(&plan, &mut collector, ctx) {
+    match execute_and_collect(&plan, &mut collector, ctx) {
         Ok(_) => {},
         Err(e) => {
-            R Err(err_explain_analyze_failed(e.message))
+            return Err(err_explain_analyze_failed(e.message))
         },
     }
 
@@ -324,15 +324,15 @@ F execute_explain_analyze(query: &SelectQuery, ctx: &ExecContext) -> Result<Expl
 # ============================================================================
 
 # Stores execution statistics per plan node
-S NodeStats {
+struct NodeStats {
     rows_produced: u64,
     rows_scanned: u64,
     pages_read: u64,
     elapsed_ms: f64,
 }
 
-X NodeStats {
-    F new() -> NodeStats {
+impl NodeStats {
+    fn new() -> NodeStats {
         NodeStats {
             rows_produced: 0,
             rows_scanned: 0,
@@ -344,13 +344,13 @@ X NodeStats {
 
 # Collector for EXPLAIN ANALYZE statistics
 # Maps plan node (by position in tree) to actual execution stats
-S AnalyzeCollector {
+struct AnalyzeCollector {
     stats_map: Vec<NodeStats>,
     current_node: u64,
 }
 
-X AnalyzeCollector {
-    F new() -> AnalyzeCollector {
+impl AnalyzeCollector {
+    fn new() -> AnalyzeCollector {
         AnalyzeCollector {
             stats_map: Vec.with_capacity(0),
             current_node: 0,
@@ -358,14 +358,14 @@ X AnalyzeCollector {
     }
 
     # Start timing for a node (returns node index)
-    F begin_node(mut self) -> u64 {
+    fn begin_node(mut self) -> u64 {
         idx := mut self.stats_map.len()
         self.stats_map.push(NodeStats.new())
         idx
     }
 
     # Record statistics for a node
-    F record_node(
+    fn record_node(
         mut self,
         node_idx: u64,
         rows_produced: u64,
@@ -382,7 +382,7 @@ X AnalyzeCollector {
     }
 
     # Get statistics for a node
-    F get_stats(self, node_idx: u64) -> &NodeStats {
+    fn get_stats(self, node_idx: u64) -> &NodeStats {
         &self.stats_map[node_idx]
     }
 }
@@ -393,7 +393,7 @@ X AnalyzeCollector {
 
 # Simplified execution that collects statistics without full executor infrastructure
 # In a real implementation, this would integrate with the full executor pipeline
-F execute_and_collect(
+fn execute_and_collect(
     node: &PlanNode,
     collector: &mut AnalyzeCollector,
     ctx: &ExecContext,
@@ -411,7 +411,7 @@ F execute_and_collect(
     start_time := mut 0.0;  # Would be: Instant.now()
 
     # Recursively execute children first
-    M node {
+    match node {
         Filter { input } => {
             execute_and_collect(input, collector, ctx)?;
         },
@@ -471,7 +471,7 @@ F execute_and_collect(
 # ============================================================================
 
 # Format a plan node with both estimated and actual statistics
-F format_analyze_node(
+fn format_analyze_node(
     node: &PlanNode,
     collector: &AnalyzeCollector,
     node_idx: u64,
@@ -492,14 +492,14 @@ F format_analyze_node(
     stats := mut collector.get_stats(node_idx)
 
     # Format node with estimated vs actual stats
-    M node {
+    match node {
         SeqScan { table, alias, filter } => {
             line := mut "{prefix}SeqScan on {table}"
-            M alias {
+            match alias {
                 Some(a) => { line = "{line} as {a}"; },
                 None => {},
             }
-            M filter {
+            match filter {
                 Some(_) => { line = "{line} (with filter)"; },
                 None => {},
             }
@@ -509,7 +509,7 @@ F format_analyze_node(
 
         IndexScan { table, index, residual, .. } => {
             line := mut "{prefix}IndexScan on {table} using {index}"
-            M residual {
+            match residual {
                 Some(_) => { line = "{line} (with residual)"; },
                 None => {},
             }
@@ -523,7 +523,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Project { input, columns } => {
@@ -532,7 +532,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         NestedLoopJoin { left, right, join_type, .. } => {
@@ -542,7 +542,7 @@ F format_analyze_node(
             # Recursively format children
             next_idx := mut format_analyze_node(left, collector, node_idx + 1, result, ctx)?;
             next_idx := mut format_analyze_node(right, collector, next_idx, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         HashJoin { build, probe, join_type, .. } => {
@@ -552,7 +552,7 @@ F format_analyze_node(
             # Recursively format children
             next_idx := mut format_analyze_node(build, collector, node_idx + 1, result, ctx)?;
             next_idx := mut format_analyze_node(probe, collector, next_idx, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Sort { input, order_by } => {
@@ -561,7 +561,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Aggregate { input, group_by, aggregates, .. } => {
@@ -570,16 +570,16 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Limit { input, limit, offset } => {
             line := mut "{prefix}Limit"
-            M limit {
+            match limit {
                 Some(lim) => { line = "{line} {lim}"; },
                 None => {},
             }
-            M offset {
+            match offset {
                 Some(off) => { line = "{line} offset {off}"; },
                 None => {},
             }
@@ -588,7 +588,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Distinct { input } => {
@@ -597,7 +597,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Window { input, window_specs } => {
@@ -606,7 +606,7 @@ F format_analyze_node(
 
             # Recursively format child
             next_idx := mut format_analyze_node(input, collector, node_idx + 1, result, ctx)?;
-            R Ok(next_idx)
+            return Ok(next_idx)
         },
 
         Values { rows } => {

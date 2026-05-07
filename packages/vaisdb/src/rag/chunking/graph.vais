@@ -3,14 +3,14 @@
 # Edge types: NEXT_CHUNK (sequential), SAME_SECTION, SAME_DOCUMENT
 # Uses GraphEngine for all node/edge operations (WAL-logged, MVCC-aware)
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError};
-U storage/txn/snapshot.{Snapshot};
-U storage/txn/clog.{Clog};
-U rag/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError};
+use storage/txn/snapshot.{Snapshot};
+use storage/txn/clog.{Clog};
+use rag/types.{
     ChunkInfo, DocumentInfo,
     LABEL_CHUNK, LABEL_DOCUMENT, LABEL_SECTION, LABEL_PARAGRAPH,
     EDGE_TYPE_NEXT_CHUNK, EDGE_TYPE_SAME_SECTION, EDGE_TYPE_SAME_DOCUMENT,
@@ -22,7 +22,7 @@ U rag/types.{
 # ChunkGraphEntry — Maps chunk_id to graph node_id
 # ============================================================================
 
-S ChunkGraphEntry {
+struct ChunkGraphEntry {
     chunk_id: u64,
     graph_node_id: u64,
     doc_id: u64,
@@ -30,8 +30,8 @@ S ChunkGraphEntry {
     position_in_doc: u32,
 }
 
-X ChunkGraphEntry {
-    F new(chunk_id: u64, graph_node_id: u64, doc_id: u64,
+impl ChunkGraphEntry {
+    fn new(chunk_id: u64, graph_node_id: u64, doc_id: u64,
           section_index: u32, position: u32) -> ChunkGraphEntry {
         ChunkGraphEntry {
             chunk_id,
@@ -47,30 +47,30 @@ X ChunkGraphEntry {
 # ChunkGraphManager — Manages graph relationships between chunks
 # ============================================================================
 
-S ChunkGraphManager {
+struct ChunkGraphManager {
     entries: Vec<ChunkGraphEntry>,   # chunk_id → node_id mapping
     is_open: bool,
 }
 
-X ChunkGraphManager {
-    F new() -> ChunkGraphManager {
+impl ChunkGraphManager {
+    fn new() -> ChunkGraphManager {
         ChunkGraphManager {
             entries: Vec.new(),
             is_open: false,
         }
     }
 
-    F open(mut self) {
+    fn open(mut self) {
         self.is_open = true;
     }
 
-    F close(mut self) {
+    fn close(mut self) {
         self.is_open = false;
     }
 
     ## Register a chunk as a graph node and return its node_id
     ## The caller (or graph engine mock) provides the allocated node_id
-    F register_chunk(mut self, chunk_id: u64, graph_node_id: u64,
+    fn register_chunk(mut self, chunk_id: u64, graph_node_id: u64,
                      doc_id: u64, section_index: u32,
                      position: u32) {
         entry := mut ChunkGraphEntry.new(
@@ -80,12 +80,12 @@ X ChunkGraphManager {
     }
 
     ## Get graph node_id for a chunk
-    F get_node_id(self, chunk_id: u64) -> Option<u64> {
+    fn get_node_id(self, chunk_id: u64) -> Option<u64> {
         i := mut 0u32;
         LW i < self.entries.len() as u32 {
             entry := mut self.entries.get(i as u64);
             I entry.chunk_id == chunk_id {
-                R Some(entry.graph_node_id);
+                return Some(entry.graph_node_id);
             }
             i = i + 1;
         }
@@ -95,7 +95,7 @@ X ChunkGraphManager {
     ## Build NEXT_CHUNK edges for a document's chunks (sequential linking)
     ## Chunks must be registered in order before calling this
     ## Returns list of (src_node_id, dst_node_id) pairs for edge creation
-    F build_next_chunk_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
+    fn build_next_chunk_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
         # Collect entries for this document, sorted by position
         doc_entries := mut Vec.new();
         i := mut 0u32;
@@ -117,7 +117,7 @@ X ChunkGraphManager {
                 I curr.position_in_doc < prev.position_in_doc {
                     doc_entries.swap(k as u64, (k - 1) as u64);
                     k = k - 1;
-                } EL {
+                } else {
                     k = 0;  # Break
                 }
             }
@@ -138,7 +138,7 @@ X ChunkGraphManager {
 
     ## Build SAME_SECTION edges for chunks in the same section
     ## Returns list of (src_node_id, dst_node_id) pairs
-    F build_same_section_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
+    fn build_same_section_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
         edges := mut Vec.new();
 
         # Group chunks by section_index
@@ -147,7 +147,7 @@ X ChunkGraphManager {
         LW i < self.entries.len() as u32 {
             entry := mut self.entries.get(i as u64);
             I entry.doc_id == doc_id {
-                M sections.get_mut(&entry.section_index) {
+                match sections.get_mut(&entry.section_index) {
                     Some(nodes) => { nodes.push(entry.graph_node_id); },
                     None => {
                         nodes := mut Vec.new();
@@ -178,7 +178,7 @@ X ChunkGraphManager {
 
     ## Build SAME_DOCUMENT edges between all chunks of a document
     ## Uses a star topology: first chunk connects to all others (avoids O(N^2) edges)
-    F build_same_document_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
+    fn build_same_document_edges(self, doc_id: u64) -> Vec<(u64, u64)> {
         edges := mut Vec.new();
         doc_nodes := mut Vec.new();
 
@@ -206,7 +206,7 @@ X ChunkGraphManager {
 
     ## Build all graph edges for a document's chunks
     ## Returns categorized edge lists for the caller to create via GraphEngine
-    F build_all_edges(self, doc_id: u64) -> ChunkEdgePlan {
+    fn build_all_edges(self, doc_id: u64) -> ChunkEdgePlan {
         ChunkEdgePlan {
             next_chunk: self.build_next_chunk_edges(doc_id),
             same_section: self.build_same_section_edges(doc_id),
@@ -215,7 +215,7 @@ X ChunkGraphManager {
     }
 
     ## Get all chunk entries for a document
-    F get_chunks_for_doc(self, doc_id: u64) -> Vec<&ChunkGraphEntry> {
+    fn get_chunks_for_doc(self, doc_id: u64) -> Vec<&ChunkGraphEntry> {
         result := mut Vec.new();
         i := mut 0u32;
         LW i < self.entries.len() as u32 {
@@ -229,7 +229,7 @@ X ChunkGraphManager {
     }
 
     ## Remove all entries for a document (on document deletion)
-    F remove_doc_entries(mut self, doc_id: u64) {
+    fn remove_doc_entries(mut self, doc_id: u64) {
         new_entries := mut Vec.new();
         i := mut 0u32;
         LW i < self.entries.len() as u32 {
@@ -246,7 +246,7 @@ X ChunkGraphManager {
     }
 
     ## Get total registered chunk entries
-    F entry_count(self) -> u64 {
+    fn entry_count(self) -> u64 {
         self.entries.len() as u64
     }
 }
@@ -255,28 +255,28 @@ X ChunkGraphManager {
 # ChunkEdgePlan — Categorized edge plan for a document
 # ============================================================================
 
-S ChunkEdgePlan {
+struct ChunkEdgePlan {
     next_chunk: Vec<(u64, u64)>,       # NEXT_CHUNK sequential edges
     same_section: Vec<(u64, u64)>,     # SAME_SECTION peer edges
     same_document: Vec<(u64, u64)>,    # SAME_DOCUMENT star edges
 }
 
-X ChunkEdgePlan {
+impl ChunkEdgePlan {
     ## Total number of edges to create
-    F total_edges(self) -> u32 {
+    fn total_edges(self) -> u32 {
         (self.next_chunk.len() + self.same_section.len() + self.same_document.len()) as u32
     }
 
     ## Get edge type string for each category
-    F next_chunk_type(self) -> Str {
+    fn next_chunk_type(self) -> Str {
         EDGE_TYPE_NEXT_CHUNK
     }
 
-    F same_section_type(self) -> Str {
+    fn same_section_type(self) -> Str {
         EDGE_TYPE_SAME_SECTION
     }
 
-    F same_document_type(self) -> Str {
+    fn same_document_type(self) -> Str {
         EDGE_TYPE_SAME_DOCUMENT
     }
 }
@@ -289,7 +289,7 @@ X ChunkEdgePlan {
 ## Returns list of byte offsets where new sections begin
 ## A section starts at: beginning of document, after a heading-like line,
 ## or after 2+ consecutive blank lines
-F detect_section_boundaries(content: &Str) -> Vec<u32> {
+fn detect_section_boundaries(content: &Str) -> Vec<u32> {
     boundaries := mut Vec.new();
     boundaries.push(0);  # Document start is always a section boundary
 
@@ -321,7 +321,7 @@ F detect_section_boundaries(content: &Str) -> Vec<u32> {
             }
             line_start = i + 1;
             in_line_start = true;
-        } EL {
+        } else {
             I b != 32 && b != 9 {  # Not space or tab
                 in_line_start = false;
             }
@@ -335,15 +335,15 @@ F detect_section_boundaries(content: &Str) -> Vec<u32> {
 }
 
 ## Assign section index to each chunk based on section boundaries
-F assign_section_index(position_byte_start: u32, boundaries: &Vec<u32>) -> u32 {
+fn assign_section_index(position_byte_start: u32, boundaries: &Vec<u32>) -> u32 {
     section := mut 0u32;
     i := mut 0u32;
     LW i < boundaries.len() as u32 {
         boundary := mut *boundaries.get(i as u64);
         I boundary <= position_byte_start {
             section = i;
-        } EL {
-            R section;
+        } else {
+            return section;
         }
         i = i + 1;
     }

@@ -3,38 +3,38 @@
 # Queue-based traversal with visited set for cycle prevention
 # Supports edge type filtering and directional traversal
 
-U std/vec
-U std/option
-U storage/error
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U graph/types
-U graph/node/storage
-U graph/edge/adj
-U graph/visibility
+use std/vec
+use std/option
+use storage/error
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use graph/types
+use graph/node/storage
+use graph/edge/adj
+use graph/visibility
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=04 (traversal)
 # ============================================================================
 
-F err_traversal_invalid_node(node_id: u64) -> VaisError {
+fn err_traversal_invalid_node(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0304001",
         "Traversal invalid start node: {node_id}"
     )
 }
 
-F err_traversal_depth_exceeded(depth: u32, max_depth: u32) -> VaisError {
+fn err_traversal_depth_exceeded(depth: u32, max_depth: u32) -> VaisError {
     VaisError.new(
         "VAIS-0304002",
         "Traversal depth {depth} exceeds max {max_depth}"
     )
 }
 
-F err_traversal_invalid_direction(direction: u8) -> VaisError {
+fn err_traversal_invalid_direction(direction: u8) -> VaisError {
     VaisError.new(
         "VAIS-0304003",
         "Invalid traversal direction: {direction}"
@@ -46,7 +46,7 @@ F err_traversal_invalid_direction(direction: u8) -> VaisError {
 # ============================================================================
 
 # Single step in traversal result
-S TraversalStep {
+struct TraversalStep {
     node_id: u64,        # Node visited
     depth: u32,          # Depth from start node (0 = start)
     parent_node: u64,    # Parent node ID (0 = start node)
@@ -54,9 +54,9 @@ S TraversalStep {
     edge_type: u16,      # Edge type (0 = start node)
 }
 
-X TraversalStep {
+impl TraversalStep {
     # Create root step (start node)
-    F root(node_id: u64) -> TraversalStep {
+    fn root(node_id: u64) -> TraversalStep {
         TraversalStep {
             node_id,
             depth: 0,
@@ -67,7 +67,7 @@ X TraversalStep {
     }
 
     # Create child step from edge
-    F from_edge(
+    fn from_edge(
         node_id: u64,
         depth: u32,
         parent_node: u64,
@@ -85,35 +85,35 @@ X TraversalStep {
 }
 
 # Traversal result
-S TraversalResult {
+struct TraversalResult {
     steps: Vec<TraversalStep>,  # All visited nodes in traversal order
     nodes_visited: u64,          # Total count of unique nodes visited
 }
 
-X TraversalResult {
-    F new() -> TraversalResult {
+impl TraversalResult {
+    fn new() -> TraversalResult {
         TraversalResult {
             steps: Vec.with_capacity(0),
             nodes_visited: 0,
         }
     }
 
-    F add_step(mut self, step: TraversalStep) {
+    fn add_step(mut self, step: TraversalStep) {
         self.steps.push(step)
         self.nodes_visited += 1
     }
 }
 
 # Traversal configuration
-S TraversalConfig {
+struct TraversalConfig {
     max_depth: u32,                  # Maximum depth to traverse (0 = unlimited)
     edge_types: Option<Vec<u16>>,    # Filter by edge types (None = all types)
     direction: u8,                    # DIRECTION_OUTGOING, INCOMING, or BOTH
 }
 
-X TraversalConfig {
+impl TraversalConfig {
     # Default: unlimited depth, all edge types, outgoing direction
-    F default() -> TraversalConfig {
+    fn default() -> TraversalConfig {
         TraversalConfig {
             max_depth: 0,
             edge_types: None,
@@ -122,14 +122,14 @@ X TraversalConfig {
     }
 
     # Check if edge type is allowed by filter
-    F is_edge_type_allowed(self, edge_type: u16) -> bool {
-        M self.edge_types {
+    fn is_edge_type_allowed(self, edge_type: u16) -> bool {
+        match self.edge_types {
             None => true,
             Some(types) => {
                 i := mut 0
                 LW i < types.len() {
                     I types[i] == edge_type {
-                        R true
+                        return true
                     }
                     i += 1
                 }
@@ -143,15 +143,15 @@ X TraversalConfig {
 # BfsTraversal — Breadth-First Search engine
 # ============================================================================
 
-S BfsTraversal {
+struct BfsTraversal {
     pool: &BufferPool,
     node_store: &NodeStore,
     snapshot: Snapshot,
     clog: &Clog,
 }
 
-X BfsTraversal {
-    F new(
+impl BfsTraversal {
+    fn new(
         pool: &BufferPool,
         node_store: &NodeStore,
         snapshot: Snapshot,
@@ -168,21 +168,21 @@ X BfsTraversal {
     # Perform BFS traversal from start_node
     # Note: This requires a node index to map node_id -> (page_id, slot_index)
     # For now, we implement the core BFS logic assuming AdjacencyManager can read adj lists
-    F traverse(
+    fn traverse(
         self,
         start_node: u64,
         adj_mgr: &AdjacencyManager,
         config: &TraversalConfig
     ) -> Result<TraversalResult, VaisError> {
         I start_node == INVALID_NODE_ID {
-            R Err(err_traversal_invalid_node(start_node))
+            return Err(err_traversal_invalid_node(start_node))
         }
 
         # Validate direction
         I config.direction != DIRECTION_OUTGOING &&
            config.direction != DIRECTION_INCOMING &&
            config.direction != DIRECTION_BOTH {
-            R Err(err_traversal_invalid_direction(config.direction))
+            return Err(err_traversal_invalid_direction(config.direction))
         }
 
         # Initialize result
@@ -237,11 +237,11 @@ X BfsTraversal {
     }
 
     # Helper: check if node is already visited
-    F is_visited(visited: &Vec<u64>, node_id: u64) -> bool {
+    fn is_visited(visited: &Vec<u64>, node_id: u64) -> bool {
         i := mut 0
         LW i < visited.len() {
             I visited[i] == node_id {
-                R true
+                return true
             }
             i += 1
         }
@@ -249,7 +249,7 @@ X BfsTraversal {
     }
 
     # Helper: process edges from adjacency list
-    F process_edges(
+    fn process_edges(
         self,
         entries: &Vec<AdjEntry>,
         current_node: u64,

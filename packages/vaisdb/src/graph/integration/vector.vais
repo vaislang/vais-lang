@@ -4,39 +4,39 @@
 # Combined scoring: vector_similarity * alpha + graph_proximity * (1 - alpha)
 # Error codes: EE=03 (graph), CC=13 (vector integration)
 
-U std/vec
-U std/string
-U std/option
-U storage/error
-U storage/buffer/pool
-U storage/txn/snapshot
-U storage/txn/clog
-U sql/types
-U sql/row
-U sql/executor/mod
-U graph/types
-U graph/query/traverse_fn
-U graph/index/property
+use std/vec
+use std/string
+use std/option
+use storage/error
+use storage/buffer/pool
+use storage/txn/snapshot
+use storage/txn/clog
+use sql/types
+use sql/row
+use sql/executor/mod
+use graph/types
+use graph/query/traverse_fn
+use graph/index/property
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=13 (vector integration)
 # ============================================================================
 
-F err_vector_graph_no_results() -> VaisError {
+fn err_vector_graph_no_results() -> VaisError {
     VaisError.new(
         "VAIS-0313001",
         "Vector search returned no results for graph expansion"
     )
 }
 
-F err_vector_graph_invalid_alpha(alpha: f64) -> VaisError {
+fn err_vector_graph_invalid_alpha(alpha: f64) -> VaisError {
     VaisError.new(
         "VAIS-0313002",
         "Invalid scoring alpha: {alpha} (must be 0.0 to 1.0)"
     )
 }
 
-F err_vector_graph_mapping_failed(reason: str) -> VaisError {
+fn err_vector_graph_mapping_failed(reason: str) -> VaisError {
     VaisError.new(
         "VAIS-0313003",
         "Vector→Graph node mapping failed: {reason}"
@@ -47,19 +47,19 @@ F err_vector_graph_mapping_failed(reason: str) -> VaisError {
 # VectorSearchHit — A single result from vector similarity search
 # ============================================================================
 
-S VectorSearchHit {
+struct VectorSearchHit {
     row_id: u64,           # Row ID from vector search (maps to SQL table row)
     node_id: u64,          # Corresponding graph node ID (mapped via join column)
     distance: f32,         # Vector distance (lower = more similar)
     similarity: f32,       # Normalized similarity score (0.0 to 1.0)
 }
 
-X VectorSearchHit {
-    F new(row_id: u64, node_id: u64, distance: f32) -> VectorSearchHit {
+impl VectorSearchHit {
+    fn new(row_id: u64, node_id: u64, distance: f32) -> VectorSearchHit {
         # Convert distance to similarity (inverse, clamped to [0, 1])
         sim := mut I distance <= 0.0 {
             1.0
-        } EL {
+        } else {
             1.0 / (1.0 + distance)
         }
 
@@ -76,7 +76,7 @@ X VectorSearchHit {
 # GraphExpandedResult — Vector hit + graph traversal neighbors
 # ============================================================================
 
-S GraphExpandedResult {
+struct GraphExpandedResult {
     # Origin: the vector search hit that seeded this expansion
     origin_node_id: u64,
     origin_similarity: f32,
@@ -90,8 +90,8 @@ S GraphExpandedResult {
     combined_score: f32,
 }
 
-X GraphExpandedResult {
-    F new(
+impl GraphExpandedResult {
+    fn new(
         origin_node_id: u64,
         origin_similarity: f32,
         neighbor_node_id: u64,
@@ -115,7 +115,7 @@ X GraphExpandedResult {
     }
 
     # For the origin node itself (depth=0)
-    F origin(node_id: u64, similarity: f32) -> GraphExpandedResult {
+    fn origin(node_id: u64, similarity: f32) -> GraphExpandedResult {
         GraphExpandedResult {
             origin_node_id: node_id,
             origin_similarity: similarity,
@@ -131,7 +131,7 @@ X GraphExpandedResult {
 # VectorGraphPipeline — Orchestrates vector search → graph expansion
 # ============================================================================
 
-S VectorGraphPipeline {
+struct VectorGraphPipeline {
     traverse_fn: GraphTraverseFunction,
     edge_type_table: &EdgeTypeTable,
     alpha: f32,              # Scoring blend: 0.0 = pure graph, 1.0 = pure vector
@@ -140,15 +140,15 @@ S VectorGraphPipeline {
     edge_type_filter: Option<Vec<str>>,  # Optional edge type filter
 }
 
-X VectorGraphPipeline {
-    F new(
+impl VectorGraphPipeline {
+    fn new(
         traverse_fn: GraphTraverseFunction,
         edge_type_table: &EdgeTypeTable,
         alpha: f32,
         max_graph_depth: u32,
     ) -> Result<VectorGraphPipeline, VaisError> {
         I alpha < 0.0 || alpha > 1.0 {
-            R Err(err_vector_graph_invalid_alpha(alpha as f64))
+            return Err(err_vector_graph_invalid_alpha(alpha as f64))
         }
 
         Ok(VectorGraphPipeline {
@@ -162,19 +162,19 @@ X VectorGraphPipeline {
     }
 
     # Builder pattern: takes self by value, returns Self
-    F with_direction(mut self, direction: u8) -> VectorGraphPipeline {
+    fn with_direction(mut self, direction: u8) -> VectorGraphPipeline {
         self.direction = direction
         self
     }
 
-    F with_edge_filter(mut self, types: Vec<str>) -> VectorGraphPipeline {
+    fn with_edge_filter(mut self, types: Vec<str>) -> VectorGraphPipeline {
         self.edge_type_filter = Some(types)
         self
     }
 
     # Expand a set of vector search hits through graph traversal
     # Returns combined results sorted by combined_score descending
-    F expand(
+    fn expand(
         self,
         hits: &Vec<VectorSearchHit>,
         snapshot: &Snapshot,
@@ -232,7 +232,7 @@ X VectorGraphPipeline {
     }
 
     # Sort results by combined_score descending (insertion sort for simplicity)
-    F sort_by_score_desc(results: &mut Vec<GraphExpandedResult>) {
+    fn sort_by_score_desc(results: &mut Vec<GraphExpandedResult>) {
         i := mut 1
         LW i < results.len() {
             j := mut i
@@ -246,7 +246,7 @@ X VectorGraphPipeline {
 
     # Deduplicate: if same neighbor_node_id appears multiple times,
     # keep only the one with highest combined_score (already sorted desc)
-    F deduplicate_by_node(results: &Vec<GraphExpandedResult>) -> Vec<GraphExpandedResult> {
+    fn deduplicate_by_node(results: &Vec<GraphExpandedResult>) -> Vec<GraphExpandedResult> {
         deduped := mut Vec.with_capacity(0)
         seen_nodes := mut Vec.with_capacity(0)
 
@@ -279,15 +279,15 @@ X VectorGraphPipeline {
 # Outputs: [node_id, origin_node_id, vector_similarity, graph_depth, combined_score]
 # ============================================================================
 
-S VectorGraphResultSource {
+struct VectorGraphResultSource {
     results: Vec<GraphExpandedResult>,
     cursor: u64,
     is_open: bool,
     stats: ExecStats,
 }
 
-X VectorGraphResultSource {
-    F new(results: Vec<GraphExpandedResult>) -> VectorGraphResultSource {
+impl VectorGraphResultSource {
+    fn new(results: Vec<GraphExpandedResult>) -> VectorGraphResultSource {
         VectorGraphResultSource {
             results,
             cursor: 0,
@@ -297,7 +297,7 @@ X VectorGraphResultSource {
     }
 
     # Convert expanded result to ExecutorRow
-    F to_executor_row(result: &GraphExpandedResult) -> ExecutorRow {
+    fn to_executor_row(result: &GraphExpandedResult) -> ExecutorRow {
         values := mut Vec.with_capacity(5)
         values.push(SqlValue.IntVal { v: result.neighbor_node_id as i64 })
         values.push(SqlValue.IntVal { v: result.origin_node_id as i64 })
@@ -308,7 +308,7 @@ X VectorGraphResultSource {
     }
 
     # Output schema
-    F output_schema() -> Vec<ExecColumn> {
+    fn output_schema() -> Vec<ExecColumn> {
         cols := mut Vec.with_capacity(5)
         cols.push(ExecColumn.new("node_id".to_string(), SqlType.Int, false))
         cols.push(ExecColumn.new("origin_node_id".to_string(), SqlType.Int, false))
@@ -318,16 +318,16 @@ X VectorGraphResultSource {
         cols
     }
 
-    F open(mut self) -> Result<(), VaisError> {
+    fn open(mut self) -> Result<(), VaisError> {
         self.cursor = 0
         self.is_open = true
         self.stats.rows_scanned = self.results.len() as u64
         Ok(())
     }
 
-    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+    fn next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
         I !self.is_open || self.cursor >= self.results.len() {
-            R Ok(None)
+            return Ok(None)
         }
 
         row := mut VectorGraphResultSource.to_executor_row(&self.results[self.cursor])
@@ -337,7 +337,7 @@ X VectorGraphResultSource {
         Ok(Some(row))
     }
 
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         self.cursor = 0
         self.is_open = false
         Ok(())
@@ -349,24 +349,24 @@ X VectorGraphResultSource {
 # Uses a join column to resolve vector result row_id → graph node_id
 # ============================================================================
 
-S VectorToGraphMapper {
+struct VectorToGraphMapper {
     join_column_idx: u64,   # Column index in vector result rows that contains node_id
 }
 
-X VectorToGraphMapper {
-    F new(join_column_idx: u64) -> VectorToGraphMapper {
+impl VectorToGraphMapper {
+    fn new(join_column_idx: u64) -> VectorToGraphMapper {
         VectorToGraphMapper { join_column_idx }
     }
 
     # Map a batch of vector search results to VectorSearchHit with graph node IDs
-    F map_results(
+    fn map_results(
         self,
         row_ids: &Vec<u64>,
         distances: &Vec<f32>,
         node_ids: &Vec<u64>,
     ) -> Result<Vec<VectorSearchHit>, VaisError> {
         I row_ids.len() != distances.len() || row_ids.len() != node_ids.len() {
-            R Err(err_vector_graph_mapping_failed(
+            return Err(err_vector_graph_mapping_failed(
                 "Mismatched vector result array lengths".to_string()
             ))
         }
@@ -387,7 +387,7 @@ X VectorToGraphMapper {
 # ============================================================================
 
 # Execute vector→graph expansion pipeline and return scored results
-F vector_graph_search(
+fn vector_graph_search(
     hits: &Vec<VectorSearchHit>,
     traverse_fn: GraphTraverseFunction,
     edge_type_table: &EdgeTypeTable,

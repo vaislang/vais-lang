@@ -4,37 +4,37 @@
 # MVCC-consistent traversal using snapshot-isolated edge visibility
 # Supports both single cycle detection and finding multiple cycles
 
-U std/vec
-U std/option
-U storage/error
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/buffer/pool
-U graph/types
-U graph/node/storage
-U graph/edge/adj
-U graph/visibility
-U graph/traversal/bfs
+use std/vec
+use std/option
+use storage/error
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/buffer/pool
+use graph/types
+use graph/node/storage
+use graph/edge/adj
+use graph/visibility
+use graph/traversal/bfs
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=05 (shortest path / cycle)
 # ============================================================================
 
-F err_cycle_invalid_node(node_id: u64) -> VaisError {
+fn err_cycle_invalid_node(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0305004",
         "Cycle detection: invalid node ID {node_id}"
     )
 }
 
-F err_cycle_invalid_direction(direction: u8) -> VaisError {
+fn err_cycle_invalid_direction(direction: u8) -> VaisError {
     VaisError.new(
         "VAIS-0305005",
         "Invalid cycle detection direction: {direction}"
     )
 }
 
-F err_cycle_max_cycles_reached(max_cycles: u32) -> VaisError {
+fn err_cycle_max_cycles_reached(max_cycles: u32) -> VaisError {
     VaisError.new(
         "VAIS-0305006",
         "Maximum cycle limit reached: {max_cycles}"
@@ -53,14 +53,14 @@ C COLOR_BLACK: u8 = 2;  # Finished (all descendants explored)
 # CycleResult — Result of cycle detection
 # ============================================================================
 
-S CycleResult {
+struct CycleResult {
     nodes: Vec<u64>,     # Sequence of node IDs forming the cycle
     edges: Vec<u64>,     # Sequence of edge IDs connecting the cycle nodes
     length: u32,         # Cycle length (number of edges)
 }
 
-X CycleResult {
-    F new(nodes: Vec<u64>, edges: Vec<u64>) -> CycleResult {
+impl CycleResult {
+    fn new(nodes: Vec<u64>, edges: Vec<u64>) -> CycleResult {
         length := mut edges.len() as u32
         CycleResult {
             nodes,
@@ -69,7 +69,7 @@ X CycleResult {
         }
     }
 
-    F empty() -> CycleResult {
+    fn empty() -> CycleResult {
         CycleResult {
             nodes: Vec.with_capacity(0),
             edges: Vec.with_capacity(0),
@@ -82,15 +82,15 @@ X CycleResult {
 # CycleDetector — DFS-based cycle detection algorithm
 # ============================================================================
 
-S CycleDetector {
+struct CycleDetector {
     pool: &BufferPool,
     node_store: &NodeStore,
     snapshot: Snapshot,
     clog: &Clog,
 }
 
-X CycleDetector {
-    F new(
+impl CycleDetector {
+    fn new(
         pool: &BufferPool,
         node_store: &NodeStore,
         snapshot: Snapshot,
@@ -106,7 +106,7 @@ X CycleDetector {
 
     # Check if there exists any cycle reachable from start node
     # Returns true if at least one cycle is found, false otherwise
-    F has_cycle(
+    fn has_cycle(
         self,
         start: u64,
         adj_mgr: &AdjacencyManager,
@@ -114,14 +114,14 @@ X CycleDetector {
     ) -> Result<bool, VaisError> {
         # Validate input
         I start == INVALID_NODE_ID {
-            R Err(err_cycle_invalid_node(start))
+            return Err(err_cycle_invalid_node(start))
         }
 
         # Validate direction
         I config.direction != DIRECTION_OUTGOING &&
            config.direction != DIRECTION_INCOMING &&
            config.direction != DIRECTION_BOTH {
-            R Err(err_cycle_invalid_direction(config.direction))
+            return Err(err_cycle_invalid_direction(config.direction))
         }
 
         # Color map: Vec<NodeColor>
@@ -150,7 +150,7 @@ X CycleDetector {
                 CycleDetector.set_color(&colors, current_node, COLOR_BLACK)
                 stack.pop()
                 stack_entries.pop()
-            } EL {
+            } else {
                 # Advance the edge index for this stack frame
                 stack[stack_top].adj_idx = next_idx + 1
                 entry := mut &stack_entries[stack_top][next_idx]
@@ -164,7 +164,7 @@ X CycleDetector {
 
                     I target_color == COLOR_GRAY {
                         # Back edge — cycle detected!
-                        R Ok(true)
+                        return Ok(true)
                     }
                     I target_color == COLOR_WHITE {
                         # Unvisited — recurse
@@ -184,7 +184,7 @@ X CycleDetector {
 
     # Find all cycles reachable from start node (up to max_cycles)
     # Returns vector of CycleResult, may be empty if no cycles exist
-    F find_cycles(
+    fn find_cycles(
         self,
         start: u64,
         adj_mgr: &AdjacencyManager,
@@ -193,14 +193,14 @@ X CycleDetector {
     ) -> Result<Vec<CycleResult>, VaisError> {
         # Validate input
         I start == INVALID_NODE_ID {
-            R Err(err_cycle_invalid_node(start))
+            return Err(err_cycle_invalid_node(start))
         }
 
         # Validate direction
         I config.direction != DIRECTION_OUTGOING &&
            config.direction != DIRECTION_INCOMING &&
            config.direction != DIRECTION_BOTH {
-            R Err(err_cycle_invalid_direction(config.direction))
+            return Err(err_cycle_invalid_direction(config.direction))
         }
 
         # Results
@@ -236,7 +236,7 @@ X CycleDetector {
                 stack.pop()
                 stack_entries.pop()
                 rec_path.pop()
-            } EL {
+            } else {
                 # Advance the edge index for this stack frame
                 stack[stack_top].adj_idx = next_idx + 1
                 entry := mut &stack_entries[stack_top][next_idx]
@@ -252,7 +252,7 @@ X CycleDetector {
                         # Back edge — cycle detected!
                         # Add closing edge to rec_path temporarily for extraction
                         rec_path.push(NodeEdgePair { node_id: target, edge_id: entry.edge_id })
-                        M CycleDetector.in_rec_path(rec_path, target) {
+                        match CycleDetector.in_rec_path(rec_path, target) {
                             Some(idx) => {
                                 cycle := mut CycleDetector.extract_cycle(rec_path, idx)
                                 cycles.push(cycle)
@@ -279,11 +279,11 @@ X CycleDetector {
     }
 
     # Helper: get color of a node (default WHITE if not found)
-    F get_color(colors: &Vec<NodeColor>, node_id: u64) -> u8 {
+    fn get_color(colors: &Vec<NodeColor>, node_id: u64) -> u8 {
         i := mut 0
         LW i < colors.len() {
             I colors[i].node_id == node_id {
-                R colors[i].color
+                return colors[i].color
             }
             i += 1
         }
@@ -291,12 +291,12 @@ X CycleDetector {
     }
 
     # Helper: set color of a node (add or update)
-    F set_color(colors: &mut Vec<NodeColor>, node_id: u64, color: u8) {
+    fn set_color(colors: &mut Vec<NodeColor>, node_id: u64, color: u8) {
         i := mut 0
         LW i < colors.len() {
             I colors[i].node_id == node_id {
                 colors[i] = NodeColor { node_id: node_id, color: color }
-                R
+                return
             }
             i += 1
         }
@@ -304,11 +304,11 @@ X CycleDetector {
     }
 
     # Helper: check if node exists in recursion path
-    F in_rec_path(rec_path: &Vec<NodeEdgePair>, node_id: u64) -> Option<u64> {
+    fn in_rec_path(rec_path: &Vec<NodeEdgePair>, node_id: u64) -> Option<u64> {
         i := mut 0
         LW i < rec_path.len() {
             I rec_path[i].node_id == node_id {
-                R Some(i)
+                return Some(i)
             }
             i += 1
         }
@@ -316,7 +316,7 @@ X CycleDetector {
     }
 
     # Helper: extract cycle from recursion path
-    F extract_cycle(rec_path: &Vec<NodeEdgePair>, cycle_start_idx: u64) -> CycleResult {
+    fn extract_cycle(rec_path: &Vec<NodeEdgePair>, cycle_start_idx: u64) -> CycleResult {
         nodes := mut Vec.with_capacity(0)
         edges := mut Vec.with_capacity(0)
 
@@ -336,7 +336,7 @@ X CycleDetector {
     }
 
     # Helper: process adjacency entries for cycle detection
-    F process_adj_entries_for_cycle(
+    fn process_adj_entries_for_cycle(
         self,
         entries: &Vec<AdjEntry>,
         current_node: u64,
@@ -350,7 +350,7 @@ X CycleDetector {
         i := mut 0
         LW i < entries.len() {
             I cycles.len() >= max_cycles as u64 {
-                R true
+                return true
             }
 
             entry := mut &entries[i]
@@ -362,7 +362,7 @@ X CycleDetector {
                 target := mut entry.target_node
             target_color := mut CycleDetector.get_color(colors, target)
 
-            M target_color {
+            match target_color {
                 COLOR_WHITE => {
                     # Unvisited - recurse into it
                     CycleDetector.set_color(colors, target, COLOR_GRAY)
@@ -371,7 +371,7 @@ X CycleDetector {
                 },
                 COLOR_GRAY => {
                     # Back edge - cycle detected!
-                    M CycleDetector.in_rec_path(rec_path, target) {
+                    match CycleDetector.in_rec_path(rec_path, target) {
                         Some(idx) => {
                             cycle := mut CycleDetector.extract_cycle(rec_path, idx)
                             cycles.push(cycle)
@@ -393,7 +393,7 @@ X CycleDetector {
     }
 
     # Helper: read adjacency entries for a node based on direction config
-    F read_adj_entries(
+    fn read_adj_entries(
         self,
         node_id: u64,
         adj_mgr: &AdjacencyManager,

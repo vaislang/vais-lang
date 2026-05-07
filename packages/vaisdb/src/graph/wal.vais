@@ -4,34 +4,34 @@
 # Uses GroupCommitManager for batched fsync
 # Error codes: EE=03 (graph), CC=09 (WAL)
 
-U storage/bytes
-U std/vec
-U storage/error
-U storage/buffer/pool
-U storage/wal/group_commit
-U storage/wal/record_types
-U storage/wal/record_graph
-U storage/page/types
-U storage/constants
-U graph/types
+use storage/bytes
+use std/vec
+use storage/error
+use storage/buffer/pool
+use storage/wal/group_commit
+use storage/wal/record_types
+use storage/wal/record_graph
+use storage/page/types
+use storage/constants
+use graph/types
 
 # ============================================================================
 # GraphWalManager — Coordinates WAL writes for graph engine
 # ============================================================================
 
-S GraphWalManager {
+struct GraphWalManager {
     gcm: &GroupCommitManager,
 }
 
-X GraphWalManager {
+impl GraphWalManager {
     # Create new WAL manager with reference to GroupCommitManager
-    F new(gcm: &GroupCommitManager) -> GraphWalManager {
+    fn new(gcm: &GroupCommitManager) -> GraphWalManager {
         GraphWalManager { gcm }
     }
 
     # Log node insertion (WAL-first, before page mutation)
     # Returns the assigned LSN
-    F log_node_insert(
+    fn log_node_insert(
         mut self,
         txn_id: u64,
         node_id: u64,
@@ -55,7 +55,7 @@ X GraphWalManager {
     }
 
     # Log node deletion (WAL-first, before page mutation)
-    F log_node_delete(
+    fn log_node_delete(
         mut self,
         txn_id: u64,
         node_id: u64,
@@ -80,7 +80,7 @@ X GraphWalManager {
 
     # Log edge insertion (WAL-first, before page mutation)
     # Bidirectional: records both src and dst adjacency page IDs
-    F log_edge_insert(
+    fn log_edge_insert(
         mut self,
         txn_id: u64,
         edge_id: u64,
@@ -111,7 +111,7 @@ X GraphWalManager {
 
     # Log edge deletion (WAL-first, before page mutation)
     # Bidirectional: records both src and dst adjacency page IDs for undo
-    F log_edge_delete(
+    fn log_edge_delete(
         mut self,
         txn_id: u64,
         edge_id: u64,
@@ -139,7 +139,7 @@ X GraphWalManager {
     }
 
     # Log property update (WAL-first, before page mutation)
-    F log_property_update(
+    fn log_property_update(
         mut self,
         txn_id: u64,
         page_id: u32,
@@ -165,7 +165,7 @@ X GraphWalManager {
     }
 
     # Log adjacency list page split (WAL-first, before page mutation)
-    F log_adj_page_split(
+    fn log_adj_page_split(
         mut self,
         txn_id: u64,
         node_id: u64,
@@ -197,7 +197,7 @@ X GraphWalManager {
 # ============================================================================
 
 # Redo a graph node insert (re-apply the page mutation)
-F redo_graph_node_insert(
+fn redo_graph_node_insert(
     payload: &GraphNodeInsertPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -219,7 +219,7 @@ F redo_graph_node_insert(
     # Bounds check
     I write_offset > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198912", "REDO: node insert out of bounds"))
+        return Err(VaisError.new("VAIS-198912", "REDO: node insert out of bounds"))
     }
 
     # Write properties data
@@ -235,7 +235,7 @@ F redo_graph_node_insert(
 }
 
 # Undo a graph node insert (remove the inserted node)
-F undo_graph_node_insert(
+fn undo_graph_node_insert(
     payload: &GraphNodeInsertPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -251,7 +251,7 @@ F undo_graph_node_insert(
     body_offset := mut PAGE_HEADER_SIZE as u64
     I body_offset + 8 > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198913", "UNDO: invalid page layout"))
+        return Err(VaisError.new("VAIS-198913", "UNDO: invalid page layout"))
     }
 
     # Parse node count (first 2 bytes of body header)
@@ -300,14 +300,14 @@ F undo_graph_node_insert(
     pool.unpin_page(frame, true)
 
     I !found {
-        R Err(VaisError.new("VAIS-198914", "UNDO: node not found in page"))
+        return Err(VaisError.new("VAIS-198914", "UNDO: node not found in page"))
     }
 
     Ok(())
 }
 
 # Redo a graph edge insert (re-apply both adjacency list entries)
-F redo_graph_edge_insert(
+fn redo_graph_edge_insert(
     payload: &GraphEdgeInsertPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -321,7 +321,7 @@ F redo_graph_edge_insert(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198915", "REDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198915", "REDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -330,7 +330,7 @@ F redo_graph_edge_insert(
         # Bounds check
         I write_offset + (ADJ_ENTRY_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198916", "REDO: adj page full"))
+            return Err(VaisError.new("VAIS-198916", "REDO: adj page full"))
         }
 
         # Serialize AdjEntry at write_offset
@@ -358,7 +358,7 @@ F redo_graph_edge_insert(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198917", "REDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198917", "REDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -366,7 +366,7 @@ F redo_graph_edge_insert(
 
         I write_offset + (ADJ_ENTRY_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198918", "REDO: adj page full"))
+            return Err(VaisError.new("VAIS-198918", "REDO: adj page full"))
         }
 
         i := mut 0u64
@@ -387,7 +387,7 @@ F redo_graph_edge_insert(
 }
 
 # Undo a graph edge insert (remove both adjacency list entries)
-F undo_graph_edge_insert(
+fn undo_graph_edge_insert(
     payload: &GraphEdgeInsertPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -399,7 +399,7 @@ F undo_graph_edge_insert(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198919", "UNDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198919", "UNDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -439,7 +439,7 @@ F undo_graph_edge_insert(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198920", "UNDO: edge not found in src adj page"))
+            return Err(VaisError.new("VAIS-198920", "UNDO: edge not found in src adj page"))
         }
     }
 
@@ -451,7 +451,7 @@ F undo_graph_edge_insert(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198921", "UNDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198921", "UNDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -487,7 +487,7 @@ F undo_graph_edge_insert(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198928", "UNDO: edge not found in dst adj page"))
+            return Err(VaisError.new("VAIS-198928", "UNDO: edge not found in dst adj page"))
         }
     }
 
@@ -495,7 +495,7 @@ F undo_graph_edge_insert(
 }
 
 # Redo a graph edge delete (re-apply the expiration)
-F redo_graph_edge_delete(
+fn redo_graph_edge_delete(
     payload: &GraphEdgeDeletePayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -508,7 +508,7 @@ F redo_graph_edge_delete(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198929", "REDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198929", "REDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -548,7 +548,7 @@ F redo_graph_edge_delete(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198930", "REDO: edge not found in src adj page"))
+            return Err(VaisError.new("VAIS-198930", "REDO: edge not found in src adj page"))
         }
     }
 
@@ -560,7 +560,7 @@ F redo_graph_edge_delete(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198931", "REDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198931", "REDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -596,7 +596,7 @@ F redo_graph_edge_delete(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198932", "REDO: edge not found in dst adj page"))
+            return Err(VaisError.new("VAIS-198932", "REDO: edge not found in dst adj page"))
         }
     }
 
@@ -604,7 +604,7 @@ F redo_graph_edge_delete(
 }
 
 # Undo a graph edge delete (restore the edge)
-F undo_graph_edge_delete(
+fn undo_graph_edge_delete(
     payload: &GraphEdgeDeletePayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -616,7 +616,7 @@ F undo_graph_edge_delete(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198933", "UNDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198933", "UNDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -663,7 +663,7 @@ F undo_graph_edge_delete(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198934", "UNDO: edge not found in src adj page"))
+            return Err(VaisError.new("VAIS-198934", "UNDO: edge not found in src adj page"))
         }
     }
 
@@ -675,7 +675,7 @@ F undo_graph_edge_delete(
         header_offset := mut PAGE_HEADER_SIZE as u64
         I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198935", "UNDO: invalid adj page layout"))
+            return Err(VaisError.new("VAIS-198935", "UNDO: invalid adj page layout"))
         }
 
         entry_count := mut ((page_data[header_offset + 9] as u16) << 8) | (page_data[header_offset + 8] as u16)
@@ -718,7 +718,7 @@ F undo_graph_edge_delete(
         pool.unpin_page(frame, true)
 
         I !found {
-            R Err(VaisError.new("VAIS-198936", "UNDO: edge not found in dst adj page"))
+            return Err(VaisError.new("VAIS-198936", "UNDO: edge not found in dst adj page"))
         }
     }
 
@@ -726,7 +726,7 @@ F undo_graph_edge_delete(
 }
 
 # Redo a property update (re-apply new properties)
-F redo_graph_property_update(
+fn redo_graph_property_update(
     payload: &GraphPropertyUpdatePayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -744,7 +744,7 @@ F redo_graph_property_update(
     # Bounds check
     I write_offset + payload.new_properties.len() > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198937", "REDO: property update out of bounds"))
+        return Err(VaisError.new("VAIS-198937", "REDO: property update out of bounds"))
     }
 
     # Write new properties
@@ -760,7 +760,7 @@ F redo_graph_property_update(
 }
 
 # Undo a property update (restore old properties)
-F undo_graph_property_update(
+fn undo_graph_property_update(
     payload: &GraphPropertyUpdatePayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -774,7 +774,7 @@ F undo_graph_property_update(
     # Bounds check
     I write_offset + payload.old_properties.len() > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198944", "UNDO: property update out of bounds"))
+        return Err(VaisError.new("VAIS-198944", "UNDO: property update out of bounds"))
     }
 
     # Write old properties
@@ -790,7 +790,7 @@ F undo_graph_property_update(
 }
 
 # Redo an adjacency list page split
-F redo_adj_page_split(
+fn redo_adj_page_split(
     payload: &AdjListPageSplitPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -804,7 +804,7 @@ F redo_adj_page_split(
     header_offset := mut PAGE_HEADER_SIZE as u64
     I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198945", "REDO: invalid adj page layout"))
+        return Err(VaisError.new("VAIS-198945", "REDO: invalid adj page layout"))
     }
 
     # Write new_page as next_adj_page (bytes 11-14)
@@ -819,7 +819,7 @@ F redo_adj_page_split(
         data_offset := mut header_offset + ADJ_PAGE_HEADER_SIZE as u64
         I data_offset + payload.split_data.len() > page_data.len() {
             pool.unpin_page(frame, false)
-            R Err(VaisError.new("VAIS-198946", "REDO: split data out of bounds"))
+            return Err(VaisError.new("VAIS-198946", "REDO: split data out of bounds"))
         }
 
         i := mut 0u64
@@ -835,7 +835,7 @@ F redo_adj_page_split(
 }
 
 # Undo an adjacency list page split
-F undo_adj_page_split(
+fn undo_adj_page_split(
     payload: &AdjListPageSplitPayload,
     pool: &mut BufferPool
 ) -> Result<(), VaisError> {
@@ -847,7 +847,7 @@ F undo_adj_page_split(
     header_offset := mut PAGE_HEADER_SIZE as u64
     I header_offset + (ADJ_PAGE_HEADER_SIZE as u64) > page_data.len() {
         pool.unpin_page(frame, false)
-        R Err(VaisError.new("VAIS-198947", "UNDO: invalid adj page layout"))
+        return Err(VaisError.new("VAIS-198947", "UNDO: invalid adj page layout"))
     }
 
     # Clear next_adj_page (set to NULL_PAGE = 0)

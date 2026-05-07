@@ -5,12 +5,12 @@
 # Orchestrates vector search, full-text search, graph traversal, and score fusion
 # Returns RagSearchResult rows for SQL query execution
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError};
-U rag/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError};
+use rag/types.{
     RagSearchResult, RagFusionConfig, ScoredChunk, ChunkInfo,
     ENGINE_TAG_RAG, DEFAULT_VECTOR_WEIGHT, DEFAULT_FULLTEXT_WEIGHT,
     DEFAULT_GRAPH_WEIGHT, DEFAULT_MEMORY_WEIGHT,
@@ -21,21 +21,21 @@ U rag/types.{
 # Error Codes: EE=08 (RAG), CC=09 (search)
 # ============================================================================
 
-F err_rag_search_failed(reason: &Str) -> VaisError {
+fn err_rag_search_failed(reason: &Str) -> VaisError {
     VaisError.new(
         "VAIS-0809001",
         "RAG_SEARCH failed: {reason}"
     )
 }
 
-F err_rag_search_not_open() -> VaisError {
+fn err_rag_search_not_open() -> VaisError {
     VaisError.new(
         "VAIS-0809002",
         "RAG_SEARCH executor not opened"
     )
 }
 
-F err_rag_search_invalid_params(reason: &Str) -> VaisError {
+fn err_rag_search_invalid_params(reason: &Str) -> VaisError {
     VaisError.new(
         "VAIS-0809003",
         "Invalid RAG_SEARCH parameters: {reason}"
@@ -46,7 +46,7 @@ F err_rag_search_invalid_params(reason: &Str) -> VaisError {
 # RagSearchParams — Parameters parsed from RAG_SEARCH() function call
 # ============================================================================
 
-S RagSearchParams {
+struct RagSearchParams {
     query_text: Str,                # User query string
     top_k: u32,                     # Number of results to return
     fusion_method: u8,              # 0=WeightedSum, 1=RRF
@@ -60,9 +60,9 @@ S RagSearchParams {
     filter_doc_ids: Vec<u64>,       # Optional: restrict to specific documents
 }
 
-X RagSearchParams {
+impl RagSearchParams {
     ## Create with default weights
-    F default(query_text: Str, top_k: u32) -> RagSearchParams {
+    fn default(query_text: Str, top_k: u32) -> RagSearchParams {
         RagSearchParams {
             query_text,
             top_k,
@@ -79,7 +79,7 @@ X RagSearchParams {
     }
 
     ## Create from explicit fusion config
-    F from_config(query_text: Str, config: &RagFusionConfig) -> RagSearchParams {
+    fn from_config(query_text: Str, config: &RagFusionConfig) -> RagSearchParams {
         RagSearchParams {
             query_text,
             top_k: config.top_k,
@@ -96,16 +96,16 @@ X RagSearchParams {
     }
 
     ## Validate parameters
-    F validate(self) -> Result<(), VaisError> {
+    fn validate(self) -> Result<(), VaisError> {
         I self.query_text.is_empty() {
-            R Err(err_rag_search_invalid_params(&"query_text is empty"));
+            return Err(err_rag_search_invalid_params(&"query_text is empty"));
         }
         I self.top_k == 0 {
-            R Err(err_rag_search_invalid_params(&"top_k must be > 0"));
+            return Err(err_rag_search_invalid_params(&"top_k must be > 0"));
         }
         total_weight := mut self.vector_weight + self.fulltext_weight + self.graph_weight;
         I total_weight < 0.01 {
-            R Err(err_rag_search_invalid_params(&"All search weights are zero"));
+            return Err(err_rag_search_invalid_params(&"All search weights are zero"));
         }
         Ok(())
     }
@@ -115,13 +115,13 @@ X RagSearchParams {
 # EngineResultSet — Results from a single engine search
 # ============================================================================
 
-S EngineResultSet {
+struct EngineResultSet {
     engine_tag: u8,                 # Which engine produced these results
     scored_chunks: Vec<ScoredChunk>,
 }
 
-X EngineResultSet {
-    F new(engine_tag: u8) -> EngineResultSet {
+impl EngineResultSet {
+    fn new(engine_tag: u8) -> EngineResultSet {
         EngineResultSet {
             engine_tag,
             scored_chunks: Vec.new(),
@@ -129,17 +129,17 @@ X EngineResultSet {
     }
 
     ## Add a scored chunk result
-    F add(mut self, chunk_id: u64, doc_id: u64, score: f64) {
+    fn add(mut self, chunk_id: u64, doc_id: u64, score: f64) {
         self.scored_chunks.push(ScoredChunk.new(chunk_id, doc_id, score, self.engine_tag));
     }
 
     ## Get result count
-    F len(self) -> u32 {
+    fn len(self) -> u32 {
         self.scored_chunks.len() as u32
     }
 
     ## Check if empty
-    F is_empty(self) -> bool {
+    fn is_empty(self) -> bool {
         self.scored_chunks.len() == 0
     }
 }
@@ -148,7 +148,7 @@ X EngineResultSet {
 # RagSearchExecutor — Volcano-style executor for RAG_SEARCH()
 # ============================================================================
 
-S RagSearchExecutor {
+struct RagSearchExecutor {
     params: RagSearchParams,
     results: Vec<RagSearchResult>,
     cursor: u32,
@@ -156,9 +156,9 @@ S RagSearchExecutor {
     exec_time_us: u64,              # Execution time in microseconds
 }
 
-X RagSearchExecutor {
+impl RagSearchExecutor {
     ## Create a new RAG search executor
-    F new(params: RagSearchParams) -> RagSearchExecutor {
+    fn new(params: RagSearchParams) -> RagSearchExecutor {
         RagSearchExecutor {
             params,
             results: Vec.new(),
@@ -179,7 +179,7 @@ X RagSearchExecutor {
     ## 5. Sort by fused score, take top_k
     ## 6. Expand context windows (optional)
     ## 7. Build RagSearchResult records
-    F open(mut self,
+    fn open(mut self,
            vector_results: &EngineResultSet,
            fulltext_results: &EngineResultSet,
            graph_boost_results: &EngineResultSet,
@@ -191,7 +191,7 @@ X RagSearchExecutor {
         # We just need to fuse them here
 
         # Step 4: Normalize and fuse
-        fused := mut M self.params.fusion_method {
+        fused := mut match self.params.fusion_method {
             0 => fuse_weighted_sum(
                 vector_results, fulltext_results, graph_boost_results,
                 self.params.vector_weight, self.params.fulltext_weight,
@@ -213,7 +213,7 @@ X RagSearchExecutor {
 
         limit := mut I self.params.top_k < fused.len() as u32 {
             self.params.top_k
-        } EL {
+        } else {
             fused.len() as u32
         };
 
@@ -240,12 +240,12 @@ X RagSearchExecutor {
     }
 
     ## Get the next result (Volcano iterator)
-    F next(&mut self) -> Option<&RagSearchResult> {
+    fn next(&mut self) -> Option<&RagSearchResult> {
         I !self.is_open {
-            R None;
+            return None;
         }
         I self.cursor >= self.results.len() as u32 {
-            R None;
+            return None;
         }
         result := mut self.results.get(self.cursor as u64);
         self.cursor = self.cursor + 1;
@@ -253,29 +253,29 @@ X RagSearchExecutor {
     }
 
     ## Close the executor
-    F close(mut self) {
+    fn close(mut self) {
         self.is_open = false;
         self.results = Vec.new();
         self.cursor = 0;
     }
 
     ## Get total result count
-    F result_count(self) -> u32 {
+    fn result_count(self) -> u32 {
         self.results.len() as u32
     }
 
     ## Get all results (for non-iterator access)
-    F get_results(self) -> &Vec<RagSearchResult> {
+    fn get_results(self) -> &Vec<RagSearchResult> {
         &self.results
     }
 
     ## Get execution time
-    F exec_time(self) -> u64 {
+    fn exec_time(self) -> u64 {
         self.exec_time_us
     }
 
     ## Set execution time (called by pipeline after measurement)
-    F set_exec_time(mut self, us: u64) {
+    fn set_exec_time(mut self, us: u64) {
         self.exec_time_us = us;
     }
 }
@@ -288,7 +288,7 @@ X RagSearchExecutor {
 ## 1. Normalize each set to [0, 1] via min-max
 ## 2. For each unique chunk_id: fused = w_v*v + w_f*f + w_g*g
 ## 3. Return combined results (unsorted)
-F fuse_weighted_sum(
+fn fuse_weighted_sum(
     vector_results: &EngineResultSet,
     fulltext_results: &EngineResultSet,
     graph_results: &EngineResultSet,
@@ -332,7 +332,7 @@ F fuse_weighted_sum(
 
 ## Reciprocal Rank Fusion across 3 engine result sets
 ## Score = Σ 1/(k + rank_i) across all lists where chunk appears
-F fuse_rrf(
+fn fuse_rrf(
     vector_results: &EngineResultSet,
     fulltext_results: &EngineResultSet,
     graph_results: &EngineResultSet,
@@ -361,15 +361,15 @@ F fuse_rrf(
 
         rrf_score := mut 0.0;
 
-        M rank_map_v.get(&chunk_id) {
+        match rank_map_v.get(&chunk_id) {
             Some(rank_v) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_v as f64); },
             None => {},
         }
-        M rank_map_f.get(&chunk_id) {
+        match rank_map_f.get(&chunk_id) {
             Some(rank_f) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_f as f64); },
             None => {},
         }
-        M rank_map_g.get(&chunk_id) {
+        match rank_map_g.get(&chunk_id) {
             Some(rank_g) => { rrf_score = rrf_score + 1.0 / (k_f64 + rank_g as f64); },
             None => {},
         }
@@ -385,9 +385,9 @@ F fuse_rrf(
 # ============================================================================
 
 ## Normalize scores to [0, 1] via min-max normalization
-F normalize_engine_scores(chunks: &Vec<ScoredChunk>) -> Vec<ScoredChunk> {
+fn normalize_engine_scores(chunks: &Vec<ScoredChunk>) -> Vec<ScoredChunk> {
     I chunks.len() == 0 {
-        R Vec.new();
+        return Vec.new();
     }
 
     # Find min and max
@@ -412,7 +412,7 @@ F normalize_engine_scores(chunks: &Vec<ScoredChunk>) -> Vec<ScoredChunk> {
             result.push(ScoredChunk.new(c.chunk_id, c.doc_id, 1.0, c.source_engine));
             j = j + 1;
         }
-    } EL {
+    } else {
         j := mut 0u32;
         LW j < chunks.len() as u32 {
             c := mut chunks.get(j as u64);
@@ -425,7 +425,7 @@ F normalize_engine_scores(chunks: &Vec<ScoredChunk>) -> Vec<ScoredChunk> {
 }
 
 ## Collect unique (chunk_id → doc_id) pairs into HashMap
-F collect_unique_chunks_map(chunks: &Vec<ScoredChunk>, acc: &mut HashMap<u64, u64>) {
+fn collect_unique_chunks_map(chunks: &Vec<ScoredChunk>, acc: &mut HashMap<u64, u64>) {
     i := mut 0u32;
     LW i < chunks.len() as u32 {
         c := mut chunks.get(i as u64);
@@ -437,7 +437,7 @@ F collect_unique_chunks_map(chunks: &Vec<ScoredChunk>, acc: &mut HashMap<u64, u6
 }
 
 ## Build a HashMap of chunk_id → normalized score for O(1) lookup
-F build_score_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, f64> {
+fn build_score_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, f64> {
     map: HashMap<u64, f64> := mut HashMap.new();
     i := mut 0u32;
     LW i < chunks.len() as u32 {
@@ -449,8 +449,8 @@ F build_score_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, f64> {
 }
 
 ## Get score from HashMap (0.0 if not present)
-F get_score_from_map(map: &HashMap<u64, f64>, chunk_id: u64) -> f64 {
-    M map.get(&chunk_id) {
+fn get_score_from_map(map: &HashMap<u64, f64>, chunk_id: u64) -> f64 {
+    match map.get(&chunk_id) {
         Some(score) => score,
         None => 0.0,
     }
@@ -458,7 +458,7 @@ F get_score_from_map(map: &HashMap<u64, f64>, chunk_id: u64) -> f64 {
 
 ## Build a HashMap of chunk_id → 1-based rank for O(1) lookup
 ## Assumes input is pre-sorted by score descending
-F build_rank_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, u32> {
+fn build_rank_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, u32> {
     map: HashMap<u64, u32> := mut HashMap.new();
     i := mut 0u32;
     LW i < chunks.len() as u32 {
@@ -472,10 +472,10 @@ F build_rank_map(chunks: &Vec<ScoredChunk>) -> HashMap<u64, u32> {
 }
 
 ## Sort scored chunks by score descending — O(N log N) merge sort
-F sort_scored_chunks_desc(chunks: &mut Vec<ScoredChunk>) {
+fn sort_scored_chunks_desc(chunks: &mut Vec<ScoredChunk>) {
     n := mut chunks.len() as u32;
     I n <= 1 {
-        R;
+        return;
     }
     # Bottom-up merge sort using auxiliary vector of indices
     indices := mut Vec.new();
@@ -505,7 +505,7 @@ F sort_scored_chunks_desc(chunks: &mut Vec<ScoredChunk>) {
                     chunks.get(indices.get(ri as u64) as u64).score) {
                     aux.set(k as u64, indices.get(li as u64));
                     li = li + 1;
-                } EL {
+                } else {
                     aux.set(k as u64, indices.get(ri as u64));
                     ri = ri + 1;
                 }
@@ -544,14 +544,14 @@ F sort_scored_chunks_desc(chunks: &mut Vec<ScoredChunk>) {
 }
 
 ## Look up chunk text from a (chunk_id, text) lookup table
-F lookup_chunk_text(chunk_id: u64, lookup: &Vec<(u64, Str)>) -> Str {
+fn lookup_chunk_text(chunk_id: u64, lookup: &Vec<(u64, Str)>) -> Str {
     # Build HashMap for O(1) lookup when called in a loop
     # Callers with many lookups should use build_chunk_text_map instead
     i := mut 0u32;
     LW i < lookup.len() as u32 {
         entry := mut lookup.get(i as u64);
         I entry.0 == chunk_id {
-            R entry.1.clone();
+            return entry.1.clone();
         }
         i = i + 1;
     }
@@ -559,7 +559,7 @@ F lookup_chunk_text(chunk_id: u64, lookup: &Vec<(u64, Str)>) -> Str {
 }
 
 ## Build a HashMap for chunk text lookups (O(1) per lookup)
-F build_chunk_text_map(lookup: &Vec<(u64, Str)>) -> HashMap<u64, Str> {
+fn build_chunk_text_map(lookup: &Vec<(u64, Str)>) -> HashMap<u64, Str> {
     map: HashMap<u64, Str> := mut HashMap.new();
     i := mut 0u32;
     LW i < lookup.len() as u32 {

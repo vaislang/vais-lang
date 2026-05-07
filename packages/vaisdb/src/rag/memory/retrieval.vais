@@ -9,17 +9,17 @@
 # - Balanced: Equal weighting between documents and memories
 # - MemoryOnly: Only agent memories (no document search)
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError};
-U rag/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError};
+use rag/types.{
     RagSearchResult, RagFusionConfig, ScoredChunk, ENGINE_TAG_RAG,
     DEFAULT_MEMORY_WEIGHT,
     err_rag_engine_closed
 };
-U rag/memory/search.{MemorySearchResult};
+use rag/memory/search.{MemorySearchResult};
 
 # ============================================================================
 # Retrieval Strategy Constants
@@ -34,7 +34,7 @@ C STRATEGY_MEMORY_ONLY: u8 = 3;
 # HybridRetrievalConfig — Configuration for hybrid retrieval
 # ============================================================================
 
-S HybridRetrievalConfig {
+struct HybridRetrievalConfig {
     strategy: u8,                   # STRATEGY_* constant
     total_budget: u32,              # Total items to return
     doc_budget_ratio: f64,          # Fraction allocated to documents [0, 1]
@@ -44,8 +44,8 @@ S HybridRetrievalConfig {
     min_score_threshold: f64,       # Minimum score to include in results
 }
 
-X HybridRetrievalConfig {
-    F default() -> HybridRetrievalConfig {
+impl HybridRetrievalConfig {
+    fn default() -> HybridRetrievalConfig {
         HybridRetrievalConfig {
             strategy: STRATEGY_BALANCED,
             total_budget: 10,
@@ -57,7 +57,7 @@ X HybridRetrievalConfig {
         }
     }
 
-    F document_first(total: u32) -> HybridRetrievalConfig {
+    fn document_first(total: u32) -> HybridRetrievalConfig {
         HybridRetrievalConfig {
             strategy: STRATEGY_DOCUMENT_FIRST,
             total_budget: total,
@@ -69,7 +69,7 @@ X HybridRetrievalConfig {
         }
     }
 
-    F memory_first(total: u32) -> HybridRetrievalConfig {
+    fn memory_first(total: u32) -> HybridRetrievalConfig {
         HybridRetrievalConfig {
             strategy: STRATEGY_MEMORY_FIRST,
             total_budget: total,
@@ -81,7 +81,7 @@ X HybridRetrievalConfig {
         }
     }
 
-    F memory_only(total: u32) -> HybridRetrievalConfig {
+    fn memory_only(total: u32) -> HybridRetrievalConfig {
         HybridRetrievalConfig {
             strategy: STRATEGY_MEMORY_ONLY,
             total_budget: total,
@@ -94,12 +94,12 @@ X HybridRetrievalConfig {
     }
 
     ## Calculate how many document results to fetch
-    F doc_budget(self) -> u32 {
+    fn doc_budget(self) -> u32 {
         (self.total_budget as f64 * self.doc_budget_ratio) as u32
     }
 
     ## Calculate how many memory results to fetch
-    F memory_budget(self) -> u32 {
+    fn memory_budget(self) -> u32 {
         (self.total_budget as f64 * self.memory_budget_ratio) as u32
     }
 }
@@ -108,7 +108,7 @@ X HybridRetrievalConfig {
 # HybridResult — A unified result from either documents or memories
 # ============================================================================
 
-S HybridResult {
+struct HybridResult {
     source_type: u8,                # 0=document_chunk, 1=memory_entry
     source_id: u64,                 # chunk_id or memory_id
     doc_id: u64,                    # Parent document (0 for memories)
@@ -119,9 +119,9 @@ S HybridResult {
     metadata: HashMap<Str, Str>,
 }
 
-X HybridResult {
+impl HybridResult {
     ## Create from a document RAG search result
-    F from_rag_result(result: &RagSearchResult, rank: u32) -> HybridResult {
+    fn from_rag_result(result: &RagSearchResult, rank: u32) -> HybridResult {
         HybridResult {
             source_type: 0,
             source_id: result.chunk_id,
@@ -135,7 +135,7 @@ X HybridResult {
     }
 
     ## Create from a memory search result
-    F from_memory_result(result: &MemorySearchResult, rank: u32) -> HybridResult {
+    fn from_memory_result(result: &MemorySearchResult, rank: u32) -> HybridResult {
         HybridResult {
             source_type: 1,
             source_id: result.memory_id,
@@ -149,20 +149,20 @@ X HybridResult {
     }
 
     ## Check if this is a document chunk
-    F is_document(self) -> bool {
+    fn is_document(self) -> bool {
         self.source_type == 0
     }
 
     ## Check if this is a memory entry
-    F is_memory(self) -> bool {
+    fn is_memory(self) -> bool {
         self.source_type == 1
     }
 
     ## Format source description
-    F source_description(self) -> Str {
+    fn source_description(self) -> Str {
         I self.source_type == 0 {
             "doc:{self.doc_id}/chunk:{self.source_id}"
-        } EL {
+        } else {
             "memory:{self.source_id}/session:{self.session_id}"
         }
     }
@@ -172,16 +172,16 @@ X HybridResult {
 # HybridRetriever — Combines document and memory retrieval
 # ============================================================================
 
-S HybridRetriever {
+struct HybridRetriever {
     config: HybridRetrievalConfig,
 }
 
-X HybridRetriever {
-    F new(config: HybridRetrievalConfig) -> HybridRetriever {
+impl HybridRetriever {
+    fn new(config: HybridRetrievalConfig) -> HybridRetriever {
         HybridRetriever { config }
     }
 
-    F default() -> HybridRetriever {
+    fn default() -> HybridRetriever {
         HybridRetriever.new(HybridRetrievalConfig.default())
     }
 
@@ -192,12 +192,12 @@ X HybridRetriever {
     ## - MemoryFirst: memory results get priority, documents fill remainder
     ## - Balanced: Interleave by score (RRF-like)
     ## - MemoryOnly: Only memory results
-    F merge(
+    fn merge(
         &self,
         rag_results: &Vec<RagSearchResult>,
         memory_results: &Vec<MemorySearchResult>,
     ) -> Vec<HybridResult> {
-        M self.config.strategy {
+        match self.config.strategy {
             0 => self.merge_document_first(rag_results, memory_results),
             1 => self.merge_memory_first(rag_results, memory_results),
             2 => self.merge_balanced(rag_results, memory_results),
@@ -207,7 +207,7 @@ X HybridRetriever {
     }
 
     ## Document-first: take doc_budget docs, then fill with memories
-    F merge_document_first(
+    fn merge_document_first(
         &self,
         rag_results: &Vec<RagSearchResult>,
         memory_results: &Vec<MemorySearchResult>,
@@ -238,7 +238,7 @@ X HybridRetriever {
     }
 
     ## Memory-first: take memory_budget memories, then fill with docs
-    F merge_memory_first(
+    fn merge_memory_first(
         &self,
         rag_results: &Vec<RagSearchResult>,
         memory_results: &Vec<MemorySearchResult>,
@@ -268,7 +268,7 @@ X HybridRetriever {
     }
 
     ## Balanced: interleave by score using RRF-style ranking
-    F merge_balanced(
+    fn merge_balanced(
         &self,
         rag_results: &Vec<RagSearchResult>,
         memory_results: &Vec<MemorySearchResult>,
@@ -325,21 +325,21 @@ X HybridRetriever {
                 }
                 fi = fi + 1;
             }
-            R filtered;
+            return filtered;
         }
 
         all
     }
 
     ## Memory-only: return only memory results
-    F merge_memory_only(
+    fn merge_memory_only(
         &self,
         memory_results: &Vec<MemorySearchResult>,
     ) -> Vec<HybridResult> {
         results := mut Vec.new();
         limit := mut I self.config.total_budget < memory_results.len() as u32 {
             self.config.total_budget
-        } EL {
+        } else {
             memory_results.len() as u32
         };
 
@@ -353,12 +353,12 @@ X HybridRetriever {
     }
 
     ## Format merged results as a context string for LLM
-    F format_context(self, results: &Vec<HybridResult>) -> Str {
+    fn format_context(self, results: &Vec<HybridResult>) -> Str {
         ctx := mut Str.new();
         i := mut 0u32;
         LW i < results.len() as u32 {
             r := mut results.get(i as u64);
-            source_tag := mut I r.is_document() { "[DOC]" } EL { "[MEM]" };
+            source_tag := mut I r.is_document() { "[DOC]" } else { "[MEM]" };
             ctx = "{ctx}{source_tag} ({r.source_description()}, score={r.score:.3}):\n{r.content}\n\n";
             i = i + 1;
         }
@@ -371,9 +371,9 @@ X HybridRetriever {
 # ============================================================================
 
 ## Normalize RAG search result scores to [0, 1]
-F normalize_rag_scores(results: &Vec<RagSearchResult>) -> Vec<(u64, f64)> {
+fn normalize_rag_scores(results: &Vec<RagSearchResult>) -> Vec<(u64, f64)> {
     I results.len() == 0 {
-        R Vec.new();
+        return Vec.new();
     }
 
     min_s := mut results.get(0).score;
@@ -392,7 +392,7 @@ F normalize_rag_scores(results: &Vec<RagSearchResult>) -> Vec<(u64, f64)> {
     j := mut 0u32;
     LW j < results.len() as u32 {
         r := mut results.get(j as u64);
-        norm := mut I range < 0.000001 { 1.0 } EL { (r.score - min_s) / range };
+        norm := mut I range < 0.000001 { 1.0 } else { (r.score - min_s) / range };
         normalized.push((r.chunk_id, norm));
         j = j + 1;
     }
@@ -400,9 +400,9 @@ F normalize_rag_scores(results: &Vec<RagSearchResult>) -> Vec<(u64, f64)> {
 }
 
 ## Normalize memory search result scores to [0, 1]
-F normalize_memory_scores(results: &Vec<MemorySearchResult>) -> Vec<(u64, f64)> {
+fn normalize_memory_scores(results: &Vec<MemorySearchResult>) -> Vec<(u64, f64)> {
     I results.len() == 0 {
-        R Vec.new();
+        return Vec.new();
     }
 
     min_s := mut results.get(0).score;
@@ -421,7 +421,7 @@ F normalize_memory_scores(results: &Vec<MemorySearchResult>) -> Vec<(u64, f64)> 
     j := mut 0u32;
     LW j < results.len() as u32 {
         r := mut results.get(j as u64);
-        norm := mut I range < 0.000001 { 1.0 } EL { (r.score - min_s) / range };
+        norm := mut I range < 0.000001 { 1.0 } else { (r.score - min_s) / range };
         normalized.push((r.memory_id, norm));
         j = j + 1;
     }
@@ -429,10 +429,10 @@ F normalize_memory_scores(results: &Vec<MemorySearchResult>) -> Vec<(u64, f64)> 
 }
 
 ## Sort hybrid results by score descending — O(N log N) merge sort
-F sort_hybrid_results_desc(results: &mut Vec<HybridResult>) {
+fn sort_hybrid_results_desc(results: &mut Vec<HybridResult>) {
     n := mut results.len() as u32;
     I n <= 1 {
-        R;
+        return;
     }
     indices := mut Vec.new();
     aux := mut Vec.new();
@@ -460,7 +460,7 @@ F sort_hybrid_results_desc(results: &mut Vec<HybridResult>) {
                     results.get(indices.get(ri as u64) as u64).score) {
                     aux.set(k as u64, indices.get(li as u64));
                     li = li + 1;
-                } EL {
+                } else {
                     aux.set(k as u64, indices.get(ri as u64));
                     ri = ri + 1;
                 }
@@ -493,7 +493,7 @@ F sort_hybrid_results_desc(results: &mut Vec<HybridResult>) {
                 I next == ci {
                     visited.set(j as u64, true);
                     done = true;
-                } EL {
+                } else {
                     results.swap(j as u64, next as u64);
                     visited.set(j as u64, true);
                     j = next;
@@ -505,7 +505,7 @@ F sort_hybrid_results_desc(results: &mut Vec<HybridResult>) {
 }
 
 ## Trim results to budget (in-place truncation)
-F trim_to_budget(results: &mut Vec<HybridResult>, budget: u32) {
+fn trim_to_budget(results: &mut Vec<HybridResult>, budget: u32) {
     LW results.len() as u32 > budget {
         results.pop();
     }

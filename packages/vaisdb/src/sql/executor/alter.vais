@@ -13,25 +13,25 @@
 #
 # Error codes: EE=01 (SQL), CC=09 (Alter), NNN=001-006
 
-U storage/bytes
-U storage/error
-U storage/constants
-U storage/buffer/pool
-U storage/wal/group_commit
-U storage/wal/record_types
-U storage/bytes
-U sql/types
-U sql/parser/ast
-U sql/catalog/manager
-U sql/catalog/schema
-U sql/executor/mod
+use storage/bytes
+use storage/error
+use storage/constants
+use storage/buffer/pool
+use storage/wal/group_commit
+use storage/wal/record_types
+use storage/bytes
+use sql/types
+use sql/parser/ast
+use sql/catalog/manager
+use sql/catalog/schema
+use sql/executor/mod
 
 # ============================================================================
 # Error Constructors (EE=01, CC=09, NNN=001-006)
 # ============================================================================
 
 # VAIS-0109001: Table not found for ALTER
-F err_table_not_found_alter(table: str) -> VaisError {
+fn err_table_not_found_alter(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0109001",
         "ALTER TABLE failed: table '{table}' does not exist"
@@ -39,7 +39,7 @@ F err_table_not_found_alter(table: str) -> VaisError {
 }
 
 # VAIS-0109002: Column not found for ALTER
-F err_column_not_found_alter(column: str, table: str) -> VaisError {
+fn err_column_not_found_alter(column: str, table: str) -> VaisError {
     VaisError.new(
         "VAIS-0109002",
         "ALTER TABLE failed: column '{column}' not found in table '{table}'"
@@ -47,7 +47,7 @@ F err_column_not_found_alter(column: str, table: str) -> VaisError {
 }
 
 # VAIS-0109003: Column already exists
-F err_column_already_exists(column: str, table: str) -> VaisError {
+fn err_column_already_exists(column: str, table: str) -> VaisError {
     VaisError.new(
         "VAIS-0109003",
         "ALTER TABLE failed: column '{column}' already exists in table '{table}'"
@@ -55,7 +55,7 @@ F err_column_already_exists(column: str, table: str) -> VaisError {
 }
 
 # VAIS-0109004: Cannot drop primary key column
-F err_cannot_drop_pk(column: str, table: str) -> VaisError {
+fn err_cannot_drop_pk(column: str, table: str) -> VaisError {
     VaisError.new(
         "VAIS-0109004",
         "ALTER TABLE failed: cannot drop primary key column '{column}' in table '{table}'"
@@ -63,7 +63,7 @@ F err_cannot_drop_pk(column: str, table: str) -> VaisError {
 }
 
 # VAIS-0109005: Incompatible type change
-F err_incompatible_type_change(column: str, old_type: str, new_type: str) -> VaisError {
+fn err_incompatible_type_change(column: str, old_type: str, new_type: str) -> VaisError {
     VaisError.new(
         "VAIS-0109005",
         "ALTER TABLE failed: incompatible type change L column '{column}' from {old_type} to {new_type}"
@@ -71,7 +71,7 @@ F err_incompatible_type_change(column: str, old_type: str, new_type: str) -> Vai
 }
 
 # VAIS-0109006: ALTER operation failed
-F err_alter_failed(detail: str) -> VaisError {
+fn err_alter_failed(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0109006",
         "ALTER TABLE failed: {detail}"
@@ -82,13 +82,13 @@ F err_alter_failed(detail: str) -> VaisError {
 # AlterResult — Returned by execute_alter_table
 # ============================================================================
 
-S AlterResult {
+struct AlterResult {
     table_name: str,
     message: str,
 }
 
-X AlterResult {
-    F new(table_name: str, message: str) -> AlterResult {
+impl AlterResult {
+    fn new(table_name: str, message: str) -> AlterResult {
         AlterResult { table_name, message }
     }
 }
@@ -100,14 +100,14 @@ X AlterResult {
 # Execute an ALTER TABLE statement
 # Dispatches to specific handlers for each operation type
 # All changes are WAL-logged via SCHEMA_CHANGE records
-partial F execute_alter_table(
+partial fn execute_alter_table(
     alter: &AlterTableStmt,
     ctx: &ExecContext,
 ) -> Result<AlterResult, VaisError> {
     # Look up table metadata
-    table_info := mut M ctx.catalog.get_table(&alter.table_name) {
+    table_info := mut match ctx.catalog.get_table(&alter.table_name) {
         Some(info) => info.clone(),
-        None => { R Err(err_table_not_found_alter(alter.table_name.clone())); },
+        None => { return Err(err_table_not_found_alter(alter.table_name.clone())); },
     }
 
     columns := mut ctx.catalog.get_columns(table_info.table_id)
@@ -117,7 +117,7 @@ partial F execute_alter_table(
     }
 
     # Dispatch to appropriate handler based on action type
-    M &alter.action {
+    match &alter.action {
         AddColumn { column } => {
             alter_add_column(&table_info, &col_vec, column, ctx)?;
             Ok(AlterResult.new(
@@ -158,7 +158,7 @@ partial F execute_alter_table(
 #   - If default is NULL: metadata-only change, no data rewrite
 #   - If default is NOT NULL: add column with added_at_version, increment table schema_version
 #     Old rows missing this column will get the default value on read (lazy migration)
-partial F alter_add_column(
+partial fn alter_add_column(
     table_info: &TableInfo,
     columns: &[ColumnInfo],
     column_def: &ColumnDef,
@@ -167,7 +167,7 @@ partial F alter_add_column(
     # Validate: column must not already exist
     LF col: columns {
         I col.name == column_def.name {
-            R Err(err_column_already_exists(column_def.name.clone(), table_info.name.clone()))
+            return Err(err_column_already_exists(column_def.name.clone(), table_info.name.clone()))
         }
     }
 
@@ -182,7 +182,7 @@ partial F alter_add_column(
     # Convert default_value Expr to SqlValue for storage
     # For now, we store default as a string representation in ColumnInfo.default_value
     # A full implementation would evaluate the Expr and store the SqlValue
-    default_str := mut M &column_def.default_value {
+    default_str := mut match &column_def.default_value {
         Some(_) => Some("DEFAULT_EXPR".to_string()),  # FUTURE(sql/executor): Evaluate default expression
         None => None,
     }
@@ -234,7 +234,7 @@ partial F alter_add_column(
 #   - Do NOT rewrite data pages
 #   - Physical cleanup happens in background GC
 # For now, we simulate by writing a SCHEMA_CHANGE record
-partial F alter_drop_column(
+partial fn alter_drop_column(
     table_info: &TableInfo,
     columns: &[ColumnInfo],
     column_name: &str,
@@ -251,14 +251,14 @@ partial F alter_drop_column(
     }
 
     I !found {
-        R Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()))
+        return Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()))
     }
 
     col := mut col_info!
 
     # Validate: cannot drop primary key column
     I col.is_primary_key {
-        R Err(err_cannot_drop_pk(column_name.clone(), table_info.name.clone()))
+        return Err(err_cannot_drop_pk(column_name.clone(), table_info.name.clone()))
     }
 
     # Write SCHEMA_CHANGE WAL record to log the drop
@@ -279,7 +279,7 @@ partial F alter_drop_column(
 # Strategy:
 #   - Metadata-only change: update ColumnInfo.name in catalog
 #   - No data rewrite required
-partial F alter_rename_column(
+partial fn alter_rename_column(
     table_info: &TableInfo,
     columns: &[ColumnInfo],
     old_name: &str,
@@ -294,12 +294,12 @@ partial F alter_rename_column(
         }
         # Also check that new_name doesn't already exist
         I &col.name == new_name {
-            R Err(err_column_already_exists(new_name.clone(), table_info.name.clone()))
+            return Err(err_column_already_exists(new_name.clone(), table_info.name.clone()))
         }
     }
 
     I !found_old {
-        R Err(err_column_not_found_alter(old_name.clone(), table_info.name.clone()))
+        return Err(err_column_not_found_alter(old_name.clone(), table_info.name.clone()))
     }
 
     # Write SCHEMA_CHANGE WAL record
@@ -321,7 +321,7 @@ partial F alter_rename_column(
 #   - Validate type compatibility using is_compatible()
 #   - Update ColumnInfo.data_type in catalog
 #   - Full data rewrite is deferred (not implemented here; would require background job)
-partial F alter_column_type(
+partial fn alter_column_type(
     table_info: &TableInfo,
     columns: &[ColumnInfo],
     column_name: &str,
@@ -339,14 +339,14 @@ partial F alter_column_type(
     }
 
     I !found {
-        R Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()))
+        return Err(err_column_not_found_alter(column_name.clone(), table_info.name.clone()))
     }
 
     old := mut old_type!
 
     # Validate: types must be compatible
     I !old.is_compatible(new_type) {
-        R Err(err_incompatible_type_change(
+        return Err(err_incompatible_type_change(
             column_name.clone(),
             old.name(),
             new_type.name(),
@@ -369,7 +369,7 @@ partial F alter_column_type(
 
 # Build ADD COLUMN WAL payload
 # Format: table_id(4B) + column_name(len-prefixed) + data_type(serialized) + nullable(1B)
-partial F build_add_column_wal(
+partial fn build_add_column_wal(
     table_id: u32,
     column_name: &str,
     data_type: &SqlType,
@@ -379,13 +379,13 @@ partial F build_add_column_wal(
     buf.write_i32_le(table_id)
     write_string(&buf, column_name)
     data_type.serialize(&buf)
-    buf.write_u8(I nullable { 1 } EL { 0 })
+    buf.write_u8(I nullable { 1 } else { 0 })
     buf.to_vec()
 }
 
 # Build DROP COLUMN WAL payload
 # Format: table_id(4B) + column_name(len-prefixed)
-partial F build_drop_column_wal(
+partial fn build_drop_column_wal(
     table_id: u32,
     column_name: &str,
 ) -> Vec<u8> {
@@ -397,7 +397,7 @@ partial F build_drop_column_wal(
 
 # Build RENAME COLUMN WAL payload
 # Format: table_id(4B) + old_name(len-prefixed) + new_name(len-prefixed)
-partial F build_rename_column_wal(
+partial fn build_rename_column_wal(
     table_id: u32,
     old_name: &str,
     new_name: &str,
@@ -411,7 +411,7 @@ partial F build_rename_column_wal(
 
 # Build ALTER TYPE WAL payload
 # Format: table_id(4B) + column_name(len-prefixed) + new_type(serialized)
-partial F build_alter_type_wal(
+partial fn build_alter_type_wal(
     table_id: u32,
     column_name: &str,
     new_type: &SqlType,

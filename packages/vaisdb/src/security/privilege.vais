@@ -4,12 +4,12 @@
 # Handles role inheritance via resolved effective roles in SessionContext
 # Error codes: EE=09 (security), CC=09 (privilege)
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError};
-U security/types.{
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError};
+use security/types.{
     SessionContext, PrivilegeCheck, GrantEntry,
     SUPERUSER_ROLE_ID, PUBLIC_ROLE_ID, SYSTEM_USER_ID,
     PRIV_SELECT, PRIV_INSERT, PRIV_UPDATE, PRIV_DELETE,
@@ -19,20 +19,20 @@ U security/types.{
     err_privilege_denied, err_privilege_insufficient,
     err_privilege_superuser_required,
 };
-U security/grant.{GrantManager};
-U security/role.{RoleManager};
+use security/grant.{GrantManager};
+use security/role.{RoleManager};
 
 # ============================================================================
 # PrivilegeChecker — Middleware for pre-query privilege verification
 # ============================================================================
 
-S PrivilegeChecker {
+struct PrivilegeChecker {
     grant_mgr: &GrantManager,
     role_mgr: &RoleManager,
 }
 
-X PrivilegeChecker {
-    F new(grant_mgr: &GrantManager, role_mgr: &RoleManager) -> PrivilegeChecker {
+impl PrivilegeChecker {
+    fn new(grant_mgr: &GrantManager, role_mgr: &RoleManager) -> PrivilegeChecker {
         PrivilegeChecker { grant_mgr, role_mgr }
     }
 
@@ -42,7 +42,7 @@ X PrivilegeChecker {
 
     # Check if the session has a specific privilege on a table
     # This is the main entry point for privilege checking before query execution
-    F check_table_privilege(
+    fn check_table_privilege(
         self,
         session: &SessionContext,
         table_name: &Str,
@@ -50,7 +50,7 @@ X PrivilegeChecker {
     ) -> Result<PrivilegeCheck, VaisError> {
         # Superuser bypasses all checks
         I session.is_superuser {
-            R Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "superuser"));
+            return Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "superuser"));
         }
 
         # Resolve all effective roles (direct + inherited)
@@ -67,11 +67,11 @@ X PrivilegeChecker {
                 I g.object_type == OBJ_TYPE_TABLE
                     && g.object_name == *table_name
                     && g.has_privilege(priv_type) {
-                    role_name := mut M self.role_mgr.get_role_name(role_id) {
+                    role_name := mut match self.role_mgr.get_role_name(role_id) {
                         Some(n) => n.clone(),
                         None => "unknown",
                     };
-                    R Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), role_name));
+                    return Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), role_name));
                 }
                 j = j + 1;
             }
@@ -86,7 +86,7 @@ X PrivilegeChecker {
             I g.object_type == OBJ_TYPE_TABLE
                 && g.object_name == *table_name
                 && g.has_privilege(priv_type) {
-                R Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "public"));
+                return Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "public"));
             }
             k = k + 1;
         }
@@ -101,7 +101,7 @@ X PrivilegeChecker {
 
     # Check privilege on a specific column
     # Falls back to table-level privilege if no column-specific grant exists
-    F check_column_privilege(
+    fn check_column_privilege(
         self,
         session: &SessionContext,
         table_name: &Str,
@@ -110,13 +110,13 @@ X PrivilegeChecker {
     ) -> Result<PrivilegeCheck, VaisError> {
         # Superuser bypasses
         I session.is_superuser {
-            R Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "superuser"));
+            return Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), "superuser"));
         }
 
         # First check table-level privilege (covers all columns)
         table_check := mut self.check_table_privilege(session, table_name, priv_type)?;
         I table_check.allowed {
-            R Ok(table_check);
+            return Ok(table_check);
         }
 
         # Then check column-specific grants
@@ -132,11 +132,11 @@ X PrivilegeChecker {
                     && g.object_name == *table_name
                     && g.applies_to_column(column_name)
                     && g.has_privilege(priv_type) {
-                    role_name := mut M self.role_mgr.get_role_name(role_id) {
+                    role_name := mut match self.role_mgr.get_role_name(role_id) {
                         Some(n) => n.clone(),
                         None => "unknown",
                     };
-                    R Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), role_name));
+                    return Ok(PrivilegeCheck.allowed(priv_type, table_name.clone(), role_name));
                 }
                 j = j + 1;
             }
@@ -151,14 +151,14 @@ X PrivilegeChecker {
     # ========================================================================
 
     # Check if the session is a superuser
-    F has_superuser(self, session: &SessionContext) -> bool {
+    fn has_superuser(self, session: &SessionContext) -> bool {
         session.is_superuser
     }
 
     # Require superuser privilege (returns error if not superuser)
-    F require_superuser(self, session: &SessionContext) -> Result<(), VaisError> {
+    fn require_superuser(self, session: &SessionContext) -> Result<(), VaisError> {
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
         Ok(())
     }
@@ -168,7 +168,7 @@ X PrivilegeChecker {
     # ========================================================================
 
     # Check SELECT privilege on multiple tables (for JOINs)
-    F check_select_on_tables(
+    fn check_select_on_tables(
         self,
         session: &SessionContext,
         table_names: &Vec<Str>,
@@ -177,7 +177,7 @@ X PrivilegeChecker {
         LW i < table_names.len() {
             check := mut self.check_table_privilege(session, &table_names[i], PRIV_SELECT)?;
             I !check.allowed {
-                R Err(err_privilege_denied(
+                return Err(err_privilege_denied(
                     &session.username,
                     &"SELECT",
                     &table_names[i],
@@ -193,53 +193,53 @@ X PrivilegeChecker {
     # ========================================================================
 
     # Check privilege for INSERT operation
-    F check_insert(
+    fn check_insert(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_INSERT)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"INSERT", table_name));
+            return Err(err_privilege_denied(&session.username, &"INSERT", table_name));
         }
         Ok(())
     }
 
     # Check privilege for UPDATE operation
-    F check_update(
+    fn check_update(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_UPDATE)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"UPDATE", table_name));
+            return Err(err_privilege_denied(&session.username, &"UPDATE", table_name));
         }
         Ok(())
     }
 
     # Check privilege for DELETE operation
-    F check_delete(
+    fn check_delete(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_DELETE)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"DELETE", table_name));
+            return Err(err_privilege_denied(&session.username, &"DELETE", table_name));
         }
         Ok(())
     }
 
     # Check privilege for SELECT operation
-    F check_select(
+    fn check_select(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_SELECT)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"SELECT", table_name));
+            return Err(err_privilege_denied(&session.username, &"SELECT", table_name));
         }
         Ok(())
     }
@@ -249,13 +249,13 @@ X PrivilegeChecker {
     # ========================================================================
 
     # Check privilege for CREATE TABLE
-    F check_create(
+    fn check_create(
         self,
         session: &SessionContext,
         database_name: &Str,
     ) -> Result<(), VaisError> {
         I session.is_superuser {
-            R Ok(());
+            return Ok(());
         }
 
         # Check CREATE privilege on the database
@@ -270,7 +270,7 @@ X PrivilegeChecker {
                 I g.object_type == OBJ_TYPE_DATABASE
                     && g.object_name == *database_name
                     && g.has_privilege(PRIV_CREATE) {
-                    R Ok(());
+                    return Ok(());
                 }
                 j = j + 1;
             }
@@ -281,27 +281,27 @@ X PrivilegeChecker {
     }
 
     # Check privilege for DROP TABLE
-    F check_drop(
+    fn check_drop(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_DROP)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"DROP", table_name));
+            return Err(err_privilege_denied(&session.username, &"DROP", table_name));
         }
         Ok(())
     }
 
     # Check privilege for ALTER TABLE
-    F check_alter(
+    fn check_alter(
         self,
         session: &SessionContext,
         table_name: &Str,
     ) -> Result<(), VaisError> {
         check := mut self.check_table_privilege(session, table_name, PRIV_ALTER)?;
         I !check.allowed {
-            R Err(err_privilege_denied(&session.username, &"ALTER", table_name));
+            return Err(err_privilege_denied(&session.username, &"ALTER", table_name));
         }
         Ok(())
     }
@@ -312,24 +312,24 @@ X PrivilegeChecker {
 
     # Check privilege based on DML operation type constant
     # dml_type: 0=SELECT, 1=INSERT, 2=UPDATE, 3=DELETE
-    F check_dml(
+    fn check_dml(
         self,
         session: &SessionContext,
         table_name: &Str,
         dml_type: u8,
     ) -> Result<(), VaisError> {
-        priv_type := mut M dml_type {
+        priv_type := mut match dml_type {
             0 => PRIV_SELECT,
             1 => PRIV_INSERT,
             2 => PRIV_UPDATE,
             3 => PRIV_DELETE,
-            _ => { R Err(err_privilege_insufficient()); },
+            _ => { return Err(err_privilege_insufficient()); },
         };
 
         check := mut self.check_table_privilege(session, table_name, priv_type)?;
         I !check.allowed {
             priv_str := mut privilege_name(priv_type);
-            R Err(err_privilege_denied(&session.username, &priv_str, table_name));
+            return Err(err_privilege_denied(&session.username, &priv_str, table_name));
         }
         Ok(())
     }

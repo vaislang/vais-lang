@@ -2,23 +2,23 @@
 # Splits total capacity across N partitions to reduce lock contention
 # Each partition is an independent BufferPool
 
-U std/sync
-U std/hashmap
-U storage/error
-U storage/page/manager
-U storage/buffer/pool
+use std/sync
+use std/hashmap
+use storage/error
+use storage/page/manager
+use storage/buffer/pool
 
 # Partitioned buffer pool: N independent pools to reduce contention
-S PartitionedBufferPool {
+struct PartitionedBufferPool {
     partitions: Vec<BufferPool>,
     partition_count: u32,
     page_manager: PageManager,
 }
 
-X PartitionedBufferPool {
+impl PartitionedBufferPool {
     # Create a new partitioned buffer pool
     # total_capacity is divided evenly across partitions
-    F new(page_manager: PageManager, page_size: u32, total_capacity: u32, partition_count_arg: u32) -> PartitionedBufferPool {
+    fn new(page_manager: PageManager, page_size: u32, total_capacity: u32, partition_count_arg: u32) -> PartitionedBufferPool {
         partition_count := mut partition_count_arg
         I partition_count == 0 {
             partition_count = 4;  # Default to 4 partitions
@@ -44,37 +44,37 @@ X PartitionedBufferPool {
 
     # Fetch a page into the buffer pool
     # Returns (partition_id, frame_id)
-    F fetch_page(mut self, file_id: u8, page_id: u32) -> Result<(u32, u32), VaisError> {
+    fn fetch_page(mut self, file_id: u8, page_id: u32) -> Result<(u32, u32), VaisError> {
         partition_id := mut self.partition_for_page(file_id, page_id)
         frame_id := mut self.partitions[partition_id as u64].fetch_page(file_id, page_id)?;
         Ok((partition_id, frame_id))
     }
 
     # Unpin a page in a specific partition
-    F unpin_page(mut self, partition_id: u32, frame_id: u32, is_dirty: bool) {
+    fn unpin_page(mut self, partition_id: u32, frame_id: u32, is_dirty: bool) {
         I partition_id >= self.partition_count {
-            R  # Invalid partition
+            return  # Invalid partition
         }
         self.partitions[partition_id as u64].unpin_page(frame_id, is_dirty)
     }
 
     # Get read-only reference to page data
-    F get_page(self, partition_id: u32, frame_id: u32) -> &[u8] {
+    fn get_page(self, partition_id: u32, frame_id: u32) -> &[u8] {
         self.partitions[partition_id as u64].get_page(frame_id)
     }
 
     # Get mutable reference to page data
-    F get_page_mut(mut self, partition_id: u32, frame_id: u32) -> &Vec<u8> {
+    fn get_page_mut(mut self, partition_id: u32, frame_id: u32) -> &Vec<u8> {
         self.partitions[partition_id as u64].get_page_mut(frame_id)
     }
 
     # Flush a specific page
-    F flush_page(mut self, partition_id: u32, frame_id: u32) -> Result<(), VaisError> {
+    fn flush_page(mut self, partition_id: u32, frame_id: u32) -> Result<(), VaisError> {
         self.partitions[partition_id as u64].flush_page(frame_id)
     }
 
     # Flush all dirty pages across all partitions
-    F flush_all(mut self) -> Result<(), VaisError> {
+    fn flush_all(mut self) -> Result<(), VaisError> {
         LF partition: &self.partitions {
             partition.flush_all()?;
         }
@@ -82,21 +82,21 @@ X PartitionedBufferPool {
     }
 
     # Release a page from the buffer pool
-    F release_page(mut self, partition_id: u32, frame_id: u32) {
+    fn release_page(mut self, partition_id: u32, frame_id: u32) {
         I partition_id >= self.partition_count {
-            R  # Invalid partition
+            return  # Invalid partition
         }
         self.partitions[partition_id as u64].release_page(frame_id)
     }
 
     # Determine which partition a page belongs to
-    F partition_for_page(self, file_id: u8, page_id: u32) -> u32 {
+    fn partition_for_page(self, file_id: u8, page_id: u32) -> u32 {
         hash := mut hash_page_location(file_id, page_id)
         hash % self.partition_count
     }
 
     # Get total capacity across all partitions
-    F get_capacity(self) -> u32 {
+    fn get_capacity(self) -> u32 {
         total := mut 0
         LF partition: &self.partitions {
             total += partition.get_capacity()
@@ -105,7 +105,7 @@ X PartitionedBufferPool {
     }
 
     # Get total used frames across all partitions
-    F used_count(self) -> u32 {
+    fn used_count(self) -> u32 {
         total := mut 0
         LF partition: &self.partitions {
             total += partition.used_count()
@@ -114,7 +114,7 @@ X PartitionedBufferPool {
     }
 
     # Get total dirty page count across all partitions
-    F dirty_count(self) -> u32 {
+    fn dirty_count(self) -> u32 {
         total := mut 0
         LF partition: &self.partitions {
             total += partition.dirty_count()
@@ -123,36 +123,36 @@ X PartitionedBufferPool {
     }
 
     # Get partition count
-    F get_partition_count(self) -> u32 {
+    fn get_partition_count(self) -> u32 {
         self.partition_count
     }
 
     # Set FPI flag on all loaded frames (called after checkpoint)
-    F set_all_needs_fpi(mut self) {
+    fn set_all_needs_fpi(mut self) {
         LF partition: &self.partitions {
             partition.set_all_needs_fpi()
         }
     }
 
     # Check if a page needs FPI
-    F needs_fpi(self, partition_id: u32, frame_id: u32) -> bool {
+    fn needs_fpi(self, partition_id: u32, frame_id: u32) -> bool {
         self.partitions[partition_id as u64].needs_fpi(frame_id)
     }
 
     # Clear FPI flag for a frame
-    F clear_fpi(mut self, partition_id: u32, frame_id: u32) {
+    fn clear_fpi(mut self, partition_id: u32, frame_id: u32) {
         self.partitions[partition_id as u64].clear_fpi(frame_id)
     }
 
     # Get partition reference (for stats collection)
-    F get_partition(self, partition_id: u32) -> &BufferPool {
+    fn get_partition(self, partition_id: u32) -> &BufferPool {
         &self.partitions[partition_id as u64]
     }
 }
 
 # Hash function for page location
 # Uses FNV-1a hash for good distribution
-F hash_page_location(file_id: u8, page_id: u32) -> u32 {
+fn hash_page_location(file_id: u8, page_id: u32) -> u32 {
     hash := mut (1u64 << 63) + 5472609002491880229;  # FNV offset basis
     prime := mut 1099511628211u64;        # FNV prime
 

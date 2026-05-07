@@ -17,15 +17,15 @@
 # - BM25 scoring: O(1) per (doc, term) pair
 # - Result sorting: O(N log top_k) via heap
 
-U storage/error.{VaisError};
-U sql/parser/ast.{Expr, BinOp};
-U sql/planner/mod.{estimate_selectivity};
-U sql/types.{SqlValue};
-U planner/types.{
+use storage/error.{VaisError};
+use sql/parser/ast.{Expr, BinOp};
+use sql/planner/mod.{estimate_selectivity};
+use sql/types.{SqlValue};
+use planner/types.{
     HybridPlanNode, HybridCost, FullTextScanParams, FullTextSearchMode,
     err_hybrid_plan_failed
 };
-U planner/cost_model.{FullTextStats, estimate_fulltext_scan_cost};
+use planner/cost_model.{FullTextStats, estimate_fulltext_scan_cost};
 
 # ============================================================================
 # Error Codes: EE=00 (common/planner), CC=08 (planner), DD=22 (fulltext_plan)
@@ -33,7 +33,7 @@ U planner/cost_model.{FullTextStats, estimate_fulltext_scan_cost};
 
 C ERR_CODE_FULLTEXT_PLAN_FAILED: Str = "VAIS-0008022";
 
-F err_fulltext_plan_failed(reason: Str) -> VaisError {
+fn err_fulltext_plan_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_FULLTEXT_PLAN_FAILED, "Full-text plan build failed: {reason}")
 }
 
@@ -43,13 +43,13 @@ F err_fulltext_plan_failed(reason: Str) -> VaisError {
 
 # Analyze query text expression to detect search mode
 # This is a simplified heuristic; in practice, would need to evaluate the expression
-F detect_search_mode(query_text_expr: &Expr) -> FullTextSearchMode {
+fn detect_search_mode(query_text_expr: &Expr) -> FullTextSearchMode {
     # For literal query strings, analyze the text
-    M query_text_expr {
+    match query_text_expr {
         Expr.Literal { value } => {
-            M value {
+            match value {
                 SqlValue.StringVal { v } => {
-                    R detect_mode_from_text(v);
+                    return detect_mode_from_text(v);
                 },
                 _ => {},
             }
@@ -62,7 +62,7 @@ F detect_search_mode(query_text_expr: &Expr) -> FullTextSearchMode {
 }
 
 # Detect search mode from query text string
-F detect_mode_from_text(text: &Str) -> FullTextSearchMode {
+fn detect_mode_from_text(text: &Str) -> FullTextSearchMode {
     # Check for quoted phrases
     I text.contains("\"") {
         # Quoted phrase detected → Phrase mode
@@ -85,13 +85,13 @@ F detect_mode_from_text(text: &Str) -> FullTextSearchMode {
     upper := mut text.to_uppercase();
     I upper.contains(" AND ") || upper.contains(" OR ") || upper.contains(" NOT ") {
         # Boolean operators detected → Boolean mode
-        R FullTextSearchMode.Boolean;
+        return FullTextSearchMode.Boolean;
     }
 
     # Check for proximity operators (e.g., "word1 NEAR word2")
     I upper.contains(" NEAR ") || upper.contains("~") {
         # Proximity search → Phrase mode with slop
-        R FullTextSearchMode.Phrase { slop: 5 };
+        return FullTextSearchMode.Phrase { slop: 5 };
     }
 
     # Default: Simple BM25 mode
@@ -103,7 +103,7 @@ F detect_mode_from_text(text: &Str) -> FullTextSearchMode {
 # ============================================================================
 
 # Context for top_k adjustment
-EN QueryContext {
+enum QueryContext {
     Standalone,            # Query is standalone (no downstream ops)
     BeforeJoin,            # Query is followed by JOIN
     BeforeLimit { n: u64 }, # Query is followed by LIMIT N
@@ -111,8 +111,8 @@ EN QueryContext {
 }
 
 # Adjust top_k based on query context
-F adjust_top_k(base_top_k: u32, context: QueryContext) -> u32 {
-    M context {
+fn adjust_top_k(base_top_k: u32, context: QueryContext) -> u32 {
+    match context {
         QueryContext.Standalone => {
             # No adjustment needed
             base_top_k
@@ -127,12 +127,12 @@ F adjust_top_k(base_top_k: u32, context: QueryContext) -> u32 {
             # Use max to ensure at least some results
             adjusted := mut I n < base_top_k as u64 {
                 n as u32
-            } EL {
+            } else {
                 base_top_k
             };
             I adjusted < 10 {
                 10  # Minimum top_k
-            } EL {
+            } else {
                 adjusted
             }
         },
@@ -150,14 +150,14 @@ F adjust_top_k(base_top_k: u32, context: QueryContext) -> u32 {
 # Push predicates into FullTextScanParams.filter
 # Full-text predicates are already handled by the query_text_expr
 # This handles additional WHERE conditions (e.g., doc_date > '2020-01-01')
-F push_predicates(
+fn push_predicates(
     params: FullTextScanParams,
     where_clause: Option<Expr>,
 ) -> FullTextScanParams {
-    M where_clause {
+    match where_clause {
         Some(expr) => {
             # Merge with existing filter
-            merged_filter := mut M params.filter {
+            merged_filter := mut match params.filter {
                 Some(existing) => {
                     Some(Expr.BinaryOp {
                         left: Box.new(existing),
@@ -194,7 +194,7 @@ F push_predicates(
 #
 # Returns:
 # - HybridPlanNode.FullTextScan with computed HybridCost and optimal search mode
-F build_fulltext_plan(
+fn build_fulltext_plan(
     params: FullTextScanParams,
     stats: &FullTextStats,
     where_clause: Option<Expr>,
@@ -203,7 +203,7 @@ F build_fulltext_plan(
     detected_mode := mut detect_search_mode(&params.query_text_expr);
 
     # Step 2: Use detected mode I params.search_mode is Simple (default)
-    final_mode := mut M params.search_mode {
+    final_mode := mut match params.search_mode {
         FullTextSearchMode.Simple => detected_mode,
         _ => params.search_mode,  # User explicitly specified mode
     };
@@ -240,7 +240,7 @@ F build_fulltext_plan(
 # ============================================================================
 
 # Build a FullTextScan plan node with query context for top_k adjustment
-F build_fulltext_plan_with_context(
+fn build_fulltext_plan_with_context(
     params: FullTextScanParams,
     stats: &FullTextStats,
     where_clause: Option<Expr>,
@@ -248,7 +248,7 @@ F build_fulltext_plan_with_context(
 ) -> Result<HybridPlanNode, VaisError> {
     # Step 1: Detect search mode
     detected_mode := mut detect_search_mode(&params.query_text_expr);
-    final_mode := mut M params.search_mode {
+    final_mode := mut match params.search_mode {
         FullTextSearchMode.Simple => detected_mode,
         _ => params.search_mode,
     };
@@ -283,7 +283,7 @@ F build_fulltext_plan_with_context(
 # ============================================================================
 
 # Build a FullTextScan plan node with an alias (for subquery or JOIN)
-F build_fulltext_plan_with_alias(
+fn build_fulltext_plan_with_alias(
     params: FullTextScanParams,
     stats: &FullTextStats,
     where_clause: Option<Expr>,
@@ -292,7 +292,7 @@ F build_fulltext_plan_with_alias(
     node := mut build_fulltext_plan(params, stats, where_clause)?;
 
     # Unwrap and re-wrap with alias
-    M node {
+    match node {
         HybridPlanNode.FullTextScan { params: inner_params, cost, .. } => {
             Ok(HybridPlanNode.FullTextScan {
                 params: inner_params,

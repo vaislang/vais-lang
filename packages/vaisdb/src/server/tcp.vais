@@ -2,24 +2,24 @@
 # Listens on configurable port, accepts connections, dispatches to handlers
 # Error codes: EE=06 (server), CC=03 (connection), CC=07 (listener)
 
-U std/vec
-U std/string
-U std/option
-U std/sync
-U std/net
-U storage/error
-U server/types
-U server/config
-U server/connection
-U server/auth
-U server/handler
-U server/protocol
+use std/vec
+use std/string
+use std/option
+use std/sync
+use std/net
+use storage/error
+use server/types
+use server/config
+use server/connection
+use server/auth
+use server/handler
+use server/protocol
 
 # ============================================================================
 # Server State
 # ============================================================================
 
-EN ServerState {
+enum ServerState {
     Starting,
     Running,
     ShuttingDown,
@@ -30,7 +30,7 @@ EN ServerState {
 # TcpServer — Main server struct
 # ============================================================================
 
-S TcpServer {
+struct TcpServer {
     config: ServerConfig,
     global_config: GlobalConfig,
     pool: ConnectionPool,
@@ -42,9 +42,9 @@ S TcpServer {
     listener_fd: i64,
 }
 
-X TcpServer {
+impl TcpServer {
     # Create new server from configuration
-    F new(config: ServerConfig) -> Result<TcpServer, VaisError> {
+    fn new(config: ServerConfig) -> Result<TcpServer, VaisError> {
         # Validate configuration
         config.validate()?;
 
@@ -67,11 +67,11 @@ X TcpServer {
     }
 
     # Start the server (bind and listen)
-    F start(mut self) -> Result<(), VaisError> {
+    fn start(mut self) -> Result<(), VaisError> {
         port := self.config.port as i64
         listener := TcpListener.bind(port)
         I !listener.is_valid() {
-            R Err(err_server_bind_failed("0.0.0.0", self.config.port))
+            return Err(err_server_bind_failed("0.0.0.0", self.config.port))
         }
         self.listener_fd = listener.fd
         self.state = Running
@@ -79,14 +79,14 @@ X TcpServer {
     }
 
     # Run the accept loop — blocks until server is stopped
-    F run_accept_loop(mut self) {
+    fn run_accept_loop(mut self) {
         LW self.is_running() {
             listener := TcpListener { fd: self.listener_fd, port: self.config.port as i64 }
             stream := listener.accept()
             I stream.is_valid() != 0 {
                 client_fd := stream.fd
                 timestamp := mut 0 as u64
-                M self.accept_connection(timestamp) {
+                match self.accept_connection(timestamp) {
                     Ok(conn_id) => {
                         proc := mut ConnectionProcessor.new(conn_id)
                         self.handle_stream(proc, stream)
@@ -100,7 +100,7 @@ X TcpServer {
     }
 
     # Handle a single TcpStream through its connection lifecycle
-    F handle_stream(mut self, proc: ConnectionProcessor, stream: TcpStream) {
+    fn handle_stream(mut self, proc: ConnectionProcessor, stream: TcpStream) {
         buf := mut Vec.with_capacity(4096)
         i := mut 0
         LW i < 4096 {
@@ -112,8 +112,8 @@ X TcpServer {
             n := stream.read(buf.as_ptr(), 4096)
             I n <= 0 {
                 running = false
-            } EL {
-                M proc.on_data_received(&buf, &mut self) {
+            } else {
+                match proc.on_data_received(&buf, &mut self) {
                     Ok(responses) => {
                         r := mut 0
                         LW r < responses.len() {
@@ -133,7 +133,7 @@ X TcpServer {
     }
 
     # Stop the server gracefully
-    F stop(mut self) -> Result<(), VaisError> {
+    fn stop(mut self) -> Result<(), VaisError> {
         self.state = ShuttingDown
 
         # Close all active connections
@@ -155,15 +155,15 @@ X TcpServer {
     }
 
     # Check if server is running
-    F is_running(self) -> bool {
-        M &self.state {
+    fn is_running(self) -> bool {
+        match &self.state {
             Running => true,
             _ => false,
         }
     }
 
     # Get server statistics
-    F get_stats(self) -> ServerStats {
+    fn get_stats(self) -> ServerStats {
         ServerStats {
             active_connections: self.pool.active_count(),
             total_connections: self.total_connections.load(),
@@ -180,13 +180,13 @@ X TcpServer {
     # Handle a new incoming TCP connection.
     # This is called by the accept loop for each new connection.
     # Returns the connection ID.
-    F accept_connection(mut self, timestamp: u64) -> Result<u64, VaisError> {
+    fn accept_connection(mut self, timestamp: u64) -> Result<u64, VaisError> {
         I !self.is_running() {
-            R Err(err_server_not_running())
+            return Err(err_server_not_running())
         }
 
         I !self.pool.has_capacity() {
-            R Err(err_max_connections(self.config.max_connections))
+            return Err(err_max_connections(self.config.max_connections))
         }
 
         # Create connection with placeholder user/database (filled in during startup)
@@ -198,35 +198,35 @@ X TcpServer {
 
     # Handle startup message from newly connected client.
     # Validates protocol version, extracts user/database, initiates auth.
-    F handle_startup(
+    fn handle_startup(
         mut self,
         conn_id: u64,
         startup: &StartupPayload,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
         # Check protocol version
         I startup.protocol_major != PROTOCOL_VERSION_MAJOR {
-            R Err(err_protocol_version(startup.protocol_major, startup.protocol_minor))
+            return Err(err_protocol_version(startup.protocol_major, startup.protocol_minor))
         }
 
         # Extract user and database
-        user := mut M startup.get_param(&"user") {
+        user := mut match startup.get_param(&"user") {
             Some(u) => u.clone(),
             None => "vaisdb",
         }
 
-        database := mut M startup.get_param(&"database") {
+        database := mut match startup.get_param(&"database") {
             Some(d) => d.clone(),
             None => "vaisdb",
         }
 
-        app_name := mut M startup.get_param(&"application_name") {
+        app_name := mut match startup.get_param(&"application_name") {
             Some(a) => a.clone(),
             None => "",
         }
 
         # Update connection with user info
         guard := mut self.pool.connections.lock()
-        M guard.get_mut(&conn_id) {
+        match guard.get_mut(&conn_id) {
             Some(conn) => {
                 conn.user = user.clone()
                 conn.database = database.clone()
@@ -245,7 +245,7 @@ X TcpServer {
     }
 
     # Handle auth response from client
-    F handle_auth_response(
+    fn handle_auth_response(
         mut self,
         conn_id: u64,
         credentials: &str,
@@ -254,7 +254,7 @@ X TcpServer {
 
         # Get user from connection
         guard2 := mut self.pool.connections.lock()
-        user := mut M guard2.get(&conn_id) {
+        user := mut match guard2.get(&conn_id) {
             Some(conn) => conn.get_user().clone(),
             None => "".to_string(),
         };
@@ -268,7 +268,7 @@ X TcpServer {
 
         # Auth succeeded — transition to Ready
         guard3 := mut self.pool.connections.lock()
-        M guard3.get_mut(&conn_id) {
+        match guard3.get_mut(&conn_id) {
             Some(conn) => { conn.set_state(Ready)?; },
             None => {},
         }
@@ -280,7 +280,7 @@ X TcpServer {
     }
 
     # Process a framed message for an authenticated connection
-    F process_message(
+    fn process_message(
         mut self,
         conn_id: u64,
         msg: &FramedMessage,
@@ -295,7 +295,7 @@ X TcpServer {
     }
 
     # Disconnect a client (cleanup)
-    F disconnect(mut self, conn_id: u64) {
+    fn disconnect(mut self, conn_id: u64) {
         self.pool.remove_connection(conn_id)
     }
 
@@ -303,27 +303,27 @@ X TcpServer {
     # Configuration Access
     # ========================================================================
 
-    F get_config(self) -> &ServerConfig {
+    fn get_config(self) -> &ServerConfig {
         &self.config
     }
 
-    F get_global_config(self) -> &GlobalConfig {
+    fn get_global_config(self) -> &GlobalConfig {
         &self.global_config
     }
 
-    F get_global_config_mut(mut self) -> &mut GlobalConfig {
+    fn get_global_config_mut(mut self) -> &mut GlobalConfig {
         &self.global_config
     }
 
-    F get_auth(self) -> &Authenticator {
+    fn get_auth(self) -> &Authenticator {
         &self.auth
     }
 
-    F get_auth_mut(mut self) -> &mut Authenticator {
+    fn get_auth_mut(mut self) -> &mut Authenticator {
         &self.auth
     }
 
-    F get_pool(self) -> &ConnectionPool {
+    fn get_pool(self) -> &ConnectionPool {
         &self.pool
     }
 }
@@ -332,7 +332,7 @@ X TcpServer {
 # Server Statistics
 # ============================================================================
 
-S ServerStats {
+struct ServerStats {
     active_connections: u64,
     total_connections: u64,
     total_queries: u64,
@@ -340,8 +340,8 @@ S ServerStats {
     port: u16,
 }
 
-X ServerStats {
-    F new() -> ServerStats {
+impl ServerStats {
+    fn new() -> ServerStats {
         ServerStats {
             active_connections: 0,
             total_connections: 0,
@@ -359,15 +359,15 @@ X ServerStats {
 # Process raw bytes received from a TCP connection.
 # Accumulates data in recv_buffer until a complete message is available.
 # Returns response bytes to send back.
-S ConnectionProcessor {
+struct ConnectionProcessor {
     conn_id: u64,
     recv_buffer: Vec<u8>,
     is_authenticated: bool,
     is_startup_done: bool,
 }
 
-X ConnectionProcessor {
-    F new(conn_id: u64) -> ConnectionProcessor {
+impl ConnectionProcessor {
+    fn new(conn_id: u64) -> ConnectionProcessor {
         ConnectionProcessor {
             conn_id,
             recv_buffer: Vec.with_capacity(0),
@@ -378,7 +378,7 @@ X ConnectionProcessor {
 
     # Append received data and try to process complete messages.
     # Returns all response messages to send.
-    F on_data_received(
+    fn on_data_received(
         mut self,
         data: &[u8],
         server: &mut TcpServer,
@@ -395,7 +395,7 @@ X ConnectionProcessor {
         # Try to parse and process complete messages
         processing := mut true
         LW processing {
-            M read_framed_message(&self.recv_buffer) {
+            match read_framed_message(&self.recv_buffer) {
                 Ok(msg) => {
                     # Remove consumed bytes from buffer
                     consumed := mut msg.total_wire_len as u64
@@ -414,13 +414,13 @@ X ConnectionProcessor {
                         startup := mut deserialize_startup(&reader)?;
                         self.is_startup_done = true
                         server.handle_startup(self.conn_id, &startup)?;
-                    } EL I !self.is_authenticated {
+                    } else I !self.is_authenticated {
                         # Next message should be AuthResponse
                         reader := mut msg.payload_reader()
                         credentials := mut deserialize_auth_response(&reader)?;
                         self.is_authenticated = true
                         server.handle_auth_response(self.conn_id, &credentials)?;
-                    } EL {
+                    } else {
                         # Normal message processing
                         server.process_message(self.conn_id, &msg)?;
                     }
@@ -443,7 +443,7 @@ X ConnectionProcessor {
     }
 
     # Check if this connection is authenticated and ready
-    F is_ready(self) -> bool {
+    fn is_ready(self) -> bool {
         self.is_authenticated
     }
 }
@@ -452,21 +452,21 @@ X ConnectionProcessor {
 # Error Constructors
 # ============================================================================
 
-F err_server_not_running() -> VaisError {
+fn err_server_not_running() -> VaisError {
     VaisError.new(
         "VAIS-0607001",
         "Server is not running"
     ).with_severity(Fatal)
 }
 
-F err_server_bind_failed(addr: str, port: u16) -> VaisError {
+fn err_server_bind_failed(addr: str, port: u16) -> VaisError {
     VaisError.new(
         "VAIS-0607002",
         "Failed to bind to {addr}:{port}"
     ).with_severity(Fatal)
 }
 
-F err_server_accept_failed() -> VaisError {
+fn err_server_accept_failed() -> VaisError {
     VaisError.new(
         "VAIS-0607003",
         "Failed to accept incoming connection"

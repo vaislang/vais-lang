@@ -2,15 +2,15 @@
 # Provides iteration over leaf entries for range scans and sequential access
 # Follows the doubly-linked leaf chain
 
-U storage/constants
-U storage/error
-U storage/buffer/pool
-U storage/btree/node
-U storage/btree/entry
-U storage/btree/latch
+use storage/constants
+use storage/error
+use storage/buffer/pool
+use storage/btree/node
+use storage/btree/entry
+use storage/btree/latch
 
 # Cursor position within the B+Tree
-S BTreeCursor {
+struct BTreeCursor {
     file_id: u8,
     page_size: u32,
     current_page_id: u32,     # Current leaf page
@@ -21,20 +21,20 @@ S BTreeCursor {
     latch_table: Option<&LatchTable>,  # Latch table for leaf latch management
 }
 
-EN ScanDirection {
+enum ScanDirection {
     Forward,
     Backward,
 }
 
 # Key-TID pair from cursor
-S CursorEntry {
+struct CursorEntry {
     key: Vec<u8>,
     tid: u32,
 }
 
-X BTreeCursor {
+impl BTreeCursor {
     # Create a cursor positioned at a specific leaf entry
-    F new(file_id: u8, page_size: u32, page_id: u32, index: u64, frame_id: u32) -> BTreeCursor {
+    fn new(file_id: u8, page_size: u32, page_id: u32, index: u64, frame_id: u32) -> BTreeCursor {
         BTreeCursor {
             file_id,
             page_size,
@@ -48,7 +48,7 @@ X BTreeCursor {
     }
 
     # Create a cursor with latch table for concurrent leaf chain traversal
-    F with_latches(file_id: u8, page_size: u32, page_id: u32, index: u64,
+    fn with_latches(file_id: u8, page_size: u32, page_id: u32, index: u64,
                    frame_id: u32, latch_table: &LatchTable) -> BTreeCursor {
         BTreeCursor {
             file_id,
@@ -63,7 +63,7 @@ X BTreeCursor {
     }
 
     # Create an invalid/exhausted cursor
-    F invalid() -> BTreeCursor {
+    fn invalid() -> BTreeCursor {
         BTreeCursor {
             file_id: 0,
             page_size: 0,
@@ -77,14 +77,14 @@ X BTreeCursor {
     }
 
     # Check if cursor is valid
-    F valid(self) -> bool {
+    fn valid(self) -> bool {
         self.is_valid
     }
 
     # Get current entry's key and TID
-    F current(self, pool: &BufferPool) -> Result<CursorEntry, VaisError> {
+    fn current(self, pool: &BufferPool) -> Result<CursorEntry, VaisError> {
         I !self.is_valid {
-            R Err(err_internal("Cursor is not valid"))
+            return Err(err_internal("Cursor is not valid"))
         }
 
         page_data := mut pool.get_page(self.current_frame)
@@ -98,9 +98,9 @@ X BTreeCursor {
     # Advance cursor to next entry (forward scan)
     # Uses latch crabbing when moving to next leaf: acquire next leaf read latch
     # before releasing current leaf
-    F next(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
+    fn next(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
         I !self.is_valid {
-            R Ok(false)
+            return Ok(false)
         }
 
         page_data := mut pool.get_page(self.current_frame)
@@ -115,11 +115,11 @@ X BTreeCursor {
             I next_page == NULL_PAGE {
                 pool.unpin_page(self.current_frame, false)
                 self.is_valid = false
-                R Ok(false)
+                return Ok(false)
             }
 
             # Acquire read latch on next leaf before releasing current (if latch table available)
-            M &self.latch_table {
+            match &self.latch_table {
                 Some(lt) => {
                     next_guard := mut LatchGuard.new_read(lt, next_page)
                     pool.unpin_page(self.current_frame, false)
@@ -141,7 +141,7 @@ X BTreeCursor {
             I new_leaf.entry_count() == 0 {
                 pool.unpin_page(self.current_frame, false)
                 self.is_valid = false
-                R Ok(false)
+                return Ok(false)
             }
         }
 
@@ -150,14 +150,14 @@ X BTreeCursor {
 
     # Move cursor to previous entry (backward scan)
     # Uses latch crabbing when moving to previous leaf
-    F prev(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
+    fn prev(mut self, pool: &mut BufferPool) -> Result<bool, VaisError> {
         I !self.is_valid {
-            R Ok(false)
+            return Ok(false)
         }
 
         I self.current_index > 0 {
             self.current_index -= 1
-            R Ok(true)
+            return Ok(true)
         }
 
         # Move to previous leaf page with latch crabbing
@@ -168,11 +168,11 @@ X BTreeCursor {
         I prev_page == NULL_PAGE {
             pool.unpin_page(self.current_frame, false)
             self.is_valid = false
-            R Ok(false)
+            return Ok(false)
         }
 
         # Acquire read latch on prev leaf before releasing current (if latch table available)
-        M &self.latch_table {
+        match &self.latch_table {
             Some(lt) => {
                 prev_guard := mut LatchGuard.new_read(lt, prev_page)
                 pool.unpin_page(self.current_frame, false)
@@ -192,7 +192,7 @@ X BTreeCursor {
         I prev_leaf.entry_count() == 0 {
             pool.unpin_page(self.current_frame, false)
             self.is_valid = false
-            R Ok(false)
+            return Ok(false)
         }
         self.current_index = (prev_leaf.entry_count() - 1) as u64
 
@@ -200,7 +200,7 @@ X BTreeCursor {
     }
 
     # Release cursor resources
-    F close(mut self, pool: &mut BufferPool) {
+    fn close(mut self, pool: &mut BufferPool) {
         I self.is_valid {
             pool.unpin_page(self.current_frame, false)
             self.is_valid = false
@@ -208,7 +208,7 @@ X BTreeCursor {
     }
 }
 
-F copy_cursor_key(key: &[u8]) -> Vec<u8> {
+fn copy_cursor_key(key: &[u8]) -> Vec<u8> {
     result: Vec<u8> := mut Vec.with_capacity(key.len())
     i := mut 0
     LW i < key.len() {
