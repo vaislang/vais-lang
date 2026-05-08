@@ -43,7 +43,10 @@ impl UndoLog {
 
         # Check if we need a new page
         I entry_size > available_space {
-            self.allocate_new_page(pool)?;
+            match self.allocate_new_page(pool) {
+                Ok(_) => {},
+                Err(e) => { self.lock.unlock(); return Err(e) },
+            }
         }
 
         # Serialize the entry to a buffer
@@ -52,7 +55,10 @@ impl UndoLog {
         entry_data := mut buf.as_bytes()
 
         # Fetch the current undo page
-        frame_id := mut pool.fetch_page(self.file_id, self.current_page_id)?;
+        frame_id := mut match pool.fetch_page(self.file_id, self.current_page_id) {
+            Ok(v) => v,
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
         frame := mut pool.get_frame_mut(frame_id)
 
         # Write entry data at current offset
@@ -63,7 +69,10 @@ impl UndoLog {
             .copy_from_slice(entry_data)
 
         # Update page header's free_space_offset and item_count
-        header := mut PageHeader.read_from_page(page_data)?;
+        header := mut match PageHeader.read_from_page(page_data) {
+            Ok(v) => v,
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
         header.free_space_offset = (self.current_offset + entry_size) as u16
         header.item_count += 1
         header.write_to_page(page_data)
@@ -82,9 +91,12 @@ impl UndoLog {
         self.current_offset += entry_size
 
         # Unpin the page
-        pool.unpin_page(frame_id, true)?;
+        match pool.unpin_page(frame_id, true) {
+            Ok(_) => {},
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
 
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
 
         Ok(undo_ptr)
     }

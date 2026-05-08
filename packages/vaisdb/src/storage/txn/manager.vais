@@ -67,7 +67,7 @@ impl TransactionManager {
         # Set CLOG status to IN_PROGRESS
         self.clog.set_status(txn_id, InProgress)
 
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
 
         # Write TXN_BEGIN WAL record
         begin_payload := mut TxnBeginPayload { isolation_level: isolation_level as u8 }
@@ -90,7 +90,7 @@ impl TransactionManager {
 
         # Verify transaction is active
         I !self.att.is_active(txn_id) {
-            # guard.drop() # disabled for dev compiler
+            self.lock.unlock()
             return Err(err_internal("Cannot commit: transaction {txn_id} is not active"))
         }
 
@@ -101,12 +101,18 @@ impl TransactionManager {
         commit_payload := mut TxnCommitPayload {}
         buf := mut ByteBuffer.with_capacity(4)
         commit_payload.serialize(&buf)
-        commit_lsn := mut self.gcm.write_record(
+        commit_lsn := mut match self.gcm.write_record(
             txn_id, TXN_COMMIT, ENGINE_META, buf.as_bytes()
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
 
         # Ensure commit record is fsynced (group commit batches for efficiency)
-        self.gcm.commit_and_wait(txn_id, commit_lsn)?;
+        match self.gcm.commit_and_wait(txn_id, commit_lsn) {
+            Ok(_) => {},
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
 
         # Set CLOG status to COMMITTED
         self.clog.set_status(txn_id, TxnStatus.Committed)
@@ -123,7 +129,7 @@ impl TransactionManager {
         # Keep in ATT for now (GC will remove later)
         # This allows concurrent readers to check transaction status
 
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
 
         Ok(())
     }
@@ -137,7 +143,7 @@ impl TransactionManager {
         entry := mut match self.att.get(txn_id) {
             Some(e) => e,
             None => {
-                # guard.drop() # disabled for dev compiler
+                self.lock.unlock()
                 return Err(err_internal("Cannot abort: transaction {txn_id} not found"))
             },
         }
@@ -151,18 +157,24 @@ impl TransactionManager {
         # Rollback via undo chain (eager undo)
         I last_undo_ptr != NULL_UNDO_PTR {
             # Perform rollback using the undo log
-            _count := mut self.perform_rollback(
+            _count := mut match self.perform_rollback(
                 txn_id,
                 last_undo_ptr,
                 pool
-            )?;
+            ) {
+                Ok(v) => v,
+                Err(e) => { self.lock.unlock(); return Err(e) },
+            }
         }
 
         # Write TXN_ABORT WAL record (after rollback is complete)
         abort_payload := mut TxnAbortPayload {}
         abort_buf := mut ByteBuffer.with_capacity(4)
         abort_payload.serialize(&abort_buf)
-        self.gcm.write_record(txn_id, TXN_ABORT, ENGINE_META, abort_buf.as_bytes())?;
+        match self.gcm.write_record(txn_id, TXN_ABORT, ENGINE_META, abort_buf.as_bytes()) {
+            Ok(_) => {},
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
 
         # Set CLOG status to ABORTED
         self.clog.set_status(txn_id, TxnStatus.Aborted)
@@ -176,7 +188,7 @@ impl TransactionManager {
         # Set state to ABORTED
         self.att.set_state(txn_id, TxnState.Aborted)
 
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
 
         Ok(())
     }
@@ -290,7 +302,7 @@ impl TransactionManager {
     fn set_timeout(mut self, timeout_sec: u32) {
         guard := mut self.lock.lock()
         self.txn_timeout_sec = timeout_sec
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
     }
 
     # Get transaction timeout (in seconds)

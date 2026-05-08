@@ -89,7 +89,10 @@ impl TruncationManager {
         safe_segment := mut lsn_segment(safe_lsn)
 
         # Find all WAL segment files
-        segments := mut self.find_all_segments()?;
+        segments := mut match self.find_all_segments() {
+            Ok(v) => v,
+            Err(e) => { self.lock.unlock(); return Err(e) },
+        }
         segments_deleted := mut 0
         segments_archived := mut 0
         remaining_segments := mut segments.len() as u32
@@ -101,7 +104,7 @@ impl TruncationManager {
             I segments.len() > 0 {
                 oldest = segments[0]
             }
-            # guard.drop() # disabled for dev compiler
+            self.lock.unlock()
             return Ok(TruncationResult {
                 segments_deleted: 0,
                 segments_archived: 0,
@@ -144,7 +147,7 @@ impl TruncationManager {
                             Some(target_dir) => {
                                 match self.archive_segment(seg_num, target_dir.clone()) {
                                     Ok(_) => {},
-                                    Err(e) => { return Err(e) },
+                                    Err(e) => { self.lock.unlock(); return Err(e) },
                                 }
                                 segments_archived += 1
                             },
@@ -155,7 +158,10 @@ impl TruncationManager {
                 }
 
                 # Delete the segment file
-                remove_file(&seg_path)?;
+                match remove_file(&seg_path) {
+                    Ok(_) => {},
+                    Err(e) => { self.lock.unlock(); return Err(e) },
+                }
                 segments_deleted += 1
                 remaining_segments -= 1
             }
@@ -176,7 +182,7 @@ impl TruncationManager {
             m = m + 1
         }
 
-        # guard.drop() # disabled for dev compiler
+        self.lock.unlock()
         Ok(TruncationResult {
             segments_deleted,
             segments_archived,
