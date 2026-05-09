@@ -84,7 +84,7 @@ smoke, local SSR/data-loading production app smoke, local server action
 production runtime smoke, local server action auth/rate-limit production
 runtime smoke, and local server action file-upload production runtime smoke
 are promoted.
-`compiler/scripts/check-integrity.sh` reports them as `WEB RUNTIME smoke=61/77` in skip-mode CI default (`77/77` with all 4 live-deploy platform credentials), `WEB UNIT tests=390/390` (kit unit tests), and `WEB PACKAGES tests=3272/3272` (22 non-kit packages).
+`compiler/scripts/check-integrity.sh` reports them as `WEB RUNTIME smoke=61/77` in skip-mode CI default (`77/77` with all 4 live-deploy platform credentials — see `packages/kit/__tests__/e2e/.env.example` for the 7 env vars: CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, VERCEL_TOKEN, NETLIFY_AUTH_TOKEN, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_LAMBDA_ROLE_ARN), `WEB UNIT tests=390/390` (kit unit tests), and `WEB PACKAGES tests=3272/3272` (22 non-kit packages).
 Do not treat live deployed adapters, production browser/device hydration beyond
 the promoted local Chromium/Firefox/WebKit smoke, live deployed action
 behavior, or full dynamic production apps as certified until a new runtime
