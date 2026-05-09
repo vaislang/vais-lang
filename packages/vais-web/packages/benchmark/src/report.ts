@@ -105,7 +105,7 @@ export function toASCIIChart(results: BenchmarkResult[]): string {
   const lines: string[] = [`${metric} (${unit})`, ""];
 
   for (const r of results) {
-    const barLen = maxValue > 0 ? Math.min(Math.round((r.value / maxValue) * BAR_WIDTH), BAR_WIDTH) : 0;
+    const barLen = maxValue > 0 ? Math.max(0, Math.min(Math.round((r.value / maxValue) * BAR_WIDTH), BAR_WIDTH)) : 0;
     const bar = "█".repeat(barLen) + "░".repeat(BAR_WIDTH - barLen);
     const label = padEnd(r.framework, labelWidth);
     const formatted = formatValue(r.value, unit);
