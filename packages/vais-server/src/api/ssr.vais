@@ -15,13 +15,13 @@ use std/http_client
 # Parsed body for POST /api/render
 struct RenderRequest {
     route: str,   # URL path, e.g. "/blog/hello"
-    props: str,   # JSON-encoded props object
+    props: str,   # raw JSON props value, or a string value without quotes
 }
 
 # Parsed body for POST /api/hydrate
 struct HydrateRequest {
     route: str,   # URL path rendered server-side
-    props: str,   # JSON-encoded props used during SSR
+    props: str,   # raw JSON props value, or a string value without quotes
 }
 
 # ============================================================================
@@ -30,8 +30,7 @@ struct HydrateRequest {
 
 # Extract the value of a top-level string field from a flat JSON object.
 # Returns "" when the field is absent or the value is not a quoted string.
-# Only handles simple {"key":"value",...} objects — sufficient for our wire
-# protocol which never nests the route/props fields.
+# Handles string fields; nested JSON values should use json_get_value.
 fn json_get_str(json: str, key: str) -> str {
     needle := "\"" + key + "\":"
     start  := ssr_str_find(json, needle, 0)
@@ -55,6 +54,93 @@ fn json_get_str(json: str, key: str) -> str {
         else { end += 1 }
     }
     ""
+}
+
+# Extract the raw JSON value of a top-level field.
+# Quoted string values are returned without quotes for compatibility with the
+# original SSR API; object/array values are returned as balanced raw JSON.
+fn json_get_value(json: str, key: str) -> str {
+    needle := "\"" + key + "\":"
+    start  := ssr_str_find(json, needle, 0)
+    I start == -1 { return "" }
+
+    val_start := start + needle.len()
+    val_start = skip_whitespace(json, val_start)
+    ssr_json_value_slice(json, val_start)
+}
+
+fn ssr_json_value_slice(json: str, start: i64) -> str {
+    c := json.char_at(start)
+    I c == 0 { return "" }
+
+    I c == 34 {
+        end := ssr_json_string_end(json, start + 1)
+        I end == -1 { return "" }
+        return json.substring(start + 1, end)
+    }
+
+    I c == 123 || c == 91 {
+        end := ssr_json_composite_end(json, start)
+        I end == -1 { return "" }
+        return json.substring(start, end + 1)
+    }
+
+    end := ssr_json_bare_value_end(json, start)
+    I end <= start { return "" }
+    json.substring(start, end)
+}
+
+fn ssr_json_string_end(s: str, i: i64) -> i64 {
+    c := s.char_at(i)
+    I c == 0 { return -1 }
+    I c == 92 { return ssr_json_string_end(s, i + 2) }
+    I c == 34 { return i }
+    ssr_json_string_end(s, i + 1)
+}
+
+fn ssr_json_composite_end(s: str, start: i64) -> i64 {
+    ssr_json_composite_end_rec(s, start, 0, false, false)
+}
+
+fn ssr_json_composite_end_rec(s: str, i: i64, depth: i64, in_string: bool, escaped: bool) -> i64 {
+    c := s.char_at(i)
+    I c == 0 { return -1 }
+
+    I in_string {
+        I escaped {
+            return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
+        }
+        I c == 92 {
+            return ssr_json_composite_end_rec(s, i + 1, depth, true, true)
+        }
+        I c == 34 {
+            return ssr_json_composite_end_rec(s, i + 1, depth, false, false)
+        }
+        return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
+    }
+
+    I c == 34 {
+        return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
+    }
+    I c == 123 || c == 91 {
+        return ssr_json_composite_end_rec(s, i + 1, depth + 1, false, false)
+    }
+    I c == 125 || c == 93 {
+        next_depth := depth - 1
+        I next_depth == 0 { return i }
+        I next_depth < 0 { return -1 }
+        return ssr_json_composite_end_rec(s, i + 1, next_depth, false, false)
+    }
+
+    ssr_json_composite_end_rec(s, i + 1, depth, false, false)
+}
+
+fn ssr_json_bare_value_end(s: str, i: i64) -> i64 {
+    c := s.char_at(i)
+    I c == 0 || c == 44 || c == 125 || c == 93 || c == 32 || c == 9 || c == 13 || c == 10 {
+        return i
+    }
+    ssr_json_bare_value_end(s, i + 1)
 }
 
 # Skip ASCII whitespace (space=32, tab=9, CR=13, LF=10) from position i.
@@ -89,13 +175,13 @@ fn ssr_match_prefix(haystack: str, hi: i64, needle: str, ni: i64) -> i64 {
 
 fn parse_render_request(body: str) -> RenderRequest {
     route := json_get_str(body, "route")
-    props := json_get_str(body, "props")
+    props := json_get_value(body, "props")
     RenderRequest { route: route, props: props }
 }
 
 fn parse_hydrate_request(body: str) -> HydrateRequest {
     route := json_get_str(body, "route")
-    props := json_get_str(body, "props")
+    props := json_get_value(body, "props")
     HydrateRequest { route: route, props: props }
 }
 
@@ -118,8 +204,8 @@ fn do_render(route: str, props: str) -> Response {
     html := "<div id='app' data-route='" + route + "'></div>"
     head := "<title>vais | " + route + "</title>"
 
-    body_start := "{\"html\": \"" + html + "\""
-    body_head := body_start + ", \"head\": \"" + head + "\""
+    body_start := "{\"html\": " + ssr_json_string(html)
+    body_head := body_start + ", \"head\": " + ssr_json_string(head)
     body := body_head + ", \"status\": 200}"
 
     headers := Headers.new().set(CONTENT_TYPE, "application/json")
@@ -128,6 +214,30 @@ fn do_render(route: str, props: str) -> Response {
         headers: headers,
         body: body,
     }
+}
+
+fn ssr_render_payload(route: str, props: str) -> str {
+    payload_start := "{\"route\":" + ssr_json_string(route)
+    payload_props := payload_start + ",\"props\":" + ssr_props_json_value(props)
+    payload_props + "}"
+}
+
+fn ssr_props_json_value(props: str) -> str {
+    I props == "" { return "{}" }
+
+    start := skip_whitespace(props, 0)
+    c := props.char_at(start)
+    I c == 123 || c == 91 || c == 34 {
+        return props
+    }
+
+    ssr_json_string(props)
+}
+
+# This only wraps already-safe string content. Full JSON string escaping remains
+# an explicit non-claim until the SSR runtime has a linked escape primitive.
+fn ssr_json_string(value: str) -> str {
+    "\"" + value + "\""
 }
 
 # Forward a bounded SSR render request to an upstream vais-web SSR service.
@@ -139,9 +249,7 @@ fn forward_ssr_render(upstream_base_url: str, route: str, props: str) -> Respons
     }
 
     endpoint := upstream_base_url + "/ssr/render"
-    payload_start := "{\"route\":\"" + route + "\""
-    payload_props := payload_start + ",\"props\":\"" + props + "\""
-    payload := payload_props + "}"
+    payload := ssr_render_payload(route, props)
 
     upstream := http_post(endpoint, payload)
     I upstream.error_code != 0 {
@@ -169,9 +277,7 @@ fn forward_ssr_render_with_timeout(upstream_base_url: str, route: str, props: st
     }
 
     endpoint := upstream_base_url + "/ssr/render"
-    payload_start := "{\"route\":\"" + route + "\""
-    payload_props := payload_start + ",\"props\":\"" + props + "\""
-    payload := payload_props + "}"
+    payload := ssr_render_payload(route, props)
 
     request := HttpRequest::post(endpoint).with_json(payload).with_timeout(timeout_ms)
     client := HttpClient::new()
@@ -208,9 +314,7 @@ fn forward_ssr_render_with_retry_observed(upstream_base_url: str, route: str, pr
     }
 
     endpoint := upstream_base_url + "/ssr/render"
-    payload_start := "{\"route\":\"" + route + "\""
-    payload_props := payload_start + ",\"props\":\"" + props + "\""
-    payload := payload_props + "}"
+    payload := ssr_render_payload(route, props)
 
     retries := mut max_retries
     I retries < 0 {
@@ -343,9 +447,7 @@ fn forward_ssr_render_with_retry(upstream_base_url: str, route: str, props: str,
     }
 
     endpoint := upstream_base_url + "/ssr/render"
-    payload_start := "{\"route\":\"" + route + "\""
-    payload_props := payload_start + ",\"props\":\"" + props + "\""
-    payload := payload_props + "}"
+    payload := ssr_render_payload(route, props)
     retries := mut max_retries
     I retries < 0 {
         retries = 0
@@ -398,10 +500,10 @@ fn do_hydrate(route: str, props: str) -> Response {
         return ssr_json_error("Missing required field: route", 400)
     }
 
-    props_val := I props == "" { "{}" } else { props }
+    props_val := ssr_props_json_value(props)
 
-    body_start := "{\"data\": \"" + props_val + "\""
-    body := body_start + ", \"route\": \"" + route + "\"}"
+    body_start := "{\"data\": " + props_val
+    body := body_start + ", \"route\": " + ssr_json_string(route) + "}"
 
     headers := Headers.new().set(CONTENT_TYPE, "application/json")
     Response {
@@ -444,7 +546,7 @@ fn handle_health(req: Request) -> Response {
 }
 
 fn ssr_json_error(message: str, status: i64) -> Response {
-    body := "{\"error\": \"" + message + "\"}"
+    body := "{\"error\": " + ssr_json_string(message) + "}"
     headers := Headers.new().set(CONTENT_TYPE, "application/json")
     Response {
         status: StatusCode.new(status, ssr_error_reason(status)),
