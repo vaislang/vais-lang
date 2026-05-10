@@ -1,6 +1,6 @@
 # VAIS Lang Monorepo Roadmap
 
-Last verified: 2026-05-03
+Last verified: 2026-05-10
 
 This root roadmap is current-only. Old monitor plans, stale package failure
 counts, and resolved "server/web reactivation blocked" claims were removed so
@@ -15,9 +15,9 @@ Current promoted package gates:
 
 | Package | Current gate |
 |---|---|
-| `packages/vaisdb` | package codegen `261/261`, runtime smoke `28/28` |
-| `packages/vais-server` | runtime smoke `13/13` |
-| `packages/vais-web` | runtime smoke `20/20` |
+| `packages/vaisdb` | package codegen `261/261`, runtime smoke `34/34` |
+| `packages/vais-server` | runtime smoke `15/15` |
+| `packages/vais-web` | runtime smoke `61/77` with credential/network-gated cases skipped, unit `390/390`, ecosystem package tests `3272/3272`, full-build `24/24` |
 
 ## Scope
 
