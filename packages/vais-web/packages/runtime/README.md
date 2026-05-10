@@ -1,6 +1,7 @@
 # @vaisx/runtime
 
-VaisX minimal runtime — the reactive core of the VaisX framework, under 3KB gzipped.
+VaisX minimal runtime — the reactive core of the VaisX framework. Runtime size
+claims require the dedicated size gate before they are public guarantees.
 
 Provides the signal-based reactivity engine, component lifecycle management, and DOM reconciliation used by all VaisX applications.
 

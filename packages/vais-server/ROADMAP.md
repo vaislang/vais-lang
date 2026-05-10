@@ -1,54 +1,73 @@
-# vais-server - Backend API Framework for Vais
-## Project Roadmap
+# vais-server Roadmap
 
-> **Version**: 0.1.0 (Initial Implementation)
-> **Goal**: Express/Axum-style backend framework written in Vais, with native vaisdb integration
-> **Language**: Pure Vais
-> **Last Updated**: 2026-04-03
+Last verified: 2026-05-10
 
----
+This file is intentionally current-only. Historical runtime promotion logs and
+intermediate smoke counts were removed from the active roadmap so future agents
+do not treat already-promoted server surfaces as blocked work.
 
-## Overview
+## Current Status
 
-vais-server completes the Vais full-stack ecosystem:
+The active source of truth for cross-repository coordination is
+`/Users/sswoo/study/projects/vais/ROADMAP.md`.
+
+Current promoted vais-server gate:
+
+| Gate | Current status |
+|---|---|
+| Runtime smoke | `SERVER RUNTIME smoke=15/15` |
+| Aggregate check | `cd compiler && bash scripts/check-integrity.sh` |
+
+## Certified Surface
+
+The promoted runtime gate verifies bounded behavior for:
+
+- minimal `App`/`Context` runtime;
+- VaisDB embedded integration;
+- request/header/content-type handling;
+- static, dynamic path-param, query-string, and wildcard router behavior;
+- bounded form and compact flat JSON body parsing;
+- nested raw-props object and array preservation for the promoted SSR path;
+- JSON string escaping for SSR hydration payloads;
+- symbolic middleware pipeline dispatch;
+- SSR render/hydrate API response contracts;
+- compiled SSR forwarding over local loopback HTTP;
+- upstream non-2xx preservation and transport failure to `502`;
+- explicit timeout to `504`;
+- bounded retry after transport failure;
+- retry-budget observability.
+
+These gates prove the promoted surfaces. They do not imply product-complete
+HTTP framework coverage.
+
+## Not Certified Yet
+
+These are active non-claims, not current regressions:
+
+- complete JSON grammar validation beyond the promoted bounded raw-props
+  parser;
+- HTTPS/TLS, redirects, keep-alive pooling, and external network reliability;
+- arbitrary middleware instance dispatch;
+- response body string-concat middleware transforms;
+- backoff and jitter policy beyond the promoted retry-budget gate;
+- deployed Node SSR operation outside the local loopback smoke.
+
+## Next vais-server Work
+
+No vais-server package task is currently open here.
+
+Start a new server task only when the root coordination roadmap promotes one
+bounded runtime gate. Keep broader framework claims out of the certified surface
+until a dedicated smoke promotes them.
+
+## Validation
+
+Use these commands for vais-server handoff and closeout:
+
+```bash
+cd /Users/sswoo/study/projects/vais/compiler
+cargo test -p vaisc --test e2e --release phase_vais_server_runtime_smoke -- --nocapture --test-threads=1
+bash scripts/check-integrity.sh
+git diff --check
+git -C ../lang diff --check
 ```
-vais-web (frontend+SSR) → vais-server (backend API) → vaisdb (database)
-```
-
-### Design Decisions
-- Architecture: Express/Axum-style middleware pipeline + tree-based router
-- HTTP: Built on vais std/async_http, std/http_server, std/websocket
-- DB: vaisdb native integration (no separate ORM needed — direct Vector/Graph/SQL/FTS queries)
-- API: REST + GraphQL + gRPC multi-protocol support
-- Auth: JWT + OAuth2 + session-based authentication built-in
-- Pattern: vaisdb project structure (src/ domain folders, tests/ mirroring)
-
----
-
-## Current Tasks (2026-04-03)
-mode: auto
-- [x] 1. 프로젝트 초기화 + core 모듈 (impl-sonnet) ✅ 2026-04-03
-  changes: README.md, src/main.vais, src/core/{app,config,context,error}.vais + 디렉토리 구조
-- [x] 2. HTTP 요청/응답 모듈 (impl-sonnet) ✅ 2026-04-03
-  changes: src/http/{method,status,header,cookie,request,response}.vais (빌더 체이닝, 13 상태코드)
-- [x] 3. 라우터 + 라우트 그룹 (impl-sonnet) ✅ 2026-04-03
-  changes: src/router/{tree,params,route,router,group}.vais (RadixTree, 405 구분, 중첩 그룹)
-- [x] 4. 미들웨어 파이프라인 + 내장 미들웨어 (impl-sonnet) ✅ 2026-04-03
-  changes: src/middleware/{pipeline,cors,logger,rate_limit,compress,recovery}.vais (before/after 체인, 429 rate limit)
-- [x] 5. WebSocket 서버 (impl-sonnet) ✅ 2026-04-03
-  changes: src/ws/{message,handler,room,server}.vais (RFC6455 프레이밍, Room 브로드캐스트, heartbeat)
-- [x] 6. 인증/인가 - JWT, OAuth, Guard (impl-sonnet) ✅ 2026-04-03
-  changes: src/auth/{jwt,oauth,session,guard,password}.vais (TokenPair, OAuth flow, CSRF state, bcrypt-style hash)
-- [x] 7. vaisdb 네이티브 통합 (impl-sonnet) ✅ 2026-04-03
-  changes: src/db/{connection,pool,query,migrate,model}.vais (TCP/임베디드, 하이브리드 쿼리빌더, 마이그레이션)
-- [x] 8. API 프로토콜 - REST/GraphQL/gRPC (impl-sonnet) ✅ 2026-04-03
-  changes: src/api/{rest,graphql,grpc,openapi}.vais (Pagination, Introspection, gRPC 디스패치, OpenAPI 3.0)
-- [x] 9. 유틸리티 + 예제 + 테스트 (impl-sonnet) ✅ 2026-04-03
-  changes: src/util/{json,validation,env}.vais, examples/4개, tests/12개 테스트 파일
-- [x] 10. 문서 + ROADMAP 정비 (impl-sonnet) ✅ 2026-04-03
-  changes: docs/architecture/overview.md, docs/guide/quickstart.md, docs/guide/middleware.md, docs/guide/database.md, CLAUDE.md
-progress: 10/10 (100%)
-
-## Execution Log
-  strategy: 3 independent tasks (#1,#2,#3) no file overlap → independent-parallel
-  strategy: 4 independent tasks (#4,#5,#7,#8) no file overlap → independent-parallel

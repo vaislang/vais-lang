@@ -1,5 +1,5 @@
 /**
- * @vaisx/runtime — VaisX minimal runtime (< 3KB gzipped)
+ * @vaisx/runtime — VaisX minimal runtime; size gate pending
  *
  * Re-exports all runtime helpers used by vaisx-compiler codegen output.
  */
