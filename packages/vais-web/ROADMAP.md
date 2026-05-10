@@ -1,6 +1,6 @@
 # vais-web Roadmap
 
-> Last Updated: 2026-05-03
+> Last Updated: 2026-05-10
 > Canonical workspace roadmap: `/Users/sswoo/study/projects/vais/ROADMAP.md`
 
 ## Reactivation Status
@@ -11,8 +11,13 @@ evidence unless the root roadmap promotes them again.
 
 Current promoted surface:
 
-- `WEB RUNTIME smoke=20/20` in
-  `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`.
+- `WEB RUNTIME smoke=61/77` in
+  `/Users/sswoo/study/projects/vais/compiler/scripts/check-integrity.sh`
+  when live-deploy platform credentials are not present. With all live-deploy
+  credentials configured, the full runtime surface is `77/77`.
+- `WEB UNIT tests=390/390`.
+- `WEB PACKAGES tests=3272/3272`.
+- `WEB FULL-BUILD gate=24/24`.
 - The promoted tests are
   `packages/kit/__tests__/e2e/vais-server-bridge.test.ts` and
   `packages/kit/__tests__/e2e/vais-web-route-hydration.test.ts` and
