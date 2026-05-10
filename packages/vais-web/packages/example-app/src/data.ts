@@ -55,7 +55,7 @@ const seedPosts: Post[] = [
     id: "post-3",
     title: "Scaling Your VaisX Application",
     content:
-      "As your VaisX application grows, understanding the module system and code splitting strategies becomes critical. This article walks through production-ready architecture.",
+      "As your VaisX application grows, understanding the module system and code splitting strategies becomes critical. This article walks through deployment-oriented architecture.",
     author: seedAuthors[2]!,
     category: seedCategories[2]!,
     comments: [],

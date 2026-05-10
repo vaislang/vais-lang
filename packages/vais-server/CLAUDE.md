@@ -15,9 +15,21 @@ vaisdb  (vector + graph + relational + full-text database)
 Key characteristics:
 - **Minimal core**: App + Router + Middleware pipeline as first-class primitives
 - **Native vaisdb integration**: direct query execution, no ORM
-- **Multi-protocol**: REST, GraphQL, gRPC, WebSocket from one server instance
-- **Built-in auth**: JWT, OAuth2, session-based authentication
+- **Protocol workbench**: REST, GraphQL, gRPC, and WebSocket modules exist, but
+  product-complete protocol support requires dedicated runtime gates
+- **Auth workbench**: JWT, OAuth2, and session modules exist, but broad auth
+  guarantees require dedicated runtime gates
 - **Pure Vais**: no FFI; system I/O via `std/async_http`, `std/http_server`, `std/websocket`
+
+Current reactivation status: `compiler/scripts/check-integrity.sh` reports
+`SERVER RUNTIME smoke=15/15`. The promoted surface covers minimal App/Context,
+VaisDB embedded integration, static/dynamic/wildcard router behavior, bounded
+body parsing, symbolic middleware pipeline dispatch, SSR render/hydrate API
+response contracts, nested raw-props preservation, JSON string escaping for SSR
+hydration payloads, compiled SSR forwarding over local loopback HTTP, upstream
+error/status mapping, timeout handling, retry, and retry-budget observability.
+Product-complete protocol and middleware support still requires dedicated
+runtime smokes before it is promoted.
 
 ---
 
@@ -176,7 +188,10 @@ Every middleware implements two hooks: `before` (pre-handler) and `after` (post-
 Route handlers are registered by name string (`"handle_users"`) rather than function pointer because Vais does not have first-class function pointers in the version targeted by this framework. The runtime resolves the name to the actual function at dispatch time. Similarly, middleware is registered by name (`app.use("cors")`) and resolved via `dispatch_before` / `dispatch_after` in `middleware/pipeline.vais`.
 
 ### Pure Vais — no FFI
-The framework itself makes no FFI calls. External runtime functions (`current_time_ms`, `str_len`, `str_char_at`, `str_slice`) are declared with `X F` and resolved by the `vaisc` linker. This keeps the core framework portable across any Vais runtime target.
+The promoted runtime path avoids new ad-hoc FFI helpers. Prefer certified
+primitive string methods such as `.len()`, `.char_at()`, and `.substring()` over
+declaring stale `X F str_*` shims. Low-level runtime externs should only be used
+when they are already part of a promoted gate or a standard-library contract.
 
 ---
 
@@ -186,7 +201,7 @@ All dependencies are from the **Vais standard library** (`std/`). No third-party
 
 | Import | Used by |
 |--------|---------|
-| `std/string` | string manipulation across all modules |
+| primitive `str` methods | promoted string parsing and slicing paths |
 | `std/vec` | `Vec<T>` — growable arrays |
 | `std/option` | `Option<T>` — nullable values |
 | `std/async_http` | HTTP/1.1 parsing (via runtime) |
@@ -251,13 +266,12 @@ C MAX_BODY_SIZE: i64 = 1048576   # 1 MB
 ```
 
 ### External functions
-Declare external runtime functions at the bottom of the file:
+Avoid adding project-local string externs for promoted runtime code. For
+non-string platform hooks, declare external runtime functions at the bottom of
+the file and add a runtime smoke before treating the behavior as certified:
 
 ```vais
 X F current_time_ms() -> i64
-X F str_len(s: str) -> i64
-X F str_char_at(s: str, i: i64) -> i64
-X F str_slice(s: str, start: i64, end: i64) -> str
 ```
 
 ### No loops that mutate outer structs
@@ -340,7 +354,7 @@ vaisdb (native query API) ← 같은 모노레포: ../vaisdb/
 ### Downstream Dependencies
 | Project | Path | 사용하는 인터페이스 |
 |---------|------|-------------------|
-| vais-web | `../vais-web/` | SSR 연동 (미정의) |
+| vais-web | `../vais-web/` | SSR bridge contract plus promoted local loopback forwarding surface |
 
 ### 작업 전 체크리스트
 - **새 유틸리티 구현 전**: `../../VAIS-ECOSYSTEM.md` "Shared Components" 확인 — std에 이미 있는 기능 재구현 금지
