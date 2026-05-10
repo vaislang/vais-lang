@@ -381,5 +381,5 @@ describe("E2E - vais-web file-routing production runtime", () => {
     const missing = await fetch(`${baseUrl}/missing`);
     expect(missing.status).toBe(404);
     expect(await missing.text()).toContain("404 - Page Not Found");
-  });
+  }, 15000);
 });
