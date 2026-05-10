@@ -49,7 +49,8 @@ Every VaisDB component maps to one or more Vais standard library modules. This t
 
 ### Vais std Library Support
 
-All previously identified gaps have been resolved in Vais v1.0.0+:
+Previously identified gaps should be checked against the current certified source
+baseline before being treated as resolved:
 
 | Feature | Module | Status |
 |---------|--------|--------|
@@ -694,7 +695,7 @@ VaisDB can be fully implemented in Vais with C FFI for the following reasons:
 | Item | Status | Notes |
 |------|--------|-------|
 | Component-to-std mapping | Done | All components mapped to Vais std or C FFI |
-| Gap analysis | Done | 7 C FFI gaps, std gaps resolved (Vais v1.0.0+) |
+| Gap analysis | Done | 7 C FFI gaps, std gaps tracked against the current certified source baseline |
 | Serialization patterns | Done | All on-disk structs: PageHeader, WAL header, MVCC tuple, AdjEntry, PostingEntry, WAL segment header, CLOG, HeapPageSlot, UndoEntry, FreelistBitmap, BTreeInternalEntry, BTreeLeafEntry, MetaPageHeader |
 | Memory management strategy | Done | Cross-referenced with Stage 4 Section 7 |
 | SIMD strategy | Done | Runtime dispatch, C FFI wrappers |

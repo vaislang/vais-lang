@@ -24,7 +24,7 @@ crates/                        # Rust crates (Vais compiler integration)
 └── vaisx-wasm/                # WASM bindings
 
 packages/                      # TypeScript packages (npm)
-├── runtime/                   # Core runtime (< 3KB)
+├── runtime/                   # Core runtime, size gate pending
 ├── cli/                       # Project scaffolding CLI
 ├── kit/                       # Core types & shared interfaces
 ├── plugin/                    # Vite-compatible plugin system
@@ -54,7 +54,7 @@ docs/                          # Documentation
 
 ## Key Design Decisions
 
-1. **Compile-time reactivity**: `$state`, `$derived`, `$effect` compiled at build time → runtime < 3KB
+1. **Compile-time reactivity**: `$state`, `$derived`, `$effect` compiled at build time; runtime size claims require a dedicated size gate
 2. **File-based routing**: `app/` directory = URL structure, per-page SSR/SSG mode
 3. **Vite-compatible plugins**: full Vite plugin API compatibility
 4. **Hybrid Rust+TS**: Rust crates for compiler integration, TypeScript packages for web runtime

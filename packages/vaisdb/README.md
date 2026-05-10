@@ -87,15 +87,19 @@ Written in [Vais](https://github.com/vaislang/vais), an AI-optimized systems pro
 
 ## Project Status
 
-**Stage: Design & Foundation**
+**Stage: Promoted bounded runtime foundation**
 
-See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
+Current certified gates: package codegen `261/261`, runtime smoke `34/34`.
+These gates prove the promoted surfaces in [ROADMAP.md](ROADMAP.md); they do not
+claim product-complete SQL, vector recall/scale, full-text execution, or
+production operations coverage.
 
 ---
 
 ## Building
 
-> Requires [Vais compiler](https://github.com/vaislang/vais) v1.0.0+
+> Requires [Vais compiler](https://github.com/vaislang/vais) built from the
+> current certified source baseline.
 
 ```bash
 # TODO: Build instructions will be added as implementation progresses

@@ -1,6 +1,6 @@
 # VaisDB Roadmap
 
-Last verified: 2026-05-03
+Last verified: 2026-05-10
 
 This file is intentionally current-only. Historical Phase Ω logs, intermediate
 failure counts, and resolved "not implemented" notes were removed from the
@@ -17,7 +17,7 @@ Current promoted VaisDB gate:
 | Gate | Current status |
 |---|---|
 | Package codegen | `vaisdb=261/261` |
-| Runtime smoke | `VAISDB RUNTIME smoke=28/28` |
+| Runtime smoke | `VAISDB RUNTIME smoke=34/34` |
 | Aggregate check | `cd compiler && bash scripts/check-integrity.sh` |
 
 There is no active `vaisdb/src/**/*.vais` codegen failure list in this roadmap.
@@ -33,6 +33,8 @@ The promoted gate verifies bounded runtime behavior across:
   bulk graph path, and vector storage WAL paths;
 - SQL catalog schema, parser/planner, planner precision, and plan formatting;
 - WAL segment discovery, checkpoint/recovery, and embedded durability;
+- MVCC visibility, command-id snapshot behavior, conflict/deadlock fixtures,
+  undo/ATT path fixtures, and CLOG status round-trips;
 - package-level codegen for all `261` VaisDB source files.
 
 These gates prove the promoted surfaces. They do not imply full product

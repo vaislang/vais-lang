@@ -7,7 +7,8 @@ VaisDB is a RAG-native hybrid database written in pure Vais. It combines vector,
 ## Language
 
 - **Implementation**: Pure Vais (.vais files) with C FFI for system calls
-- **Compiler**: [vaislang/vais](https://github.com/vaislang/vais) v1.0.0+
+- **Compiler**: [vaislang/vais](https://github.com/vaislang/vais) built from the
+  current certified source baseline
 - **Build**: `vaisc build`
 
 ## Project Structure
@@ -59,7 +60,7 @@ src/
 ## Roadmap Reference
 
 See [ROADMAP.md](ROADMAP.md) for detailed phase breakdown.
-Current promoted gate: package codegen `261/261`, runtime smoke `28/28`.
+Current promoted gate: package codegen `261/261`, runtime smoke `34/34`.
 
 Historical Phase Ω notes and intermediate failure counts are not active work.
 Do not treat old references to partial package counts, old phase names, or old

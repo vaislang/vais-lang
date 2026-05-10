@@ -11,7 +11,7 @@ VaisDB is a RAG-native hybrid database that combines four search engines in a si
 ## Installation
 
 ```bash
-# Build from source (requires Vais v1.0.0+)
+# Build from source (requires the current certified Vais source baseline)
 git clone https://github.com/vaislang/vaisdb.git
 cd vaisdb
 vaisc build

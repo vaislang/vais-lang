@@ -15,18 +15,21 @@ vaisdb  (vector + graph + relational + full-text database)
 Key characteristics:
 - **Minimal core**: App + Router + Middleware pipeline as first-class primitives
 - **Native vaisdb integration**: direct query execution, no ORM
-- **Multi-protocol**: REST, GraphQL, gRPC, WebSocket from one server instance
-- **Built-in auth**: JWT, OAuth2, session-based authentication
+- **Protocol workbench**: REST, GraphQL, gRPC, and WebSocket modules exist, but
+  product-complete protocol support requires dedicated runtime gates
+- **Auth workbench**: JWT, OAuth2, and session modules exist, but broad auth
+  guarantees require dedicated runtime gates
 - **Pure Vais**: no FFI; system I/O via `std/async_http`, `std/http_server`, `std/websocket`
 
 Current reactivation status: `compiler/scripts/check-integrity.sh` reports
-`SERVER RUNTIME smoke=13/13`. The promoted surface covers minimal App/Context,
+`SERVER RUNTIME smoke=15/15`. The promoted surface covers minimal App/Context,
 VaisDB embedded integration, static/dynamic/wildcard router behavior, bounded
 body parsing, symbolic middleware pipeline dispatch, SSR render/hydrate API
-response contracts, compiled SSR forwarding over local loopback HTTP, upstream
+response contracts, nested raw-props preservation, JSON string escaping for SSR
+hydration payloads, compiled SSR forwarding over local loopback HTTP, upstream
 error/status mapping, timeout handling, retry, and retry-budget observability.
-Product-complete protocol support still requires dedicated runtime smokes before
-it is promoted.
+Product-complete protocol and middleware support still requires dedicated
+runtime smokes before it is promoted.
 
 ---
 

@@ -1,6 +1,6 @@
 # vais-server Roadmap
 
-Last verified: 2026-05-03
+Last verified: 2026-05-10
 
 This file is intentionally current-only. Historical runtime promotion logs and
 intermediate smoke counts were removed from the active roadmap so future agents
@@ -15,7 +15,7 @@ Current promoted vais-server gate:
 
 | Gate | Current status |
 |---|---|
-| Runtime smoke | `SERVER RUNTIME smoke=13/13` |
+| Runtime smoke | `SERVER RUNTIME smoke=15/15` |
 | Aggregate check | `cd compiler && bash scripts/check-integrity.sh` |
 
 ## Certified Surface
@@ -27,6 +27,8 @@ The promoted runtime gate verifies bounded behavior for:
 - request/header/content-type handling;
 - static, dynamic path-param, query-string, and wildcard router behavior;
 - bounded form and compact flat JSON body parsing;
+- nested raw-props object and array preservation for the promoted SSR path;
+- JSON string escaping for SSR hydration payloads;
 - symbolic middleware pipeline dispatch;
 - SSR render/hydrate API response contracts;
 - compiled SSR forwarding over local loopback HTTP;
@@ -42,7 +44,8 @@ HTTP framework coverage.
 
 These are active non-claims, not current regressions:
 
-- full JSON validation, nested objects/arrays, and broad escape semantics;
+- complete JSON grammar validation beyond the promoted bounded raw-props
+  parser;
 - HTTPS/TLS, redirects, keep-alive pooling, and external network reliability;
 - arbitrary middleware instance dispatch;
 - response body string-concat middleware transforms;

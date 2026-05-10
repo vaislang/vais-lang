@@ -59,7 +59,7 @@ vais-web/
 │       └── Cargo.toml
 │
 ├── packages/                       # JS/TS 패키지
-│   ├── vaisx-runtime/              # VaisX 소형 런타임 (< 3KB gzipped)
+│   ├── vaisx-runtime/              # VaisX runtime, size gate pending
 │   │   ├── src/
 │   │   │   ├── index.ts            # 진입점
 │   │   │   ├── signal.ts           # 시그널 런타임 (컴파일러 미해결 부분용)
@@ -814,7 +814,7 @@ F increment() {               function increment() {
 
 ---
 
-## 5. VaisX 런타임 (< 3KB gzipped)
+## 5. VaisX Runtime Gate
 
 ### 5.1 역할
 
@@ -1125,7 +1125,7 @@ VaisKit (이 프로젝트)
 
 | 지표 | 목표 | 비교 |
 |------|------|------|
-| 런타임 크기 | < 3KB gzipped | Svelte ~1.6KB, React ~44KB |
+| 런타임 크기 | Dedicated size gate pending | Svelte ~1.6KB, React ~44KB |
 | SSR 렌더링 | < 5ms / 컴포넌트 | Next.js ~10ms |
 | 하이드레이션 | < 50ms (선택적) | Qwik ~0ms (resumable) |
 | HMR | < 100ms | Vite ~50ms |
