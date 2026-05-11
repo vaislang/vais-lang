@@ -22,12 +22,13 @@ Key characteristics:
 - **Pure Vais**: no FFI; system I/O via `std/async_http`, `std/http_server`, `std/websocket`
 
 Current reactivation status: `compiler/scripts/check-integrity.sh` reports
-`SERVER RUNTIME smoke=15/15`. The promoted surface covers minimal App/Context,
+`SERVER RUNTIME smoke=16/16`. The promoted surface covers minimal App/Context,
 VaisDB embedded integration, static/dynamic/wildcard router behavior, bounded
 body parsing, symbolic middleware pipeline dispatch, SSR render/hydrate API
 response contracts, nested raw-props preservation, JSON string escaping for SSR
-hydration payloads, compiled SSR forwarding over local loopback HTTP, upstream
-error/status mapping, timeout handling, retry, and retry-budget observability.
+hydration payloads, SSR raw-props JSON value grammar validation, compiled SSR
+forwarding over local loopback HTTP, upstream error/status mapping, timeout
+handling, retry, and retry-budget observability.
 Product-complete protocol and middleware support still requires dedicated
 runtime smokes before it is promoted.
 

@@ -58,7 +58,7 @@ fn json_get_str(json: str, key: str) -> str {
 
 # Extract the raw JSON value of a top-level field.
 # Quoted string values are returned without quotes for compatibility with the
-# original SSR API; object/array values are returned as balanced raw JSON.
+# original SSR API; complete JSON values are returned as raw JSON.
 fn json_get_value(json: str, key: str) -> str {
     needle := "\"" + key + "\":"
     start  := ssr_str_find(json, needle, 0)
@@ -70,77 +70,187 @@ fn json_get_value(json: str, key: str) -> str {
 }
 
 fn ssr_json_value_slice(json: str, start: i64) -> str {
-    c := json.char_at(start)
+    value_end := ssr_json_value_end(json, start)
+    I value_end == -1 { return "" }
+
+    c := json.char_at(skip_whitespace(json, start))
     I c == 0 { return "" }
 
     I c == 34 {
-        end := ssr_json_string_end(json, start + 1)
-        I end == -1 { return "" }
-        return json.substring(start + 1, end)
+        return json.substring(skip_whitespace(json, start) + 1, value_end - 1)
     }
 
-    I c == 123 || c == 91 {
-        end := ssr_json_composite_end(json, start)
-        I end == -1 { return "" }
-        return json.substring(start, end + 1)
-    }
-
-    end := ssr_json_bare_value_end(json, start)
-    I end <= start { return "" }
-    json.substring(start, end)
+    json.substring(skip_whitespace(json, start), value_end)
 }
 
 fn ssr_json_string_end(s: str, i: i64) -> i64 {
-    c := s.char_at(i)
-    I c == 0 { return -1 }
-    I c == 92 { return ssr_json_string_end(s, i + 2) }
-    I c == 34 { return i }
-    ssr_json_string_end(s, i + 1)
+    end := ssr_json_string_value_end(s, i - 1)
+    I end == -1 { return -1 }
+    end - 1
 }
 
 fn ssr_json_composite_end(s: str, start: i64) -> i64 {
-    ssr_json_composite_end_rec(s, start, 0, false, false)
+    end := ssr_json_value_end(s, start)
+    I end == -1 { return -1 }
+    end - 1
 }
 
-fn ssr_json_composite_end_rec(s: str, i: i64, depth: i64, in_string: bool, escaped: bool) -> i64 {
-    c := s.char_at(i)
-    I c == 0 { return -1 }
+fn ssr_json_value_end(s: str, i: i64) -> i64 {
+    start := skip_whitespace(s, i)
+    c := s.char_at(start)
+    I c == 34 { return ssr_json_string_value_end(s, start) }
+    I c == 123 { return ssr_json_object_end(s, start) }
+    I c == 91 { return ssr_json_array_end(s, start) }
+    I c == 45 || ssr_json_is_digit(c) == 1 { return ssr_json_number_end(s, start) }
+    I ssr_match_literal(s, start, "true") == 1 { return start + 4 }
+    I ssr_match_literal(s, start, "false") == 1 { return start + 5 }
+    I ssr_match_literal(s, start, "null") == 1 { return start + 4 }
+    -1
+}
 
-    I in_string {
-        I escaped {
-            return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
-        }
+fn ssr_json_object_end(s: str, start: i64) -> i64 {
+    i := mut skip_whitespace(s, start + 1)
+    I s.char_at(i) == 125 { return i + 1 }
+
+    LW 1 == 1 {
+        I s.char_at(i) != 34 { return -1 }
+        key_end := ssr_json_string_value_end(s, i)
+        I key_end == -1 { return -1 }
+
+        i = skip_whitespace(s, key_end)
+        I s.char_at(i) != 58 { return -1 }
+
+        value_end := ssr_json_value_end(s, i + 1)
+        I value_end == -1 { return -1 }
+
+        i = skip_whitespace(s, value_end)
+        c := s.char_at(i)
+        I c == 125 { return i + 1 }
+        I c != 44 { return -1 }
+
+        i = skip_whitespace(s, i + 1)
+        I s.char_at(i) == 125 { return -1 }
+    }
+
+    -1
+}
+
+fn ssr_json_array_end(s: str, start: i64) -> i64 {
+    i := mut skip_whitespace(s, start + 1)
+    I s.char_at(i) == 93 { return i + 1 }
+
+    LW 1 == 1 {
+        value_end := ssr_json_value_end(s, i)
+        I value_end == -1 { return -1 }
+
+        i = skip_whitespace(s, value_end)
+        c := s.char_at(i)
+        I c == 93 { return i + 1 }
+        I c != 44 { return -1 }
+
+        i = skip_whitespace(s, i + 1)
+        I s.char_at(i) == 93 { return -1 }
+    }
+
+    -1
+}
+
+fn ssr_json_string_value_end(s: str, start: i64) -> i64 {
+    I s.char_at(start) != 34 { return -1 }
+
+    i := mut (start + 1)
+    LW 1 == 1 {
+        c := s.char_at(i)
+        I c == 0 { return -1 }
+        I c < 32 { return -1 }
+        I c == 34 { return i + 1 }
         I c == 92 {
-            return ssr_json_composite_end_rec(s, i + 1, depth, true, true)
+            esc := s.char_at(i + 1)
+            I esc == 34 || esc == 92 || esc == 47 || esc == 98 || esc == 102 || esc == 110 || esc == 114 || esc == 116 {
+                i += 2
+            } else I esc == 117 {
+                I ssr_json_is_hex4(s, i + 2) == 0 { return -1 }
+                i += 6
+            } else {
+                return -1
+            }
+        } else {
+            i += 1
         }
-        I c == 34 {
-            return ssr_json_composite_end_rec(s, i + 1, depth, false, false)
-        }
-        return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
     }
 
-    I c == 34 {
-        return ssr_json_composite_end_rec(s, i + 1, depth, true, false)
-    }
-    I c == 123 || c == 91 {
-        return ssr_json_composite_end_rec(s, i + 1, depth + 1, false, false)
-    }
-    I c == 125 || c == 93 {
-        next_depth := depth - 1
-        I next_depth == 0 { return i }
-        I next_depth < 0 { return -1 }
-        return ssr_json_composite_end_rec(s, i + 1, next_depth, false, false)
-    }
-
-    ssr_json_composite_end_rec(s, i + 1, depth, false, false)
+    -1
 }
 
-fn ssr_json_bare_value_end(s: str, i: i64) -> i64 {
-    c := s.char_at(i)
-    I c == 0 || c == 44 || c == 125 || c == 93 || c == 32 || c == 9 || c == 13 || c == 10 {
-        return i
+fn ssr_json_number_end(s: str, start: i64) -> i64 {
+    i := mut start
+    I s.char_at(i) == 45 {
+        i += 1
     }
-    ssr_json_bare_value_end(s, i + 1)
+
+    c := s.char_at(i)
+    I c == 48 {
+        i += 1
+    } else I ssr_json_is_digit_one_to_nine(c) == 1 {
+        i += 1
+        LW ssr_json_is_digit(s.char_at(i)) == 1 {
+            i += 1
+        }
+    } else {
+        return -1
+    }
+
+    I s.char_at(i) == 46 {
+        i += 1
+        I ssr_json_is_digit(s.char_at(i)) == 0 { return -1 }
+        LW ssr_json_is_digit(s.char_at(i)) == 1 {
+            i += 1
+        }
+    }
+
+    exp := s.char_at(i)
+    I exp == 101 || exp == 69 {
+        i += 1
+        sign := s.char_at(i)
+        I sign == 43 || sign == 45 {
+            i += 1
+        }
+        I ssr_json_is_digit(s.char_at(i)) == 0 { return -1 }
+        LW ssr_json_is_digit(s.char_at(i)) == 1 {
+            i += 1
+        }
+    }
+
+    i
+}
+
+fn ssr_json_is_digit(c: i64) -> i64 {
+    I c >= 48 && c <= 57 { return 1 }
+    0
+}
+
+fn ssr_json_is_digit_one_to_nine(c: i64) -> i64 {
+    I c >= 49 && c <= 57 { return 1 }
+    0
+}
+
+fn ssr_json_is_hex(c: i64) -> i64 {
+    I c >= 48 && c <= 57 { return 1 }
+    I c >= 65 && c <= 70 { return 1 }
+    I c >= 97 && c <= 102 { return 1 }
+    0
+}
+
+fn ssr_json_is_hex4(s: str, i: i64) -> i64 {
+    I ssr_json_is_hex(s.char_at(i)) == 0 { return 0 }
+    I ssr_json_is_hex(s.char_at(i + 1)) == 0 { return 0 }
+    I ssr_json_is_hex(s.char_at(i + 2)) == 0 { return 0 }
+    I ssr_json_is_hex(s.char_at(i + 3)) == 0 { return 0 }
+    1
+}
+
+fn ssr_match_literal(s: str, i: i64, literal: str) -> i64 {
+    ssr_match_prefix(s, i, literal, 0)
 }
 
 # Skip ASCII whitespace (space=32, tab=9, CR=13, LF=10) from position i.
@@ -226,20 +336,9 @@ fn ssr_props_json_value(props: str) -> str {
     I props == "" { return "{}" }
 
     start := skip_whitespace(props, 0)
-    c := props.char_at(start)
-    I c == 123 || c == 91 {
-        end := ssr_json_composite_end(props, start)
-        I end != -1 && ssr_json_trailing_ws_only(props, end + 1) == 1 {
-            return props
-        }
-        return ssr_json_string(props)
-    }
-    I c == 34 {
-        end := ssr_json_string_end(props, start + 1)
-        I end != -1 && ssr_json_trailing_ws_only(props, end + 1) == 1 {
-            return props
-        }
-        return ssr_json_string(props)
+    end := ssr_json_value_end(props, start)
+    I end != -1 && ssr_json_trailing_ws_only(props, end) == 1 {
+        return props
     }
 
     ssr_json_string(props)
