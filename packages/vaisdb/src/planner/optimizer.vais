@@ -430,19 +430,19 @@ partial fn recalculate_costs(
 
         HybridPlanNode.GraphTraverse { params, alias, .. } => {
             gs := mut match &stats.graph_stats {
-                Some(s) => s,
-                None => &GraphStats.default(),
+                Some(s) => (*s).clone(),
+                None => GraphStats.default(),
             };
-            cost := mut estimate_graph_traverse_cost(&params, gs);
+            cost := mut estimate_graph_traverse_cost(&params, &gs);
             Ok(HybridPlanNode.GraphTraverse { params, alias, cost })
         },
 
         HybridPlanNode.FullTextScan { params, alias, .. } => {
             fs := mut match &stats.fulltext_stats {
-                Some(s) => s,
-                None => &FullTextStats.default(),
+                Some(s) => (*s).clone(),
+                None => FullTextStats.default(),
             };
-            cost := mut estimate_fulltext_scan_cost(&params, fs);
+            cost := mut estimate_fulltext_scan_cost(&params, &fs);
             Ok(HybridPlanNode.FullTextScan { params, alias, cost })
         },
 
@@ -482,7 +482,7 @@ partial fn recalculate_costs(
 
         HybridPlanNode.HybridFilter { input, predicate, .. } => {
             child := mut recalculate_costs(*input, stats)?;
-            child_cost := mut child.get_cost().clone();
+            child_cost := mut (*child.get_cost()).clone();
             sel := mut estimate_selectivity(&predicate);
             cost := mut child_cost.clone();
             cost.row_estimate = (child_cost.row_estimate as f64 * sel) as u64;
@@ -492,14 +492,14 @@ partial fn recalculate_costs(
 
         HybridPlanNode.HybridProject { input, columns, .. } => {
             child := mut recalculate_costs(*input, stats)?;
-            cost := mut child.get_cost().clone();
+            cost := mut (*child.get_cost()).clone();
             cost.total_cpu_cost += cost.row_estimate as f64 * 0.001;
             Ok(HybridPlanNode.HybridProject { input: Box.new(child), columns, cost })
         },
 
         HybridPlanNode.HybridSort { input, order_by, .. } => {
             child := mut recalculate_costs(*input, stats)?;
-            cost := mut child.get_cost().clone();
+            cost := mut (*child.get_cost()).clone();
             n := mut cost.row_estimate as f64;
             I n > 1.0 {
                 cost.total_cpu_cost += n * n.log2() * 0.01;
@@ -510,7 +510,7 @@ partial fn recalculate_costs(
 
         HybridPlanNode.HybridLimit { input, limit, offset, .. } => {
             child := mut recalculate_costs(*input, stats)?;
-            cost := mut child.get_cost().clone();
+            cost := mut (*child.get_cost()).clone();
             I limit.is_some() != 0 {
                 lim := mut limit!;
                 I lim < cost.row_estimate {
@@ -522,7 +522,7 @@ partial fn recalculate_costs(
 
         HybridPlanNode.HybridAggregate { input, group_by, aggregates, having, .. } => {
             child := mut recalculate_costs(*input, stats)?;
-            cost := mut child.get_cost().clone();
+            cost := mut (*child.get_cost()).clone();
             n := mut cost.row_estimate as f64;
             cost.total_cpu_cost += n * 0.05;
             groups := mut I group_by.len() == 0 { 1u64 } else { (n * 0.1) as u64 };
@@ -556,7 +556,7 @@ fn build_initial_plan(
             Some(s) => s,
             None => &VectorIndexStats.default(1536),
         };
-        cost := mut estimate_vector_scan_cost(vp, vs);
+        cost := mut estimate_vector_scan_cost(&vp, vs);
         engine_nodes.push(HybridPlanNode.VectorScan {
             params: vp.clone(),
             alias: None,
@@ -567,10 +567,10 @@ fn build_initial_plan(
     # Build graph traverse nodes
     LF gp: profile.graph_calls {
         gs := mut match &stats.graph_stats {
-            Some(s) => s,
-            None => &GraphStats.default(),
+            Some(s) => (*s).clone(),
+            None => GraphStats.default(),
         };
-        cost := mut estimate_graph_traverse_cost(gp, gs);
+        cost := mut estimate_graph_traverse_cost(&gp, &gs);
         engine_nodes.push(HybridPlanNode.GraphTraverse {
             params: gp.clone(),
             alias: None,
@@ -581,10 +581,10 @@ fn build_initial_plan(
     # Build fulltext scan nodes
     LF fp: profile.fulltext_calls {
         fs := mut match &stats.fulltext_stats {
-            Some(s) => s,
-            None => &FullTextStats.default(),
+            Some(s) => (*s).clone(),
+            None => FullTextStats.default(),
         };
-        cost := mut estimate_fulltext_scan_cost(fp, fs);
+        cost := mut estimate_fulltext_scan_cost(&fp, &fs);
         engine_nodes.push(HybridPlanNode.FullTextScan {
             params: fp.clone(),
             alias: None,
@@ -608,8 +608,8 @@ fn build_initial_plan(
     LW en_idx < engine_nodes.len() {
         node := engine_nodes[en_idx].clone()
         # Default: score fusion for hybrid search, join for relational
-        left_cost := mut combined.get_cost().clone();
-        right_cost := mut node.get_cost().clone();
+        left_cost := mut (*combined.get_cost()).clone();
+        right_cost := mut (*node.get_cost()).clone();
 
         I profile.needs_score_fusion() {
             fusion_cost := mut estimate_fusion_cost(&left_cost, &right_cost, &FusionMethod.default_rrf(), 10);

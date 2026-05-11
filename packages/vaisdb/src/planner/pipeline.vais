@@ -340,31 +340,31 @@ fn execute_plan(
     match plan {
         HybridPlanNode.SqlPlan { plan, .. } => {
             # Delegate to existing SQL executor
-            execute_sql_plan(plan, ctx)
+            execute_sql_plan(&plan, ctx)
         },
 
         HybridPlanNode.VectorScan { params, .. } => {
-            execute_vector_scan(params, ctx)
+            execute_vector_scan(&params, ctx)
         },
 
         HybridPlanNode.GraphTraverse { params, .. } => {
-            execute_graph_traverse(params, ctx)
+            execute_graph_traverse(&params, ctx)
         },
 
         HybridPlanNode.FullTextScan { params, .. } => {
-            execute_fulltext_scan(params, ctx)
+            execute_fulltext_scan(&params, ctx)
         },
 
         HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
-            execute_score_fusion(left.as_ref(), right.as_ref(), method, *top_k, ctx)
+            execute_score_fusion(left.as_ref(), right.as_ref(), &method, *top_k, ctx)
         },
 
         HybridPlanNode.CrossEngineJoin { left, right, join_type, condition, .. } => {
-            execute_cross_engine_join(left.as_ref(), right.as_ref(), *join_type, condition, ctx)
+            execute_cross_engine_join(left.as_ref(), right.as_ref(), *join_type, &condition, ctx)
         },
 
         HybridPlanNode.HybridFilter { input, predicate, .. } => {
-            execute_hybrid_filter(input.as_ref(), predicate, ctx)
+            execute_hybrid_filter(input.as_ref(), &predicate, ctx)
         },
 
         HybridPlanNode.HybridProject { input, columns, .. } => {
@@ -404,7 +404,15 @@ fn execute_sql_plan(plan: &PlanNode, ctx: &ExecContext) -> Result<Vec<ExecutorRo
                 .ok_or(err_hybrid_exec_failed("Columns not found for table"))?;
 
             # Use TableScanExecutor
-            scan := mut TableScanExecutor.new(table_info.clone(), columns, filter.clone());
+            owned_columns: Vec<ColumnInfo> := mut Vec.with_capacity(columns.len());
+            LF col: columns {
+                owned_columns.push((*col).clone());
+            }
+            owned_filter := mut match filter {
+                Some(f) => Some((*f).clone()),
+                None => None,
+            };
+            scan := mut TableScanExecutor.new(table_info.clone(), owned_columns, owned_filter);
             scan.open(ctx)?;
 
             rows := mut Vec.new();
@@ -423,7 +431,7 @@ fn execute_sql_plan(plan: &PlanNode, ctx: &ExecContext) -> Result<Vec<ExecutorRo
             eval_ctx := mut EvalContext.new();
             filtered := mut Vec.new();
             LF row: rows {
-                match eval_predicate(predicate, row.get_row(), &eval_ctx) {
+                match eval_predicate(&predicate, row.get_row(), &eval_ctx) {
                     Ok(true) => filtered.push(row.clone()),
                     _ => {},
                 }
@@ -586,7 +594,7 @@ fn rows_to_scored(rows: &Vec<ExecutorRow>, engine: EngineType) -> Vec<ScoredResu
                 _ => {},
             }
         }
-        scored.push(ScoredResult.new(row.clone(), score, engine));
+        scored.push(ScoredResult.new((*row).clone(), score, engine));
     }
     scored
 }
@@ -662,7 +670,7 @@ fn execute_cross_engine_join(
 
                 I should_join {
                     # Merge rows
-                    merged := mut merge_rows(&build_rows_vec[*build_idx], probe_row);
+                    merged := mut merge_rows(&build_rows_vec[*build_idx], &probe_row);
                     result.push(merged);
                 }
             }
@@ -680,10 +688,10 @@ fn merge_rows(left: &ExecutorRow, right: &ExecutorRow) -> ExecutorRow {
     # Combine columns from both rows
     combined_values: Vec<SqlValue> := mut Vec.new();
     LF i: 0..left_row.column_count() {
-        combined_values.push(left_row.get(i).clone());
+        combined_values.push((*left_row.get(i)).clone());
     }
     LF i: 0..right_row.column_count() {
-        combined_values.push(right_row.get(i).clone());
+        combined_values.push((*right_row.get(i)).clone());
     }
 
     merged_row := mut Row.from_values(combined_values);

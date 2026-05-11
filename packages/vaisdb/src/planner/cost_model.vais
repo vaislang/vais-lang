@@ -150,7 +150,7 @@ impl HybridStats {
     fn find_table_stats(self, table_name: &Str) -> Option<&TableStats> {
         LF stat: self.sql_stats {
             I stat.name == *table_name {
-                return Some(stat);
+                return Some(&stat);
             }
         }
         None
@@ -159,7 +159,7 @@ impl HybridStats {
     fn find_vector_stats(self, dimension: u32) -> Option<&VectorIndexStats> {
         LF stat: self.vector_stats {
             I stat.dimension == dimension {
-                return Some(stat);
+                return Some(&stat);
             }
         }
         # Return first I dimension doesn't M exactly
@@ -220,10 +220,15 @@ partial fn estimate_vector_scan_cost(
 
     # Pre-filter adds I/O I present (bitmap scan of filter column)
     I params.pre_filter.is_some() != 0 {
-        sel := mut match &params.pre_filter {
-            Some(e) => estimate_selectivity(e),
-            None => 1.0,
-        };
+        sel := mut 1.0;
+        match &params.pre_filter {
+            Some(e) => {
+                sel = estimate_selectivity(&e);
+            },
+            None => {
+                sel = 1.0;
+            },
+        }
         io_cost += n * 0.01 * sel;  # Bitmap scan cost
         cpu_cost += n * sel * 0.01;  # Filter eval cost
     }
@@ -280,10 +285,15 @@ fn estimate_graph_traverse_cost(
     # Edge type filter reduces effective degree
     effective_degree := mut avg_degree;
     I params.edge_type_filter.is_some() != 0 {
-        filter_types := mut match &params.edge_type_filter {
-            Some(v) => v.len() as f64,
-            None => 0.0,
-        };
+        filter_types := mut 0.0;
+        match &params.edge_type_filter {
+            Some(v) => {
+                filter_types = v.len() as f64;
+            },
+            None => {
+                filter_types = 0.0;
+            },
+        }
         total_types := mut stats.edge_type_count as f64;
         I total_types > 0.0 {
             effective_degree = avg_degree * (filter_types / total_types);
@@ -380,15 +390,12 @@ fn estimate_fulltext_scan_cost(
     cpu_cost := mut cpu_tokenize + cpu_score + cpu_visibility;
 
     # Phrase search adds position checking cost
-    match params.search_mode {
-        FullTextSearchMode.Phrase { slop } => {
-            cpu_cost += total_postings * 0.05;  # Position comparison per posting
-        },
-        FullTextSearchMode.Boolean => {
-            cpu_cost += estimated_terms as f64 * 0.1;  # Boolean operator eval
-        },
-        _ => {}
-    }
+    search_mode_cpu := mut match &params.search_mode {
+        FullTextSearchMode.Phrase { slop } => total_postings * 0.05,
+        FullTextSearchMode.Boolean => estimated_terms as f64 * 0.1,
+        _ => 0.0,
+    };
+    cpu_cost += search_mode_cpu;
 
     row_estimate := mut params.top_k as u64;
     mem := mut row_estimate * 48;  # doc_id + score + table_id + row_tid + overhead
@@ -495,7 +502,7 @@ partial fn estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
             left_cost := mut estimate_hybrid_cost(left.as_ref());
             right_cost := mut estimate_hybrid_cost(right.as_ref());
-            estimate_fusion_cost(&left_cost, &right_cost, method, *top_k)
+            estimate_fusion_cost(&left_cost, &right_cost, &method, *top_k)
         },
 
         HybridPlanNode.CrossEngineJoin { left, right, .. } => {
@@ -506,7 +513,7 @@ partial fn estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
 
         HybridPlanNode.HybridFilter { input, predicate, .. } => {
             child_cost := mut estimate_hybrid_cost(input.as_ref());
-            sel := mut estimate_selectivity(predicate);
+            sel := mut estimate_selectivity(&predicate);
             cpu_filter := mut child_cost.row_estimate as f64 * 0.01;
             child_cost.total_cpu_cost += cpu_filter;
             child_cost.row_estimate = (child_cost.row_estimate as f64 * sel) as u64;

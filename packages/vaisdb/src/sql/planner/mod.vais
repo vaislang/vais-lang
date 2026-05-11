@@ -332,7 +332,7 @@ fn build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode,
     filtered_plan := mut match &query.where_clause {
         Some(predicate) => {
             # Try to push down to scans; if not possible, add Filter node
-            predicate_copy := mut clone_planner_expr(predicate)
+            predicate_copy := mut clone_planner_expr(&predicate)
             plan_where(base_plan, &predicate_copy, catalog)?
         },
         None => base_plan,
@@ -368,7 +368,7 @@ fn build_plan(query: &SelectQuery, catalog: &CatalogManager) -> Result<PlanNode,
     # Step 8: Apply set operations (UNION, INTERSECT, EXCEPT)
     final_plan := mut match &query.set_op {
         Some(set_op) => {
-            plan_set_op_arm(projected_plan, set_op, catalog)?
+            plan_set_op_arm(projected_plan, &set_op, catalog)?
         },
         None => projected_plan,
     };
@@ -427,7 +427,7 @@ fn plan_table_ref(table_ref: &TableRef, catalog: &CatalogManager) -> Result<Plan
         },
 
         TableRef.Join { join } => {
-            plan_join(join, catalog)
+            plan_join(&join, catalog)
         },
 
         TableRef.Subquery { query, alias } => {
@@ -482,7 +482,7 @@ fn plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Va
 
     # Extract join condition
     condition := mut match &join.condition {
-        JoinCondition.On { expr } => Some(expr.clone()),
+        JoinCondition.On { expr } => Some((*expr).clone()),
         JoinCondition.Using { columns } => {
             # Convert USING into explicit ON condition
             # USING (a, b) → ON left.a = right.a AND left.b = right.b
@@ -535,7 +535,7 @@ fn plan_join(join: &JoinClause, catalog: &CatalogManager) -> Result<PlanNode, Va
     # Check if condition has equi-join predicates (e.g., a.x = b.y)
     match &condition {
         Some(expr) => {
-            (found_equi, lk, rk) := mut extract_equi_join_keys(expr);
+            (found_equi, lk, rk) := mut extract_equi_join_keys(&expr);
             I found_equi {
                 use_hash_join = true;
                 left_keys = lk;
@@ -640,7 +640,7 @@ fn clone_planner_expr(expr: &Expr) -> Expr {
                 right: Box.new(clone_planner_expr(right.as_ref())),
             }
         },
-        _ => expr.clone(),
+        _ => (*expr).clone(),
     }
 }
 
@@ -651,7 +651,7 @@ fn extract_equi_join_keys(expr: &Expr) -> (bool, Vec<u64>, Vec<u64>) {
 
     match expr {
         Expr.BinaryOp { left, op, right } => {
-            I bin_op_tag(op) == 5 {
+            I bin_op_tag(&op) == 5 {
                 # Check if both sides are column references
                 is_left_col := mut match left.as_ref() {
                     Expr.ColumnRef { table, column } => true,
@@ -704,7 +704,7 @@ fn plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Re
                                     Ok(PlanNode.SeqScan {
                                         table: table.clone(),
                                         alias: alias.clone(),
-                                        filter: Some(predicate.clone()),
+                                        filter: Some((*predicate).clone()),
                                     })
                                 },
                             }
@@ -713,7 +713,7 @@ fn plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Re
                             Ok(PlanNode.SeqScan {
                                 table: table.clone(),
                                 alias: alias.clone(),
-                                filter: Some(predicate.clone()),
+                                filter: Some((*predicate).clone()),
                             })
                         },
                     }
@@ -729,7 +729,7 @@ fn plan_where(input: PlanNode, predicate: &Expr, catalog: &CatalogManager) -> Re
         _ => {
             Ok(PlanNode.Filter {
                 input: Box.new(input),
-                predicate: predicate.clone(),
+                predicate: (*predicate).clone(),
             })
         },
     }
@@ -797,7 +797,7 @@ fn plan_aggregation(
     LW select_idx < select_list.len() {
         match &select_list[select_idx] {
             SelectItem.Expr { expr, .. } => {
-                append_aggregate_if_any(&mut aggregates, expr)
+                append_aggregate_if_any(&mut aggregates, &expr)
             },
             _ => {},
         }
@@ -809,7 +809,7 @@ fn plan_aggregation(
         group_by: group_items,
         aggregates,
         having: match having {
-            Some(h) => Some(h.clone()),
+            Some(h) => Some((*h).clone()),
             None => None,
         },
     })
@@ -905,7 +905,7 @@ fn has_aggregates(select_list: &[SelectItem]) -> bool {
     LF item: select_list {
         match item {
             SelectItem.Expr { expr, .. } => {
-                I is_aggregate_expr(expr) {
+                I is_aggregate_expr(&expr) {
                     return true
                 }
             },
@@ -951,7 +951,7 @@ fn plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> R
 
     match limit {
         Some(expr) => {
-            n := mut extract_constant_int_or(expr, -1)
+            n := mut extract_constant_int_or(&expr, -1)
             I n >= 0 {
                 limit_val = Some(n as u64)
                 has_limit = true
@@ -965,7 +965,7 @@ fn plan_limit(input: PlanNode, limit: &Option<Expr>, offset: &Option<Expr>) -> R
 
     match offset {
         Some(expr) => {
-            n := mut extract_constant_int_or(expr, -1)
+            n := mut extract_constant_int_or(&expr, -1)
             I n >= 0 {
                 offset_val = Some(n as u64)
                 has_offset = true
@@ -1090,7 +1090,7 @@ fn estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstima
                     # Row estimate: apply selectivity
                     row_estimate := mut match filter {
                         Some(pred) => {
-                            sel := mut estimate_selectivity(pred);
+                            sel := mut estimate_selectivity(&pred);
                             (stats.row_count as f64 * sel) as u64
                         },
                         None => stats.row_count,
@@ -1119,7 +1119,7 @@ fn estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstima
                     # Apply residual filter selectivity
                     match residual {
                         Some(pred) => {
-                            sel := mut estimate_selectivity(pred);
+                            sel := mut estimate_selectivity(&pred);
                             row_estimate = (row_estimate as f64 * sel) as u64;
                         },
                         None => {},
@@ -1138,7 +1138,7 @@ fn estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstima
             cpu_cost := mut input_cost.cpu_cost + (input_cost.row_estimate as f64);
 
             # Apply selectivity to row estimate
-            sel := mut estimate_selectivity(predicate);
+            sel := mut estimate_selectivity(&predicate);
             row_estimate := mut (input_cost.row_estimate as f64 * sel) as u64;
 
             Ok(CostEstimate.new(input_cost.io_cost, cpu_cost, row_estimate))
@@ -1163,7 +1163,7 @@ fn estimate_cost(node: &PlanNode, catalog: &CatalogManager) -> Result<CostEstima
 
             # Output rows: apply join selectivity
             join_sel := mut match condition {
-                Some(pred) => estimate_selectivity(pred),
+                Some(pred) => estimate_selectivity(&pred),
                 None => 1.0,  # Cross join: all combinations
             };
             row_estimate := mut ((left_cost.row_estimate as f64) * (right_cost.row_estimate as f64) * join_sel) as u64;
@@ -1396,13 +1396,13 @@ fn format_plan(node: &PlanNode, indent: u64) -> Str {
 
         PlanNode.NestedLoopJoin { left, right, join_type, .. } => {
             line := mut prefix + "NestedLoopJoin type="
-            line = line + &format_plan_join_type(join_type)
+            line = line + &format_plan_join_type(&join_type)
             append_two_formatted_children(line, left.as_ref(), right.as_ref(), indent)
         },
 
         PlanNode.HashJoin { build, probe, join_type, left_keys, .. } => {
             line := mut prefix + "HashJoin type="
-            line = line + &format_plan_join_type(join_type)
+            line = line + &format_plan_join_type(&join_type)
             line = line + " keys="
             line = line + &format_plan_u64(left_keys.len() as u64)
             append_two_formatted_children(line, build.as_ref(), probe.as_ref(), indent)
