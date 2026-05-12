@@ -37,10 +37,9 @@ The promoted runtime gate verifies bounded behavior for:
   lookup, expired-session rejection, and cleanup retaining live sessions;
 - OAuth Google/GitHub authorization URL construction with explicit/generated
   state, state validation, and bounded mock authorization-code exchange;
-- bounded role-free JWT access/refresh token encode/generation, bounded
-  role-bearing access/token-pair generation for promoted 1/2-role claims,
-  role-free plus role-bearing verification/decode success, and key JWT error
-  paths;
+- JWT access/refresh token encode/generation, role-free and role-bearing
+  verification/decode success, loop-based arbitrary role-count join/generation
+  as covered by the promoted 3-role smoke, and key JWT error paths;
 - compiled SSR forwarding over local loopback HTTP;
 - upstream non-2xx preservation and transport failure to `502`;
 - explicit timeout to `504`;
@@ -60,11 +59,10 @@ These are active non-claims, not current regressions:
 - arbitrary middleware instance dispatch;
 - response body string-concat middleware transforms;
 - backoff and jitter policy beyond the promoted retry-budget gate;
-- cryptographic password hashing, cryptographic JWT/HMAC, arbitrary role-count
-  JWT join/generation, general non-fixture by-value `JwtClaims.encode`, custom
-  TTL/arbitrary payload JWT, custom OAuth provider construction, real OAuth
-  network exchange, real clock integration, cryptographic state/session
-  identifiers, and external auth integration;
+- cryptographic password hashing, cryptographic JWT/HMAC, custom TTL/arbitrary
+  payload JWT, custom OAuth provider construction, real OAuth network exchange,
+  real clock integration, cryptographic state/session identifiers, and external
+  auth integration;
 - deployed Node SSR operation outside the local loopback smoke.
 
 ## Next vais-server Work

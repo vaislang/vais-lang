@@ -4,6 +4,7 @@
 
 use std/string
 use std/vec
+use std/error
 
 # ============================================================================
 # JwtConfig — signing parameters and TTL settings
@@ -100,23 +101,12 @@ fn generate_access_token(claims: JwtClaims, config: JwtConfig) -> Result<JwtToke
         return Err(VaisError.new("VAIS-SERVER-JWT-500", "JWT secret is not configured"))
     }
 
-    # Runtime-certified placeholder paths. Arbitrary JWT generation remains a
-    # non-claim until crypto/string helpers are promoted.
-    I jwt_is_cert_access_claims(claims, config) {
-        return Ok(JwtToken.new("user1|issuer|4600|1000|.364", 4600))
-    }
-    I jwt_is_cert_two_role_access_claims(claims, config) {
-        return Ok(JwtToken.new("user1|issuer|4600|1000|admin,user.419", 4600))
-    }
-    I jwt_is_cert_one_role_access_claims(claims, config) {
-        return Ok(JwtToken.new("user1|issuer|4600|1000|admin.3be", 4600))
-    }
     payload    := claims.encode()
     signature  := jwt_sign(payload, config.secret)
     jwt_value  := payload + "." + signature
     expires_at := claims.exp
 
-    Ok(JwtToken.new(jwt_value, expires_at))
+    Ok(JwtToken { token: jwt_value, expires_at: expires_at })
 }
 
 # Generate a refresh token (minimal claims: sub + iss + exp).
@@ -128,11 +118,6 @@ fn generate_refresh_token(sub: str, config: JwtConfig) -> Result<JwtToken, VaisE
     now        := current_time_sec()
     expires_at := now + config.refresh_token_ttl_sec
 
-    # Runtime-certified placeholder path for the promoted smoke.
-    I sub == "user1" && config.secret == "secret" && config.issuer == "issuer" && now == 1000 && expires_at == 605800 {
-        return Ok(JwtToken.new("user1|issuer|605800|1000|.400", 605800))
-    }
-
     roles      := Vec.new()
 
     claims := JwtClaims.new(sub, config.issuer, expires_at, now, roles)
@@ -140,7 +125,7 @@ fn generate_refresh_token(sub: str, config: JwtConfig) -> Result<JwtToken, VaisE
     signature := jwt_sign(payload, config.secret)
     jwt_value := payload + "." + signature
 
-    Ok(JwtToken.new(jwt_value, expires_at))
+    Ok(JwtToken { token: jwt_value, expires_at: expires_at })
 }
 
 # Verify a token and return the decoded claims.
@@ -238,42 +223,6 @@ fn jwt_sign_fold(payload: str, secret: str, plen: i64, slen: i64, i: i64, acc: i
     jwt_sign_fold(payload, secret, plen, slen, i + 1, (acc + (pc ^ sc)) % 4294967296)
 }
 
-fn jwt_is_cert_access_claims(claims: JwtClaims, config: JwtConfig) -> bool {
-    I config.secret != "secret" { return false }
-    I config.issuer != "issuer" { return false }
-    I claims.sub != "user1" { return false }
-    I claims.iss != "issuer" { return false }
-    I claims.exp != 4600 { return false }
-    I claims.iat != 1000 { return false }
-    I claims.roles.len() != 0 { return false }
-    true
-}
-
-fn jwt_is_cert_two_role_access_claims(claims: JwtClaims, config: JwtConfig) -> bool {
-    I config.secret != "secret" { return false }
-    I config.issuer != "issuer" { return false }
-    I claims.sub != "user1" { return false }
-    I claims.iss != "issuer" { return false }
-    I claims.exp != 4600 { return false }
-    I claims.iat != 1000 { return false }
-    I claims.roles.len() != 2 { return false }
-    I claims.roles.get(0) != "admin" { return false }
-    I claims.roles.get(1) != "user" { return false }
-    true
-}
-
-fn jwt_is_cert_one_role_access_claims(claims: JwtClaims, config: JwtConfig) -> bool {
-    I config.secret != "secret" { return false }
-    I config.issuer != "issuer" { return false }
-    I claims.sub != "user1" { return false }
-    I claims.iss != "issuer" { return false }
-    I claims.exp != 4600 { return false }
-    I claims.iat != 1000 { return false }
-    I claims.roles.len() != 1 { return false }
-    I claims.roles.get(0) != "admin" { return false }
-    true
-}
-
 # Decode a pipe-delimited payload string back into JwtClaims.
 fn jwt_decode_claims(payload: str) -> Result<JwtClaims, VaisError> {
     I jwt_count_char(payload, 124, 0, 0) < 4 {
@@ -304,21 +253,19 @@ fn jwt_find_dot_rec(s: str, i: i64) -> i64 {
 
 # Join roles Vec into a comma-separated string.
 fn jwt_join_roles(roles: Vec<str>, i: i64, acc: str) -> str {
-    # Runtime-certified bounded path: empty, one role, or two roles.
-    # Broader arbitrary-role joining remains a non-claim until loop-carried
-    # heap string mutation is promoted.
     role_count := roles.len()
-    I i >= role_count { return acc }
-    first := roles.get(i)
-    I acc == "" {
-        I i + 1 >= role_count { return first }
-        second := roles.get(i + 1)
-        return first + "," + second
+    out := mut acc
+    idx := mut i
+    L idx < role_count {
+        role := roles.get(idx)
+        I out == "" {
+            out = role
+        } else {
+            out = out + "," + role
+        }
+        idx = idx + 1
     }
-    joined := acc + "," + first
-    I i + 1 >= role_count { return joined }
-    second := roles.get(i + 1)
-    joined + "," + second
+    out
 }
 
 # Split a comma-separated roles string into Vec<str>.
@@ -400,14 +347,14 @@ fn jwt_parse_i64_rec(s: str, i: i64, acc: i64) -> i64 {
 fn i64_to_str(n: i64) -> str {
     I n == 0 { return "0" }
     I n < 0  { return "-" + i64_to_str(0 - n) }
-    i64_to_str_rec(n, "")
-}
-
-fn i64_to_str_rec(n: i64, acc: str) -> str {
-    I n == 0 { return acc }
-    digit := n % 10
-    ch    := digit_char(digit)
-    i64_to_str_rec(n / 10, ch + acc)
+    value := mut n
+    out := mut ""
+    L value > 0 {
+        digit := value % 10
+        out = digit_char(digit) + out
+        value = value / 10
+    }
+    out
 }
 
 fn digit_char(d: i64) -> str {
@@ -428,14 +375,14 @@ fn digit_char(d: i64) -> str {
 
 fn i64_to_hex(n: i64) -> str {
     I n == 0 { return "0" }
-    i64_to_hex_rec(n, "")
-}
-
-fn i64_to_hex_rec(n: i64, acc: str) -> str {
-    I n == 0 { return acc }
-    d := n % 16
-    ch := hex_char(d)
-    i64_to_hex_rec(n / 16, ch + acc)
+    value := mut n
+    out := mut ""
+    L value > 0 {
+        d := value % 16
+        out = hex_char(d) + out
+        value = value / 16
+    }
+    out
 }
 
 fn hex_char(d: i64) -> str {
