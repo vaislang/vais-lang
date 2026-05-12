@@ -171,7 +171,7 @@ Built-in authentication and authorisation. No external crate required.
 | `oauth.vais` | OAuth 2.0 flow — CSRF state generation, code exchange |
 | `session.vais` | Server-side session store with TTL |
 | `guard.vais` | Route guards — enforce JWT or session before handler runs |
-| `password.vais` | bcrypt-style hashing and verification |
+| `password.vais` | PBKDF2-HMAC-SHA256 hashing and verification with CSPRNG salts |
 
 ### ws
 WebSocket server conforming to RFC 6455.
@@ -227,4 +227,4 @@ Middleware is the primary extension point. `Pipeline.run_before` executes middle
 `QueryBuilder` produces query strings for all four vaisdb engines (SQL, Vector, Graph, FTS) from one fluent API. There is no ORM layer; `DbConnection.execute(sql)` submits queries directly to the vaisdb wire protocol. `ConnectionPool` manages TCP or embedded connections with health-check recycling.
 
 ### Pure Vais
-The framework itself uses no FFI. System I/O (`std/async_http`, `std/http_server`, `std/websocket`) is delegated to the Vais standard library. External runtime functions (`current_time_ms`, `str_len`, etc.) are declared with `X F` and resolved by `vaisc` at link time.
+The framework itself uses no FFI. System I/O (`std/async_http`, `std/http_server`, `std/websocket`) is delegated to the Vais standard library. External runtime functions (`current_time_ms`, `str_len`, etc.) are declared with `impl fn` and resolved by `vaisc` at link time.

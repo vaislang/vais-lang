@@ -114,7 +114,7 @@ vais-server/
 │   │   ├── oauth.vais         # OAuth 2.0 flow, CSRF state
 │   │   ├── session.vais       # Server-side session store with TTL
 │   │   ├── guard.vais         # Route guards — enforce JWT or session
-│   │   └── password.vais      # bcrypt-style hash and verify
+│   │   └── password.vais      # PBKDF2-HMAC-SHA256 hash and verify
 │   ├── ws/
 │   │   ├── message.vais       # WsMessage — text/binary/ping/pong/close frames
 │   │   ├── handler.vais       # WsHandler — per-connection lifecycle
@@ -272,7 +272,7 @@ non-string platform hooks, declare external runtime functions at the bottom of
 the file and add a runtime smoke before treating the behavior as certified:
 
 ```vais
-X F current_time_ms() -> i64
+impl fn current_time_ms() -> i64
 ```
 
 ### No loops that mutate outer structs
