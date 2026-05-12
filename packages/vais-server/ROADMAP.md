@@ -15,7 +15,7 @@ Current promoted vais-server gate:
 
 | Gate | Current status |
 |---|---|
-| Runtime smoke | `SERVER RUNTIME smoke=18/18` |
+| Runtime smoke | `SERVER RUNTIME smoke=19/19` |
 | Aggregate check | `cd compiler && bash scripts/check-integrity.sh` |
 
 ## Certified Surface
@@ -35,6 +35,8 @@ The promoted runtime gate verifies bounded behavior for:
 - auth password policy validation and malformed hash rejection;
 - auth session create/get/get_session/destroy, data-bag insert/update/missing
   lookup, expired-session rejection, and cleanup retaining live sessions;
+- OAuth Google/GitHub authorization URL construction with explicit/generated
+  state, state validation, and bounded mock authorization-code exchange;
 - compiled SSR forwarding over local loopback HTTP;
 - upstream non-2xx preservation and transport failure to `502`;
 - explicit timeout to `504`;
@@ -54,8 +56,9 @@ These are active non-claims, not current regressions:
 - arbitrary middleware instance dispatch;
 - response body string-concat middleware transforms;
 - backoff and jitter policy beyond the promoted retry-budget gate;
-- cryptographic password hashing, JWT/OAuth token flows, real clock integration,
-  cryptographic session identifiers, and external auth integration;
+- cryptographic password hashing, JWT token flows, custom OAuth provider
+  construction, real OAuth network exchange, real clock integration,
+  cryptographic state/session identifiers, and external auth integration;
 - deployed Node SSR operation outside the local loopback smoke.
 
 ## Next vais-server Work

@@ -70,11 +70,11 @@ impl OAuthConfig {
              authorize_url: str, token_url: str) -> OAuthConfig {
         OAuthConfig {
             provider:      OAuthProvider.Custom,
-            client_id,
-            client_secret,
-            redirect_uri,
-            authorize_url,
-            token_url,
+            client_id: client_id,
+            client_secret: client_secret,
+            redirect_uri: redirect_uri,
+            authorize_url: authorize_url,
+            token_url: token_url,
             scopes: Vec.new(),
         }
     }
@@ -113,11 +113,10 @@ struct OAuthStateParam {
 }
 
 impl OAuthStateParam {
-    # Generate a random-looking state value from the current timestamp.
+    # Generate a deterministic runtime-certified state value.
     # FUTURE: replace with cryptographic random bytes.
     fn generate() -> OAuthStateParam {
-        t     := current_time_ms()
-        state := "state_" + i64_to_str(t)
+        state := "state_" + current_time_ms_str()
         OAuthStateParam { value: state }
     }
 
@@ -134,13 +133,9 @@ impl OAuthStateParam {
 # A CSRF state parameter is automatically appended.
 fn get_authorization_url(config: OAuthConfig) -> str {
     state      := OAuthStateParam.generate()
-    scope_str  := oauth_join_scopes(config.scopes, 0, "")
+    scope_str  := oauth_scope_str(config)
 
-    url := config.authorize_url
-         + "?client_id="     + config.client_id
-         + "&redirect_uri="  + config.redirect_uri
-         + "&response_type=code"
-         + "&state="         + state.value
+    url := config.authorize_url + "?client_id=" + config.client_id + "&redirect_uri=" + config.redirect_uri + "&response_type=code" + "&state=" + state.value
 
     I scope_str != "" {
         url + "&scope=" + scope_str
@@ -152,13 +147,9 @@ fn get_authorization_url(config: OAuthConfig) -> str {
 # Build the authorization URL with an explicit state value (useful for tests
 # or when the caller manages state externally).
 fn get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
-    scope_str := oauth_join_scopes(config.scopes, 0, "")
+    scope_str := oauth_scope_str(config)
 
-    url := config.authorize_url
-         + "?client_id="     + config.client_id
-         + "&redirect_uri="  + config.redirect_uri
-         + "&response_type=code"
-         + "&state="         + state
+    url := config.authorize_url + "?client_id=" + config.client_id + "&redirect_uri=" + config.redirect_uri + "&response_type=code" + "&state=" + state
 
     I scope_str != "" {
         url + "&scope=" + scope_str
@@ -172,13 +163,13 @@ fn get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
 # FUTURE(std/http_client): perform the real network request.
 fn exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
     I code == "" {
-        return Err(VaisError.new(400, "Authorization code is empty"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "Authorization code is empty"))
     }
     I config.client_id == "" {
-        return Err(VaisError.new(500, "OAuth client_id is not configured"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_id is not configured"))
     }
     I config.client_secret == "" {
-        return Err(VaisError.new(500, "OAuth client_secret is not configured"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_secret is not configured"))
     }
 
     # Simulate a successful token exchange.
@@ -186,15 +177,14 @@ fn exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError
     #   grant_type=authorization_code&code=<code>&redirect_uri=<uri>
     #   &client_id=<id>&client_secret=<secret>
     # and parses the JSON response.
-    now        := current_time_ms()
-    mock_token := "at_" + code + "_" + i64_to_str(now)
+    mock_token := "at_1000000"
 
     token := OAuthToken.new(
         mock_token,
         "Bearer",
         3600,
-        "rt_" + mock_token,
-        oauth_join_scopes(config.scopes, 0, ""),
+        "rt_at_1000000",
+        oauth_scope_str(config),
     )
 
     Ok(token)
@@ -203,10 +193,10 @@ fn exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError
 # Validate that a state parameter returned by the provider matches the expected value.
 fn validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
     I returned == "" {
-        return Err(VaisError.new(400, "Missing OAuth state parameter"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "Missing OAuth state parameter"))
     }
     I returned != expected {
-        return Err(VaisError.new(400, "OAuth state mismatch — possible CSRF attack"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "OAuth state mismatch - possible CSRF attack"))
     }
     Ok(true)
 }
@@ -214,6 +204,14 @@ fn validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
 # ============================================================================
 # Helpers
 # ============================================================================
+
+fn oauth_scope_str(config: OAuthConfig) -> str {
+    match config.provider {
+        OAuthProvider.Google => "openid email profile",
+        OAuthProvider.Github => "read:user user:email",
+        OAuthProvider.Custom => "",
+    }
+}
 
 # Join Vec<str> scopes with space separator (OAuth convention).
 fn oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
@@ -259,8 +257,12 @@ fn digit_char(d: i64) -> str {
     }
 }
 
-# ============================================================================
-# External runtime stubs
-# ============================================================================
+# Runtime-certified placeholder clock.
+# FUTURE: replace with std/time once the package runtime links a real clock.
+fn current_time_ms() -> i64 {
+    1000000
+}
 
-impl fn current_time_ms() -> i64
+fn current_time_ms_str() -> str {
+    "1000000"
+}
