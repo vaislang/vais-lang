@@ -2,26 +2,28 @@
 # Handles: WITH (CTEs), SELECT, FROM, JOIN, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET,
 #          set operations (UNION / INTERSECT / EXCEPT)
 
-U storage/error
-U sql/types
-U sql/parser/token
-U sql/parser/ast
-U sql/parser/parser
+use storage/error
+use sql/types
+use sql/parser/token
+use sql/parser/ast
+use sql/parser/parser
 
-X Parser {
+impl fn __strlen(s: str) -> i64
+
+impl Parser {
     # Parse a full SELECT query including CTEs and set operations
-    F parse_select(mut self) -> Result<SelectQuery, VaisError> {
+    fn parse_select(mut self) -> Result<SelectQuery, VaisError> {
         # Parse optional WITH clause (CTEs)
         ctes := mut Vec.with_capacity(0)
-        I self.match_token(With) {
+        I self.match_token(TokenKind.With) {
             ctes = self.parse_cte()?;
         }
 
-        self.expect(Select)?;
+        self.expect(TokenKind.Select)?;
 
         # Parse optional DISTINCT
         distinct := mut false
-        I self.match_token(Distinct) {
+        I self.match_token(TokenKind.Distinct) {
             distinct = true
         }
 
@@ -30,7 +32,7 @@ X Parser {
 
         # Parse optional FROM clause
         from := mut Option.None
-        I self.match_token(From) {
+        I self.match_token(TokenKind.From) {
             refs := self.parse_from_clause()?;
             from = Option.Some(refs)
         }
@@ -47,8 +49,25 @@ X Parser {
         # Parse optional ORDER BY clause
         order_by := self.parse_order_by()?;
 
-        # Parse optional LIMIT/OFFSET
-        (limit, offset) := self.parse_limit_offset()?;
+        # Parse optional LIMIT/OFFSET inline. Returning a tuple of nested
+        # Option<Expr> is currently fragile in per-module codegen.
+        limit := mut Option.None
+        offset := mut Option.None
+
+        I self.match_token(TokenKind.Limit) {
+            expr := self.parse_expr()?;
+            limit = Option.Some(expr)
+        }
+
+        I self.match_token(TokenKind.Offset) {
+            expr := self.parse_expr()?;
+            offset = Option.Some(expr)
+        }
+
+        I limit.is_none() && self.match_token(TokenKind.Limit) {
+            expr := self.parse_expr()?;
+            limit = Option.Some(expr)
+        }
 
         # Build the query
         query := mut SelectQuery {
@@ -72,13 +91,13 @@ X Parser {
     }
 
     # Parse WITH clause containing one or more CTEs
-    F parse_cte(mut self) -> Result<Vec<Cte>, VaisError> {
+    fn parse_cte(mut self) -> Result<Vec<Cte>, VaisError> {
         ctes := mut Vec.with_capacity(0)
 
         more_ctes := mut true
         LW more_ctes {
             recursive := mut false
-            I self.match_token(Recursive) {
+            I self.match_token(TokenKind.Recursive) {
                 recursive = true
             }
 
@@ -86,26 +105,26 @@ X Parser {
 
             # Optional column alias list
             columns := mut Vec.with_capacity(0)
-            I self.match_token(LParen) {
+            I self.match_token(TokenKind.LParen) {
                 more_cols := mut true
                 LW more_cols {
                     col := self.expect_identifier()?;
                     columns.push(col)
-                    I !self.match_token(Comma) {
+                    I !self.match_token(TokenKind.Comma) {
                         more_cols = false
                     }
                 }
-                self.expect(RParen)?;
+                self.expect(TokenKind.RParen)?;
             }
 
-            self.expect(As)?;
-            self.expect(LParen)?;
+            self.expect(TokenKind.As)?;
+            self.expect(TokenKind.LParen)?;
             query := self.parse_select()?;
-            self.expect(RParen)?;
+            self.expect(TokenKind.RParen)?;
 
             ctes.push(Cte { name, columns, query, recursive })
 
-            I !self.match_token(Comma) {
+            I !self.match_token(TokenKind.Comma) {
                 more_ctes = false
             }
         }
@@ -114,14 +133,14 @@ X Parser {
     }
 
     # Parse the select list (between SELECT and FROM)
-    F parse_select_list(mut self) -> Result<Vec<SelectItem>, VaisError> {
+    fn parse_select_list(mut self) -> Result<Vec<SelectItem>, VaisError> {
         items := mut Vec.with_capacity(0)
 
         more_items := mut true
         LW more_items {
             item := self.parse_select_item()?;
             items.push(item)
-            I !self.match_token(Comma) {
+            I !self.match_token(TokenKind.Comma) {
                 more_items = false
             }
         }
@@ -130,10 +149,10 @@ X Parser {
     }
 
     # Parse a single select item
-    F parse_select_item(mut self) -> Result<SelectItem, VaisError> {
+    fn parse_select_item(mut self) -> Result<SelectItem, VaisError> {
         # Check for * (all columns)
-        I self.match_token(Star) {
-            R Ok(AllColumns)
+        I self.match_token(TokenKind.Star) {
+            return Ok(SelectItem.AllColumns)
         }
 
         # Check for table.* (all columns from table)
@@ -141,13 +160,13 @@ X Parser {
         I self.is_identifier() {
             saved_pos := self.pos
             table_name := self.expect_identifier()?;
-            I self.match_token(Dot) {
-                I self.match_token(Star) {
-                    R Ok(AllColumnsFrom { table: table_name })
+            I self.match_token(TokenKind.Dot) {
+                I self.match_token(TokenKind.Star) {
+                    return Ok(SelectItem.AllColumnsFrom { table: table_name })
                 }
                 # Not table.*, backtrack
                 self.pos = saved_pos
-            } EL {
+            } else {
                 # No dot, backtrack and parse as expression
                 self.pos = saved_pos
             }
@@ -156,20 +175,20 @@ X Parser {
         # Parse expression with optional alias
         expr := self.parse_expr()?;
         alias := mut Option.None
-        I self.match_token(As) {
+        I self.match_token(TokenKind.As) {
             a := self.expect_identifier()?;
             alias = Option.Some(a)
-        } EL I self.is_identifier() {
+        } else I self.is_identifier() {
             # Alias without AS keyword
             a := self.expect_identifier()?;
             alias = Option.Some(a)
         }
 
-        Ok(Expr { expr, alias })
+        Ok(SelectItem.Expr { expr, alias })
     }
 
     # Parse FROM clause (comma-separated table references with joins)
-    F parse_from_clause(mut self) -> Result<Vec<TableRef>, VaisError> {
+    fn parse_from_clause(mut self) -> Result<Vec<TableRef>, VaisError> {
         refs := mut Vec.with_capacity(0)
 
         more_refs := mut true
@@ -178,7 +197,7 @@ X Parser {
             # Check for joins attached to this table reference
             joined := self.parse_joins(table_ref)?;
             refs.push(joined)
-            I !self.match_token(Comma) {
+            I !self.match_token(TokenKind.Comma) {
                 more_refs = false
             }
         }
@@ -187,15 +206,15 @@ X Parser {
     }
 
     # Parse a single table reference (table name, subquery, or parenthesized ref)
-    F parse_table_ref(mut self) -> Result<TableRef, VaisError> {
+    fn parse_table_ref(mut self) -> Result<TableRef, VaisError> {
         # Subquery: (SELECT ...)
-        I self.match_token(LParen) {
+        I self.match_token(TokenKind.LParen) {
             query := self.parse_select()?;
-            self.expect(RParen)?;
+            self.expect(TokenKind.RParen)?;
             # Subquery in FROM requires an alias
-            self.match_token(As)
+            self.match_token(TokenKind.As)
             alias := self.expect_identifier()?;
-            R Ok(Subquery { query: Box.new(query), alias })
+            return Ok(TableRef.Subquery { query: Box.new(query), alias })
         }
 
         # Check for table-valued function: VECTOR_SEARCH(...), GRAPH_TRAVERSE(...), FULLTEXT_MATCH(...)
@@ -206,36 +225,36 @@ X Parser {
 
             # Check if this is a known table-valued function followed by LParen
             I (name_upper == "VECTOR_SEARCH" || name_upper == "GRAPH_TRAVERSE" || name_upper == "FULLTEXT_MATCH")
-                && self.check(LParen) {
+                && self.check(TokenKind.LParen) {
                 # Parse table function: name(args...) AS alias
-                self.expect(LParen)?;
+                self.expect(TokenKind.LParen)?;
 
                 # Parse comma-separated argument expressions
                 args := mut Vec.with_capacity(0)
-                I !self.check(RParen) {
+                I !self.check(TokenKind.RParen) {
                     more_args := mut true
                     LW more_args {
                         arg := self.parse_expr()?;
                         args.push(arg)
-                        I !self.match_token(Comma) {
+                        I !self.match_token(TokenKind.Comma) {
                             more_args = false
                         }
                     }
                 }
-                self.expect(RParen)?;
+                self.expect(TokenKind.RParen)?;
 
                 # Parse optional alias
                 alias := mut Option.None
-                I self.match_token(As) {
+                I self.match_token(TokenKind.As) {
                     a := self.expect_identifier()?;
                     alias = Option.Some(a)
-                } EL I self.is_identifier() && !self.is_join_keyword() {
+                } else I self.is_identifier() && !self.is_join_keyword() {
                     # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
                     a := self.expect_identifier()?;
                     alias = Option.Some(a)
                 }
 
-                R Ok(TableFunction { name, args, alias })
+                return Ok(TableFunction { name, args, alias })
             }
 
             # Not a table function, backtrack and parse as regular table name
@@ -245,20 +264,20 @@ X Parser {
         # Table name with optional alias
         name := self.expect_identifier()?;
         alias := mut Option.None
-        I self.match_token(As) {
+        I self.match_token(TokenKind.As) {
             a := self.expect_identifier()?;
             alias = Option.Some(a)
-        } EL I self.is_identifier() && !self.is_join_keyword() {
+        } else I self.is_identifier() && !self.is_join_keyword() {
             # Implicit alias (without AS) -- but not if it looks like a JOIN keyword
             a := self.expect_identifier()?;
             alias = Option.Some(a)
         }
 
-        Ok(Table { name, alias })
+        Ok(TableRef.Table { name, alias })
     }
 
     # Parse zero or more joins following a table reference
-    F parse_joins(mut self, left: TableRef) -> Result<TableRef, VaisError> {
+    fn parse_joins(mut self, left: TableRef) -> Result<TableRef, VaisError> {
         current := mut left
 
         LW self.is_join_keyword() {
@@ -269,9 +288,9 @@ X Parser {
     }
 
     # Parse a single JOIN clause
-    F parse_join(mut self, left: TableRef) -> Result<TableRef, VaisError> {
+    fn parse_join(mut self, left: TableRef) -> Result<TableRef, VaisError> {
         # Determine join type
-        join_type := mut Inner
+        join_type := mut JoinType.Inner
         is_natural := mut false
 
         # NATURAL keyword
@@ -280,84 +299,87 @@ X Parser {
             self.advance()
         }
 
-        M self.peek() {
-            Inner => {
+        match self.peek() {
+            TokenKind.Inner => {
                 self.advance()
-                join_type = Inner
+                join_type = JoinType.Inner
             },
-            Left => {
+            TokenKind.Left => {
                 self.advance()
-                join_type = Left
+                join_type = JoinType.Left
                 # Optional OUTER keyword
                 I self.check_identifier("OUTER") {
                     self.advance()
                 }
             },
-            Right => {
+            TokenKind.Right => {
                 self.advance()
-                join_type = Right
+                join_type = JoinType.Right
                 # Optional OUTER keyword
                 I self.check_identifier("OUTER") {
                     self.advance()
                 }
             },
-            Cross => {
+            TokenKind.Cross => {
                 self.advance()
-                join_type = Cross
+                join_type = JoinType.Cross
             },
-            Join => {
+            TokenKind.Join => {
                 # Plain JOIN = INNER JOIN
-                join_type = Inner
+                join_type = JoinType.Inner
             },
             _ => {
-                R Err(self.parse_error("expected JOIN keyword"))
+                return Err(self.parse_error("expected JOIN keyword"))
             },
         }
 
-        self.expect(Join)?;
+        self.expect(TokenKind.Join)?;
 
         # Parse the right side table reference
         right := self.parse_table_ref()?;
 
         # Parse join condition
-        condition := mut Natural
+        condition := mut JoinCondition.Natural
 
         I is_natural {
-            condition = Natural
-        } EL {
-            M join_type {
-                Cross => {
-                    # CROSS JOIN has no condition; use Natural as placeholder
-                    R Ok(CrossJoin {
-                        left: Box.new(left),
-                        right: Box.new(right),
-                    })
-                },
-                _ => {
-                    I self.match_token(On) {
-                        expr := self.parse_expr()?;
-                        condition = On { expr }
-                    } EL I self.match_token(Using) {
-                        self.expect(LParen)?;
-                        columns := mut Vec.with_capacity(0)
-                        more_cols := mut true
-                        LW more_cols {
-                            col := self.expect_identifier()?;
-                            columns.push(col)
-                            I !self.match_token(Comma) {
-                                more_cols = false
-                            }
-                        }
-                        self.expect(RParen)?;
-                        condition = Using { columns }
-                    } EL {
-                        R Err(self.parse_error("expected ON or USING after JOIN"))
+            condition = JoinCondition.Natural
+        } else {
+            is_cross_join := mut false
+            match join_type {
+                JoinType.Cross => { is_cross_join = true },
+                _ => {},
+            }
+
+            I is_cross_join {
+                # CROSS JOIN has no condition; use Natural as placeholder
+                return Ok(TableRef.CrossJoin {
+                    left: Box.new(left),
+                    right: Box.new(right),
+                })
+            }
+
+            I self.match_token(TokenKind.On) {
+                expr := self.parse_expr()?;
+                condition = JoinCondition.On { expr }
+            } else I self.match_token(TokenKind.Using) {
+                self.expect(TokenKind.LParen)?;
+                columns := mut Vec.with_capacity(0)
+                more_cols := mut true
+                LW more_cols {
+                    col := self.expect_identifier()?;
+                    columns.push(col)
+                    I !self.match_token(TokenKind.Comma) {
+                        more_cols = false
                     }
-                },
+                }
+                self.expect(TokenKind.RParen)?;
+                condition = JoinCondition.Using { columns }
+            } else {
+                return Err(self.parse_error("expected ON or USING after JOIN"))
             }
         }
 
-        Ok(Join {
+        Ok(TableRef.Join {
             join: JoinClause {
                 join_type,
                 left: Box.new(left),
@@ -368,99 +390,99 @@ X Parser {
     }
 
     # Parse optional WHERE clause
-    F parse_where_clause(mut self) -> Result<Option<Expr>, VaisError> {
-        I self.match_token(Where) {
+    fn parse_where_clause(mut self) -> Result<Option<Expr>, VaisError> {
+        I self.match_token(TokenKind.Where) {
             expr := self.parse_expr()?;
             Ok(Option.Some(expr))
-        } EL {
+        } else {
             Ok(Option.None)
         }
     }
 
     # Parse optional GROUP BY clause
-    F parse_group_by(mut self) -> Result<Vec<Expr>, VaisError> {
-        I self.match_token(Group) {
-            self.expect(By)?;
+    fn parse_group_by(mut self) -> Result<Vec<Expr>, VaisError> {
+        I self.match_token(TokenKind.Group) {
+            self.expect(TokenKind.By)?;
             exprs := mut Vec.with_capacity(0)
             more_exprs := mut true
             LW more_exprs {
                 expr := self.parse_expr()?;
                 exprs.push(expr)
-                I !self.match_token(Comma) {
+                I !self.match_token(TokenKind.Comma) {
                     more_exprs = false
                 }
             }
             Ok(exprs)
-        } EL {
+        } else {
             Ok(Vec.with_capacity(0))
         }
     }
 
     # Parse optional HAVING clause
-    F parse_having(mut self) -> Result<Option<Expr>, VaisError> {
-        I self.match_token(Having) {
+    fn parse_having(mut self) -> Result<Option<Expr>, VaisError> {
+        I self.match_token(TokenKind.Having) {
             expr := self.parse_expr()?;
             Ok(Option.Some(expr))
-        } EL {
+        } else {
             Ok(Option.None)
         }
     }
 
     # Parse optional ORDER BY clause
-    F parse_order_by(mut self) -> Result<Vec<OrderByItem>, VaisError> {
-        I self.match_token(Order) {
-            self.expect(By)?;
+    fn parse_order_by(mut self) -> Result<Vec<OrderByItem>, VaisError> {
+        I self.match_token(TokenKind.Order) {
+            self.expect(TokenKind.By)?;
             items := mut Vec.with_capacity(0)
             more_items := mut true
             LW more_items {
                 expr := self.parse_expr()?;
                 asc := mut true
-                I self.match_token(Asc) {
+                I self.match_token(TokenKind.Asc) {
                     asc = true
-                } EL I self.match_token(Desc) {
+                } else I self.match_token(TokenKind.Desc) {
                     asc = false
                 }
 
                 # Optional NULLS FIRST / NULLS LAST
                 nulls_first := mut Option.None
-                I self.match_token(Nulls) {
-                    I self.match_token(First) {
+                I self.match_token(TokenKind.Nulls) {
+                    I self.match_token(TokenKind.First) {
                         nulls_first = Option.Some(true)
-                    } EL I self.match_token(Last) {
+                    } else I self.match_token(TokenKind.Last) {
                         nulls_first = Option.Some(false)
-                    } EL {
-                        R Err(self.parse_error("expected FIRST or LAST after NULLS"))
+                    } else {
+                        return Err(self.parse_error("expected FIRST or LAST after NULLS"))
                     }
                 }
 
                 items.push(OrderByItem { expr, asc, nulls_first })
-                I !self.match_token(Comma) {
+                I !self.match_token(TokenKind.Comma) {
                     more_items = false
                 }
             }
             Ok(items)
-        } EL {
+        } else {
             Ok(Vec.with_capacity(0))
         }
     }
 
     # Parse optional LIMIT and OFFSET clauses
-    F parse_limit_offset(mut self) -> Result<(Option<Expr>, Option<Expr>), VaisError> {
+    fn parse_limit_offset(mut self) -> Result<(Option<Expr>, Option<Expr>), VaisError> {
         limit := mut Option.None
         offset := mut Option.None
 
-        I self.match_token(Limit) {
+        I self.match_token(TokenKind.Limit) {
             expr := self.parse_expr()?;
             limit = Option.Some(expr)
         }
 
-        I self.match_token(Offset) {
+        I self.match_token(TokenKind.Offset) {
             expr := self.parse_expr()?;
             offset = Option.Some(expr)
         }
 
         # Also allow LIMIT after OFFSET if LIMIT was not yet parsed
-        I limit.is_none() && self.match_token(Limit) {
+        I limit.is_none() && self.match_token(TokenKind.Limit) {
             expr := self.parse_expr()?;
             limit = Option.Some(expr)
         }
@@ -469,37 +491,37 @@ X Parser {
     }
 
     # Parse optional set operation (UNION/INTERSECT/EXCEPT)
-    F parse_set_operation(mut self) -> Result<Option<SetOperation>, VaisError> {
-        op_kind := mut Option.None
+    fn parse_set_operation(mut self) -> Result<Option<SetOperation>, VaisError> {
+        op_kind: Option<SetOpKind> := mut Option.None
 
-        M self.peek() {
-            Union => {
+        match self.peek() {
+            TokenKind.Union => {
                 self.advance()
-                op_kind = Option.Some(Union)
+                op_kind = Option.Some(SetOpKind.Union)
             },
-            Intersect => {
+            TokenKind.Intersect => {
                 self.advance()
-                op_kind = Option.Some(Intersect)
+                op_kind = Option.Some(SetOpKind.Intersect)
             },
-            Except => {
+            TokenKind.Except => {
                 self.advance()
-                op_kind = Option.Some(Except)
+                op_kind = Option.Some(SetOpKind.Except)
             },
             _ => {
-                R Ok(Option.None)
+                return Ok(Option.None)
             },
         }
 
         # Check for ALL
         all := mut false
-        I self.match_token(All) {
+        I self.match_token(TokenKind.All) {
             all = true
         }
 
         # Parse the right side query
         right := self.parse_select()?;
 
-        M op_kind {
+        match op_kind {
             Option.Some(op) => {
                 Ok(Option.Some(SetOperation {
                     op,

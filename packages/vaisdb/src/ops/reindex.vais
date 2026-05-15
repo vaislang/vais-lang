@@ -2,14 +2,14 @@
 # Phase 9 Task 10: Rebuild indexes, defragment database files
 # Provides: ReindexExecutor, CompactionExecutor
 
-U std/vec
-U std/string
-U std/option
-U std/sync
-U storage/error
-U storage/constants
-U ops/types
-U ops/config
+use std/vec
+use std/string
+use std/option
+use std/sync
+use storage/error
+use storage/constants
+use ops/types
+use ops/config
 
 # ============================================================================
 # ReindexExecutor — Rebuilds database indexes
@@ -22,15 +22,15 @@ U ops/config
 ##
 ## REINDEX CONCURRENTLY builds the new index without blocking reads
 ## (writes are briefly blocked during the swap).
-S ReindexExecutor {
+struct ReindexExecutor {
     config: ReindexConfig,
     is_running: bool,
     lock: Mutex<()>,
 }
 
-X ReindexExecutor {
+impl ReindexExecutor {
     ## Create a new reindex executor
-    F new(config: ReindexConfig) -> ReindexExecutor {
+    fn new(config: ReindexConfig) -> ReindexExecutor {
         ReindexExecutor {
             config,
             is_running: false,
@@ -39,7 +39,7 @@ X ReindexExecutor {
     }
 
     ## Execute REINDEX on specified target
-    F execute(
+    fn execute(
         mut self,
         target: &ReindexTarget,
         current_time_ms: u64,
@@ -47,14 +47,14 @@ X ReindexExecutor {
         guard := mut self.lock.lock()
 
         I self.is_running {
-            R Err(err_reindex_failed("REINDEX already in progress"))
+            return Err(err_reindex_failed("REINDEX already in progress"))
         }
         self.is_running = true
 
         start_ms := mut current_time_ms
         result := mut ReindexResult.new()
 
-        M target.target_type {
+        match target.target_type {
             0 => {
                 # REINDEX_TARGET_TABLE: rebuild all indexes on a table
                 result = self.reindex_table(&target.name)?;
@@ -69,7 +69,7 @@ X ReindexExecutor {
             },
             _ => {
                 self.is_running = false
-                R Err(err_reindex_failed("Unknown reindex target type"))
+                return Err(err_reindex_failed("Unknown reindex target type"))
             },
         }
 
@@ -79,7 +79,7 @@ X ReindexExecutor {
     }
 
     ## Check if reindex is running
-    F is_running(self) -> bool {
+    fn is_running(self) -> bool {
         self.is_running
     }
 
@@ -88,7 +88,7 @@ X ReindexExecutor {
     # ========================================================================
 
     ## Rebuild all indexes on a specific table
-    F reindex_table(self, table_name: &str) -> Result<ReindexResult, VaisError> {
+    fn reindex_table(self, table_name: &str) -> Result<ReindexResult, VaisError> {
         result := mut ReindexResult.new()
 
         # In production implementation:
@@ -112,7 +112,7 @@ X ReindexExecutor {
     }
 
     ## Rebuild a single specific index
-    F reindex_single_index(self, index_name: &str) -> Result<ReindexResult, VaisError> {
+    fn reindex_single_index(self, index_name: &str) -> Result<ReindexResult, VaisError> {
         result := mut ReindexResult.new()
 
         # In production implementation:
@@ -138,7 +138,7 @@ X ReindexExecutor {
     }
 
     ## Rebuild all indexes in the database
-    F reindex_database(self) -> Result<ReindexResult, VaisError> {
+    fn reindex_database(self) -> Result<ReindexResult, VaisError> {
         result := mut ReindexResult.new()
 
         # In production implementation:
@@ -162,15 +162,15 @@ X ReindexExecutor {
 ##
 ## More aggressive than VACUUM: actually moves data pages around.
 ## Requires exclusive access to each file being compacted.
-S CompactionExecutor {
+struct CompactionExecutor {
     config: CompactionConfig,
     is_running: bool,
     lock: Mutex<()>,
 }
 
-X CompactionExecutor {
+impl CompactionExecutor {
     ## Create a new compaction executor
-    F new(config: CompactionConfig) -> CompactionExecutor {
+    fn new(config: CompactionConfig) -> CompactionExecutor {
         CompactionExecutor {
             config,
             is_running: false,
@@ -179,14 +179,14 @@ X CompactionExecutor {
     }
 
     ## Execute database compaction
-    F execute(
+    fn execute(
         mut self,
         current_time_ms: u64,
     ) -> Result<CompactionResult, VaisError> {
         guard := mut self.lock.lock()
 
         I self.is_running {
-            R Err(err_compaction_failed("Compaction already in progress"))
+            return Err(err_compaction_failed("Compaction already in progress"))
         }
         self.is_running = true
 
@@ -231,7 +231,7 @@ X CompactionExecutor {
     }
 
     ## Check if compaction is running
-    F is_running(self) -> bool {
+    fn is_running(self) -> bool {
         self.is_running
     }
 
@@ -241,7 +241,7 @@ X CompactionExecutor {
 
     ## Compact a single database file
     ## Moves used pages to fill gaps, truncates file end
-    F compact_file(self, file_id: u8) -> Result<CompactionResult, VaisError> {
+    fn compact_file(self, file_id: u8) -> Result<CompactionResult, VaisError> {
         result := mut CompactionResult.new()
 
         # In production implementation:
@@ -274,7 +274,7 @@ X CompactionExecutor {
 
     ## Estimate fragmentation percentage for a file
     ## Returns (total_pages, free_pages, fragmentation_percent)
-    F estimate_fragmentation(
+    fn estimate_fragmentation(
         self,
         total_pages: u64,
         free_pages: u64,
@@ -283,18 +283,18 @@ X CompactionExecutor {
         # Fragmentation = free pages NOT at the end of file
         # (free pages at the end can be reclaimed by simple truncation)
         I total_pages == 0 {
-            R 0.0
+            return 0.0
         }
         internal_free := mut I free_pages > free_at_end {
             free_pages - free_at_end
-        } EL {
+        } else {
             0
         }
         (internal_free as f64) / (total_pages as f64) * 100.0
     }
 
     ## Check if a file should be compacted based on fragmentation
-    F should_compact(self, total_pages: u64, free_pages: u64, free_at_end: u64) -> bool {
+    fn should_compact(self, total_pages: u64, free_pages: u64, free_at_end: u64) -> bool {
         frag := mut self.estimate_fragmentation(total_pages, free_pages, free_at_end)
         frag >= self.config.min_fragmentation_percent
     }

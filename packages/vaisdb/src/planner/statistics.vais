@@ -8,16 +8,16 @@
 # - Sampling: reservoir sampling for histogram building on large tables
 # - ANALYZE integration: command executor for statistics refresh
 
-U storage/error.{VaisError, err_internal};
-U storage/buffer/pool.{BufferPool};
-U sql/catalog/manager.{CatalogManager};
-U sql/catalog/schema.{TableInfo, ColumnInfo, IndexInfo};
-U sql/planner/mod.{TableStats, CostEstimate};
-U sql/types.{SqlType, SqlValue};
-U planner/cost_model.{
+use storage/error.{VaisError, err_internal};
+use storage/buffer/pool.{BufferPool};
+use sql/catalog/manager.{CatalogManager};
+use sql/catalog/schema.{TableInfo, ColumnInfo, IndexInfo};
+use sql/planner/mod.{TableStats, CostEstimate};
+use sql/types.{SqlType, SqlValue};
+use planner/cost_model.{
     VectorIndexStats, GraphStats, FullTextStats, HybridStats
 };
-U std/time;
+use std/time;
 
 # ============================================================================
 # Error Code Constants (EE=00 Common, CC=08 Planner, SubCC=03 Statistics)
@@ -31,21 +31,21 @@ C ERR_CODE_STATS_HISTOGRAM_FAILED: Str = "VAIS-0008032";
 # Error Constructors
 # ============================================================================
 
-F err_stats_collection_failed(reason: Str) -> VaisError {
+fn err_stats_collection_failed(reason: Str) -> VaisError {
     VaisError.new(
         ERR_CODE_STATS_COLLECTION_FAILED,
         "Statistics collection failed: {reason}"
     )
 }
 
-F err_stats_invalid_sample_size(size: u64) -> VaisError {
+fn err_stats_invalid_sample_size(size: u64) -> VaisError {
     VaisError.new(
         ERR_CODE_STATS_INVALID_SAMPLE_SIZE,
         "Invalid sample size: {size} (must be > 0)"
     )
 }
 
-F err_stats_histogram_failed(reason: Str) -> VaisError {
+fn err_stats_histogram_failed(reason: Str) -> VaisError {
     VaisError.new(
         ERR_CODE_STATS_HISTOGRAM_FAILED,
         "Histogram construction failed: {reason}"
@@ -66,7 +66,7 @@ C MIN_ROWS_FOR_SAMPLING: u64 = 5000;  # Sample I table has > 5000 rows
 # ============================================================================
 
 # Value distribution statistics for a single column
-S TableColumnStats {
+struct TableColumnStats {
     table_name: Str,
     column_name: Str,
     n_distinct: u64,           # Estimated distinct values
@@ -77,8 +77,8 @@ S TableColumnStats {
     avg_width: u32,            # Average serialized size in bytes
 }
 
-X TableColumnStats {
-    F new(table_name: Str, column_name: Str) -> TableColumnStats {
+impl TableColumnStats {
+    fn new(table_name: Str, column_name: Str) -> TableColumnStats {
         TableColumnStats {
             table_name,
             column_name,
@@ -93,18 +93,18 @@ X TableColumnStats {
 
     # Estimate selectivity for equality predicate: col = value
     # Uses histogram I available, otherwise 1/n_distinct
-    F estimate_equality_selectivity(self) -> f64 {
+    fn estimate_equality_selectivity(self) -> f64 {
         I self.n_distinct == 0 {
-            R 0.1;  # Fallback default
+            return 0.1;  # Fallback default
         }
         1.0 / (self.n_distinct as f64)
     }
 
     # Estimate selectivity for range predicate: col < value
     # Uses histogram bucket interpolation
-    F estimate_range_selectivity(self, value: &SqlValue) -> f64 {
+    fn estimate_range_selectivity(self, value: &SqlValue) -> f64 {
         I self.histogram.len() == 0 {
-            R 0.3;  # Fallback default
+            return 0.3;  # Fallback default
         }
 
         # Binary search for bucket containing value
@@ -112,21 +112,21 @@ X TableColumnStats {
         found_bucket := mut false;
         LF i: 0..self.histogram.len() {
             I !found_bucket {
-                M compare_values(value, &self.histogram[i]) {
+                match compare_values(value, &self.histogram[i]) {
                     Ok(cmp) => {
                         I cmp < 0 {
                             bucket_idx = i;
                             found_bucket = true;
                         }
                     },
-                    Err(_) => { R 0.3 },  # Cannot compare, use default
+                    Err(_) => { return 0.3 },  # Cannot compare, use default
                 }
             }
         }
 
         # Estimate selectivity based on bucket position
         total_buckets := mut self.histogram.len();
-        I total_buckets == 0 { R 0.3; }
+        I total_buckets == 0 { return 0.3; }
         (bucket_idx as f64) / (total_buckets as f64)
     }
 }
@@ -135,14 +135,14 @@ X TableColumnStats {
 # Statistics Collection Configuration
 # ============================================================================
 
-S StatisticsConfig {
+struct StatisticsConfig {
     sample_size: u64,
     histogram_buckets: u64,
     force_full_scan: bool,  # If true, scan all rows (no sampling)
 }
 
-X StatisticsConfig {
-    F default() -> StatisticsConfig {
+impl StatisticsConfig {
+    fn default() -> StatisticsConfig {
         StatisticsConfig {
             sample_size: DEFAULT_SAMPLE_SIZE,
             histogram_buckets: DEFAULT_HISTOGRAM_BUCKETS,
@@ -150,19 +150,19 @@ X StatisticsConfig {
         }
     }
 
-    F with_sample_size(mut self, size: u64) -> StatisticsConfig {
+    fn with_sample_size(mut self, size: u64) -> StatisticsConfig {
         self.sample_size = size;
-        self
+        (*self)
     }
 
-    F with_histogram_buckets(mut self, buckets: u64) -> StatisticsConfig {
+    fn with_histogram_buckets(mut self, buckets: u64) -> StatisticsConfig {
         self.histogram_buckets = buckets;
-        self
+        (*self)
     }
 
-    F with_force_full_scan(mut self) -> StatisticsConfig {
+    fn with_force_full_scan(mut self) -> StatisticsConfig {
         self.force_full_scan = true;
-        self
+        (*self)
     }
 }
 
@@ -170,15 +170,15 @@ X StatisticsConfig {
 # ANALYZE Result
 # ============================================================================
 
-S AnalyzeResult {
+struct AnalyzeResult {
     table_name: Str,
     stats: TableStats,
     column_stats: Vec<TableColumnStats>,
     elapsed_ms: u64,
 }
 
-X AnalyzeResult {
-    F new(table_name: Str, stats: TableStats, column_stats: Vec<TableColumnStats>, elapsed_ms: u64) -> AnalyzeResult {
+impl AnalyzeResult {
+    fn new(table_name: Str, stats: TableStats, column_stats: Vec<TableColumnStats>, elapsed_ms: u64) -> AnalyzeResult {
         AnalyzeResult {
             table_name,
             stats,
@@ -187,7 +187,7 @@ X AnalyzeResult {
         }
     }
 
-    F to_string(self) -> Str {
+    fn to_string(self) -> Str {
         "ANALYZE {self.table_name}: {self.stats.row_count} rows, {self.column_stats.len()} columns, {self.elapsed_ms}ms"
     }
 }
@@ -196,20 +196,20 @@ X AnalyzeResult {
 # Statistics Collector
 # ============================================================================
 
-S StatisticsCollector {
+struct StatisticsCollector {
     config: StatisticsConfig,
 }
 
-X StatisticsCollector {
+impl StatisticsCollector {
     # Create a new collector with default configuration
-    F new() -> StatisticsCollector {
+    fn new() -> StatisticsCollector {
         StatisticsCollector {
             config: StatisticsConfig.default(),
         }
     }
 
     # Create with custom configuration
-    F with_config(config: StatisticsConfig) -> StatisticsCollector {
+    fn with_config(config: StatisticsConfig) -> StatisticsCollector {
         StatisticsCollector { config }
     }
 
@@ -219,16 +219,16 @@ X StatisticsCollector {
 
     # Collect basic table statistics: row count, page count, avg row size
     # This is a simplified implementation that estimates from table metadata
-    F collect_table_stats(
+    fn collect_table_stats(
         self,
         catalog: &CatalogManager,
         pool: &BufferPool,
         table_name: &Str
     ) -> Result<TableStats, VaisError> {
         # Lookup table in catalog
-        table_info := mut M catalog.get_table(table_name) {
+        table_info := mut match catalog.get_table(table_name) {
             Some(info) => info,
-            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
+            None => { return Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         # Use catalog metadata as base estimate
@@ -242,7 +242,7 @@ X StatisticsCollector {
 
     # Collect column statistics: distinct values, null fraction, histogram
     # Uses reservoir sampling I table is large
-    F collect_column_stats(
+    fn collect_column_stats(
         self,
         catalog: &CatalogManager,
         pool: &BufferPool,
@@ -250,9 +250,9 @@ X StatisticsCollector {
         column_name: &Str
     ) -> Result<TableColumnStats, VaisError> {
         # Get table metadata
-        table_info := mut M catalog.get_table(table_name) {
+        table_info := mut match catalog.get_table(table_name) {
             Some(info) => info,
-            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
+            None => { return Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         # Get column metadata
@@ -263,8 +263,8 @@ X StatisticsCollector {
                 column_info = Some(col);
             }
         }
-        M column_info {
-            None => { R Err(err_stats_collection_failed("Column '{column_name}' not found in '{table_name}'")) },
+        match column_info {
+            None => { return Err(err_stats_collection_failed("Column '{column_name}' not found in '{table_name}'")) },
             Some(_) => {},
         }
 
@@ -295,7 +295,7 @@ X StatisticsCollector {
 
     # Collect vector index statistics from catalog metadata
     # In a full implementation, would read HNSW meta page
-    F collect_vector_stats(
+    fn collect_vector_stats(
         self,
         catalog: &CatalogManager,
         table_name: &Str,
@@ -319,7 +319,7 @@ X StatisticsCollector {
 
     # Collect graph statistics from graph metadata
     # In a full implementation, would read graph meta page
-    F collect_graph_stats(
+    fn collect_graph_stats(
         self,
         catalog: &CatalogManager
     ) -> Result<GraphStats, VaisError> {
@@ -338,7 +338,7 @@ X StatisticsCollector {
 
     # Collect full-text statistics from fulltext metadata
     # In a full implementation, would read fulltext meta page
-    F collect_fulltext_stats(
+    fn collect_fulltext_stats(
         self,
         catalog: &CatalogManager
     ) -> Result<FullTextStats, VaisError> {
@@ -356,7 +356,7 @@ X StatisticsCollector {
     # ========================================================================
 
     # Collect all statistics across all engines
-    F collect_all(
+    fn collect_all(
         self,
         catalog: &CatalogManager,
         pool: &BufferPool
@@ -368,19 +368,19 @@ X StatisticsCollector {
         # For now, simplified version
 
         # Collect vector stats (if any vector indexes exist)
-        M self.collect_vector_stats(catalog, &"embeddings", &"vector") {
+        match self.collect_vector_stats(catalog, &"embeddings", &"vector") {
             Ok(vec_stats) => stats.vector_stats.push(vec_stats),
             Err(_) => {},  # No vector index, skip
         }
 
         # Collect graph stats (if graph engine is active)
-        M self.collect_graph_stats(catalog) {
+        match self.collect_graph_stats(catalog) {
             Ok(graph_stats) => stats.graph_stats = Some(graph_stats),
             Err(_) => {},  # No graph engine, skip
         }
 
         # Collect fulltext stats (if fulltext engine is active)
-        M self.collect_fulltext_stats(catalog) {
+        match self.collect_fulltext_stats(catalog) {
             Ok(ft_stats) => stats.fulltext_stats = Some(ft_stats),
             Err(_) => {},  # No fulltext engine, skip
         }
@@ -393,7 +393,7 @@ X StatisticsCollector {
     # ========================================================================
 
     # Execute ANALYZE on a specific table
-    F analyze_table(
+    fn analyze_table(
         self,
         catalog: &CatalogManager,
         pool: &BufferPool,
@@ -407,14 +407,14 @@ X StatisticsCollector {
 
         # Collect column stats for all columns
         column_stats := mut Vec.new();
-        table_info := mut M catalog.get_table(table_name) {
+        table_info := mut match catalog.get_table(table_name) {
             Some(info) => info,
-            None => { R Err(err_stats_collection_failed("Table '{table_name}' not found")) },
+            None => { return Err(err_stats_collection_failed("Table '{table_name}' not found")) },
         };
 
         columns := mut catalog.get_columns(table_info.table_id);
         LF col: columns {
-            M self.collect_column_stats(catalog, pool, table_name, &col.name) {
+            match self.collect_column_stats(catalog, pool, table_name, &col.name) {
                 Ok(col_stats) => column_stats.push(col_stats),
                 Err(e) => {
                     # Log warning but continue
@@ -440,23 +440,23 @@ X StatisticsCollector {
 
 # Reservoir sampling: select sample_size rows uniformly at random from input
 # Uses FNV hash-based pseudo-random selection (no external RNG dependency)
-F reservoir_sample(rows: &Vec<SqlValue>, sample_size: u64, seed: u64) -> Vec<SqlValue> {
+fn reservoir_sample(rows: &Vec<SqlValue>, sample_size: u64, seed: u64) -> Vec<SqlValue> {
     I sample_size == 0 || rows.len() == 0 {
-        R Vec.new();
+        return Vec.new();
     }
 
     reservoir: Vec<SqlValue> := mut Vec.new();
-    i: u64 := mut 0;
+    i := mut 0u64;
 
     LF val: rows {
         I i < sample_size {
-            reservoir.push(val.clone());
-        } EL {
+            reservoir.push((*val).clone());
+        } else {
             # Replace with probability sample_size/i
             rand := mut pseudo_random(seed, i as u64);
             j := mut (rand as u64) % (i + 1);
             I j < sample_size {
-                reservoir[j] = val.clone();
+                reservoir[j] = (*val).clone();
             }
         }
         i += 1;
@@ -472,9 +472,9 @@ F reservoir_sample(rows: &Vec<SqlValue>, sample_size: u64, seed: u64) -> Vec<Sql
 # Build equi-depth histogram with given bucket count
 # Input: sorted sample of values
 # Output: bucket boundary values
-F build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlValue> {
+fn build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlValue> {
     I sorted_sample.len() == 0 || bucket_count == 0 {
-        R Vec.new();
+        return Vec.new();
     }
 
     boundaries := mut Vec.new();
@@ -483,13 +483,13 @@ F build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlVa
 
     I bucket_size == 0 {
         # Too few samples for requested buckets
-        R sorted_sample.clone();
+        return (*sorted_sample).clone();
     }
 
     LF i: 1..bucket_count {
         idx := mut i * bucket_size;
         I idx < sample_size {
-            boundaries.push(sorted_sample[idx].clone());
+            boundaries.push((*sorted_sample[idx]).clone());
         }
     }
 
@@ -502,7 +502,7 @@ F build_histogram(sorted_sample: &Vec<SqlValue>, bucket_count: u64) -> Vec<SqlVa
 
 # Generate pseudo-random u64 from seed and index
 # Uses FNV-1a hash followed by mixing for better distribution
-F pseudo_random(seed: u64, index: u64) -> u64 {
+fn pseudo_random(seed: u64, index: u64) -> u64 {
     h := mut seed ^ index;
     h = h.wrapping_mul(1099511628211);
     h ^= h >> 33;
@@ -519,21 +519,21 @@ F pseudo_random(seed: u64, index: u64) -> u64 {
 # Compare two SqlValue instances
 # Returns: Ok(-1) I a < b, Ok(0) I a == b, Ok(1) I a > b
 # Returns: Err I values are not comparable
-F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
-    M a {
+fn compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
+    match a {
         SqlValue.Null => {
-            M b {
+            match b {
                 SqlValue.Null => Ok(0),
                 _ => Ok(-1),
             }
         },
         SqlValue.IntVal { v } => {
             va := *v;
-            M b {
+            match b {
                 SqlValue.IntVal { v } => {
                     I va < *v { Ok(-1) }
-                    EL I va > *v { Ok(1) }
-                    EL { Ok(0) }
+                    else I va > *v { Ok(1) }
+                    else { Ok(0) }
                 },
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
@@ -541,11 +541,11 @@ F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
         },
         SqlValue.FloatVal { v } => {
             va := *v;
-            M b {
+            match b {
                 SqlValue.FloatVal { v } => {
                     I va < *v { Ok(-1) }
-                    EL I va > *v { Ok(1) }
-                    EL { Ok(0) }
+                    else I va > *v { Ok(1) }
+                    else { Ok(0) }
                 },
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
@@ -553,11 +553,11 @@ F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
         },
         SqlValue.StringVal { v } => {
             va := v.clone();
-            M b {
+            match b {
                 SqlValue.StringVal { v } => {
                     I va < *v { Ok(-1) }
-                    EL I va > *v { Ok(1) }
-                    EL { Ok(0) }
+                    else I va > *v { Ok(1) }
+                    else { Ok(0) }
                 },
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
@@ -565,11 +565,11 @@ F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
         },
         SqlValue.DateVal { v } => {
             va := *v;
-            M b {
+            match b {
                 SqlValue.DateVal { v } => {
                     I va < *v { Ok(-1) }
-                    EL I va > *v { Ok(1) }
-                    EL { Ok(0) }
+                    else I va > *v { Ok(1) }
+                    else { Ok(0) }
                 },
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
@@ -577,18 +577,18 @@ F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
         },
         SqlValue.TimestampVal { v } => {
             va := *v;
-            M b {
+            match b {
                 SqlValue.TimestampVal { v } => {
                     I va < *v { Ok(-1) }
-                    EL I va > *v { Ok(1) }
-                    EL { Ok(0) }
+                    else I va > *v { Ok(1) }
+                    else { Ok(0) }
                 },
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
             }
         },
         _ => {
-            M b {
+            match b {
                 SqlValue.Null => Ok(1),
                 _ => Err(err_stats_collection_failed("Cannot compare values of different types")),
             }
@@ -601,6 +601,6 @@ F compare_values(a: &SqlValue, b: &SqlValue) -> Result<i32, VaisError> {
 # ============================================================================
 
 # Get current time in milliseconds
-F current_time_millis() -> i64 {
+fn current_time_millis() -> i64 {
     time_millis()
 }

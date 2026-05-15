@@ -2,16 +2,18 @@
 # Parse once, execute many with parameter binding ($1, $2, ...)
 # Supports plan caching (optional, for future optimizer integration)
 
-U storage/error
-U sql/types
-U sql/parser/ast
-U sql/parser/parser
+use storage/error
+use sql/types
+use sql/parser/ast
+use sql/parser/parser
+
+impl fn __strlen(s: str) -> i64
 
 # ============================================================================
 # PreparedStatement - Cached parsed statement with parameter support
 # ============================================================================
 
-S PreparedStatement {
+struct PreparedStatement {
     name: str,                        # Statement name
     sql: str,                         # Original SQL text
     parsed: Statement,                # Parsed AST (parse once)
@@ -19,15 +21,15 @@ S PreparedStatement {
     param_types: Vec<Option<SqlType>>, # Optional type hints per parameter
 }
 
-X PreparedStatement {
+impl PreparedStatement {
     # Parse SQL, count parameters, create prepared statement
-    F prepare(name: str, sql: str) -> Result<PreparedStatement, VaisError> {
+    fn prepare(name: str, sql: str) -> Result<PreparedStatement, VaisError> {
         # Parse the SQL
         stmts := mut parse_sql(sql.clone())?;
 
         # Must be exactly one statement
         I stmts.len() != 1 {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0101001",
                 "Prepared statement must contain exactly one SQL statement"
             ))
@@ -55,10 +57,10 @@ X PreparedStatement {
 
     # Substitute parameters into AST, return new Statement with literals
     # Error if wrong param count
-    F bind(self, params: &[SqlValue]) -> Result<Statement, VaisError> {
+    fn bind(self, params: &[SqlValue]) -> Result<Statement, VaisError> {
         # Check parameter count
         I params.len() != self.param_count as u64 {
-            R Err(par_err_param_count_mismatch(self.param_count, params.len()))
+            return Err(par_err_param_count_mismatch(self.param_count, params.len()))
         }
 
         # Substitute parameters into AST
@@ -66,17 +68,17 @@ X PreparedStatement {
     }
 
     # Get parameter count
-    F param_count(self) -> u32 {
+    fn param_count(self) -> u32 {
         self.param_count
     }
 
     # Get statement name
-    F get_name(self) -> &str {
+    fn get_name(self) -> &str {
         &self.name
     }
 
     # Get original SQL text
-    F get_sql(self) -> &str {
+    fn get_sql(self) -> &str {
         &self.sql
     }
 }
@@ -85,14 +87,14 @@ X PreparedStatement {
 # PreparedStatementCache - Manage prepared statements
 # ============================================================================
 
-S PreparedStatementCache {
+struct PreparedStatementCache {
     statements: Vec<(str, PreparedStatement)>,  # name -> prepared stmt (Vec since no HashMap yet)
     max_size: u64,                            # Max cached statements
 }
 
-X PreparedStatementCache {
+impl PreparedStatementCache {
     # Create new cache with max size
-    F new(max_size: u64) -> PreparedStatementCache {
+    fn new(max_size: u64) -> PreparedStatementCache {
         PreparedStatementCache {
             statements: Vec.with_capacity(0),
             max_size,
@@ -100,11 +102,11 @@ X PreparedStatementCache {
     }
 
     # Parse and cache a prepared statement
-    F prepare(mut self, name: str, sql: str) -> Result<(), VaisError> {
+    fn prepare(mut self, name: str, sql: str) -> Result<(), VaisError> {
         # Check if statement with this name already exists
         LF i: 0..self.statements.len() {
             I self.statements[i].0 == name {
-                R Err(VaisError.new(
+                return Err(VaisError.new(
                     "VAIS-0101001",
                     "Prepared statement '{name}' already exists"
                 ))
@@ -126,11 +128,11 @@ X PreparedStatementCache {
     }
 
     # Lookup, bind parameters, and return ready-to-execute statement
-    F execute(self, name: &str, params: &[SqlValue]) -> Result<Statement, VaisError> {
+    fn execute(self, name: &str, params: &[SqlValue]) -> Result<Statement, VaisError> {
         # Find the prepared statement
         LF i: 0..self.statements.len() {
             I self.statements[i].0 == *name {
-                R self.statements[i].1.bind(params)
+                return self.statements[i].1.bind(params)
             }
         }
 
@@ -138,12 +140,12 @@ X PreparedStatementCache {
     }
 
     # Remove a prepared statement from cache
-    F deallocate(mut self, name: &str) -> Result<(), VaisError> {
+    fn deallocate(mut self, name: &str) -> Result<(), VaisError> {
         # Find and remove
         LF i: 0..self.statements.len() {
             I self.statements[i].0 == *name {
                 self.statements.remove(i)
-                R Ok(())
+                return Ok(())
             }
         }
 
@@ -151,17 +153,17 @@ X PreparedStatementCache {
     }
 
     # Check if statement exists
-    F exists(self, name: &str) -> bool {
+    fn exists(self, name: &str) -> bool {
         LF i: 0..self.statements.len() {
             I self.statements[i].0 == *name {
-                R true
+                return true
             }
         }
         false
     }
 
     # Get cache size
-    F count(self) -> u64 {
+    fn count(self) -> u64 {
         self.statements.len()
     }
 }
@@ -171,17 +173,17 @@ X PreparedStatementCache {
 # ============================================================================
 
 # Walk AST to find maximum parameter index
-F count_parameters(stmt: &Statement) -> u32 {
-    M stmt {
-        Select { query } => count_params_in_query(query),
+fn count_parameters(stmt: &Statement) -> u32 {
+    match stmt {
+        Select { query } => count_params_in_query(&query),
         Insert { insert } => {
             max := mut 0u32
             # Count in source (VALUES or SELECT)
-            M &insert.source {
+            match &insert.source {
                 Values { rows } => {
                     LF row: rows {
                         LF expr: row {
-                            expr_max := mut count_params_in_expr(expr)
+                            expr_max := mut count_params_in_expr(&expr)
                             I expr_max > max {
                                 max = expr_max
                             }
@@ -189,7 +191,7 @@ F count_parameters(stmt: &Statement) -> u32 {
                     }
                 },
                 Query { query } => {
-                    max = count_params_in_query(query)
+                    max = count_params_in_query(&query)
                 },
             }
             max
@@ -204,9 +206,9 @@ F count_parameters(stmt: &Statement) -> u32 {
                 }
             }
             # Count in where clause
-            M &update.where_clause {
+            match &update.where_clause {
                 Option.Some(expr) => {
-                    expr_max := mut count_params_in_expr(expr)
+                    expr_max := mut count_params_in_expr(&expr)
                     I expr_max > max {
                         max = expr_max
                     }
@@ -216,26 +218,26 @@ F count_parameters(stmt: &Statement) -> u32 {
             max
         },
         Delete { delete } => {
-            M &delete.where_clause {
-                Option.Some(expr) => count_params_in_expr(expr),
+            match &delete.where_clause {
+                Option.Some(expr) => count_params_in_expr(&expr),
                 Option.None => 0,
             }
         },
         CreateTable { create } => {
             max := mut 0u32
             LF col: &create.columns {
-                M &col.default_value {
+                match &col.default_value {
                     Option.Some(expr) => {
-                        expr_max := mut count_params_in_expr(expr)
+                        expr_max := mut count_params_in_expr(&expr)
                         I expr_max > max {
                             max = expr_max
                         }
                     },
                     Option.None => {},
                 }
-                M &col.check_expr {
+                match &col.check_expr {
                     Option.Some(expr) => {
-                        expr_max := mut count_params_in_expr(expr)
+                        expr_max := mut count_params_in_expr(&expr)
                         I expr_max > max {
                             max = expr_max
                         }
@@ -251,7 +253,7 @@ F count_parameters(stmt: &Statement) -> u32 {
         Execute { params, .. } => {
             max := mut 0u32
             LF expr: params {
-                expr_max := mut count_params_in_expr(expr)
+                expr_max := mut count_params_in_expr(&expr)
                 I expr_max > max {
                     max = expr_max
                 }
@@ -263,7 +265,7 @@ F count_parameters(stmt: &Statement) -> u32 {
 }
 
 # Count parameters in a SelectQuery
-F count_params_in_query(query: &SelectQuery) -> u32 {
+fn count_params_in_query(query: &SelectQuery) -> u32 {
     max := mut 0u32
 
     # CTEs
@@ -276,9 +278,9 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
 
     # Select list
     LF item: &query.select_list {
-        M item {
+        match item {
             Expr { expr, .. } => {
-                expr_max := mut count_params_in_expr(expr)
+                expr_max := mut count_params_in_expr(&expr)
                 I expr_max > max {
                     max = expr_max
                 }
@@ -288,10 +290,10 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
     }
 
     # FROM clause
-    M &query.from {
+    match &query.from {
         Option.Some(refs) => {
             LF table_ref: refs {
-                ref_max := mut count_params_in_table_ref(table_ref)
+                ref_max := mut count_params_in_table_ref(&table_ref)
                 I ref_max > max {
                     max = ref_max
                 }
@@ -301,9 +303,9 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
     }
 
     # WHERE
-    M &query.where_clause {
+    match &query.where_clause {
         Option.Some(expr) => {
-            expr_max := mut count_params_in_expr(expr)
+            expr_max := mut count_params_in_expr(&expr)
             I expr_max > max {
                 max = expr_max
             }
@@ -313,16 +315,16 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
 
     # GROUP BY
     LF expr: &query.group_by {
-        expr_max := mut count_params_in_expr(expr)
+        expr_max := mut count_params_in_expr(&expr)
         I expr_max > max {
             max = expr_max
         }
     }
 
     # HAVING
-    M &query.having {
+    match &query.having {
         Option.Some(expr) => {
-            expr_max := mut count_params_in_expr(expr)
+            expr_max := mut count_params_in_expr(&expr)
             I expr_max > max {
                 max = expr_max
             }
@@ -339,18 +341,18 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
     }
 
     # LIMIT/OFFSET
-    M &query.limit {
+    match &query.limit {
         Option.Some(expr) => {
-            expr_max := mut count_params_in_expr(expr)
+            expr_max := mut count_params_in_expr(&expr)
             I expr_max > max {
                 max = expr_max
             }
         },
         Option.None => {},
     }
-    M &query.offset {
+    match &query.offset {
         Option.Some(expr) => {
-            expr_max := mut count_params_in_expr(expr)
+            expr_max := mut count_params_in_expr(&expr)
             I expr_max > max {
                 max = expr_max
             }
@@ -359,7 +361,7 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
     }
 
     # Set operations
-    M &query.set_op {
+    match &query.set_op {
         Option.Some(set_op) => {
             set_max := mut count_params_in_query(&*set_op.right)
             I set_max > max {
@@ -373,18 +375,18 @@ F count_params_in_query(query: &SelectQuery) -> u32 {
 }
 
 # Count parameters in a TableRef
-F count_params_in_table_ref(table_ref: &TableRef) -> u32 {
-    M table_ref {
+fn count_params_in_table_ref(table_ref: &TableRef) -> u32 {
+    match table_ref {
         Subquery { query, .. } => count_params_in_query(&**query),
         Join { join } => {
             left_max := mut count_params_in_table_ref(&*join.left)
             right_max := mut count_params_in_table_ref(&*join.right)
-            max := mut I left_max > right_max { left_max } EL { right_max }
+            max := mut I left_max > right_max { left_max } else { right_max }
 
             # Check condition
-            M &join.condition {
+            match &join.condition {
                 On { expr } => {
-                    cond_max := mut count_params_in_expr(expr)
+                    cond_max := mut count_params_in_expr(&expr)
                     I cond_max > max {
                         max = cond_max
                     }
@@ -396,20 +398,20 @@ F count_params_in_table_ref(table_ref: &TableRef) -> u32 {
         CrossJoin { left, right } => {
             left_max := mut count_params_in_table_ref(&**left)
             right_max := mut count_params_in_table_ref(&**right)
-            I left_max > right_max { left_max } EL { right_max }
+            I left_max > right_max { left_max } else { right_max }
         },
         _ => 0,
     }
 }
 
 # Recursive parameter counting in expressions
-F count_params_in_expr(expr: &Expr) -> u32 {
-    M expr {
+fn count_params_in_expr(expr: &Expr) -> u32 {
+    match expr {
         Parameter { idx } => *idx,
         BinaryOp { left, right, .. } => {
             left_max := mut count_params_in_expr(&**left)
             right_max := mut count_params_in_expr(&**right)
-            I left_max > right_max { left_max } EL { right_max }
+            I left_max > right_max { left_max } else { right_max }
         },
         UnaryOp { operand, .. } => count_params_in_expr(&**operand),
         IsNull { expr: e, .. } => count_params_in_expr(&**e),
@@ -417,13 +419,13 @@ F count_params_in_expr(expr: &Expr) -> u32 {
             e_max := mut count_params_in_expr(&**e)
             low_max := mut count_params_in_expr(&**low)
             high_max := mut count_params_in_expr(&**high)
-            max := mut I e_max > low_max { e_max } EL { low_max }
-            I high_max > max { high_max } EL { max }
+            max := mut I e_max > low_max { e_max } else { low_max }
+            I high_max > max { high_max } else { max }
         },
         InList { expr: e, list, .. } => {
             max := mut count_params_in_expr(&**e)
             LF item: list {
-                item_max := mut count_params_in_expr(item)
+                item_max := mut count_params_in_expr(&item)
                 I item_max > max {
                     max = item_max
                 }
@@ -433,17 +435,17 @@ F count_params_in_expr(expr: &Expr) -> u32 {
         InSubquery { expr: e, query, .. } => {
             e_max := mut count_params_in_expr(&**e)
             q_max := mut count_params_in_query(&**query)
-            I e_max > q_max { e_max } EL { q_max }
+            I e_max > q_max { e_max } else { q_max }
         },
         Exists { query, .. } => count_params_in_query(&**query),
         Like { expr: e, pattern, .. } => {
             e_max := mut count_params_in_expr(&**e)
             p_max := mut count_params_in_expr(&**pattern)
-            I e_max > p_max { e_max } EL { p_max }
+            I e_max > p_max { e_max } else { p_max }
         },
         Case { operand, when_clauses, else_result } => {
             max := mut 0u32
-            M operand {
+            match operand {
                 Option.Some(op) => {
                     max = count_params_in_expr(&**op)
                 },
@@ -459,7 +461,7 @@ F count_params_in_expr(expr: &Expr) -> u32 {
                     max = res_max
                 }
             }
-            M else_result {
+            match else_result {
                 Option.Some(e) => {
                     e_max := mut count_params_in_expr(&**e)
                     I e_max > max {
@@ -474,7 +476,7 @@ F count_params_in_expr(expr: &Expr) -> u32 {
         FunctionCall { args, .. } => {
             max := mut 0u32
             LF arg: args {
-                arg_max := mut count_params_in_expr(arg)
+                arg_max := mut count_params_in_expr(&arg)
                 I arg_max > max {
                     max = arg_max
                 }
@@ -484,7 +486,7 @@ F count_params_in_expr(expr: &Expr) -> u32 {
         WindowFunc { func, partition_by, order_by } => {
             max := mut count_params_in_expr(&**func)
             LF expr: partition_by {
-                expr_max := mut count_params_in_expr(expr)
+                expr_max := mut count_params_in_expr(&expr)
                 I expr_max > max {
                     max = expr_max
                 }
@@ -501,7 +503,7 @@ F count_params_in_expr(expr: &Expr) -> u32 {
         Concat { left, right } => {
             left_max := mut count_params_in_expr(&**left)
             right_max := mut count_params_in_expr(&**right)
-            I left_max > right_max { left_max } EL { right_max }
+            I left_max > right_max { left_max } else { right_max }
         },
         _ => 0,
     }
@@ -512,30 +514,30 @@ F count_params_in_expr(expr: &Expr) -> u32 {
 # ============================================================================
 
 # Substitute parameters in a Statement
-F substitute_params(stmt: &Statement, params: &[SqlValue]) -> Result<Statement, VaisError> {
-    M stmt {
+fn substitute_params(stmt: &Statement, params: &[SqlValue]) -> Result<Statement, VaisError> {
+    match stmt {
         Select { query } => {
-            new_query := mut substitute_query(query, params)?;
-            Ok(Select { query: new_query })
+            new_query := mut substitute_query(&query, params)?;
+            Ok(Statement.Select { query: new_query })
         },
         Insert { insert } => {
-            new_source := mut M &insert.source {
+            new_source := mut match &insert.source {
                 Values { rows } => {
                     new_rows := mut Vec.with_capacity(0)
                     LF row: rows {
                         new_row := mut Vec.with_capacity(0)
                         LF expr: row {
-                            new_row.push(substitute_expr(expr, params)?)
+                            new_row.push(substitute_expr(&expr, params)?)
                         }
                         new_rows.push(new_row)
                     }
-                    Values { rows: new_rows }
+                    InsertSource.Values { rows: new_rows }
                 },
                 Query { query } => {
-                    Query { query: substitute_query(query, params)? }
+                    InsertSource.Query { query: substitute_query(&query, params)? }
                 },
             }
-            Ok(Insert {
+            Ok(Statement.Insert {
                 insert: InsertStmt {
                     table_name: insert.table_name.clone(),
                     columns: insert.columns.clone(),
@@ -551,11 +553,11 @@ F substitute_params(stmt: &Statement, params: &[SqlValue]) -> Result<Statement, 
                     value: substitute_expr(&assign.value, params)?,
                 })
             }
-            new_where := mut M &update.where_clause {
-                Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+            new_where := mut match &update.where_clause {
+                Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
                 Option.None => Option.None,
             }
-            Ok(Update {
+            Ok(Statement.Update {
                 update: UpdateStmt {
                     table_name: update.table_name.clone(),
                     assignments: new_assignments,
@@ -564,11 +566,11 @@ F substitute_params(stmt: &Statement, params: &[SqlValue]) -> Result<Statement, 
             })
         },
         Delete { delete } => {
-            new_where := mut M &delete.where_clause {
-                Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+            new_where := mut match &delete.where_clause {
+                Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
                 Option.None => Option.None,
             }
-            Ok(Delete {
+            Ok(Statement.Delete {
                 delete: DeleteStmt {
                     table_name: delete.table_name.clone(),
                     where_clause: new_where,
@@ -576,12 +578,12 @@ F substitute_params(stmt: &Statement, params: &[SqlValue]) -> Result<Statement, 
             })
         },
         # Other statement types just clone as-is (no parameters expected)
-        _ => Ok(stmt.clone()),
+        _ => Ok((*stmt).clone()),
     }
 }
 
 # Substitute parameters in a SelectQuery
-F substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQuery, VaisError> {
+fn substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQuery, VaisError> {
     # CTEs
     new_ctes := mut Vec.with_capacity(0)
     LF cte: &query.ctes {
@@ -596,24 +598,24 @@ F substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQue
     # Select list
     new_select_list := mut Vec.with_capacity(0)
     LF item: &query.select_list {
-        new_item := mut M item {
+        new_item := mut match item {
             Expr { expr, alias } => {
-                Expr {
-                    expr: substitute_expr(expr, params)?,
+                SelectItem.Expr {
+                    expr: substitute_expr(&expr, params)?,
                     alias: alias.clone(),
                 }
             },
-            _ => item.clone(),
+            _ => (*item).clone(),
         }
         new_select_list.push(new_item)
     }
 
     # FROM clause
-    new_from := mut M &query.from {
+    new_from := mut match &query.from {
         Option.Some(refs) => {
             new_refs := mut Vec.with_capacity(0)
             LF table_ref: refs {
-                new_refs.push(substitute_table_ref(table_ref, params)?)
+                new_refs.push(substitute_table_ref(&table_ref, params)?)
             }
             Option.Some(new_refs)
         },
@@ -621,20 +623,20 @@ F substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQue
     }
 
     # WHERE
-    new_where := mut M &query.where_clause {
-        Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+    new_where := mut match &query.where_clause {
+        Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
         Option.None => Option.None,
     }
 
     # GROUP BY
     new_group_by := mut Vec.with_capacity(0)
     LF expr: &query.group_by {
-        new_group_by.push(substitute_expr(expr, params)?)
+        new_group_by.push(substitute_expr(&expr, params)?)
     }
 
     # HAVING
-    new_having := mut M &query.having {
-        Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+    new_having := mut match &query.having {
+        Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
         Option.None => Option.None,
     }
 
@@ -649,17 +651,17 @@ F substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQue
     }
 
     # LIMIT/OFFSET
-    new_limit := mut M &query.limit {
-        Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+    new_limit := mut match &query.limit {
+        Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
         Option.None => Option.None,
     }
-    new_offset := mut M &query.offset {
-        Option.Some(expr) => Option.Some(substitute_expr(expr, params)?),
+    new_offset := mut match &query.offset {
+        Option.Some(expr) => Option.Some(substitute_expr(&expr, params)?),
         Option.None => Option.None,
     }
 
     # Set operations
-    new_set_op := mut M &query.set_op {
+    new_set_op := mut match &query.set_op {
         Option.Some(set_op) => {
             Option.Some(SetOperation {
                 op: set_op.op.clone(),
@@ -686,10 +688,10 @@ F substitute_query(query: &SelectQuery, params: &[SqlValue]) -> Result<SelectQue
 }
 
 # Substitute parameters in a TableRef
-F substitute_table_ref(table_ref: &TableRef, params: &[SqlValue]) -> Result<TableRef, VaisError> {
-    M table_ref {
+fn substitute_table_ref(table_ref: &TableRef, params: &[SqlValue]) -> Result<TableRef, VaisError> {
+    match table_ref {
         Subquery { query, alias } => {
-            Ok(Subquery {
+            Ok(TableRef.Subquery {
                 query: Box.new(substitute_query(&**query, params)?),
                 alias: alias.clone(),
             })
@@ -697,13 +699,13 @@ F substitute_table_ref(table_ref: &TableRef, params: &[SqlValue]) -> Result<Tabl
         Join { join } => {
             new_left := mut Box.new(substitute_table_ref(&*join.left, params)?)
             new_right := mut Box.new(substitute_table_ref(&*join.right, params)?)
-            new_condition := mut M &join.condition {
+            new_condition := mut match &join.condition {
                 On { expr } => {
-                    On { expr: substitute_expr(expr, params)? }
+                    JoinCondition.On { expr: substitute_expr(&expr, params)? }
                 },
                 _ => join.condition.clone(),
             }
-            Ok(Join {
+            Ok(TableRef.Join {
                 join: JoinClause {
                     join_type: join.join_type.clone(),
                     left: new_left,
@@ -713,31 +715,31 @@ F substitute_table_ref(table_ref: &TableRef, params: &[SqlValue]) -> Result<Tabl
             })
         },
         CrossJoin { left, right } => {
-            Ok(CrossJoin {
+            Ok(TableRef.CrossJoin {
                 left: Box.new(substitute_table_ref(&**left, params)?),
                 right: Box.new(substitute_table_ref(&**right, params)?),
             })
         },
-        _ => Ok(table_ref.clone()),
+        _ => Ok((*table_ref).clone()),
     }
 }
 
 # Recursive expression substitution - replace Parameter nodes with Literal nodes
-F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
-    M expr {
+fn substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
+    match expr {
         # Parameter marker: replace with literal
         Parameter { idx } => {
             # Parameter indices are 1-based ($1 = params[0])
             I *idx == 0 || (*idx as u64) > params.len() {
-                R Err(err_param_out_of_range(*idx, params.len() as u32))
+                return Err(err_param_out_of_range(*idx, params.len() as u32))
             }
             param_idx := mut (*idx - 1) as u64
-            Ok(Literal { value: params[param_idx].clone() })
+            Ok(Expr.Literal { value: params[param_idx].clone() })
         },
 
         # Binary operation
         BinaryOp { left, op, right } => {
-            Ok(BinaryOp {
+            Ok(Expr.BinaryOp {
                 left: Box.new(substitute_expr(&**left, params)?),
                 op: *op,
                 right: Box.new(substitute_expr(&**right, params)?),
@@ -746,7 +748,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # Unary operation
         UnaryOp { op, operand } => {
-            Ok(UnaryOp {
+            Ok(Expr.UnaryOp {
                 op: *op,
                 operand: Box.new(substitute_expr(&**operand, params)?),
             })
@@ -754,7 +756,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # IS NULL / IS NOT NULL
         IsNull { expr: e, negated } => {
-            Ok(IsNull {
+            Ok(Expr.IsNull {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 negated: *negated,
             })
@@ -762,7 +764,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # BETWEEN
         Between { expr: e, low, high, negated } => {
-            Ok(Between {
+            Ok(Expr.Between {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 low: Box.new(substitute_expr(&**low, params)?),
                 high: Box.new(substitute_expr(&**high, params)?),
@@ -774,9 +776,9 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
         InList { expr: e, list, negated } => {
             new_list := mut Vec.with_capacity(0)
             LF item: list {
-                new_list.push(substitute_expr(item, params)?)
+                new_list.push(substitute_expr(&item, params)?)
             }
-            Ok(InList {
+            Ok(Expr.InList {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 list: new_list,
                 negated: *negated,
@@ -785,7 +787,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # IN (subquery)
         InSubquery { expr: e, query, negated } => {
-            Ok(InSubquery {
+            Ok(Expr.InSubquery {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 query: Box.new(substitute_query(&**query, params)?),
                 negated: *negated,
@@ -794,7 +796,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # EXISTS (subquery)
         Exists { query, negated } => {
-            Ok(Exists {
+            Ok(Expr.Exists {
                 query: Box.new(substitute_query(&**query, params)?),
                 negated: *negated,
             })
@@ -802,7 +804,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # LIKE
         Like { expr: e, pattern, negated } => {
-            Ok(Like {
+            Ok(Expr.Like {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 pattern: Box.new(substitute_expr(&**pattern, params)?),
                 negated: *negated,
@@ -811,7 +813,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # CASE
         Case { operand, when_clauses, else_result } => {
-            new_operand := mut M operand {
+            new_operand := mut match operand {
                 Option.Some(op) => Option.Some(Box.new(substitute_expr(&**op, params)?)),
                 Option.None => Option.None,
             }
@@ -822,11 +824,11 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
                     result: substitute_expr(&when_clause.result, params)?,
                 })
             }
-            new_else := mut M else_result {
+            new_else := mut match else_result {
                 Option.Some(e) => Option.Some(Box.new(substitute_expr(&**e, params)?)),
                 Option.None => Option.None,
             }
-            Ok(Case {
+            Ok(Expr.Case {
                 operand: new_operand,
                 when_clauses: new_when_clauses,
                 else_result: new_else,
@@ -835,7 +837,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # CAST
         Cast { expr: e, target_type } => {
-            Ok(Cast {
+            Ok(Expr.Cast {
                 expr: Box.new(substitute_expr(&**e, params)?),
                 target_type: target_type.clone(),
             })
@@ -845,9 +847,9 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
         FunctionCall { name, args, distinct } => {
             new_args := mut Vec.with_capacity(0)
             LF arg: args {
-                new_args.push(substitute_expr(arg, params)?)
+                new_args.push(substitute_expr(&arg, params)?)
             }
-            Ok(FunctionCall {
+            Ok(Expr.FunctionCall {
                 name: name.clone(),
                 args: new_args,
                 distinct: *distinct,
@@ -859,7 +861,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
             new_func := mut Box.new(substitute_expr(&**func, params)?)
             new_partition := mut Vec.with_capacity(0)
             LF expr: partition_by {
-                new_partition.push(substitute_expr(expr, params)?)
+                new_partition.push(substitute_expr(&expr, params)?)
             }
             new_order := mut Vec.with_capacity(0)
             LF item: order_by {
@@ -869,7 +871,7 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
                     nulls_first: item.nulls_first,
                 })
             }
-            Ok(WindowFunc {
+            Ok(Expr.WindowFunc {
                 func: new_func,
                 partition_by: new_partition,
                 order_by: new_order,
@@ -878,21 +880,21 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 
         # Scalar subquery
         Subquery { query } => {
-            Ok(Subquery {
+            Ok(Expr.Subquery {
                 query: Box.new(substitute_query(&**query, params)?),
             })
         },
 
         # String concatenation
         Concat { left, right } => {
-            Ok(Concat {
+            Ok(Expr.Concat {
                 left: Box.new(substitute_expr(&**left, params)?),
                 right: Box.new(substitute_expr(&**right, params)?),
             })
         },
 
         # Literals, column refs, star - clone as-is
-        _ => Ok(expr.clone()),
+        _ => Ok((*expr).clone()),
     }
 }
 
@@ -900,21 +902,21 @@ F substitute_expr(expr: &Expr, params: &[SqlValue]) -> Result<Expr, VaisError> {
 # Error constructors
 # ============================================================================
 
-F err_stmt_not_found(name: str) -> VaisError {
+fn err_stmt_not_found(name: str) -> VaisError {
     VaisError.new(
         "VAIS-0101001",
         "Prepared statement '{name}' not found"
     )
 }
 
-F par_err_param_count_mismatch(expected: u32, got: u64) -> VaisError {
+fn par_err_param_count_mismatch(expected: u32, got: u64) -> VaisError {
     VaisError.new(
         "VAIS-0101001",
         "Expected {expected} parameters, got {got}"
     )
 }
 
-F err_param_out_of_range(idx: u32, max: u32) -> VaisError {
+fn err_param_out_of_range(idx: u32, max: u32) -> VaisError {
     VaisError.new(
         "VAIS-0101001",
         "Parameter ${idx} out of range (max ${max})"

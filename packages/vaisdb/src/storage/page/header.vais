@@ -2,29 +2,29 @@
 # All 4 engines share this header. Every page on disk begins with these 48 bytes.
 # Fields ordered for natural alignment: u64 at 8-byte, u32 at 4-byte, u16 at 2-byte boundaries.
 
-U storage/bytes
-U storage/constants
-U storage/error
-U storage/checksum
-U storage/page/types
-U storage/page/flags
-U std/hash
+use storage/bytes
+use storage/constants
+use storage/error
+use storage/checksum
+use storage/page/types
+use storage/page/flags
+use std/hash
 
-F write_checksum_slice(page_data: &mut [u8], checksum: u32) {
+fn write_checksum_slice(page_data: &mut [u8], checksum: u32) {
     page_data[20] = (checksum & 255) as u8
     page_data[21] = ((checksum >> 8) & 255) as u8
     page_data[22] = ((checksum >> 16) & 255) as u8
     page_data[23] = ((checksum >> 24) & 255) as u8
 }
 
-F write_checksum_vec(page_data: &Vec<u8>, checksum: u32) {
+fn write_checksum_vec(page_data: &Vec<u8>, checksum: u32) {
     page_data[20] = (checksum & 255) as u8
     page_data[21] = ((checksum >> 8) & 255) as u8
     page_data[22] = ((checksum >> 16) & 255) as u8
     page_data[23] = ((checksum >> 24) & 255) as u8
 }
 
-S PageHeader {
+struct PageHeader {
     page_lsn: u64,           # LSN of last WAL record that modified this page
     txn_id: u64,             # Transaction that last modified this page
     page_id: u32,            # Unique page identifier (0 = meta page)
@@ -42,9 +42,9 @@ S PageHeader {
     format_version: u8,      # Page format version (starts at 1)
 }
 
-X PageHeader {
+impl PageHeader {
     # Create a new page header with defaults
-    F new(page_id: u32, page_type: u8, engine_tag: u8) -> PageHeader {
+    fn new(page_id: u32, page_type: u8, engine_tag: u8) -> PageHeader {
         PageHeader {
             page_lsn: 0,
             txn_id: 0,
@@ -65,12 +65,12 @@ X PageHeader {
     }
 
     # Create an unused/empty page header
-    F unused(page_id: u32) -> PageHeader {
+    fn unused(page_id: u32) -> PageHeader {
         PageHeader.new(page_id, PAGE_TYPE_UNUSED, ENGINE_TAG_COMMON)
     }
 
     # Serialize page header to ByteBuffer (writes exactly 48 bytes)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.page_lsn)
         buf.write_i64_le(self.txn_id)
         buf.write_i32_le(self.page_id)
@@ -89,7 +89,7 @@ X PageHeader {
     }
 
     # Deserialize page header from ByteBuffer (reads exactly 48 bytes)
-    F deserialize(buf: &ByteBuffer) -> Result<PageHeader, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PageHeader, VaisError> {
         Ok(PageHeader {
             page_lsn: read_i64_le_checked(buf)?,
             txn_id: read_i64_le_checked(buf)?,
@@ -110,55 +110,73 @@ X PageHeader {
     }
 
     # Serialize page header directly into a page-sized byte array at offset 0
-    F write_to_page(self, page_data: &mut [u8]) {
-        buf := mut ByteBuffer.new();
-        self.serialize(&buf);
+    fn write_to_page(self, page_data: &mut [u8]) {
+        buf := mut ByteBuffer.with_capacity(PAGE_HEADER_SIZE as u64)
+        self.serialize(&buf)
+        header_bytes := mut buf.to_vec()
+        LF i: 0..header_bytes.len() {
+            page_data[i] = header_bytes[i]
+        }
+    }
+
+    # Vec-backed variant for callers that hold a Vec<u8>.
+    fn write_to_page_vec(self, page_data: &Vec<u8>) {
+        buf := mut ByteBuffer.with_capacity(PAGE_HEADER_SIZE as u64)
+        self.serialize(&buf)
+        header_bytes := mut buf.to_vec()
+        LF i: 0..header_bytes.len() {
+            page_data[i] = header_bytes[i]
+        }
     }
 
     # Read page header from a page-sized byte array at offset 0
-    F read_from_page(page_data: &[u8]) -> Result<PageHeader, VaisError> {
-        buf := mut ByteBuffer.new();
+    fn read_from_page(page_data: &[u8]) -> Result<PageHeader, VaisError> {
+        buf := mut ByteBuffer.wrap_readonly(page_data);
         PageHeader.deserialize(&buf)
+    }
+
+    # Vec-backed variant for callers that hold a BufferPool page Vec.
+    fn read_from_page_vec(page_data: &Vec<u8>) -> Result<PageHeader, VaisError> {
+        PageHeader.read_from_page(page_data)
     }
 
     # Update the checksum field in a Vec-backed page buffer.
     # Must be called AFTER all page content is written.
-    F update_checksum(page_data: &Vec<u8>) {
-        # Use crc32c directly on Vec data
-        checksum := mut crc32c(page_data)
+    fn update_checksum(page_data: &Vec<u8>) {
+        checksum := mut calculate_page_checksum(page_data)
         write_checksum_vec(page_data, checksum)
     }
 
     # Update the checksum field in any mutable page slice.
-    F update_checksum_slice(page_data: &mut [u8]) {
+    fn update_checksum_slice(page_data: &mut [u8]) {
         checksum := mut calculate_page_checksum_mut(page_data)
         write_checksum_slice(page_data, checksum)
     }
 
-    F update_checksum_vec(page_data: &Vec<u8>) {
+    fn update_checksum_vec(page_data: &Vec<u8>) {
         PageHeader.update_checksum(page_data)
     }
 
     # Check if this page has a valid chain link
-    F has_next(self) -> bool {
+    fn has_next(self) -> bool {
         self.next_page != NULL_PAGE
     }
 
-    F has_prev(self) -> bool {
+    fn has_prev(self) -> bool {
         self.prev_page != NULL_PAGE
     }
 
-    F has_overflow(self) -> bool {
+    fn has_overflow(self) -> bool {
         self.overflow_page != NULL_PAGE
     }
 
     # Get PageFlags wrapper
-    F get_flags(self) -> PageFlags {
+    fn get_flags(self) -> PageFlags {
         PageFlags.from_bits(self.flags)
     }
 
     # Set flags from PageFlags wrapper
-    F set_flags(mut self, flags: PageFlags) {
+    fn set_flags(mut self, flags: PageFlags) {
         self.flags = flags.to_bits()
     }
 }

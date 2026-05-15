@@ -1,6 +1,17 @@
 import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult } from "../types.js";
 import type { ServerOptions, RequestHandlerOptions } from "./types.js";
 
+function collectRoutes(routes: RouteManifest["routes"]): RouteManifest["routes"] {
+  const result: RouteManifest["routes"] = [];
+  for (const route of routes) {
+    result.push(route);
+    if (route.children.length > 0) {
+      result.push(...collectRoutes(route.children));
+    }
+  }
+  return result;
+}
+
 /**
  * Generate JS code string for the server entry point.
  * The generated code creates a Node.js HTTP server with route handling
@@ -10,7 +21,7 @@ export function generateServerEntry(
   manifest: RouteManifest,
   options: ServerOptions
 ): string {
-  const routes = manifest.routes
+  const routes = collectRoutes(manifest.routes)
     .map((r) => `  { pattern: ${JSON.stringify(r.pattern)} }`)
     .join(",\n");
 
@@ -41,7 +52,7 @@ function matchRoute(pathname) {
   return null;
 }
 
-function serveStaticFile(res, filePath) {
+function serveStaticFile(res, filePath, status = 200) {
   try {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath);
@@ -56,7 +67,7 @@ function serveStaticFile(res, filePath) {
         ".svg": "image/svg+xml",
       };
       const contentType = contentTypes[ext] || "application/octet-stream";
-      res.writeHead(200, { "Content-Type": contentType });
+      res.writeHead(status, { "Content-Type": contentType });
       res.end(content);
       return true;
     }
@@ -88,7 +99,7 @@ const server = http.createServer((req, res) => {
 
   // 404
   const notFoundPath = path.join(STATIC_DIR, "404.html");
-  if (serveStaticFile(res, notFoundPath)) return;
+  if (serveStaticFile(res, notFoundPath, 404)) return;
 
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");

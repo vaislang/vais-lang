@@ -4,22 +4,22 @@
 # WAL-first: all mutations write WAL before modifying catalog
 # Error codes: EE=09 (security), CC=02 (constraint), CC=10 (not found)
 
-U std/bytes.{ByteBuffer};
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U std/hashmap.HashMap;
-U storage/error.{VaisError, err_internal};
-U storage/constants.{INVALID_TXN_ID};
-U storage/buffer/pool.{BufferPool};
-U storage/wal/group_commit.{GroupCommitManager};
-U storage/wal/record_types.{
+use std/bytes.{ByteBuffer};
+use std/vec.Vec;
+use std/string.Str;
+use std/option.{Option, Some, None};
+use std/hashmap.HashMap;
+use storage/error.{VaisError, err_internal};
+use storage/constants.{INVALID_TXN_ID};
+use storage/buffer/pool.{BufferPool};
+use storage/wal/group_commit.{GroupCommitManager};
+use storage/wal/record_types.{
     SECURITY_ROLE_CREATE, SECURITY_ROLE_DROP
 };
-U sql/catalog/manager.{CatalogManager};
-U sql/catalog/schema.{RoleCatalogEntry};
-U sql/parser/ast.{CreateRoleStmt};
-U security/types.{
+use sql/catalog/manager.{CatalogManager};
+use sql/catalog/schema.{RoleCatalogEntry};
+use sql/parser/ast.{CreateRoleStmt};
+use security/types.{
     SecurityMeta, RoleInfo, SessionContext,
     SUPERUSER_ROLE_ID, PUBLIC_ROLE_ID,
     ENGINE_TAG_SECURITY,
@@ -33,14 +33,14 @@ U security/types.{
 # RoleManager — Manages database roles
 # ============================================================================
 
-S RoleManager {
+struct RoleManager {
     roles: HashMap<Str, RoleInfo>,          # In-memory cache: role_name -> RoleInfo
     roles_by_id: HashMap<u64, Str>,         # Reverse index: role_id -> role_name
 }
 
-X RoleManager {
+impl RoleManager {
     # Create a new role manager with built-in roles (superuser, public)
-    F new() -> RoleManager {
+    fn new() -> RoleManager {
         roles := mut HashMap.new();
         roles_by_id := mut HashMap.new();
 
@@ -58,18 +58,18 @@ X RoleManager {
     }
 
     # Load additional roles from catalog at startup
-    F load_from_catalog(catalog: &CatalogManager) -> RoleManager {
+    fn load_from_catalog(catalog: &CatalogManager) -> RoleManager {
         mgr := mut RoleManager.new();
 
         cat_roles := mut catalog.all_roles();
-        i: u64 := mut 0;
+        i := mut 0u64;
         LW i < cat_roles.len() {
             entry := mut cat_roles[i];
             # Skip built-in roles (already loaded)
             I entry.role_id == SUPERUSER_ROLE_ID || entry.role_id == PUBLIC_ROLE_ID {
                 i = i + 1;
                 # Continue to next iteration
-            } EL {
+            } else {
                 info := mut RoleInfo.new(
                     entry.role_id,
                     entry.role_name.clone(),
@@ -90,7 +90,7 @@ X RoleManager {
     # Execute CREATE ROLE
     # ========================================================================
 
-    F execute_create_role(
+    fn execute_create_role(
         mut self,
         stmt: &CreateRoleStmt,
         meta: &mut SecurityMeta,
@@ -103,15 +103,15 @@ X RoleManager {
     ) -> Result<u64, VaisError> {
         # 1. Permission check
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Validate role name
         validate_role_name(&stmt.role_name)?;
 
         # 3. Check for duplicate
-        I self.roles.contains_key(&stmt.role_name) {
-            R Err(err_role_already_exists(&stmt.role_name));
+        I self.roles.contains_key(&stmt.role_name) != 0 {
+            return Err(err_role_already_exists(&stmt.role_name));
         }
 
         # 4. Allocate role ID
@@ -127,17 +127,17 @@ X RoleManager {
         );
 
         # 6. Add parent roles (IN ROLE clause)
-        j: u64 := mut 0;
+        j := mut 0u64;
         LW j < stmt.in_roles.len() {
             parent_name := mut &stmt.in_roles[j];
-            M self.roles.get(parent_name) {
+            match self.roles.get(parent_name) {
                 Some(parent) => {
                     # Check for circular dependency before adding
                     self.check_circular(parent.role_id, role_id)?;
                     role_info.add_parent_role(parent.role_id);
                 },
                 None => {
-                    R Err(err_role_not_found(parent_name));
+                    return Err(err_role_not_found(parent_name));
                 },
             };
             j = j + 1;
@@ -167,7 +167,7 @@ X RoleManager {
     # Execute DROP ROLE
     # ========================================================================
 
-    F execute_drop_role(
+    fn execute_drop_role(
         mut self,
         role_name: &Str,
         if_exists: bool,
@@ -182,24 +182,24 @@ X RoleManager {
     ) -> Result<(), VaisError> {
         # 1. Permission check
         I !session.is_superuser {
-            R Err(err_privilege_superuser_required());
+            return Err(err_privilege_superuser_required());
         }
 
         # 2. Check existence
-        role_id: u64 := mut 0;
-        M self.roles.get(role_name) {
+        role_id := mut 0u64;
+        match self.roles.get(role_name) {
             Some(role) => {
                 # Cannot drop system roles
                 I role.is_system {
-                    R Err(err_internal("Cannot drop system role"));
+                    return Err(err_internal("Cannot drop system role"));
                 }
                 role_id = role.role_id;
             },
             None => {
                 I if_exists {
-                    R Ok(());
+                    return Ok(());
                 }
-                R Err(err_role_not_found(role_name));
+                return Err(err_role_not_found(role_name));
             },
         };
 
@@ -212,8 +212,8 @@ X RoleManager {
         }
 
         # 4. Write WAL record
-        wal_buf := mut ByteBuffer.new(128);
-        wal_buf.put_string(role_name);
+        wal_buf := mut ByteBuffer.with_capacity(128);
+        wal_buf.write_str(role_name);
         wal_bytes := mut wal_buf.to_vec();
         gcm.write_record(txn_id, SECURITY_ROLE_DROP, ENGINE_TAG_SECURITY, &wal_bytes)?;
 
@@ -233,30 +233,30 @@ X RoleManager {
     # ========================================================================
 
     # Add a member role to a parent role (role inheritance)
-    F add_role_member(
+    fn add_role_member(
         mut self,
         parent_role_name: &Str,
         member_role_name: &Str,
     ) -> Result<(), VaisError> {
         # Look up parent
-        parent_id: u64 := mut 0;
-        M self.roles.get(parent_role_name) {
+        parent_id := mut 0u64;
+        match self.roles.get(parent_role_name) {
             Some(r) => { parent_id = r.role_id; },
-            None => { R Err(err_role_not_found(parent_role_name)); },
+            None => { return Err(err_role_not_found(parent_role_name)); },
         };
 
         # Look up member
-        member_id: u64 := mut 0;
-        M self.roles.get(member_role_name) {
+        member_id := mut 0u64;
+        match self.roles.get(member_role_name) {
             Some(r) => { member_id = r.role_id; },
-            None => { R Err(err_role_not_found(member_role_name)); },
+            None => { return Err(err_role_not_found(member_role_name)); },
         };
 
         # Check for circular dependency
         self.check_circular(parent_id, member_id)?;
 
         # Add parent role to member's parent list
-        M self.roles.get_mut(member_role_name) {
+        match self.roles.get_mut(member_role_name) {
             Some(member) => {
                 member.add_parent_role(parent_id);
             },
@@ -267,18 +267,18 @@ X RoleManager {
     }
 
     # Remove a member role from a parent role
-    F remove_role_member(
+    fn remove_role_member(
         mut self,
         parent_role_name: &Str,
         member_role_name: &Str,
     ) -> Result<bool, VaisError> {
-        parent_id: u64 := mut 0;
-        M self.roles.get(parent_role_name) {
+        parent_id := mut 0u64;
+        match self.roles.get(parent_role_name) {
             Some(r) => { parent_id = r.role_id; },
-            None => { R Err(err_role_not_found(parent_role_name)); },
+            None => { return Err(err_role_not_found(parent_role_name)); },
         };
 
-        M self.roles.get_mut(member_role_name) {
+        match self.roles.get_mut(member_role_name) {
             Some(member) => {
                 Ok(member.remove_parent_role(parent_id))
             },
@@ -292,19 +292,19 @@ X RoleManager {
 
     # Resolve all effective roles for a user (direct roles + transitive inherited roles)
     # Returns a flat Vec of all role_ids the user effectively has
-    F resolve_effective_roles(self, direct_role_ids: &Vec<u64>) -> Vec<u64> {
+    fn resolve_effective_roles(self, direct_role_ids: &Vec<u64>) -> Vec<u64> {
         visited := mut HashMap.new();
         result := mut Vec.new();
 
         # BFS through role inheritance graph
         queue := mut Vec.new();
-        qi: u64 := mut 0;
+        qi := mut 0u64;
 
         # Seed with direct roles
-        i: u64 := mut 0;
+        i := mut 0u64;
         LW i < direct_role_ids.len() {
             rid := mut direct_role_ids[i];
-            I !visited.contains_key(&rid) {
+            I visited.contains_key(rid) == 0 {
                 visited.insert(rid, true);
                 result.push(rid);
                 queue.push(rid);
@@ -318,17 +318,17 @@ X RoleManager {
             qi = qi + 1;
 
             # Find this role and follow its parent_role_ids
-            M self.roles_by_id.get(&current_id) {
+            match self.roles_by_id.get(&current_id) {
                 Some(name) => {
-                    M self.roles.get(name) {
+                    match self.roles.get(name) {
                         Some(role) => {
-                            j: u64 := mut 0;
-                            LW j < role.parent_role_ids.len() {
-                                parent_id := mut role.parent_role_ids[j];
-                                I !visited.contains_key(&parent_id) {
-                                    visited.insert(parent_id, true);
-                                    result.push(parent_id);
-                                    queue.push(parent_id);
+                            j := mut 0u64;
+                                LW j < role.parent_role_ids.len() {
+                                    parent_id := mut role.parent_role_ids[j];
+                                    I visited.contains_key(parent_id) == 0 {
+                                        visited.insert(parent_id, true);
+                                        result.push(parent_id);
+                                        queue.push(parent_id);
                                 }
                                 j = j + 1;
                             }
@@ -349,17 +349,17 @@ X RoleManager {
 
     # Check if adding parent_id as a parent of member_id would create a cycle
     # Uses DFS from member_id's existing parents to see if parent_id is reachable
-    F check_circular(self, parent_id: u64, member_id: u64) -> Result<(), VaisError> {
+    fn check_circular(self, parent_id: u64, member_id: u64) -> Result<(), VaisError> {
         I parent_id == member_id {
-            parent_name := mut M self.roles_by_id.get(&parent_id) {
+            parent_name := mut match self.roles_by_id.get(&parent_id) {
                 Some(n) => n.clone(),
                 None => "unknown",
             };
-            member_name := mut M self.roles_by_id.get(&member_id) {
+            member_name := mut match self.roles_by_id.get(&member_id) {
                 Some(n) => n.clone(),
                 None => "unknown",
             };
-            R Err(err_circular_role_grant(&parent_name, &member_name));
+            return Err(err_circular_role_grant(&parent_name, &member_name));
         }
 
         # DFS: check if parent_id is reachable from member_id through inheritance
@@ -370,29 +370,29 @@ X RoleManager {
         LW stack.len() > 0 {
             current := mut stack.pop().unwrap();
             I current == member_id {
-                parent_name := mut M self.roles_by_id.get(&parent_id) {
+                parent_name := mut match self.roles_by_id.get(&parent_id) {
                     Some(n) => n.clone(),
                     None => "unknown",
                 };
-                member_name := mut M self.roles_by_id.get(&member_id) {
+                member_name := mut match self.roles_by_id.get(&member_id) {
                     Some(n) => n.clone(),
                     None => "unknown",
                 };
-                R Err(err_circular_role_grant(&parent_name, &member_name));
+                return Err(err_circular_role_grant(&parent_name, &member_name));
             }
 
-            I !visited.contains_key(&current) {
+            I visited.contains_key(current) == 0 {
                 visited.insert(current, true);
 
                 # Follow parent links
-                M self.roles_by_id.get(&current) {
+                match self.roles_by_id.get(&current) {
                     Some(name) => {
-                        M self.roles.get(name) {
+                        match self.roles.get(name) {
                             Some(role) => {
-                                j: u64 := mut 0;
+                                j := mut 0u64;
                                 LW j < role.parent_role_ids.len() {
                                     pid := mut role.parent_role_ids[j];
-                                    I !visited.contains_key(&pid) {
+                                    I visited.contains_key(pid) == 0 {
                                         stack.push(pid);
                                     }
                                     j = j + 1;
@@ -414,46 +414,49 @@ X RoleManager {
     # ========================================================================
 
     # Get role by name
-    F get_role(self, role_name: &Str) -> Option<&RoleInfo> {
+    fn get_role(self, role_name: &Str) -> Option<&RoleInfo> {
         self.roles.get(role_name)
     }
 
     # Get role name by ID
-    F get_role_name(self, role_id: u64) -> Option<&Str> {
+    fn get_role_name(self, role_id: u64) -> Option<&Str> {
         self.roles_by_id.get(&role_id)
     }
 
     # Get role ID by name
-    F get_role_id(self, role_name: &Str) -> Option<u64> {
-        M self.roles.get(role_name) {
+    fn get_role_id(self, role_name: &Str) -> Option<u64> {
+        match self.roles.get(role_name) {
             Some(r) => Some(r.role_id),
             None => None,
         }
     }
 
     # Check if a role exists
-    F role_exists(self, role_name: &Str) -> bool {
-        self.roles.contains_key(role_name)
+    fn role_exists(self, role_name: &Str) -> bool {
+        self.roles.contains_key(role_name) != 0
     }
 
     # Get count of registered roles
-    F role_count(self) -> u64 {
+    fn role_count(self) -> u64 {
         self.roles.len()
     }
 
     # List all role names
-    F all_role_names(self) -> Vec<Str> {
+    fn all_role_names(self) -> Vec<Str> {
         names := mut Vec.new();
-        LW key, _: &self.roles {
-            names.push(key.clone());
+        keys := mut self.roles.keys();
+        i := mut 0u64;
+        LW i < keys.len() {
+            names.push(keys[i].clone());
+            i = i + 1;
         }
         names
     }
 
     # Check if a role_id has a specific parent role (direct only, not transitive)
-    F has_direct_parent(self, role_name: &Str, parent_id: u64) -> bool {
-        M self.roles.get(role_name) {
-            Some(role) => role.parent_role_ids.contains(&parent_id),
+    fn has_direct_parent(self, role_name: &Str, parent_id: u64) -> bool {
+        match self.roles.get(role_name) {
+            Some(role) => role.parent_role_ids.contains(parent_id) != 0,
             None => false,
         }
     }

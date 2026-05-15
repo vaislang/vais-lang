@@ -3,6 +3,8 @@
 사용 가능/불가 문법 및 타입 규칙 분류표.
 기준 버전: Phase 184 (unambiguous keywords) + Phase 158 (strict type coercion).
 
+현재 보증 기준은 `../compiler/docs/certification/VAIS_CORE_V0.md`의 Core v0이다. 이 문서는 기존 안전/주의/미해결 정보를 보존하지만, Core v0에 포함되지 않은 기능은 보증 대상이 아니다. 제외 및 재승격 기준은 `../compiler/docs/certification/EXCLUDED_FEATURES.md`를 따른다.
+
 ---
 
 ## 1. 타입 시스템 — 안전한 암묵 통합 vs 금지된 암묵 통합

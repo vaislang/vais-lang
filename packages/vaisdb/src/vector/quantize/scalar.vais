@@ -19,9 +19,9 @@
 #
 # Error codes: VAIS-0206NNN (EE=02 vector, CC=06 quantize)
 
-U storage/bytes
-U std/math
-U storage/error
+use storage/bytes
+use std/math
+use storage/error
 
 # ============================================================================
 # Error Handling
@@ -29,7 +29,7 @@ U storage/error
 
 # Error: Quantizer not trained
 # Code: VAIS-0206001
-F err_not_trained() -> VaisError {
+fn err_not_trained() -> VaisError {
     VaisError.new(
         "VAIS-0206001",
         "Quantizer not trained - call train() before use"
@@ -38,7 +38,7 @@ F err_not_trained() -> VaisError {
 
 # Error: Insufficient training data
 # Code: VAIS-0206002
-F err_insufficient_training_data(count: u64) -> VaisError {
+fn err_insufficient_training_data(count: u64) -> VaisError {
     VaisError.new(
         "VAIS-0206002",
         "Insufficient training data: {count} vectors provided, need at least 100"
@@ -47,7 +47,7 @@ F err_insufficient_training_data(count: u64) -> VaisError {
 
 # Error: Dimension mismatch
 # Code: VAIS-0206003
-F err_dimension_mismatch(expected: u32, actual: u64) -> VaisError {
+fn err_dimension_mismatch(expected: u32, actual: u64) -> VaisError {
     VaisError.new(
         "VAIS-0206003",
         "Vector dimension mismatch: expected {expected}, got {actual}"
@@ -59,7 +59,7 @@ F err_dimension_mismatch(expected: u32, actual: u64) -> VaisError {
 # ============================================================================
 
 # Scalar quantizer with per-dimension min/max learned from training
-S ScalarQuantizer {
+struct ScalarQuantizer {
     dim: u32,              # Vector dimensionality
     min_vals: Vec<f32>,    # Per-dimension minimum values
     max_vals: Vec<f32>,    # Per-dimension maximum values
@@ -67,14 +67,17 @@ S ScalarQuantizer {
     trained: bool,         # Whether quantizer has been trained
 }
 
-X ScalarQuantizer {
+impl ScalarQuantizer {
     # Create a new untrained quantizer for the given dimension
-    F new(dim: u32) -> ScalarQuantizer {
+    fn new(dim: u32) -> ScalarQuantizer {
+        min_vals: Vec<f32> := mut Vec.with_capacity(0)
+        max_vals: Vec<f32> := mut Vec.with_capacity(0)
+        scales: Vec<f32> := mut Vec.with_capacity(0)
         ScalarQuantizer {
             dim,
-            min_vals: Vec.with_capacity(0),
-            max_vals: Vec.with_capacity(0),
-            scales: Vec.with_capacity(0),
+            min_vals,
+            max_vals,
+            scales,
             trained: false,
         }
     }
@@ -82,25 +85,28 @@ X ScalarQuantizer {
     # Train the quantizer from a set of sample vectors
     # Learns min/max per dimension from the training set
     # Requires at least 100 vectors for robust estimation
-    F train(mut self, vectors: &[&[f32]]) -> Result<(), VaisError> {
+    fn train(mut self, vectors: &[&[f32]]) -> Result<(), VaisError> {
         # Validate training data size
         I vectors.len() < 100 {
-            R Err(err_insufficient_training_data(vectors.len()))
+            return Err(err_insufficient_training_data(vectors.len()))
         }
 
         # Validate all vectors have correct dimension
         i := mut 0
         LW i < vectors.len() {
             I vectors[i].len() != self.dim as u64 {
-                R Err(err_dimension_mismatch(self.dim, vectors[i].len()))
+                return Err(err_dimension_mismatch(self.dim, vectors[i].len()))
             }
             i = i + 1
         }
 
         # Initialize min/max arrays with first vector's values
-        self.min_vals = Vec.with_capacity(self.dim as u64)
-        self.max_vals = Vec.with_capacity(self.dim as u64)
-        self.scales = Vec.with_capacity(self.dim as u64)
+        min_vals: Vec<f32> := mut Vec.with_capacity(self.dim as u64)
+        max_vals: Vec<f32> := mut Vec.with_capacity(self.dim as u64)
+        scales: Vec<f32> := mut Vec.with_capacity(self.dim as u64)
+        self.min_vals = min_vals
+        self.max_vals = max_vals
+        self.scales = scales
 
         d := mut 0
         LW d < self.dim as u64 {
@@ -137,12 +143,12 @@ X ScalarQuantizer {
         LW d < self.dim as u64 {
 
             range := mut self.max_vals[d] - self.min_vals[d]
-            epsilon := mut 1e-8
+            epsilon := mut 0.00000001
 
             I range < epsilon {
                 # Constant dimension - set scale to 0
                 self.scales.push(0.0)
-            } EL {
+            } else {
                 # Normal case: (max - min) / 255.0
                 self.scales.push(range / 255.0)
             }
@@ -157,16 +163,16 @@ X ScalarQuantizer {
     # Quantize an f32 vector to i8 vector
     # Formula: q_d = round((v_d - min_d) / (max_d - min_d) * 255) - 128
     # Maps [min_d, max_d] -> [-128, 127]
-    F quantize(self, vector: &[f32]) -> Result<Vec<i8>, VaisError> {
+    fn quantize(self, vector: &[f32]) -> Result<Vec<i8>, VaisError> {
         I !self.trained {
-            R Err(err_not_trained())
+            return Err(err_not_trained())
         }
 
         I vector.len() != self.dim as u64 {
-            R Err(err_dimension_mismatch(self.dim, vector.len()))
+            return Err(err_dimension_mismatch(self.dim, vector.len()))
         }
 
-        quantized := mut Vec.with_capacity(self.dim as u64)
+        quantized: Vec<i8> := mut Vec.with_capacity(self.dim as u64)
 
         d := mut 0
         LW d < self.dim as u64 {
@@ -178,14 +184,14 @@ X ScalarQuantizer {
             # Handle constant dimension (scale == 0)
             I scale_d == 0.0 {
                 quantized.push(0)
-            } EL {
+            } else {
                 # Quantize: (val - min) / scale - 128
                 # Clamp to [-128, 127] range
                 normalized := mut (val - min_d) / scale_d
                 quantized_val := mut normalized - 128.0
 
                 # Round and clamp
-                rounded := mut quantized_val.round()
+                rounded := mut round(quantized_val)
                 I rounded < -128.0 {
                     rounded = -128.0
                 }
@@ -204,16 +210,16 @@ X ScalarQuantizer {
 
     # Dequantize an i8 vector back to approximate f32 vector
     # Formula: v_d = (q_d + 128) / 255.0 * (max_d - min_d) + min_d
-    F dequantize(self, quantized: &[i8]) -> Result<Vec<f32>, VaisError> {
+    fn dequantize(self, quantized: &[i8]) -> Result<Vec<f32>, VaisError> {
         I !self.trained {
-            R Err(err_not_trained())
+            return Err(err_not_trained())
         }
 
         I quantized.len() != self.dim as u64 {
-            R Err(err_dimension_mismatch(self.dim, quantized.len()))
+            return Err(err_dimension_mismatch(self.dim, quantized.len()))
         }
 
-        dequantized := mut Vec.with_capacity(self.dim as u64)
+        dequantized: Vec<f32> := mut Vec.with_capacity(self.dim as u64)
 
         d := mut 0
         LW d < self.dim as u64 {
@@ -235,15 +241,15 @@ X ScalarQuantizer {
     # Compute L2 distance directly on quantized vectors (no dequantization)
     # Uses integer arithmetic for efficiency, then scales result
     # Formula: sqrt(sum((scale_d * (a[d] - b[d]))^2))
-    F quantized_l2_distance(self, a: &[i8], b: &[i8]) -> f32 {
+    fn quantized_l2_distance(self, a: &[i8], b: &[i8]) -> f32 {
         I !self.trained {
             # Return infinity if not trained (error case)
-            R f32.INFINITY
+            return 3.4028235e38
         }
 
         I a.len() != self.dim as u64 || b.len() != self.dim as u64 {
             # Return infinity on dimension mismatch (error case)
-            R f32.INFINITY
+            return 3.4028235e38
         }
 
         sum_sq := mut 0.0
@@ -273,38 +279,38 @@ X ScalarQuantizer {
     #   [f32; dim]: min_vals
     #   [f32; dim]: max_vals
     #   [f32; dim]: scales
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         # Write dimension
         buf.write_i32_le(self.dim)
 
         # Write trained flag
-        buf.write_u8(I self.trained { 1 } EL { 0 })
+        buf.write_u8(I self.trained { 1 } else { 0 })
 
         # Write min_vals
         d := mut 0
         LW d < self.dim as u64 {
-            buf.put_f32_le(self.min_vals[d])
+            buf.write_f32_le(f32_bits(self.min_vals[d]))
             d = d + 1
         }
 
         # Write max_vals
         d = 0
         LW d < self.dim as u64 {
-            buf.put_f32_le(self.max_vals[d])
+            buf.write_f32_le(f32_bits(self.max_vals[d]))
             d = d + 1
         }
 
         # Write scales
         d = 0
         LW d < self.dim as u64 {
-            buf.put_f32_le(self.scales[d])
+            buf.write_f32_le(f32_bits(self.scales[d]))
             d = d + 1
         }
     }
 
     # Deserialize quantizer parameters from ByteBuffer
     # Returns error if buffer is too short or data is invalid
-    F deserialize(buf: &ByteBuffer) -> Result<ScalarQuantizer, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<ScalarQuantizer, VaisError> {
         # Read dimension
         dim := mut read_i32_le_checked(buf)?;
 
@@ -313,7 +319,7 @@ X ScalarQuantizer {
         trained := mut trained_byte == 1
 
         # Read min_vals
-        min_vals := mut Vec.with_capacity(dim as u64)
+        min_vals: Vec<f32> := mut Vec.with_capacity(dim as u64)
         d := mut 0
         LW d < dim {
             min_vals.push(get_f32_le_checked(buf)? as f32)
@@ -321,7 +327,7 @@ X ScalarQuantizer {
         }
 
         # Read max_vals
-        max_vals := mut Vec.with_capacity(dim as u64)
+        max_vals: Vec<f32> := mut Vec.with_capacity(dim as u64)
         d = 0
         LW d < dim {
             max_vals.push(get_f32_le_checked(buf)? as f32)
@@ -329,7 +335,7 @@ X ScalarQuantizer {
         }
 
         # Read scales
-        scales := mut Vec.with_capacity(dim as u64)
+        scales: Vec<f32> := mut Vec.with_capacity(dim as u64)
         d = 0
         LW d < dim {
             scales.push(get_f32_le_checked(buf)? as f32)
@@ -346,30 +352,30 @@ X ScalarQuantizer {
     }
 
     # Get compression ratio (f32 -> i8 = 4x compression)
-    F compression_ratio() -> f32 {
+    fn compression_ratio() -> f32 {
         4.0
     }
 
     # Get memory usage per quantized vector in bytes
     # Returns dim bytes (one i8 per dimension)
-    F memory_per_vector(self) -> u64 {
+    fn memory_per_vector(self) -> u64 {
         self.dim as u64
     }
 
     # Get codebook size in bytes (quantization parameters)
     # Returns 1 + 4 + 3 * dim * 4 bytes
     # (trained flag + dim + 3 f32 arrays of length dim)
-    F codebook_size(self) -> u64 {
+    fn codebook_size(self) -> u64 {
         5 + (3 * self.dim as u64 * 4)
     }
 
     # Check if quantizer is trained
-    F is_trained(self) -> bool {
+    fn is_trained(self) -> bool {
         self.trained
     }
 
     # Get vector dimension
-    F dimension(self) -> u32 {
+    fn dimension(self) -> u32 {
         self.dim
     }
 }

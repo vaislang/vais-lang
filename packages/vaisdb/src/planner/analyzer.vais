@@ -7,9 +7,9 @@
 # - GRAPH_TRAVERSE(start_node_id, max_depth [, direction] [, edge_types] [, return_paths] [, use_dfs])
 # - FULLTEXT_MATCH(table, column, query_text, top_k)
 
-U storage/error.{VaisError};
-U sql/parser/ast.{SelectQuery, SelectItem, TableRef, Expr, Cte, SetOperation, JoinClause};
-U planner/types.{QueryProfile, VectorScanParams, GraphTraverseNodeParams, FullTextScanParams, FullTextSearchMode, DIRECTION_OUTGOING};
+use storage/error.{VaisError};
+use sql/parser/ast.{SelectQuery, SelectItem, TableRef, Expr, Cte, SetOperation, JoinClause};
+use planner/types.{QueryProfile, VectorScanParams, GraphTraverseNodeParams, FullTextScanParams, FullTextSearchMode, DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH};
 
 # ============================================================================
 # Error Code: EE=00 (common/planner), CC=08 (planner), NNN=010
@@ -17,7 +17,7 @@ U planner/types.{QueryProfile, VectorScanParams, GraphTraverseNodeParams, FullTe
 
 C ERR_CODE_ANALYZE_FAILED: Str = "VAIS-0008010";
 
-F err_analyze_failed(reason: Str) -> VaisError {
+fn err_analyze_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_ANALYZE_FAILED, "Query analysis failed: {reason}")
 }
 
@@ -26,7 +26,7 @@ F err_analyze_failed(reason: Str) -> VaisError {
 # ============================================================================
 
 # Analyze a SelectQuery to detect which engines are involved
-F analyze_query(query: &SelectQuery) -> Result<QueryProfile, VaisError> {
+partial fn analyze_query(query: &SelectQuery) -> Result<QueryProfile, VaisError> {
     profile := mut QueryProfile.new();
 
     # Walk all parts of the query
@@ -39,7 +39,7 @@ F analyze_query(query: &SelectQuery) -> Result<QueryProfile, VaisError> {
 # SelectQuery Analysis
 # ============================================================================
 
-F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Result<(), VaisError> {
     # 1. Analyze CTEs (WITH clause)
     LF cte: &query.ctes {
         analyze_cte(cte, profile)?;
@@ -51,19 +51,19 @@ F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Resul
     }
 
     # 3. Analyze FROM clause
-    M &query.from {
+    match &query.from {
         Some(table_refs) => {
             LF table_ref: table_refs {
-                analyze_table_ref(table_ref, profile)?;
+                analyze_table_ref(&table_ref, profile)?;
             }
         },
         None => {},
     }
 
     # 4. Analyze WHERE clause
-    M &query.where_clause {
+    match &query.where_clause {
         Some(expr) => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(&expr, profile)?;
         },
         None => {},
     }
@@ -74,9 +74,9 @@ F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Resul
     }
 
     # 6. Analyze HAVING
-    M &query.having {
+    match &query.having {
         Some(expr) => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(&expr, profile)?;
         },
         None => {},
     }
@@ -87,23 +87,23 @@ F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Resul
     }
 
     # 8. Analyze LIMIT/OFFSET
-    M &query.limit {
+    match &query.limit {
         Some(expr) => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(&expr, profile)?;
         },
         None => {},
     }
-    M &query.offset {
+    match &query.offset {
         Some(expr) => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(&expr, profile)?;
         },
         None => {},
     }
 
     # 9. Analyze set operations (UNION, INTERSECT, EXCEPT)
-    M &query.set_op {
+    match &query.set_op {
         Some(set_op) => {
-            analyze_set_op(set_op, profile)?;
+            analyze_set_op(&set_op, profile)?;
         },
         None => {},
     }
@@ -114,15 +114,15 @@ F analyze_select_query(query: &SelectQuery, profile: &mut QueryProfile) -> Resul
 # Helper: analyze a SetOperation's right-hand query
 # Extracted to a typed function boundary to avoid Option<SetOperation> generic erasure
 # when accessing set_op.right (Box<SelectQuery>) inside a match arm.
-F analyze_set_op(set_op: &SetOperation, profile: &mut QueryProfile) -> Result<(), VaisError> {
-    analyze_select_query(&set_op.right, profile)
+partial fn analyze_set_op(set_op: &SetOperation, profile: &mut QueryProfile) -> Result<(), VaisError> {
+    analyze_select_query(set_op.right.as_ref(), profile)
 }
 
 # ============================================================================
 # CTE Analysis
 # ============================================================================
 
-F analyze_cte(cte: &Cte, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn analyze_cte(cte: &Cte, profile: &mut QueryProfile) -> Result<(), VaisError> {
     analyze_select_query(&cte.query, profile)
 }
 
@@ -130,8 +130,8 @@ F analyze_cte(cte: &Cte, profile: &mut QueryProfile) -> Result<(), VaisError> {
 # SELECT Item Analysis
 # ============================================================================
 
-F analyze_select_item(item: &SelectItem, profile: &mut QueryProfile) -> Result<(), VaisError> {
-    M item {
+partial fn analyze_select_item(item: &SelectItem, profile: &mut QueryProfile) -> Result<(), VaisError> {
+    match item {
         SelectItem.AllColumns => {
             # SELECT * — no engine functions here
             Ok(())
@@ -141,7 +141,7 @@ F analyze_select_item(item: &SelectItem, profile: &mut QueryProfile) -> Result<(
             Ok(())
         },
         SelectItem.Expr { expr, .. } => {
-            analyze_expr(expr, profile)
+            analyze_expr(&expr, profile)
         },
     }
 }
@@ -150,8 +150,8 @@ F analyze_select_item(item: &SelectItem, profile: &mut QueryProfile) -> Result<(
 # TableRef Analysis
 # ============================================================================
 
-F analyze_table_ref(table_ref: &TableRef, profile: &mut QueryProfile) -> Result<(), VaisError> {
-    M table_ref {
+partial fn analyze_table_ref(table_ref: &TableRef, profile: &mut QueryProfile) -> Result<(), VaisError> {
+    match table_ref {
         TableRef.Table { name, .. } => {
             # Regular table reference
             profile.sql_tables.push(name.clone());
@@ -159,34 +159,34 @@ F analyze_table_ref(table_ref: &TableRef, profile: &mut QueryProfile) -> Result<
             Ok(())
         },
         TableRef.Join { join } => {
-            analyze_join_clause(join, profile)
+            analyze_join_clause(&join, profile)
         },
         TableRef.Subquery { query, .. } => {
-            analyze_select_query(query, profile)
+            analyze_select_query(query.as_ref(), profile)
         },
         TableRef.CrossJoin { left, right } => {
-            analyze_table_ref(left, profile)?;
-            analyze_table_ref(right, profile)
+            analyze_table_ref(left.as_ref(), profile)?;
+            analyze_table_ref(right.as_ref(), profile)
         },
         TableRef.TableFunction { name, args, alias } => {
             # Table-valued function — detect engine functions (VECTOR_SEARCH, etc.)
             analyze_function_call(name, args, profile)?;
             LF arg: args {
-                analyze_expr(arg, profile)?;
+                analyze_expr(&arg, profile)?;
             }
             Ok(())
         },
     }
 }
 
-F analyze_join_clause(join: &JoinClause, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn analyze_join_clause(join: &JoinClause, profile: &mut QueryProfile) -> Result<(), VaisError> {
     analyze_table_ref(&join.left, profile)?;
     analyze_table_ref(&join.right, profile)?;
 
     # Analyze join condition
-    M &join.condition {
+    match &join.condition {
         JoinCondition.On { expr } => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(&expr, profile)?;
         },
         JoinCondition.Using { .. } => {
             # Column list, no expressions
@@ -199,14 +199,14 @@ F analyze_join_clause(join: &JoinClause, profile: &mut QueryProfile) -> Result<(
     Ok(())
 }
 
-U sql/parser/ast.{JoinCondition};
+use sql/parser/ast.{JoinCondition};
 
 # ============================================================================
 # Expression Analysis — Recursive Walker
 # ============================================================================
 
-F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError> {
-    M expr {
+partial fn analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError> {
+    match expr {
         Expr.Literal { .. } => {
             # No engine functions
             Ok(())
@@ -220,43 +220,43 @@ F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError>
             Ok(())
         },
         Expr.BinaryOp { left, right, .. } => {
-            analyze_expr(left, profile)?;
-            analyze_expr(right, profile)
+            analyze_expr(left.as_ref(), profile)?;
+            analyze_expr(right.as_ref(), profile)
         },
         Expr.UnaryOp { operand, .. } => {
-            analyze_expr(operand, profile)
+            analyze_expr(operand.as_ref(), profile)
         },
         Expr.IsNull { expr, .. } => {
-            analyze_expr(expr, profile)
+            analyze_expr(expr.as_ref(), profile)
         },
         Expr.Between { expr, low, high, .. } => {
-            analyze_expr(expr, profile)?;
-            analyze_expr(low, profile)?;
-            analyze_expr(high, profile)
+            analyze_expr(expr.as_ref(), profile)?;
+            analyze_expr(low.as_ref(), profile)?;
+            analyze_expr(high.as_ref(), profile)
         },
         Expr.InList { expr, list, .. } => {
-            analyze_expr(expr, profile)?;
+            analyze_expr(expr.as_ref(), profile)?;
             LF item: list {
-                analyze_expr(item, profile)?;
+                analyze_expr(&item, profile)?;
             }
             Ok(())
         },
         Expr.InSubquery { expr, query, .. } => {
-            analyze_expr(expr, profile)?;
-            analyze_select_query(query, profile)
+            analyze_expr(expr.as_ref(), profile)?;
+            analyze_select_query(query.as_ref(), profile)
         },
         Expr.Exists { query, .. } => {
-            analyze_select_query(query, profile)
+            analyze_select_query(query.as_ref(), profile)
         },
         Expr.Like { expr, pattern, .. } => {
-            analyze_expr(expr, profile)?;
-            analyze_expr(pattern, profile)
+            analyze_expr(expr.as_ref(), profile)?;
+            analyze_expr(pattern.as_ref(), profile)
         },
         Expr.Case { operand, when_clauses, else_result } => {
             # Analyze operand I present
-            M operand {
+            match operand {
                 Some(op) => {
-                    analyze_expr(op, profile)?;
+                    analyze_expr(op.as_ref(), profile)?;
                 },
                 None => {},
             }
@@ -266,30 +266,30 @@ F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError>
                 analyze_expr(&when.result, profile)?;
             }
             # Analyze ELSE clause I present
-            M else_result {
+            match else_result {
                 Some(res) => {
-                    analyze_expr(res, profile)?;
+                    analyze_expr(res.as_ref(), profile)?;
                 },
                 None => {},
             }
             Ok(())
         },
         Expr.Cast { expr, .. } => {
-            analyze_expr(expr, profile)
+            analyze_expr(expr.as_ref(), profile)
         },
         Expr.FunctionCall { name, args, .. } => {
             # This is where we detect engine functions!
             analyze_function_call(name, args, profile)?;
             # Also analyze arguments recursively
             LF arg: args {
-                analyze_expr(arg, profile)?;
+                analyze_expr(&arg, profile)?;
             }
             Ok(())
         },
         Expr.WindowFunc { func, partition_by, order_by } => {
-            analyze_expr(func, profile)?;
+            analyze_expr(func.as_ref(), profile)?;
             LF expr: partition_by {
-                analyze_expr(expr, profile)?;
+                analyze_expr(&expr, profile)?;
             }
             LF order_item: order_by {
                 analyze_expr(&order_item.expr, profile)?;
@@ -297,11 +297,11 @@ F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError>
             Ok(())
         },
         Expr.Subquery { query } => {
-            analyze_select_query(query, profile)
+            analyze_select_query(query.as_ref(), profile)
         },
         Expr.Concat { left, right } => {
-            analyze_expr(left, profile)?;
-            analyze_expr(right, profile)
+            analyze_expr(left.as_ref(), profile)?;
+            analyze_expr(right.as_ref(), profile)
         },
         Expr.Star => {
             # Wildcard, no engine functions
@@ -314,11 +314,11 @@ F analyze_expr(expr: &Expr, profile: &mut QueryProfile) -> Result<(), VaisError>
 # Function Call Detection — Identify Engine Functions
 # ============================================================================
 
-F analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     # Normalize function name to uppercase for case-insensitive matching
     upper_name := mut name.to_uppercase();
 
-    M upper_name.as_str() {
+    match upper_name.as_str() {
         "VECTOR_SEARCH" => {
             extract_vector_search_params(args, profile)?;
             profile.uses_vector = true;
@@ -346,9 +346,9 @@ F analyze_function_call(name: &Str, args: &Vec<Expr>, profile: &mut QueryProfile
 # ============================================================================
 
 # VECTOR_SEARCH(table, column, query_vector, top_k [, ef_search])
-F extract_vector_search_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn extract_vector_search_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() < 4 || args.len() > 5 {
-        R Err(err_analyze_failed(
+        return Err(err_analyze_failed(
             "VECTOR_SEARCH requires 4-5 arguments: (table, column, query_vector, top_k [, ef_search])"
         ));
     }
@@ -373,7 +373,7 @@ F extract_vector_search_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> 
 
     # Build VectorScanParams
     params := mut VectorScanParams.new(table_name, column_name, query_vector_expr, top_k);
-    I ef_search.is_some() {
+    I ef_search.is_some() != 0 {
         params = params.with_ef_search(ef_search!);
     }
 
@@ -386,9 +386,9 @@ F extract_vector_search_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> 
 # ============================================================================
 
 # GRAPH_TRAVERSE(start_node_id, max_depth [, direction] [, edge_types] [, return_paths] [, use_dfs])
-F extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() < 2 || args.len() > 6 {
-        R Err(err_analyze_failed(
+        return Err(err_analyze_failed(
             "GRAPH_TRAVERSE requires 2-6 arguments: (start_node_id, max_depth [, direction] [, edge_types] [, return_paths] [, use_dfs])"
         ));
     }
@@ -400,7 +400,7 @@ F extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) ->
     max_depth := mut extract_integer_literal(&args[1])?;
 
     # Extract optional direction (arg 2, default OUTGOING)
-    direction: u8 := mut DIRECTION_OUTGOING;
+    direction := mut DIRECTION_OUTGOING;
     I args.len() >= 3 {
         direction = extract_direction(&args[2])?;
     }
@@ -426,7 +426,7 @@ F extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) ->
     # Build GraphTraverseNodeParams
     params := mut GraphTraverseNodeParams.new(start_node_expr, max_depth);
     params = params.with_direction(direction);
-    I edge_type_filter.is_some() {
+    I edge_type_filter.is_some() != 0 {
         params = params.with_edge_filter(edge_type_filter!);
     }
     I return_paths {
@@ -445,9 +445,9 @@ F extract_graph_traverse_params(args: &Vec<Expr>, profile: &mut QueryProfile) ->
 # ============================================================================
 
 # FULLTEXT_MATCH(table, column, query_text, top_k)
-F extract_fulltext_match_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
+partial fn extract_fulltext_match_params(args: &Vec<Expr>, profile: &mut QueryProfile) -> Result<(), VaisError> {
     I args.len() != 4 {
-        R Err(err_analyze_failed(
+        return Err(err_analyze_failed(
             "FULLTEXT_MATCH requires 4 arguments: (table, column, query_text, top_k)"
         ));
     }
@@ -475,14 +475,14 @@ F extract_fulltext_match_params(args: &Vec<Expr>, profile: &mut QueryProfile) ->
 # Argument Extraction Helpers
 # ============================================================================
 
-U sql/types.{SqlValue};
+use sql/types.{SqlValue};
 
 # Extract a string literal from an expression
-F extract_string_literal(expr: &Expr) -> Result<Str, VaisError> {
-    M expr {
+fn extract_string_literal(expr: &Expr) -> Result<Str, VaisError> {
+    match expr {
         Expr.Literal { value } => {
-            M value {
-                SqlValue.StringVal { v: ref s } => Ok(s.clone()),
+            match value {
+                SqlValue.StringVal { v } => Ok(v.clone()),
                 _ => Err(err_analyze_failed("Expected string literal")),
             }
         },
@@ -491,19 +491,14 @@ F extract_string_literal(expr: &Expr) -> Result<Str, VaisError> {
 }
 
 # Extract an integer literal from an expression and convert to u32
-F extract_integer_literal(expr: &Expr) -> Result<u32, VaisError> {
-    M expr {
+fn extract_integer_literal(expr: &Expr) -> Result<u32, VaisError> {
+    match expr {
         Expr.Literal { value } => {
-            M value {
-                SqlValue.IntVal { v: n } => {
+            match value {
+                SqlValue.IntVal { v } => {
+                    n := v;
                     I *n < 0 {
-                        R Err(err_analyze_failed("Expected non-negative integer"));
-                    }
-                    Ok(*n as u32)
-                },
-                SqlValue.IntVal { v: n } => {
-                    I *n < 0 {
-                        R Err(err_analyze_failed("Expected non-negative integer"));
+                        return Err(err_analyze_failed("Expected non-negative integer"));
                     }
                     Ok(*n as u32)
                 },
@@ -515,11 +510,11 @@ F extract_integer_literal(expr: &Expr) -> Result<u32, VaisError> {
 }
 
 # Extract a boolean literal from an expression
-F extract_boolean_literal(expr: &Expr) -> Result<bool, VaisError> {
-    M expr {
+fn extract_boolean_literal(expr: &Expr) -> Result<bool, VaisError> {
+    match expr {
         Expr.Literal { value } => {
-            M value {
-                SqlValue.BoolVal { v: b } => Ok(*b),
+            match value {
+                SqlValue.BoolVal { v } => Ok(*v),
                 _ => Err(err_analyze_failed("Expected boolean literal")),
             }
         },
@@ -528,29 +523,28 @@ F extract_boolean_literal(expr: &Expr) -> Result<bool, VaisError> {
 }
 
 # Extract direction from expression (string literal: "OUTGOING", "INCOMING", "BOTH")
-F extract_direction(expr: &Expr) -> Result<u8, VaisError> {
+fn extract_direction(expr: &Expr) -> Result<u8, VaisError> {
     dir_str := mut extract_string_literal(expr)?;
     upper_dir := mut dir_str.to_uppercase();
 
-    M upper_dir.as_str() {
+    match upper_dir.as_str() {
         "OUTGOING" => Ok(DIRECTION_OUTGOING),
-        "INCOMING" => Ok(planner/types.DIRECTION_INCOMING),
-        "BOTH" => Ok(planner/types.DIRECTION_BOTH),
+        "INCOMING" => Ok(DIRECTION_INCOMING),
+        "BOTH" => Ok(DIRECTION_BOTH),
         _ => Err(err_analyze_failed("Direction must be 'OUTGOING', 'INCOMING', or 'BOTH'")),
     }
 }
-
-U planner/types.{DIRECTION_INCOMING, DIRECTION_BOTH};
 
 # Extract string array from expression
 # Accepts: single string literal → single-element array
 # Accepts: comma-separated string (split on ',') → multi-element array
 # SqlValue has no Array variant, so we parse from string or function call
-F extract_string_array(expr: &Expr) -> Result<Vec<Str>, VaisError> {
-    M expr {
+fn extract_string_array(expr: &Expr) -> Result<Vec<Str>, VaisError> {
+    match expr {
         Expr.Literal { value } => {
-            M value {
-                SqlValue.StringVal { v: ref s } => {
+            match value {
+                SqlValue.StringVal { v } => {
+                    s := &v
                     # Comma-separated string → split into array
                     I s.contains(',') {
                         result: Vec<Str> := mut Vec.new();
@@ -561,7 +555,7 @@ F extract_string_array(expr: &Expr) -> Result<Vec<Str>, VaisError> {
                             }
                         }
                         Ok(result)
-                    } EL {
+                    } else {
                         # Single string → single-element array
                         result: Vec<Str> := mut Vec.new();
                         result.push(s.clone());

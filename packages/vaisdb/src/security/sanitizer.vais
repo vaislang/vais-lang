@@ -4,19 +4,19 @@
 # Enforces prepared statements at protocol level (advisory warnings)
 # Error codes: EE=09 (security), CC=01 (validation)
 
-U std/vec.Vec;
-U std/string.Str;
-U std/option.{Option, Some, None};
-U storage/error.{VaisError};
+use std/vec.Vec;
+use std/string.{Str, str_byte_at};
+use std/option.{Option, Some, None};
+use storage/error.{VaisError, ErrorSeverity};
 
 # ============================================================================
 # InputSanitizer — SQL injection prevention
 # ============================================================================
 
-S InputSanitizer {}
+struct InputSanitizer {}
 
-X InputSanitizer {
-    F new() -> InputSanitizer {
+impl InputSanitizer {
+    fn new() -> InputSanitizer {
         InputSanitizer {}
     }
 
@@ -24,15 +24,15 @@ X InputSanitizer {
     # Rules: 1-128 chars, starts with letter or underscore,
     #        contains only alphanumeric, underscore, no SQL keywords as bare identifiers
     # Returns Ok(()) if valid, Err with message if invalid
-    F validate_identifier(self, name: &Str) -> Result<(), VaisError> {
+    fn validate_identifier(self, name: &Str) -> Result<(), VaisError> {
         I name.len() == 0 {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0901010",
                 "Empty identifier is not allowed"
             ));
         }
         I name.len() > 128 {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0901011",
                 "Identifier exceeds maximum length of 128 characters"
             ));
@@ -41,27 +41,27 @@ X InputSanitizer {
         n_len := mut name.len();
 
         # First character must be letter or underscore
-        first := mut name[0];
+        first := mut str_byte_at(name, 0 as i64);
         first_valid := mut (first >= 0x61 && first <= 0x7A)   # a-z
                     || (first >= 0x41 && first <= 0x5A)    # A-Z
                     || first == 0x5F;                       # _
         I !first_valid {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0901012",
                 "Identifier must start with a letter or underscore: '{name}'"
             ));
         }
 
         # Remaining characters: alphanumeric + underscore
-        i: u64 := mut 1;
+        i := mut 1u64;
         LW i < n_len {
-            b := mut name[i];
+            b := mut str_byte_at(name, i as i64);
             is_valid := mut (b >= 0x61 && b <= 0x7A)
                      || (b >= 0x41 && b <= 0x5A)
                      || (b >= 0x30 && b <= 0x39)
                      || b == 0x5F;
             I !is_valid {
-                R Err(VaisError.new(
+                return Err(VaisError.new(
                     "VAIS-0901013",
                     "Identifier contains invalid character at position {i}: '{name}'"
                 ));
@@ -72,7 +72,7 @@ X InputSanitizer {
         # Check for dangerous SQL keywords used as bare identifiers
         upper := mut to_upper(name);
         I is_reserved_keyword(&upper) {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0901014",
                 "Reserved keyword '{name}' cannot be used as an identifier without quoting"
             ).with_hint("Use double-quotes: \"{name}\""));
@@ -85,23 +85,23 @@ X InputSanitizer {
     # Doubles single quotes: ' -> ''
     # Removes null bytes (0x00)
     # Escapes backslash: \ -> \\
-    F escape_string_literal(self, value: &Str) -> Str {
+    fn escape_string_literal(self, value: &Str) -> Str {
         v_len := mut value.len();
-        result := mut Str.with_capacity(v_len * 2);
-        i: u64 := mut 0;
+        result := mut String.with_capacity(v_len * 2);
+        i := mut 0u64;
         LW i < v_len {
-            b := mut value[i];
+            b := mut str_byte_at(value, i as i64);
             I b == 0x27 {
                 # Single quote -> double single quote
                 result.push_byte(0x27);
                 result.push_byte(0x27);
-            } EL I b == 0x5C {
+            } else I b == 0x5C {
                 # Backslash -> double backslash
                 result.push_byte(0x5C);
                 result.push_byte(0x5C);
-            } EL I b == 0x00 {
+            } else I b == 0x00 {
                 # Strip null bytes (potential injection vector)
-            } EL {
+            } else {
                 result.push_byte(b);
             }
             i = i + 1;
@@ -111,46 +111,47 @@ X InputSanitizer {
 
     # Check if a string literal contains potential injection patterns
     # Returns true if suspicious patterns detected
-    F has_injection_patterns(self, value: &Str) -> bool {
+    fn has_injection_patterns(self, value: &Str) -> bool {
         len := mut value.len();
 
         # Check for common SQL injection patterns
         # 1. Unmatched quotes
-        quote_count: u64 := mut 0;
-        i: u64 := mut 0;
+        quote_count := mut 0u64;
+        i := mut 0u64;
         LW i < len {
-            I value[i] == 0x27 {
+            I str_byte_at(value, i as i64) == 0x27 {
                 quote_count = quote_count + 1;
             }
             i = i + 1;
         }
         I quote_count % 2 != 0 {
-            R true;  # Odd number of quotes is suspicious
+            return true;  # Odd number of quotes is suspicious
         }
 
         # 2. SQL comment markers (-- or /* or */)
+        bytes := mut value.as_bytes();
         I contains_pattern(bytes, "--") {
-            R true;
+            return true;
         }
         I contains_pattern(bytes, "/*") {
-            R true;
+            return true;
         }
         I contains_pattern(bytes, "*/") {
-            R true;
+            return true;
         }
 
         # 3. Semicolons (statement terminator / stacking)
-        j: u64 := mut 0;
+        j := mut 0u64;
         LW j < len {
-            I value[j] == 0x3B {
-                R true;
+            I str_byte_at(value, j as i64) == 0x3B {
+                return true;
             }
             j = j + 1;
         }
 
         # 4. UNION keyword pattern (case-insensitive)
         I contains_pattern_ci(bytes, "union") {
-            R true;
+            return true;
         }
 
         false
@@ -158,10 +159,10 @@ X InputSanitizer {
 
     # Warn about non-prepared-statement query usage
     # Returns a warning message string (empty if prepared statement)
-    F check_prepared_statement_usage(self, is_prepared: bool) -> Option<Str> {
+    fn check_prepared_statement_usage(self, is_prepared: bool) -> Option<Str> {
         I !is_prepared {
             Some("WARNING: Using non-parameterized queries is discouraged. Use prepared statements for security.")
-        } EL {
+        } else {
             None
         }
     }
@@ -171,16 +172,16 @@ X InputSanitizer {
 # ErrorSanitizer — Remove internal info from client-facing errors
 # ============================================================================
 
-S ErrorSanitizer {}
+struct ErrorSanitizer {}
 
-X ErrorSanitizer {
-    F new() -> ErrorSanitizer {
+impl ErrorSanitizer {
+    fn new() -> ErrorSanitizer {
         ErrorSanitizer {}
     }
 
     # Sanitize an error message for client consumption
     # Removes: file paths, stack traces, internal schema details, page IDs
-    F sanitize_error(self, err: &VaisError) -> VaisError {
+    fn sanitize_error(self, err: &VaisError) -> VaisError {
         clean_message := mut sanitize_message(&err.message);
         clean_detail := mut sanitize_message(&err.detail);
         clean_hint := mut err.hint.clone();  # Hints are safe (user-facing by design)
@@ -196,13 +197,13 @@ X ErrorSanitizer {
             result = result.with_hint(clean_hint);
         }
         I err.is_fatal() {
-            result = result.with_severity(storage/error.ErrorSeverity.Fatal);
+            result = result.with_severity(ErrorSeverity.Fatal);
         }
         result
     }
 
     # Sanitize a full error message, replacing internal details with generic text
-    F sanitize_for_client(self, message: &Str) -> Str {
+    fn sanitize_for_client(self, message: &Str) -> Str {
         sanitize_message(message)
     }
 }
@@ -212,7 +213,7 @@ X ErrorSanitizer {
 # ============================================================================
 
 # Sanitize a message string by removing internal information
-F sanitize_message(message: &Str) -> Str {
+fn sanitize_message(message: &Str) -> Str {
     result := mut message.clone();
 
     # 1. Remove file paths (anything matching /path/to/file.vais:line)
@@ -229,12 +230,12 @@ F sanitize_message(message: &Str) -> Str {
 
 # Redact file paths from error messages
 # Matches patterns like: /some/path/file.vais:123 or src/module/file.vais
-F redact_file_paths(msg: &Str) -> Str {
+fn redact_file_paths(msg: &Str) -> Str {
     msg_len := mut msg.len();
-    result := mut Str.with_capacity(msg_len);
-    i: u64 := mut 0;
+    result := mut String.with_capacity(msg_len);
+    i := mut 0u64;
     in_path := mut false;
-    path_start: u64 := mut 0;
+    path_start := mut 0u64;
 
     LW i < msg_len {
         # Detect start of a path: '/' followed by alphanumeric
@@ -273,15 +274,15 @@ F redact_file_paths(msg: &Str) -> Str {
                         i = i + 1;
                     }
                     in_path = false;
-                } EL {
+                } else {
                     result.push_byte(msg[i]);
                     i = i + 1;
                 }
-            } EL {
+            } else {
                 result.push_byte(msg[i]);
                 i = i + 1;
             }
-        } EL {
+        } else {
             result.push_byte(msg[i]);
             i = i + 1;
         }
@@ -291,10 +292,10 @@ F redact_file_paths(msg: &Str) -> Str {
 }
 
 # Redact page/slot/offset references
-F redact_page_references(msg: &Str) -> Str {
+fn redact_page_references(msg: &Str) -> Str {
     msg_len2 := mut msg.len();
-    result := mut Str.with_capacity(msg_len2);
-    i: u64 := mut 0;
+    result := mut String.with_capacity(msg_len2);
+    i := mut 0u64;
 
     LW i < msg_len2 {
         # Detect "page " or "PAGE " followed by a number
@@ -311,11 +312,11 @@ F redact_page_references(msg: &Str) -> Str {
                 LW i < msg_len2 && msg[i] >= 0x30 && msg[i] <= 0x39 {
                     i = i + 1;
                 }
-            } EL {
+            } else {
                 result.push_byte(msg[i]);
                 i = i + 1;
             }
-        } EL {
+        } else {
             result.push_byte(msg[i]);
             i = i + 1;
         }
@@ -325,10 +326,10 @@ F redact_page_references(msg: &Str) -> Str {
 }
 
 # Redact internal struct names and memory addresses
-F redact_internal_names(msg: &Str) -> Str {
+fn redact_internal_names(msg: &Str) -> Str {
     msg_len3 := mut msg.len();
-    result := mut Str.with_capacity(msg_len3);
-    i: u64 := mut 0;
+    result := mut String.with_capacity(msg_len3);
+    i := mut 0u64;
 
     LW i < msg_len3 {
         # Detect hex addresses (0x followed by hex digits)
@@ -345,7 +346,7 @@ F redact_internal_names(msg: &Str) -> Str {
                 I !is_hex {
                     # Exit the inner loop via sentinel
                     hex_end = msg_len3 + 1;
-                } EL {
+                } else {
                     hex_end = hex_end + 1;
                 }
             }
@@ -361,7 +362,7 @@ F redact_internal_names(msg: &Str) -> Str {
                            || (b >= 0x41 && b <= 0x46);
                     I is_hex {
                         actual_end = actual_end + 1;
-                    } EL {
+                    } else {
                         hex_end = actual_end;
                         actual_end = msg_len3;  # exit
                     }
@@ -372,11 +373,11 @@ F redact_internal_names(msg: &Str) -> Str {
             I hex_end - hex_start >= 8 {
                 result = result + "[addr]";
                 i = hex_end;
-            } EL {
+            } else {
                 result.push_byte(msg[i]);
                 i = i + 1;
             }
-        } EL {
+        } else {
             result.push_byte(msg[i]);
             i = i + 1;
         }
@@ -386,26 +387,26 @@ F redact_internal_names(msg: &Str) -> Str {
 }
 
 # Check if a byte slice contains a pattern (case-sensitive)
-F contains_pattern(bytes: &[u8], pattern: &Str) -> bool {
+fn contains_pattern(bytes: &[u8], pattern: &Str) -> bool {
     pat_len := mut __strlen(pattern);
     I bytes.len() < pat_len {
-        R false;
+        return false;
     }
-    i: u64 := mut 0;
+    i := mut 0u64;
     limit := mut bytes.len() - pat_len + 1;
     LW i < limit {
         found := mut true;
-        j: u64 := mut 0;
+        j := mut 0u64;
         LW j < pat_len {
             I bytes[i + j] != pattern[j] {
                 found = false;
                 j = pat_len;  # break
-            } EL {
+            } else {
                 j = j + 1;
             }
         }
         I found {
-            R true;
+            return true;
         }
         i = i + 1;
     }
@@ -413,28 +414,28 @@ F contains_pattern(bytes: &[u8], pattern: &Str) -> bool {
 }
 
 # Check if a byte slice contains a pattern (case-insensitive)
-F contains_pattern_ci(bytes: &[u8], pattern: &Str) -> bool {
+fn contains_pattern_ci(bytes: &[u8], pattern: &Str) -> bool {
     pat_len := mut __strlen(pattern);
     I bytes.len() < pat_len {
-        R false;
+        return false;
     }
-    i: u64 := mut 0;
+    i := mut 0u64;
     limit := mut bytes.len() - pat_len + 1;
     LW i < limit {
         found := mut true;
-        j: u64 := mut 0;
+        j := mut 0u64;
         LW j < pat_len {
             a := mut to_lower_byte(bytes[i + j]);
             b := mut to_lower_byte(pattern[j]);
             I a != b {
                 found = false;
                 j = pat_len;  # break
-            } EL {
+            } else {
                 j = j + 1;
             }
         }
         I found {
-            R true;
+            return true;
         }
         i = i + 1;
     }
@@ -442,24 +443,24 @@ F contains_pattern_ci(bytes: &[u8], pattern: &Str) -> bool {
 }
 
 # Convert byte to lowercase
-F to_lower_byte(b: u8) -> u8 {
+fn to_lower_byte(b: u8) -> u8 {
     I b >= 0x41 && b <= 0x5A {
         b + 0x20
-    } EL {
+    } else {
         b
     }
 }
 
 # Convert string to uppercase
-F to_upper(s: &Str) -> Str {
+fn to_upper(s: &Str) -> Str {
     s_len := mut s.len();
-    result := mut Str.with_capacity(s_len);
-    i: u64 := mut 0;
+    result := mut String.with_capacity(s_len);
+    i := mut 0u64;
     LW i < s_len {
         b := mut s[i];
         I b >= 0x61 && b <= 0x7A {
             result.push_byte(b - 0x20);
-        } EL {
+        } else {
             result.push_byte(b);
         }
         i = i + 1;
@@ -468,35 +469,35 @@ F to_upper(s: &Str) -> Str {
 }
 
 # Check if a string is a reserved SQL keyword
-F is_reserved_keyword(upper: &Str) -> bool {
-    I *upper == "SELECT" { R true; }
-    I *upper == "INSERT" { R true; }
-    I *upper == "UPDATE" { R true; }
-    I *upper == "DELETE" { R true; }
-    I *upper == "DROP" { R true; }
-    I *upper == "CREATE" { R true; }
-    I *upper == "ALTER" { R true; }
-    I *upper == "TABLE" { R true; }
-    I *upper == "INDEX" { R true; }
-    I *upper == "FROM" { R true; }
-    I *upper == "WHERE" { R true; }
-    I *upper == "AND" { R true; }
-    I *upper == "OR" { R true; }
-    I *upper == "NOT" { R true; }
-    I *upper == "NULL" { R true; }
-    I *upper == "TRUE" { R true; }
-    I *upper == "FALSE" { R true; }
-    I *upper == "GRANT" { R true; }
-    I *upper == "REVOKE" { R true; }
-    I *upper == "UNION" { R true; }
-    I *upper == "ALL" { R true; }
-    I *upper == "AS" { R true; }
-    I *upper == "ON" { R true; }
-    I *upper == "INTO" { R true; }
-    I *upper == "VALUES" { R true; }
-    I *upper == "SET" { R true; }
-    I *upper == "BEGIN" { R true; }
-    I *upper == "COMMIT" { R true; }
-    I *upper == "ROLLBACK" { R true; }
+fn is_reserved_keyword(upper: &Str) -> bool {
+    I *upper == "SELECT" { return true; }
+    I *upper == "INSERT" { return true; }
+    I *upper == "UPDATE" { return true; }
+    I *upper == "DELETE" { return true; }
+    I *upper == "DROP" { return true; }
+    I *upper == "CREATE" { return true; }
+    I *upper == "ALTER" { return true; }
+    I *upper == "TABLE" { return true; }
+    I *upper == "INDEX" { return true; }
+    I *upper == "FROM" { return true; }
+    I *upper == "WHERE" { return true; }
+    I *upper == "AND" { return true; }
+    I *upper == "OR" { return true; }
+    I *upper == "NOT" { return true; }
+    I *upper == "NULL" { return true; }
+    I *upper == "TRUE" { return true; }
+    I *upper == "FALSE" { return true; }
+    I *upper == "GRANT" { return true; }
+    I *upper == "REVOKE" { return true; }
+    I *upper == "UNION" { return true; }
+    I *upper == "ALL" { return true; }
+    I *upper == "AS" { return true; }
+    I *upper == "ON" { return true; }
+    I *upper == "INTO" { return true; }
+    I *upper == "VALUES" { return true; }
+    I *upper == "SET" { return true; }
+    I *upper == "BEGIN" { return true; }
+    I *upper == "COMMIT" { return true; }
+    I *upper == "ROLLBACK" { return true; }
     false
 }

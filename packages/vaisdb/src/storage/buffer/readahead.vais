@@ -2,21 +2,21 @@
 # Detects sequential access patterns and prefetches pages
 # Improves performance for sequential scans (table scans, index scans)
 
-U std/sync
-U std/hashmap
-U std/option
-U std/vec
+use std/sync
+use std/hashmap
+use std/option
+use std/vec
 
 # Access history for a single file
-S FileAccessHistory {
+struct FileAccessHistory {
     file_id: u8,
     recent_pages: Vec<u32>,      # Last N page accesses (in order)
     history_size: u64,          # How many accesses to track (default: 4)
     prefetch_distance: u32,       # How many pages to prefetch ahead (default: 8)
 }
 
-X FileAccessHistory {
-    F new(file_id: u8) -> FileAccessHistory {
+impl FileAccessHistory {
+    fn new(file_id: u8) -> FileAccessHistory {
         FileAccessHistory {
             file_id,
             recent_pages: Vec.with_capacity(0),
@@ -26,7 +26,7 @@ X FileAccessHistory {
     }
 
     # Record a page access
-    F record(mut self, page_id: u32) {
+    fn record(mut self, page_id: u32) {
         self.recent_pages.push(page_id)
 
         # Keep only the last N accesses
@@ -37,9 +37,9 @@ X FileAccessHistory {
 
     # Check if recent accesses form a sequential pattern
     # Returns Some(stride) if sequential, None otherwise
-    F detect_sequential(self) -> Option<i32> {
+    fn detect_sequential(self) -> Option<i32> {
         I self.recent_pages.len() < 3 {
-            R None;  # Need at least 3 accesses to detect pattern
+            return None;  # Need at least 3 accesses to detect pattern
         }
 
         # Check if all consecutive pairs have the same stride
@@ -48,43 +48,43 @@ X FileAccessHistory {
         LF i: 1..(self.recent_pages.len() - 1) {
             stride := mut (self.recent_pages[i + 1] as i32) - (self.recent_pages[i] as i32)
             I stride != first_stride {
-                R None;  # Pattern broken
+                return None;  # Pattern broken
             }
         }
 
         # Check for common sequential patterns
         I first_stride == 1 || first_stride == -1 {
-            R Some(first_stride)
+            return Some(first_stride)
         }
         None  # Not a simple sequential pattern
     }
 
     # Get the last accessed page
-    F last_page(self) -> Option<u32> {
+    fn last_page(self) -> Option<u32> {
         I self.recent_pages.len() == 0 {
             None
-        } EL {
+        } else {
             Some(self.recent_pages[self.recent_pages.len() - 1])
         }
     }
 
     # Clear history (e.g., after pattern change)
-    F clear(mut self) {
+    fn clear(mut self) {
         self.recent_pages.clear()
     }
 }
 
 # Read-ahead prefetcher: tracks access patterns and suggests prefetches
-S ReadAhead {
+struct ReadAhead {
     file_histories: HashMap<u8, FileAccessHistory>,
     lock: Mutex<()>,
     enabled: bool,
     prefetch_distance: u32,   # Default prefetch distance
 }
 
-X ReadAhead {
+impl ReadAhead {
     # Create a new read-ahead prefetcher
-    F create() -> ReadAhead {
+    fn create() -> ReadAhead {
         ReadAhead {
             file_histories: HashMap.with_capacity(16),
             lock: Mutex.new(()),
@@ -94,7 +94,7 @@ X ReadAhead {
     }
 
     # Create with custom prefetch distance
-    F with_distance(prefetch_distance: u32) -> ReadAhead {
+    fn with_distance(prefetch_distance: u32) -> ReadAhead {
         ReadAhead {
             file_histories: HashMap.with_capacity(16),
             lock: Mutex.new(()),
@@ -104,103 +104,119 @@ X ReadAhead {
     }
 
     # Record a page access
-    F notify_access(mut self, file_id: u8, page_id: u32) {
+    partial fn notify_access(mut self, file_id: u8, page_id: u32) {
         I !self.enabled {
-            R
+            return
         }
 
         guard := mut self.lock.lock()
 
         # Get or create file history
-        I !self.file_histories.contains_key(file_id) {
+        I self.file_histories.contains_key(file_id) == 0 {
             history := mut FileAccessHistory.new(file_id)
             self.file_histories.insert(file_id, history)
         }
 
-        history := mut self.file_histories.get(file_id)!
+        history := mut match self.file_histories.get_opt(file_id) {
+            Some(value) => value,
+            None => {
+                guard.unlock()
+                return
+            },
+        }
         history.record(page_id)
+        self.file_histories.insert(file_id, history)
 
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
     }
 
     # Check if prefetch is needed for this access
     # Returns Some((start_page, count)) if prefetch should happen
-    F should_prefetch(self, file_id: u8, page_id: u32) -> Option<(u32, u32)> {
+    fn should_prefetch(self, file_id: u8, page_id: u32) -> Option<(u32, u32)> {
         I !self.enabled {
-            R None
+            return None
         }
 
         guard := mut self.lock.lock()
 
-        I !self.file_histories.contains_key(file_id) {
-            # guard.drop() # disabled for dev compiler
-            R None
+        I self.file_histories.contains_key(file_id) == 0 {
+            guard.unlock()
+            return None
         }
-        history := mut self.file_histories.get(file_id)
+        history := mut match self.file_histories.get_opt(file_id) {
+            Some(value) => value,
+            None => {
+                guard.unlock()
+                return None
+            },
+        }
 
         # Detect sequential pattern
         stride_opt := mut history.detect_sequential()
-        I stride_opt.is_none() {
-            # guard.drop() # disabled for dev compiler
-            R None
+        I stride_opt.is_none() != 0 {
+            guard.unlock()
+            return None
         }
-        stride := mut stride_opt.unwrap_or(0)
+        stride := mut match stride_opt {
+            Some(value) => value,
+            None => 0 as i32,
+        }
 
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
 
         # Calculate prefetch range based on stride
         I stride > 0 {
             # Forward sequential access
             start_page := mut page_id + 1
             count := mut self.prefetch_distance
-            R Some((start_page, count))
+            return Some((start_page, count))
         }
         None
     }
 
     # Clear history for a file (e.g., after file close)
-    F clear_file(mut self, file_id: u8) {
+    fn clear_file(mut self, file_id: u8) {
         guard := mut self.lock.lock()
         self.file_histories.remove(file_id)
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
     }
 
     # Clear all histories
-    F clear_all(mut self) {
+    fn clear_all(mut self) {
         guard := mut self.lock.lock()
         self.file_histories.clear()
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
     }
 
     # Enable/disable read-ahead
-    F set_enabled(mut self, enabled: bool) {
+    fn set_enabled(mut self, enabled: bool) {
         self.enabled = enabled
     }
 
     # Check if read-ahead is enabled
-    F is_enabled(self) -> bool {
+    fn is_enabled(self) -> bool {
         self.enabled
     }
 
     # Set prefetch distance
-    F set_prefetch_distance(mut self, distance: u32) {
+    fn set_prefetch_distance(mut self, distance: u32) {
         self.prefetch_distance = distance
     }
 
     # Get prefetch distance
-    F get_prefetch_distance(self) -> u32 {
+    fn get_prefetch_distance(self) -> u32 {
         self.prefetch_distance
     }
 
     # Get statistics: number of files being tracked
-    F tracked_file_count(self) -> u64 {
+    fn tracked_file_count(self) -> u64 {
         guard := mut self.lock.lock()
         count := mut self.file_histories.len()
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
         count
     }
 
-    F drop(mut self) {
+    fn drop(mut self) {
         # self.file_histories.drop() # disabled for dev compiler
         # self.lock.drop() # disabled for dev compiler
     }

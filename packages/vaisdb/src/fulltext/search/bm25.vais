@@ -3,9 +3,9 @@
 # BM25 formula: score = IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
 # IDF (Inverse Document Frequency) = ln((N - df + 0.5) / (df + 0.5) + 1)
 
-U std/vec
-U std/hashmap
-U fulltext/types
+use std/vec
+use std/hashmap
+use fulltext/types
 
 # ============================================================================
 # ln() lookup table — 256 entries covering [1.0, 2.0)
@@ -84,17 +84,17 @@ C LN_TABLE: [f64; 256] = [
 # BM25Scorer — Configurable BM25 scoring implementation
 # ============================================================================
 
-S BM25Scorer {
+struct BM25Scorer {
     k1: f64,                    # Term frequency saturation parameter (default 1.2)
     b: f64,                     # Document length normalization parameter (default 0.75)
     idf_cache: HashMap<u32, f64>, # Cache for IDF values keyed by document frequency
 }
 
-X BM25Scorer {
+impl BM25Scorer {
     # Create new BM25 scorer with default parameters
     # k1=1.2 controls how quickly TF impact saturates
     # b=0.75 controls how much document length affects scoring
-    F new() -> BM25Scorer {
+    fn new() -> BM25Scorer {
         BM25Scorer {
             k1: DEFAULT_BM25_K1,
             b: DEFAULT_BM25_B,
@@ -105,7 +105,7 @@ X BM25Scorer {
     # Create BM25 scorer with custom parameters
     # k1: higher values give more weight to term frequency (typical range: 1.2-2.0)
     # b: higher values penalize long documents more (typical range: 0.5-0.8)
-    F with_params(k1: f64, b: f64) -> BM25Scorer {
+    fn with_params(k1: f64, b: f64) -> BM25Scorer {
         BM25Scorer {
             k1,
             b,
@@ -114,7 +114,7 @@ X BM25Scorer {
     }
 
     # Invalidate IDF cache (call when total_docs changes significantly)
-    F clear_idf_cache(mut self) {
+    fn clear_idf_cache(mut self) {
         self.idf_cache.clear()
     }
 
@@ -126,9 +126,9 @@ X BM25Scorer {
     # - df=0 → IDF=0 (term appears in no documents)
     # - df>N → IDF=0 (data corruption, treat as invalid)
     # - N=0 → IDF=0 (no documents in corpus)
-    F calculate_idf(df: u32, total_docs: u64) -> f64 {
+    fn calculate_idf(df: u32, total_docs: u64) -> f64 {
         I total_docs == 0 || df == 0 {
-            R 0.0
+            return 0.0
         }
 
         n := mut total_docs as f64
@@ -136,7 +136,7 @@ X BM25Scorer {
 
         # Guard against df > total_docs (data corruption)
         I df_f > n {
-            R 0.0
+            return 0.0
         }
 
         # IDF = ln((N - df + 0.5) / (df + 0.5) + 1)
@@ -161,7 +161,7 @@ X BM25Scorer {
     #
     # Formula:
     # score = IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
-    F score(
+    fn score(
         self,
         tf: u32,
         df: u32,
@@ -171,12 +171,12 @@ X BM25Scorer {
     ) -> f64 {
         # Edge case: no term occurrences
         I tf == 0 {
-            R 0.0
+            return 0.0
         }
 
         # Edge case: no corpus statistics
         I total_docs == 0 || avg_doc_length == 0.0 {
-            R 0.0
+            return 0.0
         }
 
         # Calculate IDF component
@@ -207,7 +207,7 @@ X BM25Scorer {
     # - term_scores: pre-computed BM25 scores for each query term
     #
     # Returns: total score (sum of individual term scores)
-    F batch_score(self, term_scores: &Vec<f64>) -> f64 {
+    fn batch_score(self, term_scores: &Vec<f64>) -> f64 {
         total := mut 0.0
         i := mut 0
         LW i < term_scores.len() {
@@ -228,7 +228,7 @@ X BM25Scorer {
     # - total_docs: total number of documents in corpus
     #
     # Returns: sum of BM25 scores for all terms
-    F score_multi_term(
+    fn score_multi_term(
         mut self,
         term_freqs: &Vec<(u32, u32)>,
         doc_length: u32,
@@ -236,7 +236,7 @@ X BM25Scorer {
         total_docs: u64,
     ) -> f64 {
         I avg_doc_length == 0.0 || total_docs == 0 {
-            R 0.0
+            return 0.0
         }
 
         total := mut 0.0
@@ -254,8 +254,8 @@ X BM25Scorer {
                 # Look up cached IDF for this df value, compute and store if missing
                 idf := mut 0.0
                 cached := mut self.idf_cache.get(df)
-                M cached {
-                    Some(v) => { idf = v; },
+                match cached {
+                    Some(v) => { idf = *v; },
                     None => {
                         idf = BM25Scorer.calculate_idf(df, total_docs)
                         self.idf_cache.insert(df, idf)
@@ -284,7 +284,7 @@ X BM25Scorer {
     # - total_docs: total number of documents in corpus (passed once)
     #
     # Returns: Vec<f64> of BM25 scores, one per doc_entry
-    F score_batch(
+    fn score_batch(
         mut self,
         doc_entries: &Vec<(u32, u64, u64)>,  # (doc_length, term_start, term_count)
         term_freqs: &Vec<(u32, u32)>,
@@ -294,7 +294,7 @@ X BM25Scorer {
         results := mut Vec.with_capacity(0)
 
         I avg_doc_length == 0.0 || total_docs == 0 {
-            R results
+            return results
         }
 
         avgdl := mut avg_doc_length
@@ -314,8 +314,8 @@ X BM25Scorer {
                 I tf > 0 {
                     idf := mut 0.0
                     cached := mut self.idf_cache.get(df)
-                    M cached {
-                        Some(v) => { idf = v; },
+                    match cached {
+                        Some(v) => { idf = *v; },
                         None => {
                             idf = BM25Scorer.calculate_idf(df, total_docs)
                             self.idf_cache.insert(df, idf)
@@ -353,7 +353,7 @@ X BM25Scorer {
 #
 # Accuracy: max error < 2e-6 across all positive f64 values.
 # Performance: ~3-5x faster than the 15-term Taylor series implementation.
-F ln_fast(x: f64) -> f64 {
+fn ln_fast(x: f64) -> f64 {
     # Delegate to the Taylor series ln() for correctness.
     # The LN_TABLE lookup approach requires indexable fixed-size arrays
     # which are not supported in this environment.
@@ -363,13 +363,13 @@ F ln_fast(x: f64) -> f64 {
 # Natural logarithm using Taylor series approximation (kept for reference / high-accuracy use)
 # ln(x) = 2 * sum((1/(2n+1)) * ((x-1)/(x+1))^(2n+1)) for n=0 to infinity
 # This implementation uses argument reduction and 15 terms for accuracy
-F ln(x: f64) -> f64 {
+fn ln(x: f64) -> f64 {
     # Edge cases
     I x <= 0.0 {
-        R 0.0  # Undefined, return 0 for safety
+        return 0.0  # Undefined, return 0 for safety
     }
     I x == 1.0 {
-        R 0.0
+        return 0.0
     }
 
     # Argument reduction: bring x into range [0.5, 2)

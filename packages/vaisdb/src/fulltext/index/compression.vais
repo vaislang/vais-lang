@@ -2,12 +2,12 @@
 # Variable-byte (VByte) encoding for doc_id deltas
 # Delta encoding for sorted doc_id lists to reduce storage
 
-U std/vec
-U storage/bytes
-U storage/error
+use std/vec
+use storage/bytes
+use storage/error
 
 # Decoded VByte result — value and bytes consumed
-S VByteResult {
+struct VByteResult {
     value: u64,
     consumed: u64,
 }
@@ -18,13 +18,13 @@ S VByteResult {
 # ============================================================================
 
 # Encode a u64 value using variable-byte encoding
-F vbyte_encode(value: u64) -> Vec<u8> {
+fn vbyte_encode(value: u64) -> Vec<u8> {
     result := mut Vec.with_capacity(0)
     v := mut value
 
     I v == 0 {
         result.push(0)
-    } EL {
+    } else {
         LW v > 0 {
             byte := mut (v & 127) as u8
             v = v >> 7
@@ -40,7 +40,7 @@ F vbyte_encode(value: u64) -> Vec<u8> {
 
 # Decode a u64 value from variable-byte encoding
 # Returns (decoded_value, bytes_consumed)
-F vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
+fn vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
     value := mut 0
     shift := mut 0
     pos := mut start
@@ -48,7 +48,7 @@ F vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
     decoding := mut true
     LW decoding {
         I pos >= data.len() {
-            R Err(VaisError.new(
+            return Err(VaisError.new(
                 "VAIS-0405003",
                 "VByte decode: unexpected end of data"
             ))
@@ -61,10 +61,10 @@ F vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
         I (byte & 128) == 0 {
             # Last byte
             decoding = false
-        } EL {
+        } else {
             shift += 7
             I shift > 63 {
-                R Err(VaisError.new(
+                return Err(VaisError.new(
                     "VAIS-0405004",
                     "VByte decode: value overflow (more than 10 bytes)"
                 ))
@@ -83,12 +83,12 @@ F vbyte_decode(data: &[u8], start: u64) -> Result<VByteResult, VaisError> {
 # Input: sorted doc_ids [10, 15, 23, 30]
 # Deltas: [10, 5, 8, 7]
 # Output: VByte-encoded deltas
-F delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
+fn delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
     result := mut Vec.with_capacity(0)
 
     I doc_ids.len() == 0 {
         # empty: skip
-    } EL {
+    } else {
         # Encode count
         count_bytes := mut vbyte_encode(doc_ids.len() as u64)
         i := mut 0
@@ -123,40 +123,40 @@ F delta_encode_doc_ids(doc_ids: &Vec<u64>) -> Vec<u8> {
 }
 
 # Delta-decode VByte-encoded doc_ids back to sorted list
-F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
+fn delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
     result := mut Vec.with_capacity(0)
 
     I data.len() == 0 {
         # empty: skip
-    } EL {
+    } else {
         pos := mut 0
 
         # Decode count
         count := mut 0u64
         consumed := mut 0u64
         __mv1 := vbyte_decode(data, pos)
-        M __mv1 {
+        match __mv1 {
             Ok(vb) => {
                 count = vb.value
                 consumed = vb.consumed
             },
-            Err(e) => { R Err(e) },
+            Err(e) => { return Err(e) },
         }
         pos += consumed
 
         I count == 0 {
             # zero count: skip
-        } EL {
+        } else {
             # Decode first doc_id (absolute)
             first_id := mut 0u64
             consumed2 := mut 0u64
             __mv2 := vbyte_decode(data, pos)
-            M __mv2 {
+            match __mv2 {
                 Ok(vb) => {
                     first_id = vb.value
                     consumed2 = vb.consumed
                 },
-                Err(e) => { R Err(e) },
+                Err(e) => { return Err(e) },
             }
             pos += consumed2
             result.push(first_id)
@@ -167,12 +167,12 @@ F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
                 delta := mut 0u64
                 consumed3 := mut 0u64
                 __mv3 := vbyte_decode(data, pos)
-                M __mv3 {
+                match __mv3 {
                     Ok(vb) => {
                         delta = vb.value
                         consumed3 = vb.consumed
                     },
-                    Err(e) => { R Err(e) },
+                    Err(e) => { return Err(e) },
                 }
                 pos += consumed3
                 prev := mut result[result.len() - 1]
@@ -193,13 +193,13 @@ F delta_decode_doc_ids(data: &[u8]) -> Result<Vec<u64>, VaisError> {
 # Encode a list of PostingEntry into compressed bytes
 # Entries must be sorted by doc_id
 # Format: [delta_encoded_doc_ids][vbyte_term_freqs][position_data]
-F encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
+fn encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
     result := mut Vec.with_capacity(0)
 
     I entries.len() == 0 {
         # Write count = 0
         result.push(0)
-    } EL {
+    } else {
         # Extract doc_ids for delta encoding
         doc_ids := mut Vec.with_capacity(entries.len())
         i := mut 0
@@ -267,25 +267,25 @@ F encode_posting_list(entries: &Vec<PostingEntryCompact>) -> Vec<u8> {
 }
 
 # Decode compressed posting list back to entries
-F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError> {
+fn decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError> {
     result := mut Vec.with_capacity(0)
     pos := mut 0
 
     I data.len() == 0 || data[0] == 0 {
         # empty or zero-count: skip
-    } EL {
+    } else {
         # Decode doc_ids
         doc_ids := mut delta_decode_doc_ids(data)?;
         # Re-compute pos by re-parsing to find where doc_ids end
         count := mut 0u64
         consumed4 := mut 0u64
         __mv4 := vbyte_decode(data, 0)
-        M __mv4 {
+        match __mv4 {
             Ok(vb) => {
                 count = vb.value
                 consumed4 = vb.consumed
             },
-            Err(e) => { R Err(e) },
+            Err(e) => { return Err(e) },
         }
         pos = consumed4
         prev := mut 0
@@ -294,15 +294,15 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
             val := mut 0u64
             consumed5 := mut 0u64
             __mv5 := vbyte_decode(data, pos)
-            M __mv5 {
+            match __mv5 {
                 Ok(vb) => {
                     val = vb.value
                     consumed5 = vb.consumed
                 },
-                Err(e) => { R Err(e) },
+                Err(e) => { return Err(e) },
             }
             pos += consumed5
-            I i == 0 { prev = val } EL { prev += val }
+            I i == 0 { prev = val } else { prev += val }
             i += 1
         }
 
@@ -313,12 +313,12 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
             freq := mut 0u64
             consumed6 := mut 0u64
             __mv6 := vbyte_decode(data, pos)
-            M __mv6 {
+            match __mv6 {
                 Ok(vb) => {
                     freq = vb.value
                     consumed6 = vb.consumed
                 },
-                Err(e) => { R Err(e) },
+                Err(e) => { return Err(e) },
             }
             pos += consumed6
             freqs.push(freq as u32)
@@ -331,12 +331,12 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
             pos_count := mut 0u64
             consumed7 := mut 0u64
             __mv7 := vbyte_decode(data, pos)
-            M __mv7 {
+            match __mv7 {
                 Ok(vb) => {
                     pos_count = vb.value
                     consumed7 = vb.consumed
                 },
-                Err(e) => { R Err(e) },
+                Err(e) => { return Err(e) },
             }
             pos += consumed7
 
@@ -345,12 +345,12 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
                 first_pos := mut 0u64
                 consumed8 := mut 0u64
                 __mv8 := vbyte_decode(data, pos)
-                M __mv8 {
+                match __mv8 {
                     Ok(vb) => {
                         first_pos = vb.value
                         consumed8 = vb.consumed
                     },
-                    Err(e) => { R Err(e) },
+                    Err(e) => { return Err(e) },
                 }
                 pos += consumed8
                 positions.push(first_pos as u32)
@@ -360,12 +360,12 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
                     delta := mut 0u64
                     consumed9 := mut 0u64
                     __mv9 := vbyte_decode(data, pos)
-                    M __mv9 {
+                    match __mv9 {
                         Ok(vb) => {
                             delta = vb.value
                             consumed9 = vb.consumed
                         },
-                        Err(e) => { R Err(e) },
+                        Err(e) => { return Err(e) },
                     }
                     pos += consumed9
                     prev_pos := mut positions[positions.len() - 1]
@@ -391,7 +391,7 @@ F decode_posting_list(data: &[u8]) -> Result<Vec<PostingEntryCompact>, VaisError
 # MVCC metadata is stored separately in the page-level PostingEntry
 # ============================================================================
 
-S PostingEntryCompact {
+struct PostingEntryCompact {
     doc_id: u64,
     term_freq: u32,
     positions: Vec<u32>,

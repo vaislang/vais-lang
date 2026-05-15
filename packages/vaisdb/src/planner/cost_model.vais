@@ -7,10 +7,10 @@
 #   Graph traverse: O(avg_degree^depth × N_filtered) CPU, O(nodes_visited) I/O
 #   BM25 search:  O(Σ posting_length × query_terms) CPU, O(dict_lookup + posting_pages) I/O
 
-U storage/error.{VaisError};
-U sql/planner/mod.{CostEstimate, TableStats, estimate_selectivity};
-U sql/parser/ast.{Expr};
-U planner/types.{
+use storage/error.{VaisError};
+use sql/planner/mod.{CostEstimate, TableStats, estimate_selectivity};
+use sql/parser/ast.{Expr};
+use planner/types.{
     HybridCost, HybridPlanNode, EngineType,
     VectorScanParams, GraphTraverseNodeParams, FullTextScanParams,
     FusionMethod, err_hybrid_cost_failed
@@ -54,7 +54,7 @@ C CROSS_JOIN_PROBE_CPU: f64 = 0.05;        # CPU per probe
 # Vector Search Statistics (from catalog/metadata)
 # ============================================================================
 
-S VectorIndexStats {
+struct VectorIndexStats {
     vector_count: u64,
     dimension: u32,
     m: u16,                  # HNSW M parameter
@@ -63,8 +63,8 @@ S VectorIndexStats {
     is_quantized: bool,      # Whether quantization is active
 }
 
-X VectorIndexStats {
-    F default(dimension: u32) -> VectorIndexStats {
+impl VectorIndexStats {
+    fn default(dimension: u32) -> VectorIndexStats {
         VectorIndexStats {
             vector_count: 0,
             dimension,
@@ -80,7 +80,7 @@ X VectorIndexStats {
 # Graph Statistics (from graph engine metadata)
 # ============================================================================
 
-S GraphStats {
+struct GraphStats {
     node_count: u64,
     edge_count: u64,
     avg_out_degree: f64,
@@ -89,8 +89,8 @@ S GraphStats {
     edge_type_count: u32,
 }
 
-X GraphStats {
-    F default() -> GraphStats {
+impl GraphStats {
+    fn default() -> GraphStats {
         GraphStats {
             node_count: 0,
             edge_count: 0,
@@ -106,7 +106,7 @@ X GraphStats {
 # Full-Text Statistics (from fulltext engine metadata)
 # ============================================================================
 
-S FullTextStats {
+struct FullTextStats {
     document_count: u64,
     dictionary_size: u64,       # Number of unique terms
     avg_posting_length: u64,    # Average posting list length
@@ -114,8 +114,8 @@ S FullTextStats {
     total_tokens: u64,          # Total tokens across all documents
 }
 
-X FullTextStats {
-    F default() -> FullTextStats {
+impl FullTextStats {
+    fn default() -> FullTextStats {
         FullTextStats {
             document_count: 0,
             dictionary_size: 0,
@@ -130,15 +130,15 @@ X FullTextStats {
 # Unified Statistics Container
 # ============================================================================
 
-S HybridStats {
+struct HybridStats {
     sql_stats: Vec<TableStats>,        # Per-table SQL statistics
     vector_stats: Vec<VectorIndexStats>, # Per-index vector stats
     graph_stats: Option<GraphStats>,
     fulltext_stats: Option<FullTextStats>,
 }
 
-X HybridStats {
-    F new() -> HybridStats {
+impl HybridStats {
+    fn new() -> HybridStats {
         HybridStats {
             sql_stats: Vec.new(),
             vector_stats: Vec.new(),
@@ -147,24 +147,24 @@ X HybridStats {
         }
     }
 
-    F find_table_stats(self, table_name: &Str) -> Option<&TableStats> {
+    fn find_table_stats(self, table_name: &Str) -> Option<&TableStats> {
         LF stat: self.sql_stats {
             I stat.name == *table_name {
-                R Some(stat);
+                return Some(&stat);
             }
         }
         None
     }
 
-    F find_vector_stats(self, dimension: u32) -> Option<&VectorIndexStats> {
+    fn find_vector_stats(self, dimension: u32) -> Option<&VectorIndexStats> {
         LF stat: self.vector_stats {
             I stat.dimension == dimension {
-                R Some(stat);
+                return Some(&stat);
             }
         }
         # Return first I dimension doesn't M exactly
         I self.vector_stats.len() > 0 {
-            R Some(&self.vector_stats[0]);
+            return Some(&self.vector_stats[0]);
         }
         None
     }
@@ -181,7 +181,7 @@ X HybridStats {
 # - At target layer, search ef_search candidates
 # - Each candidate: 1 distance computation = O(dimension)
 # - I/O: read HNSW node pages for visited nodes
-F estimate_vector_scan_cost(
+partial fn estimate_vector_scan_cost(
     params: &VectorScanParams,
     stats: &VectorIndexStats,
 ) -> HybridCost {
@@ -189,9 +189,9 @@ F estimate_vector_scan_cost(
     I n <= 0.0 { n = 1.0; }
 
     dim := mut stats.dimension as f64;
-    ef := mut I params.ef_search.is_some() {
+    ef := mut I params.ef_search.is_some() != 0 {
         params.ef_search! as f64
-    } EL {
+    } else {
         stats.ef_search_default as f64
     };
     layers := mut stats.max_layer as f64;
@@ -219,8 +219,16 @@ F estimate_vector_scan_cost(
     }
 
     # Pre-filter adds I/O I present (bitmap scan of filter column)
-    I params.pre_filter.is_some() {
-        sel := mut estimate_selectivity(params.pre_filter.as_ref()!);
+    I params.pre_filter.is_some() != 0 {
+        sel := mut 1.0;
+        match &params.pre_filter {
+            Some(e) => {
+                sel = estimate_selectivity(&e);
+            },
+            None => {
+                sel = 1.0;
+            },
+        }
         io_cost += n * 0.01 * sel;  # Bitmap scan cost
         cpu_cost += n * sel * 0.01;  # Filter eval cost
     }
@@ -245,7 +253,7 @@ F estimate_vector_scan_cost(
         fulltext_io_cost: 0.0,
         fulltext_cpu_cost: 0.0,
         vector_dimension: stats.dimension,
-        vector_ef_search: I params.ef_search.is_some() { params.ef_search! } EL { stats.ef_search_default },
+        vector_ef_search: I params.ef_search.is_some() != 0 { params.ef_search! } else { stats.ef_search_default },
         graph_avg_degree: 0.0,
         graph_max_depth: 0,
         fulltext_posting_length: 0,
@@ -258,7 +266,7 @@ F estimate_vector_scan_cost(
 # - Visit O(avg_degree^depth) nodes in worst case
 # - Each visit: read adj page + visibility check
 # - Edge type filter reduces visited nodes
-F estimate_graph_traverse_cost(
+fn estimate_graph_traverse_cost(
     params: &GraphTraverseNodeParams,
     stats: &GraphStats,
 ) -> HybridCost {
@@ -268,16 +276,24 @@ F estimate_graph_traverse_cost(
     avg_degree := mut I params.direction == 2 {
         # BOTH: consider both in and out degrees
         stats.avg_out_degree + stats.avg_in_degree
-    } EL I params.direction == 1 {
+    } else I params.direction == 1 {
         stats.avg_in_degree
-    } EL {
+    } else {
         stats.avg_out_degree
     };
 
     # Edge type filter reduces effective degree
     effective_degree := mut avg_degree;
-    I params.edge_type_filter.is_some() {
-        filter_types := mut params.edge_type_filter.as_ref()!.len() as f64;
+    I params.edge_type_filter.is_some() != 0 {
+        filter_types := mut 0.0;
+        match &params.edge_type_filter {
+            Some(v) => {
+                filter_types = v.len() as f64;
+            },
+            None => {
+                filter_types = 0.0;
+            },
+        }
         total_types := mut stats.edge_type_count as f64;
         I total_types > 0.0 {
             effective_degree = avg_degree * (filter_types / total_types);
@@ -287,7 +303,7 @@ F estimate_graph_traverse_cost(
     # Estimated nodes visited: geometric series sum 1 + d + d^2 + ... + d^depth
     nodes_visited := mut I effective_degree <= 1.0 {
         depth + 1.0
-    } EL {
+    } else {
         (effective_degree.powf(depth + 1.0) - 1.0) / (effective_degree - 1.0)
     };
 
@@ -309,7 +325,7 @@ F estimate_graph_traverse_cost(
     cpu_cost := mut cpu_filter + cpu_visibility;
 
     # Property reads I filter present
-    I params.filter.is_some() {
+    I params.filter.is_some() != 0 {
         io_cost += nodes_visited * GRAPH_PROPERTY_READ_IO;
         cpu_cost += nodes_visited * 0.1;  # Filter eval per node
     }
@@ -345,7 +361,7 @@ F estimate_graph_traverse_cost(
 # - Posting list scan: O(posting_length) per term
 # - BM25 scoring: O(1) per (doc, term) pair
 # - Result sorting: O(N log top_k) via heap
-F estimate_fulltext_scan_cost(
+fn estimate_fulltext_scan_cost(
     params: &FullTextScanParams,
     stats: &FullTextStats,
 ) -> HybridCost {
@@ -374,15 +390,12 @@ F estimate_fulltext_scan_cost(
     cpu_cost := mut cpu_tokenize + cpu_score + cpu_visibility;
 
     # Phrase search adds position checking cost
-    M params.search_mode {
-        FullTextSearchMode.Phrase { slop } => {
-            cpu_cost += total_postings * 0.05;  # Position comparison per posting
-        },
-        FullTextSearchMode.Boolean => {
-            cpu_cost += estimated_terms as f64 * 0.1;  # Boolean operator eval
-        },
-        _ => {}
-    }
+    search_mode_cpu := mut match &params.search_mode {
+        FullTextSearchMode.Phrase { slop } => total_postings * 0.05,
+        FullTextSearchMode.Boolean => estimated_terms as f64 * 0.1,
+        _ => 0.0,
+    };
+    cpu_cost += search_mode_cpu;
 
     row_estimate := mut params.top_k as u64;
     mem := mut row_estimate * 48;  # doc_id + score + table_id + row_tid + overhead
@@ -409,10 +422,10 @@ F estimate_fulltext_scan_cost(
 }
 
 # Need FullTextSearchMode for the M above
-U planner/types.{FullTextSearchMode};
+use planner/types.{FullTextSearchMode};
 
 # Estimate cost for score fusion of two result sets
-F estimate_fusion_cost(
+fn estimate_fusion_cost(
     left_cost: &HybridCost,
     right_cost: &HybridCost,
     method: &FusionMethod,
@@ -428,7 +441,7 @@ F estimate_fusion_cost(
     # CPU: normalization + merge + method-specific
     cpu_normalize := mut total_rows * FUSION_NORMALIZE_CPU;
     cpu_merge := mut total_rows * FUSION_MERGE_CPU;
-    cpu_method := mut M method {
+    cpu_method := mut match method {
         FusionMethod.WeightedSum { .. } => total_rows * FUSION_NORMALIZE_CPU,
         FusionMethod.ReciprocalRankFusion { .. } => total_rows * FUSION_RRF_CPU,
     };
@@ -448,7 +461,7 @@ F estimate_fusion_cost(
 }
 
 # Estimate cost for cross-engine join
-F estimate_cross_engine_join_cost(
+fn estimate_cross_engine_join_cost(
     left_cost: &HybridCost,
     right_cost: &HybridCost,
 ) -> HybridCost {
@@ -456,8 +469,8 @@ F estimate_cross_engine_join_cost(
     right_rows := mut right_cost.row_estimate as f64;
 
     # Hash join: build on smaller side, probe with larger
-    build_rows := mut I left_rows < right_rows { left_rows } EL { right_rows };
-    probe_rows := mut I left_rows < right_rows { right_rows } EL { left_rows };
+    build_rows := mut I left_rows < right_rows { left_rows } else { right_rows };
+    probe_rows := mut I left_rows < right_rows { right_rows } else { left_rows };
 
     io_cost := mut left_cost.total_io_cost + right_cost.total_io_cost;
     cpu_build := mut build_rows * CROSS_JOIN_HASH_BUILD_CPU;
@@ -465,7 +478,7 @@ F estimate_cross_engine_join_cost(
     cpu_cost := mut left_cost.total_cpu_cost + right_cost.total_cpu_cost + cpu_build + cpu_probe;
 
     # Output cardinality: min of left/right (assuming PK-FK join)
-    row_estimate := mut I left_rows < right_rows { left_cost.row_estimate } EL { right_cost.row_estimate };
+    row_estimate := mut I left_rows < right_rows { left_cost.row_estimate } else { right_cost.row_estimate };
 
     mem := mut left_cost.total_memory_bytes + right_cost.total_memory_bytes +
            (build_rows as u64 * 128);  # Hash table overhead
@@ -479,28 +492,28 @@ F estimate_cross_engine_join_cost(
 }
 
 # Estimate cost for an entire HybridPlanNode tree (recursive)
-F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
-    M node {
+partial fn estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
+    match node {
         HybridPlanNode.SqlPlan { cost, .. } => cost.clone(),
         HybridPlanNode.VectorScan { cost, .. } => cost.clone(),
         HybridPlanNode.GraphTraverse { cost, .. } => cost.clone(),
         HybridPlanNode.FullTextScan { cost, .. } => cost.clone(),
 
         HybridPlanNode.ScoreFusion { left, right, method, top_k, .. } => {
-            left_cost := mut estimate_hybrid_cost(left);
-            right_cost := mut estimate_hybrid_cost(right);
-            estimate_fusion_cost(&left_cost, &right_cost, method, *top_k)
+            left_cost := mut estimate_hybrid_cost(left.as_ref());
+            right_cost := mut estimate_hybrid_cost(right.as_ref());
+            estimate_fusion_cost(&left_cost, &right_cost, &method, *top_k)
         },
 
         HybridPlanNode.CrossEngineJoin { left, right, .. } => {
-            left_cost := mut estimate_hybrid_cost(left);
-            right_cost := mut estimate_hybrid_cost(right);
+            left_cost := mut estimate_hybrid_cost(left.as_ref());
+            right_cost := mut estimate_hybrid_cost(right.as_ref());
             estimate_cross_engine_join_cost(&left_cost, &right_cost)
         },
 
         HybridPlanNode.HybridFilter { input, predicate, .. } => {
-            child_cost := mut estimate_hybrid_cost(input);
-            sel := mut estimate_selectivity(predicate);
+            child_cost := mut estimate_hybrid_cost(input.as_ref());
+            sel := mut estimate_selectivity(&predicate);
             cpu_filter := mut child_cost.row_estimate as f64 * 0.01;
             child_cost.total_cpu_cost += cpu_filter;
             child_cost.row_estimate = (child_cost.row_estimate as f64 * sel) as u64;
@@ -508,13 +521,13 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         },
 
         HybridPlanNode.HybridProject { input, .. } => {
-            child_cost := mut estimate_hybrid_cost(input);
+            child_cost := mut estimate_hybrid_cost(input.as_ref());
             child_cost.total_cpu_cost += child_cost.row_estimate as f64 * 0.001;
             child_cost
         },
 
         HybridPlanNode.HybridSort { input, .. } => {
-            child_cost := mut estimate_hybrid_cost(input);
+            child_cost := mut estimate_hybrid_cost(input.as_ref());
             n := mut child_cost.row_estimate as f64;
             I n > 1.0 {
                 child_cost.total_cpu_cost += n * n.log2() * 0.01;
@@ -524,8 +537,8 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         },
 
         HybridPlanNode.HybridLimit { input, limit, .. } => {
-            child_cost := mut estimate_hybrid_cost(input);
-            I limit.is_some() {
+            child_cost := mut estimate_hybrid_cost(input.as_ref());
+            I limit.is_some() != 0 {
                 lim := mut limit!;
                 I lim < child_cost.row_estimate {
                     child_cost.row_estimate = lim;
@@ -535,11 +548,11 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
         },
 
         HybridPlanNode.HybridAggregate { input, group_by, .. } => {
-            child_cost := mut estimate_hybrid_cost(input);
+            child_cost := mut estimate_hybrid_cost(input.as_ref());
             n := mut child_cost.row_estimate as f64;
             child_cost.total_cpu_cost += n * 0.05;  # Hashing + aggregation per row
             # Cardinality after GROUP BY: rough estimate
-            groups := mut I group_by.len() == 0 { 1u64 } EL { (n * 0.1) as u64 };
+            groups := mut I group_by.len() == 0 { 1u64 } else { (n * 0.1) as u64 };
             I groups < 1 { groups = 1; }
             child_cost.row_estimate = groups;
             child_cost.total_memory_bytes += groups * 128;  # Hash table for groups
@@ -554,21 +567,21 @@ F estimate_hybrid_cost(node: &HybridPlanNode) -> HybridCost {
 
 # Compare two HybridCost values for plan selection
 # Returns true I `a` is cheaper than `b`
-F is_cheaper(a: &HybridCost, b: &HybridCost) -> bool {
+fn is_cheaper(a: &HybridCost, b: &HybridCost) -> bool {
     a.total() < b.total()
 }
 
 # Compare with bias toward lower memory usage (for memory-constrained environments)
-F is_cheaper_memory_aware(a: &HybridCost, b: &HybridCost, memory_budget: u64) -> bool {
+fn is_cheaper_memory_aware(a: &HybridCost, b: &HybridCost, memory_budget: u64) -> bool {
     # If one plan fits in budget and the other doesn't, prefer the one that fits
     a_fits := mut a.total_memory_bytes <= memory_budget;
     b_fits := mut b.total_memory_bytes <= memory_budget;
 
     I a_fits && !b_fits {
-        R true;
+        return true;
     }
     I !a_fits && b_fits {
-        R false;
+        return false;
     }
 
     # Both fit or neither fits: compare by total cost

@@ -2,20 +2,20 @@
 # Provides fixed-size, sentence-boundary, and paragraph-boundary chunking
 # Each strategy splits text into byte ranges that respect logical boundaries
 
-U std/vec.Vec;
-U std/string.Str;
+use std/vec.Vec;
+use std/string.Str;
 
 # ============================================================================
 # ChunkBoundary — Represents a chunk's byte range in the original text
 # ============================================================================
 
-S ChunkBoundary {
+struct ChunkBoundary {
     start_byte: u32,            # Start byte offset in original text
     end_byte: u32,              # End byte offset (exclusive)
 }
 
-X ChunkBoundary {
-    F new(start_byte: u32, end_byte: u32) -> ChunkBoundary {
+impl ChunkBoundary {
+    fn new(start_byte: u32, end_byte: u32) -> ChunkBoundary {
         ChunkBoundary { start_byte, end_byte }
     }
 }
@@ -27,7 +27,7 @@ X ChunkBoundary {
 ## Split text into fixed-size chunks by token count
 ## Respects word boundaries and targets the specified token count per chunk
 ## Falls back to mid-word split if a single word exceeds max_size
-F split_fixed_size(
+fn split_fixed_size(
     content: &Str,
     target_size: u32,
     min_size: u32,
@@ -38,25 +38,25 @@ F split_fixed_size(
     len := mut bytes.len();
 
     I len == 0 {
-        R boundaries;
+        return boundaries;
     }
 
-    chunk_start: u64 := mut 0;
-    token_count: u32 := mut 0;
-    pos: u64 := mut 0;
-    last_word_end: u64 := mut 0;  # Last valid word boundary
+    chunk_start := mut 0u64;
+    token_count := mut 0u32;
+    pos := mut 0u64;
+    last_word_end := mut 0;  # Last valid word boundary
 
     LW pos < len {
         # Skip whitespace
-        I is_whitespace(bytes[pos]) {
-            I pos > chunk_start && !is_whitespace(bytes[pos - 1]) {
+        I rag_is_whitespace(bytes[pos]) {
+            I pos > chunk_start && !rag_is_whitespace(bytes[pos - 1]) {
                 last_word_end = pos;
             }
             pos += 1;
-        } EL {
+        } else {
             # Start of a word
             word_start := mut pos;
-            LW pos < len && !is_whitespace(bytes[pos]) {
+            LW pos < len && !rag_is_whitespace(bytes[pos]) {
                 pos += 1;
             }
 
@@ -85,7 +85,7 @@ F split_fixed_size(
                     chunk_start = chunk_end;
 
                     # Skip any whitespace at start of next chunk
-                    LW chunk_start < len && is_whitespace(bytes[chunk_start]) {
+                    LW chunk_start < len && rag_is_whitespace(bytes[chunk_start]) {
                         chunk_start += 1;
                     }
 
@@ -103,10 +103,15 @@ F split_fixed_size(
         # Only add if it meets minimum size or it's the only chunk
         I final_tokens >= min_size || boundaries.is_empty() {
             boundaries.push(ChunkBoundary.new(chunk_start as u32, len as u32));
-        } EL I !boundaries.is_empty() {
-            # Merge with previous chunk if too small
-            last_idx := mut boundaries.len() - 1;
-            boundaries[last_idx].end_byte = len as u32;
+        } else I !boundaries.is_empty() {
+            # Merge with previous chunk — pop-modify-push since codegen
+            # lacks write-through-index for Vec<Struct>[i].field = ...
+            match boundaries.pop() {
+                Some(last) => {
+                    boundaries.push(ChunkBoundary.new(last.start_byte, len as u32));
+                },
+                None => {},
+            }
         }
     }
 
@@ -120,7 +125,7 @@ F split_fixed_size(
 ## Split text at sentence boundaries (. ! ?)
 ## Accumulates sentences until target_size is reached
 ## Falls back to fixed-size if a single sentence exceeds max_size
-F split_sentence_boundary(
+fn split_sentence_boundary(
     content: &Str,
     target_size: u32,
     min_size: u32,
@@ -129,13 +134,13 @@ F split_sentence_boundary(
     boundaries := mut Vec.new();
     sentence_ends := mut find_sentence_boundaries(content);
 
-    I sentence_ends.is_empty() {
+    I sentence_ends.is_empty() != 0 {
         # No sentence boundaries found, fall back to fixed-size
-        R split_fixed_size(content, target_size, min_size, max_size);
+        return split_fixed_size(content, target_size, min_size, max_size);
     }
 
-    chunk_start: u64 := mut 0;
-    i: u64 := mut 0;
+    chunk_start := mut 0u64;
+    i := mut 0u64;
 
     LW i < sentence_ends.len() {
         sentence_end := mut sentence_ends[i];
@@ -144,7 +149,7 @@ F split_sentence_boundary(
         # Check if adding this sentence would exceed target
         I chunk_tokens >= target_size {
             # Check if this is a single giant sentence
-            I chunk_start == sentence_ends[I i > 0 { i - 1 } EL { 0 }] {
+            I chunk_start == sentence_ends[I i > 0 { i - 1 } else { 0 }] {
                 # Single sentence is too large, fall back to fixed-size for this chunk
                 fixed_chunks := mut split_fixed_size(
                     &content.substring(chunk_start, sentence_end),
@@ -153,7 +158,7 @@ F split_sentence_boundary(
                     max_size,
                 );
 
-                j: u64 := mut 0;
+                j := mut 0u64;
                 LW j < fixed_chunks.len() {
                     boundaries.push(ChunkBoundary.new(
                         (chunk_start + fixed_chunks[j].start_byte as u64) as u32,
@@ -162,19 +167,19 @@ F split_sentence_boundary(
                     j += 1;
                 }
                 chunk_start = sentence_end;
-            } EL I chunk_tokens <= max_size {
+            } else I chunk_tokens <= max_size {
                 # Good chunk size, create boundary
                 boundaries.push(ChunkBoundary.new(chunk_start as u32, sentence_end as u32));
                 chunk_start = sentence_end;
-            } EL {
+            } else {
                 # Exceeded max_size, create chunk at previous sentence
-                prev_end := mut I i > 0 { sentence_ends[i - 1] } EL { sentence_end };
+                prev_end := mut I i > 0 { sentence_ends[i - 1] } else { sentence_end };
                 I prev_end > chunk_start {
                     boundaries.push(ChunkBoundary.new(chunk_start as u32, prev_end as u32));
                     chunk_start = prev_end;
                     # Don't increment i, process this sentence in next iteration
                     i -= 1;
-                } EL {
+                } else {
                     # Edge case: first sentence, just split it
                     boundaries.push(ChunkBoundary.new(chunk_start as u32, sentence_end as u32));
                     chunk_start = sentence_end;
@@ -192,10 +197,13 @@ F split_sentence_boundary(
         final_tokens := mut count_tokens_in_range(content, chunk_start, content_len);
         I final_tokens >= min_size || boundaries.is_empty() {
             boundaries.push(ChunkBoundary.new(chunk_start as u32, content_len as u32));
-        } EL I !boundaries.is_empty() {
-            # Merge with previous chunk
-            last_idx := mut boundaries.len() - 1;
-            boundaries[last_idx].end_byte = content_len as u32;
+        } else I !boundaries.is_empty() {
+            match boundaries.pop() {
+                Some(last) => {
+                    boundaries.push(ChunkBoundary.new(last.start_byte, content_len as u32));
+                },
+                None => {},
+            }
         }
     }
 
@@ -209,7 +217,7 @@ F split_sentence_boundary(
 ## Split text at paragraph boundaries (double newline)
 ## Accumulates paragraphs until target_size is reached
 ## Falls back to sentence split if a single paragraph exceeds max_size
-F split_paragraph_boundary(
+fn split_paragraph_boundary(
     content: &Str,
     target_size: u32,
     min_size: u32,
@@ -218,13 +226,13 @@ F split_paragraph_boundary(
     boundaries := mut Vec.new();
     paragraph_ends := mut find_paragraph_boundaries(content);
 
-    I paragraph_ends.is_empty() {
+    I paragraph_ends.is_empty() != 0 {
         # No paragraph boundaries found, fall back to sentence-based
-        R split_sentence_boundary(content, target_size, min_size, max_size);
+        return split_sentence_boundary(content, target_size, min_size, max_size);
     }
 
-    chunk_start: u64 := mut 0;
-    i: u64 := mut 0;
+    chunk_start := mut 0u64;
+    i := mut 0u64;
 
     LW i < paragraph_ends.len() {
         para_end := mut paragraph_ends[i];
@@ -235,9 +243,9 @@ F split_paragraph_boundary(
                 # Good chunk size
                 boundaries.push(ChunkBoundary.new(chunk_start as u32, para_end as u32));
                 chunk_start = para_end;
-            } EL {
+            } else {
                 # Paragraph too large, fall back to sentence splitting
-                para_start := mut I i > 0 { paragraph_ends[i - 1] } EL { 0 };
+                para_start := mut I i > 0 { paragraph_ends[i - 1] } else { 0 };
                 I para_start < para_end {
                     sentence_chunks := mut split_sentence_boundary(
                         &content.substring(para_start, para_end),
@@ -246,7 +254,7 @@ F split_paragraph_boundary(
                         max_size,
                     );
 
-                    j: u64 := mut 0;
+                    j := mut 0u64;
                     LW j < sentence_chunks.len() {
                         boundaries.push(ChunkBoundary.new(
                             (para_start + sentence_chunks[j].start_byte as u64) as u32,
@@ -269,10 +277,13 @@ F split_paragraph_boundary(
         final_tokens := mut count_tokens_in_range(content, chunk_start, content_len);
         I final_tokens >= min_size || boundaries.is_empty() {
             boundaries.push(ChunkBoundary.new(chunk_start as u32, content_len as u32));
-        } EL I !boundaries.is_empty() {
-            # Merge with previous chunk
-            last_idx := mut boundaries.len() - 1;
-            boundaries[last_idx].end_byte = content_len as u32;
+        } else I !boundaries.is_empty() {
+            match boundaries.pop() {
+                Some(last) => {
+                    boundaries.push(ChunkBoundary.new(last.start_byte, content_len as u32));
+                },
+                None => {},
+            }
         }
     }
 
@@ -284,11 +295,11 @@ F split_paragraph_boundary(
 # ============================================================================
 
 ## Find all sentence boundaries in text (. ! ? followed by whitespace or end)
-F find_sentence_boundaries(content: &Str) -> Vec<u64> {
+fn find_sentence_boundaries(content: &Str) -> Vec<u64> {
     boundaries := mut Vec.new();
     bytes := mut content.as_bytes();
     len := mut bytes.len();
-    i: u64 := mut 0;
+    i := mut 0u64;
 
     LW i < len {
         b := mut bytes[i];
@@ -304,17 +315,17 @@ F find_sentence_boundaries(content: &Str) -> Vec<u64> {
             }
 
             # Check for whitespace or end of text
-            I j >= len || is_whitespace(bytes[j]) {
+            I j >= len || rag_is_whitespace(bytes[j]) {
                 # Skip trailing whitespace to find actual content end
-                LW j < len && is_whitespace(bytes[j]) {
+                LW j < len && rag_is_whitespace(bytes[j]) {
                     j += 1;
                 }
                 boundaries.push(j);
                 i = j;
-            } EL {
+            } else {
                 i += 1;
             }
-        } EL {
+        } else {
             i += 1;
         }
     }
@@ -323,11 +334,11 @@ F find_sentence_boundaries(content: &Str) -> Vec<u64> {
 }
 
 ## Find all paragraph boundaries in text (double newline)
-F find_paragraph_boundaries(content: &Str) -> Vec<u64> {
+fn find_paragraph_boundaries(content: &Str) -> Vec<u64> {
     boundaries := mut Vec.new();
     bytes := mut content.as_bytes();
     len := mut bytes.len();
-    i: u64 := mut 0;
+    i := mut 0u64;
 
     LW i < len {
         # Look for \n\n (with possible \r)
@@ -347,10 +358,10 @@ F find_paragraph_boundaries(content: &Str) -> Vec<u64> {
             I newline_count >= 2 {
                 boundaries.push(j);
                 i = j;
-            } EL {
+            } else {
                 i += 1;
             }
-        } EL {
+        } else {
             i += 1;
         }
     }
@@ -359,20 +370,20 @@ F find_paragraph_boundaries(content: &Str) -> Vec<u64> {
 }
 
 ## Count tokens (whitespace-delimited words) in a byte range
-F count_tokens_in_range(content: &Str, start: u64, end: u64) -> u32 {
+fn count_tokens_in_range(content: &Str, start: u64, end: u64) -> u32 {
     I start >= end {
-        R 0;
+        return 0;
     }
 
     bytes := mut content.as_bytes();
-    count: u32 := mut 0;
+    count := mut 0u32;
     pos := mut start;
     in_word := mut false;
 
     LW pos < end && pos < bytes.len() {
-        I is_whitespace(bytes[pos]) {
+        I rag_is_whitespace(bytes[pos]) {
             in_word = false;
-        } EL {
+        } else {
             I !in_word {
                 count += 1;
                 in_word = true;
@@ -385,20 +396,20 @@ F count_tokens_in_range(content: &Str, start: u64, end: u64) -> u32 {
 }
 
 ## Find the maximum valid word boundary before max_size tokens
-F find_max_boundary(content: &Str, start: u64, end: u64, max_size: u32) -> u64 {
+fn find_max_boundary(content: &Str, start: u64, end: u64, max_size: u32) -> u64 {
     bytes := mut content.as_bytes();
     pos := mut start;
-    token_count: u32 := mut 0;
+    token_count := mut 0u32;
     last_boundary := mut start;
 
     LW pos < end && pos < bytes.len() {
         # Skip whitespace
-        I is_whitespace(bytes[pos]) {
+        I rag_is_whitespace(bytes[pos]) {
             last_boundary = pos;
             pos += 1;
-        } EL {
+        } else {
             # Start of word
-            LW pos < end && pos < bytes.len() && !is_whitespace(bytes[pos]) {
+            LW pos < end && pos < bytes.len() && !rag_is_whitespace(bytes[pos]) {
                 pos += 1;
             }
 
@@ -407,9 +418,9 @@ F find_max_boundary(content: &Str, start: u64, end: u64, max_size: u32) -> u64 {
             I token_count >= max_size {
                 # Use last boundary before exceeding max
                 I last_boundary > start {
-                    R last_boundary;
+                    return last_boundary;
                 }
-                R pos;  # No good boundary, use current position
+                return pos;  # No good boundary, use current position
             }
 
             last_boundary = pos;
@@ -420,6 +431,6 @@ F find_max_boundary(content: &Str, start: u64, end: u64, max_size: u32) -> u64 {
 }
 
 ## Check if byte is whitespace (space, tab, newline, carriage return)
-F is_whitespace(b: u8) -> bool {
+fn rag_is_whitespace(b: u8) -> bool {
     b == 32 || b == 9 || b == 10 || b == 13
 }

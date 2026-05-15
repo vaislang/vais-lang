@@ -3,18 +3,19 @@
 # Provides COPY FROM (import CSV/JSON/JSONL/binary) and COPY TO (export).
 # Supports graph import ordering validation (nodes before edges).
 
-U std/vec
-U std/string
-U std/option
-U std/result
-U storage/error
+use std/vec
+use std/string
+use std/option
+use std/result
+use storage/error
+use storage/bytes.{from_utf8_lossy}
 
 # ============================================================================
 # Types
 # ============================================================================
 
 # CopyFormat — Supported import/export formats
-EN CopyFormat {
+enum CopyFormat {
     Csv,
     Json,
     Jsonl,
@@ -22,13 +23,13 @@ EN CopyFormat {
 }
 
 # CopyDirection — Import or export
-EN CopyDirection {
+enum CopyDirection {
     CopyFrom,
     CopyTo,
 }
 
 # CopyOptions — Configuration for COPY operation
-S CopyOptions {
+struct CopyOptions {
     format: CopyFormat,
     delimiter: u8,              # default 44 = ','
     has_header: bool,           # default true
@@ -40,7 +41,7 @@ S CopyOptions {
 }
 
 # CopyState — Per-operation state
-S CopyState {
+struct CopyState {
     direction: CopyDirection,
     table_name: str,
     columns: Vec<str>,
@@ -50,7 +51,7 @@ S CopyState {
 }
 
 # CopyHandler — Main handler for COPY operations
-S CopyHandler {
+struct CopyHandler {
     # Tracks whether nodes have been imported (for graph ordering)
     nodes_imported: bool,
 }
@@ -59,9 +60,9 @@ S CopyHandler {
 # CopyOptions Implementation
 # ============================================================================
 
-X CopyOptions {
+impl CopyOptions {
     # Create default CopyOptions
-    F default() -> CopyOptions {
+    fn default() -> CopyOptions {
         CopyOptions {
             format: Csv,
             delimiter: 44,          # ','
@@ -75,51 +76,51 @@ X CopyOptions {
     }
 
     # Builder: set format
-    F with_format(mut self, format: CopyFormat) -> CopyOptions {
+    fn with_format(mut self, format: CopyFormat) -> CopyOptions {
         self.format = format
-        self
+        (*self)
     }
 
     # Builder: set delimiter
-    F with_delimiter(mut self, delimiter: u8) -> CopyOptions {
+    fn with_delimiter(mut self, delimiter: u8) -> CopyOptions {
         self.delimiter = delimiter
-        self
+        (*self)
     }
 
     # Builder: set has_header
-    F with_header(mut self, has_header: bool) -> CopyOptions {
+    fn with_header(mut self, has_header: bool) -> CopyOptions {
         self.has_header = has_header
-        self
+        (*self)
     }
 
     # Builder: set null_string
-    F with_null_string(mut self, null_string: str) -> CopyOptions {
+    fn with_null_string(mut self, null_string: str) -> CopyOptions {
         self.null_string = null_string
-        self
+        (*self)
     }
 
     # Builder: set quote_char
-    F with_quote_char(mut self, quote_char: u8) -> CopyOptions {
+    fn with_quote_char(mut self, quote_char: u8) -> CopyOptions {
         self.quote_char = quote_char
-        self
+        (*self)
     }
 
     # Builder: set escape_char
-    F with_escape_char(mut self, escape_char: u8) -> CopyOptions {
+    fn with_escape_char(mut self, escape_char: u8) -> CopyOptions {
         self.escape_char = escape_char
-        self
+        (*self)
     }
 
     # Builder: set wal_bypass
-    F with_wal_bypass(mut self, wal_bypass: bool) -> CopyOptions {
+    fn with_wal_bypass(mut self, wal_bypass: bool) -> CopyOptions {
         self.wal_bypass = wal_bypass
-        self
+        (*self)
     }
 
     # Builder: set batch_size
-    F with_batch_size(mut self, batch_size: u32) -> CopyOptions {
+    fn with_batch_size(mut self, batch_size: u32) -> CopyOptions {
         self.batch_size = batch_size
-        self
+        (*self)
     }
 }
 
@@ -127,9 +128,9 @@ X CopyOptions {
 # CopyState Implementation
 # ============================================================================
 
-X CopyState {
+impl CopyState {
     # Create new CopyState
-    F new(
+    fn new(
         direction: CopyDirection,
         table_name: str,
         columns: Vec<str>,
@@ -146,12 +147,12 @@ X CopyState {
     }
 
     # Increment rows processed
-    F add_rows(mut self, count: u64) {
+    fn add_rows(mut self, count: u64) {
         self.rows_processed = self.rows_processed + count
     }
 
     # Increment bytes processed
-    F add_bytes(mut self, count: u64) {
+    fn add_bytes(mut self, count: u64) {
         self.bytes_processed = self.bytes_processed + count
     }
 }
@@ -160,16 +161,16 @@ X CopyState {
 # CopyHandler Implementation
 # ============================================================================
 
-X CopyHandler {
+impl CopyHandler {
     # Create new CopyHandler
-    F new() -> CopyHandler {
+    fn new() -> CopyHandler {
         CopyHandler {
             nodes_imported: false,
         }
     }
 
     # Start COPY FROM operation
-    F start_copy_from(
+    fn start_copy_from(
         mut self,
         table: str,
         columns: Vec<str>,
@@ -178,7 +179,7 @@ X CopyHandler {
         # FUTURE(catalog): Validate table exists via CatalogManager
         # Currently validates table name is not empty
         I table.len() == 0 {
-            R Err(err_copy_table_not_found(""))
+            return Err(err_copy_table_not_found(""))
         }
 
         # Check graph import ordering
@@ -197,11 +198,11 @@ X CopyHandler {
             options,
         )
 
-        R Ok(state)
+        return Ok(state)
     }
 
     # Process COPY FROM data chunk
-    F process_copy_data(
+    fn process_copy_data(
         mut self,
         state: &mut CopyState,
         data: &[u8],
@@ -209,7 +210,7 @@ X CopyHandler {
         # FUTURE(integration): Full implementation would parse data, validate columns,
         # convert to row format, and insert (optionally bypass WAL)
 
-        M state.options.format {
+        match state.options.format {
             Csv => {
                 # Simple CSV parsing (single line for demonstration)
                 fields := mut parse_csv_line(
@@ -222,44 +223,44 @@ X CopyHandler {
                 actual_cols := mut fields.len() as u64
 
                 I actual_cols != expected_cols {
-                    R Err(err_copy_column_mismatch(expected_cols, actual_cols))
+                    return Err(err_copy_column_mismatch(expected_cols, actual_cols))
                 }
 
                 # FUTURE(integration): Insert parsed row via executor
                 state.add_rows(1)
                 state.add_bytes(data.len() as u64)
-                R Ok(1)
+                return Ok(1)
             },
             Json => {
                 # FUTURE(integration): Parse JSON object and insert
                 state.add_bytes(data.len() as u64)
-                R Ok(0)
+                return Ok(0)
             },
             Jsonl => {
                 # FUTURE(integration): Parse JSONL (one object per line) and insert
                 state.add_bytes(data.len() as u64)
-                R Ok(0)
+                return Ok(0)
             },
             VectorBinary => {
                 # FUTURE(integration): Parse binary vector format and insert
                 state.add_bytes(data.len() as u64)
-                R Ok(0)
+                return Ok(0)
             },
         }
     }
 
     # Finish COPY FROM operation
-    F finish_copy_from(
+    fn finish_copy_from(
         mut self,
         state: &CopyState,
     ) -> Result<u64, VaisError> {
         # FUTURE(integration): Flush any pending batch inserts
         # Return total rows imported
-        R Ok(state.rows_processed)
+        return Ok(state.rows_processed)
     }
 
     # Start COPY TO operation
-    F start_copy_to(
+    fn start_copy_to(
         mut self,
         table: str,
         columns: Vec<str>,
@@ -267,7 +268,7 @@ X CopyHandler {
     ) -> Result<CopyState, VaisError> {
         # FUTURE(catalog): Validate table exists via CatalogManager
         I table.len() == 0 {
-            R Err(err_copy_table_not_found(""))
+            return Err(err_copy_table_not_found(""))
         }
 
         state := mut CopyState.new(
@@ -277,27 +278,27 @@ X CopyHandler {
             options,
         )
 
-        R Ok(state)
+        return Ok(state)
     }
 
     # Generate COPY TO data chunk
-    F generate_copy_data(
+    fn generate_copy_data(
         mut self,
         state: &mut CopyState,
     ) -> Result<Vec<u8>, VaisError> {
         # FUTURE(integration): Fetch rows from table, format based on options, update state
         # Currently returns empty data
-        LF empty: Vec<u8> = Vec.with_capacity(0)
-        R Ok(empty)
+        empty := Vec.with_capacity(0u64)
+        return Ok(empty)
     }
 
     # Finish COPY TO operation
-    F finish_copy_to(
+    fn finish_copy_to(
         mut self,
         state: &CopyState,
     ) -> Result<u64, VaisError> {
         # Return total rows exported
-        R Ok(state.rows_processed)
+        return Ok(state.rows_processed)
     }
 }
 
@@ -307,9 +308,9 @@ X CopyHandler {
 
 # Parse a single CSV line into fields
 # Handles quoted fields containing delimiters
-F parse_csv_line(data: &[u8], delimiter: u8, quote_char: u8) -> Vec<str> {
-    LF fields: Vec<str> = Vec.with_capacity(0)
-    LF current_field: Vec<u8> = Vec.with_capacity(0)
+fn parse_csv_line(data: &[u8], delimiter: u8, quote_char: u8) -> Vec<str> {
+    fields := mut Vec.with_capacity(0u64)
+    current_field := mut Vec.with_capacity(0u64)
     in_quotes := mut false
     len := mut data.len()
     i := mut 0
@@ -320,12 +321,12 @@ F parse_csv_line(data: &[u8], delimiter: u8, quote_char: u8) -> Vec<str> {
         I byte == quote_char {
             # Toggle quote state
             in_quotes = !in_quotes
-        } EL I byte == delimiter && !in_quotes {
+        } else I byte == delimiter && !in_quotes {
             # End of field
             field_str := mut from_utf8_lossy(&current_field)
             fields.push(field_str)
             current_field.clear()
-        } EL {
+        } else {
             # Regular character
             current_field.push(byte)
         }
@@ -339,7 +340,7 @@ F parse_csv_line(data: &[u8], delimiter: u8, quote_char: u8) -> Vec<str> {
         fields.push(field_str)
     }
 
-    R fields
+    return fields
 }
 
 # ============================================================================
@@ -347,15 +348,15 @@ F parse_csv_line(data: &[u8], delimiter: u8, quote_char: u8) -> Vec<str> {
 # ============================================================================
 
 # Validate graph import order (nodes before edges)
-F validate_graph_import_order(
+fn validate_graph_import_order(
     table_name: &str,
     is_edge_table: bool,
     nodes_imported: bool,
 ) -> Result<(), VaisError> {
     I is_edge_table && !nodes_imported {
-        R Err(err_copy_graph_order_violation(table_name.clone()))
+        return Err(err_copy_graph_order_violation(table_name.clone()))
     }
-    R Ok(())
+    return Ok(())
 }
 
 # ============================================================================
@@ -363,7 +364,7 @@ F validate_graph_import_order(
 # ============================================================================
 
 # VAIS-0605001: Copy format error
-F err_copy_format_error(detail: str) -> VaisError {
+fn err_copy_format_error(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0605001",
         "Copy format error: {detail}"
@@ -371,7 +372,7 @@ F err_copy_format_error(detail: str) -> VaisError {
 }
 
 # VAIS-0605002: Copy table not found
-F err_copy_table_not_found(table: str) -> VaisError {
+fn err_copy_table_not_found(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0605002",
         "Table not found: {table}"
@@ -379,7 +380,7 @@ F err_copy_table_not_found(table: str) -> VaisError {
 }
 
 # VAIS-0605003: Copy column mismatch
-F err_copy_column_mismatch(expected: u64, actual: u64) -> VaisError {
+fn err_copy_column_mismatch(expected: u64, actual: u64) -> VaisError {
     VaisError.new(
         "VAIS-0605003",
         "Column count mismatch: expected {expected}, got {actual}"
@@ -387,7 +388,7 @@ F err_copy_column_mismatch(expected: u64, actual: u64) -> VaisError {
 }
 
 # VAIS-0605004: Graph import order violation
-F err_copy_graph_order_violation(table: str) -> VaisError {
+fn err_copy_graph_order_violation(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0605004",
         "Graph import order violation: edge table '{table}' cannot be imported before node tables"

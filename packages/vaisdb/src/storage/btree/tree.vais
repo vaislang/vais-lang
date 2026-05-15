@@ -2,20 +2,20 @@
 # Manages the tree with root page tracking and basic operations
 # Delegates to buffer pool for page access
 
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/buffer/pool
-U storage/btree/node
-U storage/btree/entry
-U storage/btree/latch
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/buffer/pool
+use storage/btree/node
+use storage/btree/entry
+use storage/btree/latch
 
 # Default latch table capacity (one latch per buffer pool slot)
 C DEFAULT_LATCH_CAPACITY: u32 = 4096
 
 # B+Tree index structure
-S BTree {
+struct BTree {
     root_page_id: u32,       # Page ID of root node
     file_id: u8,             # File where tree lives (usually data.vdb = 0)
     page_size: u32,
@@ -24,9 +24,9 @@ S BTree {
     latch_table: LatchTable, # Per-page latches for concurrent access
 }
 
-X BTree {
+impl BTree {
     # Create a new empty B+Tree with a single leaf root
-    F new(root_page_id: u32, file_id: u8, page_size: u32) -> BTree {
+    fn new(root_page_id: u32, file_id: u8, page_size: u32) -> BTree {
         BTree {
             root_page_id,
             file_id,
@@ -38,7 +38,7 @@ X BTree {
     }
 
     # Create with custom latch table capacity
-    F with_latch_capacity(root_page_id: u32, file_id: u8, page_size: u32, latch_capacity: u32) -> BTree {
+    fn with_latch_capacity(root_page_id: u32, file_id: u8, page_size: u32, latch_capacity: u32) -> BTree {
         BTree {
             root_page_id,
             file_id,
@@ -51,7 +51,7 @@ X BTree {
 
     # Search for a key, returns (page_id, slot_id) via TID or None
     # Read latch crabbing through internal nodes is handled by find_leaf()
-    F search(self, key: &[u8], pool: &mut BufferPool) -> Result<Option<u32>, VaisError> {
+    fn search(self, key: &[u8], pool: &mut BufferPool) -> Result<Option<u32>, VaisError> {
         leaf_frame := mut self.find_leaf(key, pool)?;
         page_data := mut pool.get_page(leaf_frame)
         leaf := mut BTreeLeafNode.from_page_data(page_data, self.page_size)?;
@@ -67,9 +67,9 @@ X BTree {
     # Note: leaf read latch is acquired and immediately released — the buffer pin
     # provides logical protection for read-only callers. Write callers (insert/delete)
     # acquire their own write latch on the leaf independently.
-    F find_leaf(self, key: &[u8], pool: &mut BufferPool) -> Result<u32, VaisError> {
+    fn find_leaf(self, key: &[u8], pool: &mut BufferPool) -> Result<u32, VaisError> {
         current_page := mut self.root_page_id
-        parent_guard := mut None
+        parent_guard: Option<LatchGuard> := mut None
 
         LF level: 0..(self.height - 1) {
             # Acquire read latch on current node
@@ -85,10 +85,9 @@ X BTree {
             pool.unpin_page(frame_id, false)
 
             # Release parent latch (if any) — child latch already held via next iteration
-            M parent_guard {
+            match parent_guard {
                 Some(pg) => {
-                    pg := mut pg
-                    pg.release();
+                    pg.release()
                 },
                 None => {},
             }
@@ -101,10 +100,9 @@ X BTree {
         leaf_guard := mut LatchGuard.new_read(&self.latch_table, current_page)
 
         # Release the last internal node latch
-        M parent_guard {
+        match parent_guard {
             Some(pg) => {
-                pg := mut pg
-                pg.release();
+                pg.release()
             },
             None => {},
         }
@@ -120,7 +118,7 @@ X BTree {
     # Range scan: find all entries with keys in [start_key, end_key]
     # Returns Vec<(key, tid)>
     # Uses latch crabbing on leaf chain: acquire next leaf latch before releasing current
-    F range_scan(self, start_key: &[u8], end_key: &[u8], pool: &mut BufferPool) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
+    fn range_scan(self, start_key: &[u8], end_key: &[u8], pool: &mut BufferPool) -> Result<Vec<(Vec<u8>, u32)>, VaisError> {
         results := mut Vec.with_capacity(0)
 
         # Find starting leaf (find_leaf handles internal node latch crabbing)
@@ -138,11 +136,11 @@ X BTree {
         has_next := mut true
         LW has_next {
             LW i < leaf.entry_count() as u64 {
-                key := mut leaf.get_key(i).to_vec()
+                key := mut copy_key_slice(leaf.get_key(i))
                 I key_greater_than(&key, end_key) {
                     current_guard.release()
                     pool.unpin_page(frame_id, false)
-                    R Ok(results)
+                    return Ok(results)
                 }
                 results.push((key, leaf.entries[i].tid))
                 i += 1
@@ -155,7 +153,7 @@ X BTree {
                 current_guard.release()
                 pool.unpin_page(frame_id, false)
                 has_next = false
-            } EL {
+            } else {
                 # Acquire next leaf's read latch before releasing current
                 next_guard := mut LatchGuard.new_read(&self.latch_table, next)
                 current_guard.release()
@@ -173,28 +171,38 @@ X BTree {
     }
 
     # Access the latch table (for insert/delete/cursor operations)
-    F get_latch_table(self) -> &LatchTable { &self.latch_table }
+    fn get_latch_table(self) -> &LatchTable { &self.latch_table }
 
     # Get tree statistics
-    F get_root_page(self) -> u32 { self.root_page_id }
-    F get_height(self) -> u32 { self.height }
-    F get_entry_count(self) -> u64 { self.entry_count }
+    fn get_root_page(self) -> u32 { self.root_page_id }
+    fn get_height(self) -> u32 { self.height }
+    fn get_entry_count(self) -> u64 { self.entry_count }
 
     # Update root after split
-    F set_root(mut self, new_root_page: u32) {
+    fn set_root(mut self, new_root_page: u32) {
         self.root_page_id = new_root_page
         self.height += 1
     }
 
     # Increment entry count
-    F inc_entries(mut self) { self.entry_count += 1; }
-    F dec_entries(mut self) { I self.entry_count > 0 { self.entry_count -= 1; } }
+    fn inc_entries(mut self) { self.entry_count += 1; }
+    fn dec_entries(mut self) { I self.entry_count > 0 { self.entry_count -= 1; } }
 }
 
 # Helper: check if a > b
-F key_greater_than(a: &[u8], b: &[u8]) -> bool {
-    M compare_keys(a, b) {
+fn key_greater_than(a: &[u8], b: &[u8]) -> bool {
+    match compare_keys(a, b) {
         Greater => true,
         _ => false,
     }
+}
+
+fn copy_key_slice(key: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(key.len())
+    i := mut 0
+    LW i < key.len() {
+        result.push(key[i])
+        i += 1
+    }
+    result
 }

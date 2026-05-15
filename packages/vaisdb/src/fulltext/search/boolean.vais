@@ -2,77 +2,78 @@
 # Supports AND, OR, NOT boolean queries with phrase query support
 # Simple query syntax: "word1 word2" (AND), "word1 OR word2", "-word" (NOT), "exact phrase"
 
-U std/vec
-U std/string
-U storage/error
-U fulltext/types
+use std/vec
+use std/string
+use storage/error
+use fulltext/types
 
 # ============================================================================
 # Query AST — Abstract syntax tree for boolean queries
 # ============================================================================
 
-# TermQuery — Single term M S TermQuery {
+# TermQuery — Single term
+struct TermQuery {
     term: str,
 }
 
-X TermQuery {
-    F new(term: str) -> TermQuery {
+impl TermQuery {
+    fn new(term: str) -> TermQuery {
         TermQuery { term }
     }
 }
 
 # PhraseQuery — Exact phrase M with optional slop
-S PhraseQuery {
+struct PhraseQuery {
     terms: Vec<str>,    # Ordered terms in the phrase
     slop: u32,          # Maximum position gap (0 = exact phrase)
 }
 
-X PhraseQuery {
-    F new(terms: Vec<str>) -> PhraseQuery {
+impl PhraseQuery {
+    fn new(terms: Vec<str>) -> PhraseQuery {
         PhraseQuery { terms, slop: 0 }
     }
 
-    F with_slop(terms: Vec<str>, slop: u32) -> PhraseQuery {
+    fn with_slop(terms: Vec<str>, slop: u32) -> PhraseQuery {
         PhraseQuery { terms, slop }
     }
 }
 
 # BooleanClause — Clause in a boolean query
-EN BooleanClause {
+enum BooleanClause {
     Must(Query),        # Document MUST match this query (AND)
     Should(Query),      # Document SHOULD match this query (OR)
     MustNot(Query),     # Document MUST NOT match this query (NOT)
 }
 
 # BooleanQuery — Combination of clauses
-S BooleanQuery {
+struct BooleanQuery {
     clauses: Vec<BooleanClause>,
 }
 
-X BooleanQuery {
-    F new() -> BooleanQuery {
+impl BooleanQuery {
+    fn new() -> BooleanQuery {
         BooleanQuery { clauses: Vec.with_capacity(0) }
     }
 
-    F add_must(mut self, query: Query) {
+    fn add_must(mut self, query: Query) {
         self.clauses.push(Must(query))
     }
 
-    F add_should(mut self, query: Query) {
+    fn add_should(mut self, query: Query) {
         self.clauses.push(Should(query))
     }
 
-    F add_must_not(mut self, query: Query) {
+    fn add_must_not(mut self, query: Query) {
         self.clauses.push(MustNot(query))
     }
 
-    F clause_count(self) -> u64 {
+    fn clause_count(self) -> u64 {
         self.clauses.len()
     }
 }
 
 # Query — Top-level query enum
-EN Query {
+enum Query {
     Term(TermQuery),
     Phrase(PhraseQuery),
     Boolean(BooleanQuery),
@@ -82,11 +83,11 @@ EN Query {
 # BooleanQueryParser — Parse query strings into Query AST
 # ============================================================================
 
-S BooleanQueryParser {}
+struct BooleanQueryParser {}
 
-X BooleanQueryParser {
+impl BooleanQueryParser {
     # Create new parser
-    F new() -> BooleanQueryParser {
+    fn new() -> BooleanQueryParser {
         BooleanQueryParser {}
     }
 
@@ -104,12 +105,12 @@ X BooleanQueryParser {
     # term .= ["-"] (word | OR word | "phrase")
     #
     # Returns: Query enum
-    F parse(self, query_str: &str) -> Result<Query, VaisError> {
+    fn parse(self, query_str: &str) -> Result<Query, VaisError> {
         # Tokenize query string
         tokens := mut self.tokenize(query_str)?;
 
         I tokens.len() == 0 {
-            R Err(err_fulltext_invalid_query(&"Empty query"))
+            return Err(err_fulltext_invalid_query(&"Empty query"))
         }
 
         # Parse tokens into query
@@ -118,36 +119,36 @@ X BooleanQueryParser {
 
     # Tokenize query string into tokens
     # Returns Vec of tokens: words, "OR", "-", quoted phrases
-    F tokenize(self, query_str: &str) -> Result<Vec<str>, VaisError> {
+    fn tokenize(self, query_str: &str) -> Result<Vec<str>, VaisError> {
         tokens := mut Vec.with_capacity(0)
         qs_len := mut __strlen(query_str)
         i := mut 0
 
         LW i < qs_len {
-            ch := mut query_str[i] as char
+            ch := mut query_str[i] as u8
 
             # Skip whitespace
-            I ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+            I ch == 32u8 || ch == 9u8 || ch == 10u8 || ch == 13u8 {
                 i += 1
-            } EL I ch == '"' {
+            } else I ch == 34u8 {
                 # Handle quoted phrase
                 phrase := mut self.extract_quoted_phrase(query_str, i)?;
                 tokens.push(phrase)
                 # Skip past closing quote
                 i += __strlen(phrase) + 2;  # +2 for opening and closing quotes
-            } EL I ch == '-' {
+            } else I ch == 45u8 {
                 # Handle negation operator
                 tokens.push("-")
                 i += 1
-            } EL {
+            } else {
                 # Extract word
                 word_start := mut i
                 at_word_end := mut false
                 LW i < qs_len && !at_word_end {
-                    word_ch := mut query_str[i] as char
-                    I word_ch == ' ' || word_ch == '\t' || word_ch == '\n' || word_ch == '\r' || word_ch == '"' {
+                    word_ch := mut query_str[i] as u8
+                    I word_ch == 32u8 || word_ch == 9u8 || word_ch == 10u8 || word_ch == 13u8 || word_ch == 34u8 {
                         at_word_end = true
-                    } EL {
+                    } else {
                         i += 1
                     }
                 }
@@ -163,14 +164,14 @@ X BooleanQueryParser {
     }
 
     # Extract quoted phrase content (without quotes)
-    F extract_quoted_phrase(self, s: &str, start: u64) -> Result<str, VaisError> {
+    fn extract_quoted_phrase(self, s: &str, start: u64) -> Result<str, VaisError> {
         s_len := mut __strlen(s)
         i := mut start + 1;  # Skip opening quote
         phrase_start := mut i
 
         # Find closing quote
         LW i < s_len {
-            I (s[i] as char) == '"' {
+            I (s[i] as u8) == 34u8 {
                 # Found closing quote
                 phrase_bytes := mut Vec.with_capacity(i - phrase_start)
                 j := mut phrase_start
@@ -178,7 +179,7 @@ X BooleanQueryParser {
                     phrase_bytes.push(s[j])
                     j += 1
                 }
-                R Ok(from_utf8(&phrase_bytes)?)
+                return Ok(from_utf8(&phrase_bytes)?)
             }
             i += 1
         }
@@ -188,7 +189,7 @@ X BooleanQueryParser {
     }
 
     # Parse tokens into Query AST
-    F parse_tokens(self, tokens: &Vec<str>) -> Result<Query, VaisError> {
+    fn parse_tokens(self, tokens: &Vec<str>) -> Result<Query, VaisError> {
         boolean_query := mut BooleanQuery.new()
         i := mut 0
         default_operator_is_or := mut false
@@ -200,18 +201,18 @@ X BooleanQueryParser {
             I token.as_str() == "-" {
                 i += 1
                 I i >= tokens.len() {
-                    R Err(err_fulltext_invalid_query(&"Negation without term"))
+                    return Err(err_fulltext_invalid_query(&"Negation without term"))
                 }
 
                 negated_term := mut &tokens[i]
                 term_query := mut TermQuery.new(negated_term.clone())
                 boolean_query.add_must_not(Term(term_query))
                 i += 1
-            } EL I token.as_str() == "OR" || token.as_str() == "or" {
+            } else I token.as_str() == "OR" || token.as_str() == "or" {
                 # Check for OR operator
                 default_operator_is_or = true
                 i += 1
-            } EL {
+            } else {
                 # Regular term or phrase
                 I self.is_phrase(token) {
                     # Phrase query (contains spaces - was quoted)
@@ -221,17 +222,17 @@ X BooleanQueryParser {
                     I default_operator_is_or {
                         boolean_query.add_should(Phrase(phrase_query))
                         default_operator_is_or = false
-                    } EL {
+                    } else {
                         boolean_query.add_must(Phrase(phrase_query))
                     }
-                } EL {
+                } else {
                     # Term query
                     term_query := mut TermQuery.new(token.clone())
 
                     I default_operator_is_or {
                         boolean_query.add_should(Term(term_query))
                         default_operator_is_or = false
-                    } EL {
+                    } else {
                         boolean_query.add_must(Term(term_query))
                     }
                 }
@@ -242,9 +243,9 @@ X BooleanQueryParser {
 
         # If only one clause and it's a MUST, return the inner query directly
         I boolean_query.clause_count() == 1 {
-            M &boolean_query.clauses[0] {
-                Must(q) -> R Ok(q.clone()),
-                _ -> {},
+            match &boolean_query.clauses[0] {
+                Must(q) => { return Ok(q.clone()) },
+                _ => {},
             }
         }
 
@@ -252,12 +253,12 @@ X BooleanQueryParser {
     }
 
     # Check if token represents a phrase (contains internal spaces)
-    F is_phrase(self, token: &str) -> bool {
+    fn is_phrase(self, token: &str) -> bool {
         token_len := mut __strlen(token)
         i := mut 0
         LW i < token_len {
-            I (token[i] as char) == ' ' {
-                R true
+            I (token[i] as u8) == 32u8 {
+                return true
             }
             i += 1
         }
@@ -265,19 +266,19 @@ X BooleanQueryParser {
     }
 
     # Split phrase into individual terms
-    F split_phrase_into_terms(self, phrase: &str) -> Vec<str> {
+    fn split_phrase_into_terms(self, phrase: &str) -> Vec<str> {
         terms := mut Vec.with_capacity(0)
         phrase_len := mut __strlen(phrase)
         i := mut 0
 
         LW i < phrase_len {
             # Skip whitespace
-            LW i < phrase_len && (phrase[i] as char) == ' ' {
+            LW i < phrase_len && (phrase[i] as u8) == 32u8 {
                 i += 1
             }
 
             term_start := mut i
-            LW i < phrase_len && (phrase[i] as char) != ' ' {
+            LW i < phrase_len && (phrase[i] as u8) != 32u8 {
                 i += 1
             }
 
@@ -291,15 +292,8 @@ X BooleanQueryParser {
     }
 
     # Extract substring (helper)
-    F substring(self, s: &str, start: u64, end: u64) -> str {
-        s_len := mut __strlen(s)
-        result_bytes := mut Vec.with_capacity(end - start)
-        i := mut start
-        LW i < end && i < s_len {
-            result_bytes.push(s[i])
-            i += 1
-        }
-        from_utf8(&result_bytes).unwrap_or("")
+    fn substring(self, s: &str, start: u64, end: u64) -> str {
+        s.substring(start, end)
     }
 }
 
@@ -307,11 +301,11 @@ X BooleanQueryParser {
 # BooleanQueryExecutor — Execute boolean queries against search results
 # ============================================================================
 
-S BooleanQueryExecutor {}
+struct BooleanQueryExecutor {}
 
-X BooleanQueryExecutor {
+impl BooleanQueryExecutor {
     # Create new executor
-    F new() -> BooleanQueryExecutor {
+    fn new() -> BooleanQueryExecutor {
         BooleanQueryExecutor {}
     }
 
@@ -327,30 +321,30 @@ X BooleanQueryExecutor {
     # - MUST clauses: Intersect doc_id sets, sum scores
     # - SHOULD clauses: Union doc_id sets, sum scores
     # - MUST_NOT clauses: Remove doc_ids from result set
-    F execute(
+    fn execute(
         self,
         query: &Query,
         results_per_term: &Vec<(str, Vec<(u64, f64)>)>,
     ) -> Vec<(u64, f64)> {
-        M query {
-            Term(tq) -> {
+        match query {
+            Term(tq) => {
                 # Simple term query
                 self.execute_term_query(&tq.term, results_per_term)
-            }
-            Phrase(pq) -> {
+            },
+            Phrase(pq) => {
                 # Phrase query (treat as intersection of terms for now)
                 # Note: Actual phrase verification done by PhraseSearcher
                 self.execute_phrase_query(&pq.terms, results_per_term)
-            }
-            Boolean(bq) -> {
+            },
+            Boolean(bq) => {
                 # Boolean query
                 self.execute_boolean_query(&bq.clauses, results_per_term)
-            }
+            },
         }
     }
 
     # Execute term query
-    F execute_term_query(
+    fn execute_term_query(
         self,
         term: &str,
         results_per_term: &Vec<(str, Vec<(u64, f64)>)>,
@@ -359,7 +353,7 @@ X BooleanQueryExecutor {
         i := mut 0
         LW i < results_per_term.len() {
             I results_per_term[i].0.as_str() == term.as_str() {
-                R results_per_term[i].1.clone()
+                return results_per_term[i].1.clone()
             }
             i += 1
         }
@@ -367,13 +361,13 @@ X BooleanQueryExecutor {
     }
 
     # Execute phrase query (intersection of term results)
-    F execute_phrase_query(
+    fn execute_phrase_query(
         self,
         terms: &Vec<str>,
         results_per_term: &Vec<(str, Vec<(u64, f64)>)>,
     ) -> Vec<(u64, f64)> {
         I terms.len() == 0 {
-            R Vec.with_capacity(0)
+            return Vec.with_capacity(0)
         }
 
         # Start with first term's results
@@ -391,7 +385,7 @@ X BooleanQueryExecutor {
     }
 
     # Execute boolean query
-    F execute_boolean_query(
+    fn execute_boolean_query(
         self,
         clauses: &Vec<BooleanClause>,
         results_per_term: &Vec<(str, Vec<(u64, f64)>)>,
@@ -403,23 +397,23 @@ X BooleanQueryExecutor {
         # Process each clause
         i := mut 0
         LW i < clauses.len() {
-            M &clauses[i] {
-                Must(q) -> {
-                    clause_results := mut self.execute(q, results_per_term)
+            match &clauses[i] {
+                Must(q) => {
+                    clause_results := mut self.execute(&q, results_per_term)
                     must_results.push(clause_results)
-                }
-                Should(q) -> {
-                    clause_results := mut self.execute(q, results_per_term)
+                },
+                Should(q) => {
+                    clause_results := mut self.execute(&q, results_per_term)
                     should_results.push(clause_results)
-                }
-                MustNot(q) -> {
-                    clause_results := mut self.execute(q, results_per_term)
+                },
+                MustNot(q) => {
+                    clause_results := mut self.execute(&q, results_per_term)
                     j := mut 0
                     LW j < clause_results.len() {
                         must_not_doc_ids.push(clause_results[j].0)
                         j += 1
                     }
-                }
+                },
             }
             i += 1
         }
@@ -441,7 +435,7 @@ X BooleanQueryExecutor {
     # - If MUST clauses exist: intersect all MUST results
     # - If SHOULD clauses exist: union all SHOULD results (added to MUST if any)
     # - Remove MUST_NOT doc_ids
-    F combine_boolean_results(
+    fn combine_boolean_results(
         self,
         must_results: &Vec<Vec<(u64, f64)>>,
         should_results: &Vec<Vec<(u64, f64)>>,
@@ -475,7 +469,7 @@ X BooleanQueryExecutor {
     }
 
     # Intersect two result sets, summing scores for common doc_ids
-    F intersect_results(
+    fn intersect_results(
         self,
         results1: &Vec<(u64, f64)>,
         results2: &Vec<(u64, f64)>,
@@ -489,11 +483,11 @@ X BooleanQueryExecutor {
 
             # Find matching doc_id in results2
             found_score := mut self.find_score_for_doc(doc_id, results2)
-            M found_score {
-                Some(score2) -> {
+            match found_score {
+                Some(score2) => {
                     result.push((doc_id, score1 + score2))
-                }
-                None -> {}
+                },
+                None => {},
             }
 
             i += 1
@@ -503,7 +497,7 @@ X BooleanQueryExecutor {
     }
 
     # Union two result sets, summing scores for common doc_ids
-    F union_results(
+    fn union_results(
         self,
         results1: &Vec<(u64, f64)>,
         results2: &Vec<(u64, f64)>,
@@ -517,15 +511,15 @@ X BooleanQueryExecutor {
             score2 := mut results2[i].1
 
             found_idx := mut self.find_index_for_doc(doc_id, &result)
-            M found_idx {
-                Some(idx) -> {
+            match found_idx {
+                Some(idx) => {
                     # Update score
                     result[idx].1 += score2
-                }
-                None -> {
+                },
+                None => {
                     # Add new entry
                     result.push((doc_id, score2))
-                }
+                },
             }
 
             i += 1
@@ -535,7 +529,7 @@ X BooleanQueryExecutor {
     }
 
     # Filter out doc_ids from results
-    F filter_out_doc_ids(
+    fn filter_out_doc_ids(
         self,
         results: &Vec<(u64, f64)>,
         exclude_doc_ids: &Vec<u64>,
@@ -566,11 +560,11 @@ X BooleanQueryExecutor {
     }
 
     # Find score for doc_id in results
-    F find_score_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<f64> {
+    fn find_score_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<f64> {
         i := mut 0
         LW i < results.len() {
             I results[i].0 == doc_id {
-                R Some(results[i].1)
+                return Some(results[i].1)
             }
             i += 1
         }
@@ -578,11 +572,11 @@ X BooleanQueryExecutor {
     }
 
     # Find index for doc_id in results
-    F find_index_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<u64> {
+    fn find_index_for_doc(self, doc_id: u64, results: &Vec<(u64, f64)>) -> Option<u64> {
         i := mut 0
         LW i < results.len() {
             I results[i].0 == doc_id {
-                R Some(i)
+                return Some(i)
             }
             i += 1
         }
@@ -590,9 +584,9 @@ X BooleanQueryExecutor {
     }
 
     # Sort results by score descending (bubble sort)
-    F sort_by_score(self, results: &Vec<(u64, f64)>) {
+    fn sort_by_score(self, results: &Vec<(u64, f64)>) {
         I results.len() <= 1 {
-            R
+            return
         }
 
         n := mut results.len()

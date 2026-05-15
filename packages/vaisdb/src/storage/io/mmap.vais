@@ -2,25 +2,25 @@
 # Uses mmap/munmap via std/file.vais (with C FFI fallback)
 # Provides zero-copy page reads when possible
 
-U storage/file
-U storage/constants
-U storage/error
+use storage/file
+use storage/constants
+use storage/error
 
 # Memory-mapped file region
-S MmapRegion {
+struct MmapRegion {
     file: File,
     base_addr: u64,     # Base address of mmap region (0 if not mapped)
     length: u64,         # Length of mapped region
     page_size: u32,
 }
 
-X MmapRegion {
+impl MmapRegion {
     # Create a new mmap region for a file
-    F open(file: File, page_size: u32) -> Result<MmapRegion, VaisError> {
+    fn open(file: File, page_size: u32) -> Result<MmapRegion, VaisError> {
         file_size := mut file.size()?;
         I file_size == 0 {
-            R Ok(MmapRegion {
-                file,
+            return Ok(MmapRegion {
+                file: file.clone(),
                 base_addr: 0,
                 length: 0,
                 page_size,
@@ -37,10 +37,10 @@ X MmapRegion {
     }
 
     # Read a page via mmap (zero-copy slice reference)
-    F read_page(self, page_id: u32) -> Result<&[u8], VaisError> {
+    fn read_page(self, page_id: u32) -> Result<&[u8], VaisError> {
         offset := mut (page_id as u64) * (self.page_size as u64)
         I offset + (self.page_size as u64) > self.length {
-            R Err(err_io("mmap", "Page beyond mapped region"))
+            return Err(err_io("mmap", "Page beyond mapped region"))
         }
 
         page_ptr := mut self.base_addr + offset
@@ -48,10 +48,10 @@ X MmapRegion {
     }
 
     # Write a page via mmap (copy into mapped region)
-    F write_page(mut self, page_id: u32, data: &[u8]) -> Result<(), VaisError> {
+    fn write_page(mut self, page_id: u32, data: &[u8]) -> Result<(), VaisError> {
         offset := mut (page_id as u64) * (self.page_size as u64)
         I offset + (self.page_size as u64) > self.length {
-            R Err(err_io("mmap", "Page beyond mapped region"))
+            return Err(err_io("mmap", "Page beyond mapped region"))
         }
 
         page_ptr := mut self.base_addr + offset
@@ -60,7 +60,7 @@ X MmapRegion {
     }
 
     # Sync mapped pages to disk
-    F sync(self) -> Result<(), VaisError> {
+    fn sync(self) -> Result<(), VaisError> {
         I self.base_addr != 0 {
             self.file.fsync()?;
         }
@@ -68,7 +68,7 @@ X MmapRegion {
     }
 
     # Remap after file extension
-    F remap(mut self) -> Result<(), VaisError> {
+    fn remap(mut self) -> Result<(), VaisError> {
         I self.base_addr != 0 {
             self.file.munmap(self.base_addr, self.length as u64)?;
         }
@@ -81,7 +81,7 @@ X MmapRegion {
     }
 
     # Prefetch hint for sequential scan
-    F advise_sequential(self, page_id: u32, count: u32) -> Result<(), VaisError> {
+    fn advise_sequential(self, page_id: u32, count: u32) -> Result<(), VaisError> {
         offset := mut (page_id as u64) * (self.page_size as u64)
         length := mut (count as u64) * (self.page_size as u64)
         self.file.madvise(offset, length as u64, "sequential")?;
@@ -89,7 +89,7 @@ X MmapRegion {
     }
 
     # Close and unmap
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         I self.base_addr != 0 {
             self.file.munmap(self.base_addr, self.length as u64)?;
             self.base_addr = 0
@@ -99,14 +99,12 @@ X MmapRegion {
     }
 
     # Check if a page is within the mapped region
-    F is_page_mapped(self, page_id: u32) -> bool {
+    fn is_page_mapped(self, page_id: u32) -> bool {
         offset := mut (page_id as u64) * (self.page_size as u64)
         offset + (self.page_size as u64) <= self.length
     }
 }
 
 # Extern C FFI helpers for raw pointer operations
-extern "C" {
-    F unsafe_slice_from_addr(addr: u64, len: u64) -> &[u8]
-    F unsafe_copy_to_addr(addr: u64, data: &[u8], len: u64)
-}
+N fn unsafe_slice_from_addr(addr: u64, len: u64) -> &[u8]
+N fn unsafe_copy_to_addr(addr: u64, data: &[u8], len: u64)

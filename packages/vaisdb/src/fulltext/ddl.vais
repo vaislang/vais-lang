@@ -1,30 +1,30 @@
 # src/fulltext/ddl.vais
 # CREATE/DROP FULLTEXT INDEX DDL operations and incremental maintenance
 
-U std/vec
-U std/string
-U std/option
-U storage/constants
-U storage/error
-U storage/buffer/pool
-U storage/page/allocator
-U storage/wal/group_commit
-U fulltext/types
-U storage/hash
-U fulltext/tokenizer
-U fulltext/index/dictionary
-U fulltext/index/posting
+use std/vec
+use std/string
+use std/option
+use storage/constants
+use storage/error
+use storage/buffer/pool
+use storage/page/allocator
+use storage/wal/group_commit
+use fulltext/types
+use storage/hash
+use fulltext/tokenizer
+use fulltext/index/dictionary
+use fulltext/index/posting
 
 # Result of building a full-text index
-S BuildResult {
+struct BuildResult {
     docs_indexed: u32,
     terms_created: u32,
     total_tokens: u64,
 }
 
-X BuildResult {
+impl BuildResult {
     # Create a new build result
-    F new(docs_indexed: u32, terms_created: u32, total_tokens: u64) -> BuildResult {
+    fn new(docs_indexed: u32, terms_created: u32, total_tokens: u64) -> BuildResult {
         BuildResult {
             docs_indexed,
             terms_created,
@@ -33,7 +33,7 @@ X BuildResult {
     }
 
     # Clone the build result
-    F clone(self) -> BuildResult {
+    fn clone(self) -> BuildResult {
         BuildResult {
             docs_indexed: self.docs_indexed,
             terms_created: self.terms_created,
@@ -43,14 +43,14 @@ X BuildResult {
 }
 
 # DDL operations for full-text indexes
-S FullTextDDL {
-    allocator: PageAllocator,
-    pool: BufferPool,
+struct FullTextDDL {
+    allocator: &PageAllocator,
+    pool: &BufferPool,
 }
 
-X FullTextDDL {
+impl FullTextDDL {
     # Create a new full-text DDL handler
-    F new(allocator: PageAllocator, pool: BufferPool) -> FullTextDDL {
+    fn new(allocator: &PageAllocator, pool: &BufferPool) -> FullTextDDL {
         FullTextDDL {
             allocator,
             pool,
@@ -66,7 +66,7 @@ X FullTextDDL {
     #
     # Returns: index_id
     # Note: Caller should log WAL record for DDL operation
-    F create_fulltext_index(
+    fn create_fulltext_index(
         mut self,
         table_id: u32,
         column_id: u32,
@@ -76,15 +76,11 @@ X FullTextDDL {
         gcm: &GroupCommitManager,
     ) -> Result<u32, VaisError> {
         # Step 1: Allocate dictionary B+Tree root page
-        M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+        match self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
             Ok(dict_root_page) => {
                 # Step 2: Create FullTextMeta with default values
-                meta := mut FullTextMeta.new(
-                    table_id,
-                    column_id,
-                    dict_root_page,
-                    config.clone(),
-                )
+                meta := mut FullTextMeta.new(config.clone())
+                meta.dict_root_page = dict_root_page
 
                 # Step 3: Register in catalog
                 # Note: Actual catalog registration done by caller
@@ -92,30 +88,22 @@ X FullTextDDL {
                 index_id := mut (table_id << 16) | (column_id as u32)
 
                 # Step 4: Initialize dictionary B+Tree root page
-                M self.pool.pin_page(FILE_ID_FULLTEXT, dict_root_page, txn_id) {
-                    Ok(page_guard) => {
-                        # Initialize as empty B+Tree leaf node
-                        # Format: [is_leaf: u8 = 1][num_keys: u16 = 0][...]
-                        page_data := mut page_guard.data_mut()
-                        page_data[0] = 1u8; # is_leaf
-                        page_data[1] = 0u8; # num_keys low byte
-                        page_data[2] = 0u8; # num_keys high byte
-
-                        page_guard.mark_dirty()
-                        self.pool.unpin_page(FILE_ID_FULLTEXT, dict_root_page)
-
+                # (frame-based pin/unpin; page initialization handled by dict_index later)
+                match self.pool.pin_page(FILE_ID_FULLTEXT, dict_root_page) {
+                    Ok(frame_id) => {
+                        self.pool.unpin_page(frame_id, true)
                         Ok(index_id)
-                    }
+                    },
                     Err(e) => {
                         # Failed to initialize, free the allocated page
-                        M self.allocator.free_page(FILE_ID_FULLTEXT, dict_root_page, txn_id, cmd_id, gcm) {
-                            Ok(_) => {}
-                            Err(_) => {}
+                        match self.allocator.free_page(FILE_ID_FULLTEXT, dict_root_page, txn_id, cmd_id, gcm) {
+                            Ok(_) => {},
+                            Err(_) => {},
                         }
                         Err(e)
-                    }
+                    },
                 }
-            }
+            },
             Err(e) => {
                 Err(e)
             }
@@ -128,7 +116,7 @@ X FullTextDDL {
     # 2. Free all dictionary and posting list pages
     #
     # Note: Caller should log WAL record for DDL operation
-    F drop_fulltext_index(
+    fn drop_fulltext_index(
         mut self,
         index_id: u32,
         meta: &FullTextMeta,
@@ -139,11 +127,11 @@ X FullTextDDL {
         # Step 1: Free dictionary B+Tree pages
         # Note: In a full implementation, we would traverse the B+Tree and free all pages
         # For simplicity, we free only the root page here
-        M self.allocator.free_page(FILE_ID_FULLTEXT, meta.dict_root_page, txn_id, cmd_id, gcm) {
-            Ok(_) => {}
+        match self.allocator.free_page(FILE_ID_FULLTEXT, meta.dict_root_page, txn_id, cmd_id, gcm) {
+            Ok(_) => {},
             Err(e) => {
-                R Err(e)
-            }
+                return Err(e)
+            },
         }
 
         # Step 2: Free posting list pages
@@ -166,7 +154,7 @@ X FullTextDDL {
     #
     # Returns: BuildResult with statistics
     # Note: Caller should log WAL records for index entries
-    F build_fulltext_index(
+    fn build_fulltext_index(
         mut self,
         index_id: u32,
         meta: &FullTextMeta,
@@ -176,8 +164,8 @@ X FullTextDDL {
         gcm: &GroupCommitManager,
     ) -> Result<BuildResult, VaisError> {
         tokenizer := mut Tokenizer.new(meta.config.clone())
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
-        posting_store := mut PostingStore.new(self.allocator.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page, DEFAULT_PAGE_SIZE)
+        posting_store := mut PostingStore.new(DEFAULT_PAGE_SIZE, &self.pool, &self.allocator)
 
         docs_indexed := mut 0u32
         terms_created := mut 0u32
@@ -206,89 +194,85 @@ X FullTextDDL {
                     total_tokens += term_freq as u64
 
                     # Lookup or create dictionary entry
-                    M dict_index.lookup_term(term, &self.pool) {
+                    match dict_index.lookup_term(term, self.pool) {
                         Ok(Some(dict_entry)) => {
                             # Term exists, append to posting list
+                            positions := mut Vec.with_capacity(0)
                             posting_entry := mut PostingEntry.new(
                                 doc_id,
-                                meta.table_id,
-                                0u32, # row_tid (placeholder)
                                 term_freq,
-                                doc_length,
+                                positions,
                                 txn_id,
                                 cmd_id,
                             )
 
                             term_hash := mut fnv1a_hash(term)
-                            M posting_store.append_entry(
+                            match posting_store.append_entry(
                                 dict_entry.posting_head_page,
                                 &posting_entry,
                                 term_hash,
                                 txn_id,
                                 gcm,
-                                &self.pool,
                             ) {
-                                Ok(_) => {}
+                                Ok(_) => {},
                                 Err(e) => {
-                                    R Err(e)
-                                }
+                                    return Err(e)
+                                },
                             }
-                        }
+                        },
                         Ok(None) => {
                             # Term does not exist, create new dictionary entry
                             # Allocate page for posting list head
-                            M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+                            match self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
                                 Ok(posting_head_page) => {
                                     # Insert term into dictionary
-                                    M dict_index.insert_term(
+                                    match dict_index.insert_term(
                                         term,
                                         posting_head_page,
                                         txn_id,
                                         gcm,
-                                        &self.pool,
+                                        self.pool,
                                     ) {
                                         Ok(_) => {
                                             terms_created += 1
 
                                             # Create first posting entry
+                                            positions2 := mut Vec.with_capacity(0)
                                             posting_entry := mut PostingEntry.new(
                                                 doc_id,
-                                                meta.table_id,
-                                                0u32, # row_tid (placeholder)
                                                 term_freq,
-                                                doc_length,
+                                                positions2,
                                                 txn_id,
                                                 cmd_id,
                                             )
 
                                             term_hash := mut fnv1a_hash(term)
-                                            M posting_store.append_entry(
+                                            match posting_store.append_entry(
                                                 posting_head_page,
                                                 &posting_entry,
                                                 term_hash,
                                                 txn_id,
                                                 gcm,
-                                                &self.pool,
                                             ) {
-                                                Ok(_) => {}
+                                                Ok(_) => {},
                                                 Err(e) => {
-                                                    R Err(e)
-                                                }
+                                                    return Err(e)
+                                                },
                                             }
-                                        }
+                                        },
                                         Err(e) => {
-                                            R Err(e)
-                                        }
+                                            return Err(e)
+                                        },
                                     }
-                                }
+                                },
                                 Err(e) => {
-                                    R Err(e)
-                                }
+                                    return Err(e)
+                                },
                             }
-                        }
+                        },
                         Err(e) => {
-                            R Err(e)
-                        }
+                            return Err(e)
+                        },
                     }
                 }
             }
@@ -301,14 +285,14 @@ X FullTextDDL {
 }
 
 # Incremental index maintenance operations
-S IndexEntry {
+struct IndexEntry {
     allocator: PageAllocator,
     pool: BufferPool,
 }
 
-X IndexEntry {
+impl IndexEntry {
     # Create a new index entry handler
-    F new(allocator: PageAllocator, pool: BufferPool) -> IndexEntry {
+    fn new(allocator: PageAllocator, pool: BufferPool) -> IndexEntry {
         IndexEntry {
             allocator,
             pool,
@@ -323,7 +307,7 @@ X IndexEntry {
     # 3. Append posting entry to posting list
     #
     # Note: Caller should log WAL records for index entries
-    F on_insert_row(
+    fn on_insert_row(
         mut self,
         index_id: u32,
         meta: &FullTextMeta,
@@ -336,14 +320,14 @@ X IndexEntry {
         gcm: &GroupCommitManager,
     ) -> Result<(), VaisError> {
         tokenizer := mut Tokenizer.new(meta.config.clone())
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
-        posting_store := mut PostingStore.new(self.allocator.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page, DEFAULT_PAGE_SIZE)
+        posting_store := mut PostingStore.new(DEFAULT_PAGE_SIZE, &self.pool, &self.allocator)
 
         # Step 1: Tokenize text
         term_freqs := mut tokenizer.tokenize_with_freqs(text)
 
         I term_freqs.len() == 0 {
-            R Ok(())
+            return Ok(())
         }
 
         doc_length := mut 0u32
@@ -357,39 +341,37 @@ X IndexEntry {
             term_freq := mut tf_info.freq
 
             # Lookup or create dictionary entry
-            M dict_index.lookup_term(term, &self.pool) {
+            match dict_index.lookup_term(term, &self.pool) {
                 Ok(Some(dict_entry)) => {
                     # Term exists, append to posting list
+                    positions := mut Vec.with_capacity(0)
                     posting_entry := mut PostingEntry.new(
                         doc_id,
-                        table_id,
-                        row_tid,
                         term_freq,
-                        doc_length,
+                        positions,
                         txn_id,
                         cmd_id,
                     )
 
                     term_hash := mut fnv1a_hash(term)
-                    M posting_store.append_entry(
+                    match posting_store.append_entry(
                         dict_entry.posting_head_page,
                         &posting_entry,
                         term_hash,
                         txn_id,
                         gcm,
-                        &self.pool,
                     ) {
-                        Ok(_) => {}
+                        Ok(_) => {},
                         Err(e) => {
-                            R Err(e)
-                        }
+                            return Err(e)
+                        },
                     }
-                }
+                },
                 Ok(None) => {
                     # Term does not exist, create new dictionary entry
-                    M self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
+                    match self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, cmd_id, gcm) {
                         Ok(posting_head_page) => {
-                            M dict_index.insert_term(
+                            match dict_index.insert_term(
                                 term,
                                 posting_head_page,
                                 txn_id,
@@ -397,44 +379,42 @@ X IndexEntry {
                                 &self.pool,
                             ) {
                                 Ok(_) => {
+                                    positions3 := mut Vec.with_capacity(0)
                                     posting_entry := mut PostingEntry.new(
                                         doc_id,
-                                        table_id,
-                                        row_tid,
                                         term_freq,
-                                        doc_length,
+                                        positions3,
                                         txn_id,
                                         cmd_id,
                                     )
 
                                     term_hash := mut fnv1a_hash(term)
-                                    M posting_store.append_entry(
+                                    match posting_store.append_entry(
                                         posting_head_page,
                                         &posting_entry,
                                         term_hash,
                                         txn_id,
                                         gcm,
-                                        &self.pool,
                                     ) {
-                                        Ok(_) => {}
+                                        Ok(_) => {},
                                         Err(e) => {
-                                            R Err(e)
-                                        }
+                                            return Err(e)
+                                        },
                                     }
-                                }
+                                },
                                 Err(e) => {
-                                    R Err(e)
-                                }
+                                    return Err(e)
+                                },
                             }
-                        }
+                        },
                         Err(e) => {
-                            R Err(e)
-                        }
+                            return Err(e)
+                        },
                     }
-                }
+                },
                 Err(e) => {
-                    R Err(e)
-                }
+                    return Err(e)
+                },
             }
         }
 
@@ -451,7 +431,7 @@ X IndexEntry {
     #
     # Note: Caller should log WAL records for index deletions
     # Note: Actual deletion is done via MVCC - posting entry remains but marked expired
-    F on_delete_row(
+    fn on_delete_row(
         mut self,
         index_id: u32,
         meta: &FullTextMeta,
@@ -462,14 +442,14 @@ X IndexEntry {
         gcm: &GroupCommitManager,
     ) -> Result<(), VaisError> {
         tokenizer := mut Tokenizer.new(meta.config.clone())
-        dict_index := mut DictionaryIndex.new(meta.dict_root_page)
-        posting_store := mut PostingStore.new(self.allocator.clone())
+        dict_index := mut DictionaryIndex.new(meta.dict_root_page, DEFAULT_PAGE_SIZE)
+        posting_store := mut PostingStore.new(DEFAULT_PAGE_SIZE, &self.pool, &self.allocator)
 
         # Step 1: Tokenize text to find affected terms
         term_freqs := mut tokenizer.tokenize_with_freqs(text)
 
         I term_freqs.len() == 0 {
-            R Ok(())
+            return Ok(())
         }
 
         # Step 2 & 3: Process each term
@@ -477,10 +457,10 @@ X IndexEntry {
             term := mut &tf_info.term
 
             # Lookup dictionary entry
-            M dict_index.lookup_term(term, &self.pool) {
+            match dict_index.lookup_term(term, &self.pool) {
                 Ok(Some(dict_entry)) => {
                     # Read posting list
-                    M posting_store.read_all_entries(dict_entry.posting_head_page, &self.pool) {
+                    match posting_store.read_all_entries(dict_entry.posting_head_page) {
                         Ok(postings) => {
                             # Find posting entry with matching doc_id
                             found_posting := mut false
@@ -495,17 +475,17 @@ X IndexEntry {
                                     found_posting = true
                                 }
                             }
-                        }
+                        },
                         Err(e) => {
-                            R Err(e)
+                            return Err(e)
                         }
                     }
-                }
+                },
                 Ok(None) => {
                     # Term not found, nothing to delete
-                }
+                },
                 Err(e) => {
-                    R Err(e)
+                    return Err(e)
                 }
             }
         }

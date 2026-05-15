@@ -8,15 +8,15 @@
 # undo          — Undo phase with CLR support
 # truncation    — WAL segment truncation and archiving
 
-U storage/error
-U storage/wal/writer
-U storage/wal/lsn
-U storage/buffer/pool
-U storage/recovery/redo
-U storage/recovery/undo
+use storage/error
+use storage/wal/writer
+use storage/wal/lsn
+use storage/buffer/pool
+use storage/recovery/redo
+use storage/recovery/undo
 
 # Full crash recovery result
-S RecoveryResult {
+struct RecoveryResult {
     analysis_txns: u32,        # Transactions found in analysis
     active_txns: u32,          # Uncommitted transactions requiring undo
     records_redone: u64,       # WAL records replayed in redo phase
@@ -26,7 +26,7 @@ S RecoveryResult {
 
 # Perform full ARIES crash recovery
 # Called on database startup after unclean shutdown
-F perform_recovery(
+fn perform_recovery(
     wal_dir: &str,
     checkpoint_lsn: u64,
     writer: &mut WalWriter,
@@ -36,14 +36,16 @@ F perform_recovery(
     # Scan WAL from last checkpoint, rebuild ATT and dirty page table
     analysis := mut recovery_analysis(wal_dir, checkpoint_lsn)?;
 
-    total_txns := mut analysis.txn_table.len() as u32
+    total_txns := mut analysis.txn_entries.len() as u32
     active_count := mut 0
-    LF item: &analysis.txn_table {
-        entry := item.1
-        M entry.state {
-            redo.Active => { active_count += 1; },
+    ei: i64 := mut 0
+    LW ei < analysis.txn_entries.len() as i64 {
+        entry := analysis.txn_entries[ei]
+        match entry.state {
+            Active => { active_count += 1; },
             _ => {},
         }
+        ei = ei + 1
     }
 
     # Phase 2: REDO
@@ -67,23 +69,23 @@ F perform_recovery(
 
 # Quick check: does the database need recovery?;
 # Returns true if WAL contains records after the last checkpoint
-F needs_recovery(
+fn needs_recovery(
     wal_dir: &str,
     checkpoint_lsn: u64,
 ) -> Result<bool, VaisError> {
     I checkpoint_lsn == NULL_LSN {
         # No checkpoint ever taken, need recovery if WAL exists
-        iter := mut redo.WalRecordIterator.from_lsn(wal_dir.to_string(), NULL_LSN)?;
-        __mv1 := iter.next()?; M __mv1 {
+        iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), NULL_LSN)?;
+        __mv1 := iter.next()?; match __mv1 {
             Some(_) => Ok(true),
             None => Ok(false),
         }
-    } EL {
+    } else {
         # Check if there are records after the checkpoint
-        iter := mut redo.WalRecordIterator.from_lsn(wal_dir.to_string(), checkpoint_lsn)?;
+        iter := mut WalRecordIterator.from_lsn(wal_dir.to_string(), checkpoint_lsn)?;
         # Skip past the checkpoint record itself
         first := mut iter.next()?;
-        __mv2 := iter.next()?; M __mv2 {
+        __mv2 := iter.next()?; match __mv2 {
             Some(_) => Ok(true),
             None => Ok(false),
         }

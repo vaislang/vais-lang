@@ -3,11 +3,11 @@
 # Based on Stage 4 Memory Architecture - concurrency control for graph operations
 # Error codes: EE=03 (graph), CC=08 (concurrency)
 
-U std/sync.{RwLock};
-U std/vec.Vec;
-U std/option.{Option, Some, None};
-U std/result.Result;
-U storage/error.{VaisError, ErrorSeverity};
+use std/sync.{RwLock};
+use std/vec.Vec;
+use std/option.{Option, Some, None};
+use std/result.Result;
+use storage/error.{VaisError, ErrorSeverity};
 
 # ============================================================================
 # Constants
@@ -23,21 +23,21 @@ C LOCK_TIMEOUT_MS: u64 = 5000;
 # Error constructors (EE=03 graph, CC=08 concurrency)
 # ============================================================================
 
-F err_graph_lock_timeout(node_id: u64) -> VaisError {
+fn err_graph_lock_timeout(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0308001",
         "Lock timeout on graph node {node_id} after {LOCK_TIMEOUT_MS}ms"
     )
 }
 
-F err_graph_deadlock_prevention(node_id: u64) -> VaisError {
+fn err_graph_deadlock_prevention(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0308002",
         "Deadlock prevention: cannot acquire lock on node {node_id}"
     )
 }
 
-F err_graph_lock_poisoned(node_id: u64) -> VaisError {
+fn err_graph_lock_poisoned(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0308003",
         "Lock poisoned for graph node {node_id}"
@@ -48,20 +48,20 @@ F err_graph_lock_poisoned(node_id: u64) -> VaisError {
 # Lock modes
 # ============================================================================
 
-EN LockMode = Shared | Exclusive;
+enum LockMode = Shared | Exclusive;
 
 # ============================================================================
 # NodeLock — Per-node RwLock wrapper
 # ============================================================================
 
-S NodeLock {
+struct NodeLock {
     node_id: u64,
     lock: RwLock<()>,
     ref_count: u32,    # Number of active guards
 }
 
-X NodeLock {
-    F new(node_id: u64) -> NodeLock {
+impl NodeLock {
+    fn new(node_id: u64) -> NodeLock {
         NodeLock {
             node_id,
             lock: RwLock.new(()),
@@ -70,39 +70,39 @@ X NodeLock {
     }
 
     # Acquire shared (read) lock
-    F read_lock(mut self) {
+    fn read_lock(mut self) {
         self.lock.read_lock();
         self.ref_count += 1;
     }
 
     # Acquire exclusive (write) lock
-    F write_lock(mut self) {
+    fn write_lock(mut self) {
         self.lock.write_lock();
         self.ref_count += 1;
     }
 
     # Try to acquire shared lock without blocking
-    F try_read_lock(mut self) -> bool {
+    fn try_read_lock(mut self) -> bool {
         I self.lock.try_read_lock() {
             self.ref_count += 1;
             true
-        } EL {
+        } else {
             false
         }
     }
 
     # Try to acquire exclusive lock without blocking
-    F try_write_lock(mut self) -> bool {
+    fn try_write_lock(mut self) -> bool {
         I self.lock.try_write_lock() {
             self.ref_count += 1;
             true
-        } EL {
+        } else {
             false
         }
     }
 
     # Release shared lock
-    F read_unlock(mut self) {
+    fn read_unlock(mut self) {
         self.lock.read_unlock();
         I self.ref_count > 0 {
             self.ref_count -= 1;
@@ -110,7 +110,7 @@ X NodeLock {
     }
 
     # Release exclusive lock
-    F write_unlock(mut self) {
+    fn write_unlock(mut self) {
         self.lock.write_unlock();
         I self.ref_count > 0 {
             self.ref_count -= 1;
@@ -118,7 +118,7 @@ X NodeLock {
     }
 
     # Check if lock is currently held
-    F is_held(self) -> bool {
+    fn is_held(self) -> bool {
         self.ref_count > 0
     }
 }
@@ -127,13 +127,13 @@ X NodeLock {
 # LockSlot — Hash table entry for lock striping
 # ============================================================================
 
-S LockSlot {
+struct LockSlot {
     slot_lock: RwLock<()>,      # Protects the locks vector
     locks: Vec<NodeLock>,        # Locks in this slot
 }
 
-X LockSlot {
-    F new() -> LockSlot {
+impl LockSlot {
+    fn new() -> LockSlot {
         LockSlot {
             slot_lock: RwLock.new(()),
             locks: Vec.new(),
@@ -141,16 +141,16 @@ X LockSlot {
     }
 
     # Find or create node lock in this slot
-    F get_or_create_lock(mut self, node_id: u64) -> &mut NodeLock {
+    fn get_or_create_lock(mut self, node_id: u64) -> &mut NodeLock {
         # Acquire slot lock for modification
         self.slot_lock.write_lock();
 
         # Search for existing lock
-        i: u64 := mut 0;
+        i := mut 0u64;
         LW i < self.locks.len() {
             I self.locks[i].node_id == node_id {
                 self.slot_lock.write_unlock();
-                R &mut self.locks[i];
+                return &mut self.locks[i];
             }
             i += 1;
         }
@@ -163,14 +163,14 @@ X LockSlot {
     }
 
     # Find existing node lock in this slot (read-only)
-    F find_lock(self, node_id: u64) -> Option<&NodeLock> {
+    fn find_lock(self, node_id: u64) -> Option<&NodeLock> {
         self.slot_lock.read_lock();
-        i: u64 := mut 0;
+        i := mut 0u64;
         LW i < self.locks.len() {
             I self.locks[i].node_id == node_id {
                 result := mut Some(&self.locks[i]);
                 self.slot_lock.read_unlock();
-                R result;
+                return result;
             }
             i += 1;
         }
@@ -183,16 +183,16 @@ X LockSlot {
 # GraphLockManager — Node-level lock manager
 # ============================================================================
 
-S GraphLockManager {
+struct GraphLockManager {
     slots: Vec<LockSlot>,
     capacity: u32,
 }
 
-X GraphLockManager {
+impl GraphLockManager {
     # Create new lock manager with specified capacity
-    F new(capacity: u32) -> GraphLockManager {
+    fn new(capacity: u32) -> GraphLockManager {
         slots := mut Vec.with_capacity(capacity as u64);
-        i: u32 := mut 0;
+        i := mut 0u32;
         LW i < capacity {
             slots.push(LockSlot.new());
             i += 1;
@@ -201,17 +201,17 @@ X GraphLockManager {
     }
 
     # Create with default capacity
-    F default() -> GraphLockManager {
+    fn default() -> GraphLockManager {
         GraphLockManager.new(DEFAULT_LOCK_CAPACITY)
     }
 
     # Hash node_id to slot index
-    F hash(self, node_id: u64) -> u64 {
+    fn hash(self, node_id: u64) -> u64 {
         (node_id % (self.capacity as u64)) as u64
     }
 
     # Acquire shared (read) lock on node
-    F lock_node_shared(mut self, node_id: u64) -> Result<NodeLockGuard, VaisError> {
+    fn lock_node_shared(mut self, node_id: u64) -> Result<NodeLockGuard, VaisError> {
         slot_idx := mut self.hash(node_id);
         lock := mut self.slots[slot_idx].get_or_create_lock(node_id);
         lock.read_lock();
@@ -219,7 +219,7 @@ X GraphLockManager {
     }
 
     # Acquire exclusive (write) lock on node
-    F lock_node_exclusive(mut self, node_id: u64) -> Result<NodeLockGuard, VaisError> {
+    fn lock_node_exclusive(mut self, node_id: u64) -> Result<NodeLockGuard, VaisError> {
         slot_idx := mut self.hash(node_id);
         lock := mut self.slots[slot_idx].get_or_create_lock(node_id);
         lock.write_lock();
@@ -227,39 +227,39 @@ X GraphLockManager {
     }
 
     # Try to acquire shared lock without blocking
-    F try_lock_node_shared(mut self, node_id: u64) -> Result<Option<NodeLockGuard>, VaisError> {
+    fn try_lock_node_shared(mut self, node_id: u64) -> Result<Option<NodeLockGuard>, VaisError> {
         slot_idx := mut self.hash(node_id);
         lock := mut self.slots[slot_idx].get_or_create_lock(node_id);
         I lock.try_read_lock() {
             Ok(Some(NodeLockGuard.new(self, node_id, LockMode.Shared)))
-        } EL {
+        } else {
             Ok(None)
         }
     }
 
     # Try to acquire exclusive lock without blocking
-    F try_lock_node_exclusive(mut self, node_id: u64) -> Result<Option<NodeLockGuard>, VaisError> {
+    fn try_lock_node_exclusive(mut self, node_id: u64) -> Result<Option<NodeLockGuard>, VaisError> {
         slot_idx := mut self.hash(node_id);
         lock := mut self.slots[slot_idx].get_or_create_lock(node_id);
         I lock.try_write_lock() {
             Ok(Some(NodeLockGuard.new(self, node_id, LockMode.Exclusive)))
-        } EL {
+        } else {
             Ok(None)
         }
     }
 
     # Lock an edge (both src and dst nodes) in ID order to prevent deadlock
-    F lock_edge(mut self, src: u64, dst: u64) -> Result<EdgeLockGuard, VaisError> {
+    fn lock_edge(mut self, src: u64, dst: u64) -> Result<EdgeLockGuard, VaisError> {
         # Always lock in ascending node ID order to prevent deadlock
         I src < dst {
             src_guard := mut self.lock_node_exclusive(src)?;
             dst_guard := mut self.lock_node_exclusive(dst)?;
             Ok(EdgeLockGuard.new(src, dst, src_guard, dst_guard))
-        } EL I src > dst {
+        } else I src > dst {
             dst_guard := mut self.lock_node_exclusive(dst)?;
             src_guard := mut self.lock_node_exclusive(src)?;
             Ok(EdgeLockGuard.new(src, dst, src_guard, dst_guard))
-        } EL {
+        } else {
             # Self-loop: only lock once
             src_guard := mut self.lock_node_exclusive(src)?;
             Ok(EdgeLockGuard.new_self_loop(src, src_guard))
@@ -267,15 +267,17 @@ X GraphLockManager {
     }
 
     # Release node lock explicitly (normally handled by guard drop)
-    F release_node(mut self, node_id: u64, mode: LockMode) {
+    fn release_node(mut self, node_id: u64, mode: LockMode) {
         slot_idx := mut self.hash(node_id);
-        I opt_lock := mut self.slots[slot_idx].find_lock(node_id) {
-            I lock := mut opt_lock {
-                M mode {
+        opt_lock := mut self.slots[slot_idx].find_lock(node_id)
+        match opt_lock {
+            Some(lock) => {
+                match mode {
                     LockMode.Shared => lock.read_unlock(),
                     LockMode.Exclusive => lock.write_unlock(),
                 }
-            }
+            },
+            None => {},
         }
     }
 }
@@ -284,15 +286,15 @@ X GraphLockManager {
 # NodeLockGuard — RAII-style guard for node locks
 # ============================================================================
 
-S NodeLockGuard {
+struct NodeLockGuard {
     manager: &mut GraphLockManager,
     node_id: u64,
     mode: LockMode,
     held: bool,
 }
 
-X NodeLockGuard {
-    F new(manager: &mut GraphLockManager, node_id: u64, mode: LockMode) -> NodeLockGuard {
+impl NodeLockGuard {
+    fn new(manager: &mut GraphLockManager, node_id: u64, mode: LockMode) -> NodeLockGuard {
         NodeLockGuard {
             manager,
             node_id,
@@ -302,7 +304,7 @@ X NodeLockGuard {
     }
 
     # Release the lock early (before drop)
-    F release(mut self) {
+    fn release(mut self) {
         I self.held {
             self.manager.release_node(self.node_id, self.mode);
             self.held = false;
@@ -310,24 +312,24 @@ X NodeLockGuard {
     }
 
     # Get node ID
-    F node_id(self) -> u64 {
+    fn node_id(self) -> u64 {
         self.node_id
     }
 
     # Get lock mode
-    F mode(self) -> LockMode {
+    fn mode(self) -> LockMode {
         self.mode
     }
 
     # Check if lock is still held
-    F is_held(self) -> bool {
+    fn is_held(self) -> bool {
         self.held
     }
 }
 
 # Drop implementation: release lock on scope exit
-X Drop for NodeLockGuard {
-    F drop(mut self) {
+impl NodeLockGuard {
+    fn drop(mut self) {
         self.release();
     }
 }
@@ -336,16 +338,16 @@ X Drop for NodeLockGuard {
 # EdgeLockGuard — Lock guard for edge operations
 # ============================================================================
 
-S EdgeLockGuard {
+struct EdgeLockGuard {
     src_id: u64,
     dst_id: u64,
     src_guard: NodeLockGuard,
     dst_guard: Option<NodeLockGuard>,   # None for self-loops
 }
 
-X EdgeLockGuard {
+impl EdgeLockGuard {
     # Create edge guard for two different nodes
-    F new(
+    fn new(
         src_id: u64,
         dst_id: u64,
         src_guard: NodeLockGuard,
@@ -360,7 +362,7 @@ X EdgeLockGuard {
     }
 
     # Create edge guard for self-loop (src == dst)
-    F new_self_loop(node_id: u64, guard: NodeLockGuard) -> EdgeLockGuard {
+    fn new_self_loop(node_id: u64, guard: NodeLockGuard) -> EdgeLockGuard {
         EdgeLockGuard {
             src_id: node_id,
             dst_id: node_id,
@@ -370,34 +372,33 @@ X EdgeLockGuard {
     }
 
     # Get source node ID
-    F src_id(self) -> u64 {
+    fn src_id(self) -> u64 {
         self.src_id
     }
 
     # Get destination node ID
-    F dst_id(self) -> u64 {
+    fn dst_id(self) -> u64 {
         self.dst_id
     }
 
     # Check if this is a self-loop
-    F is_self_loop(self) -> bool {
+    fn is_self_loop(self) -> bool {
         self.src_id == self.dst_id
     }
 
     # Release both locks early (before drop)
-    F release(mut self) {
+    fn release(mut self) {
         self.src_guard.release();
-        I opt_dst := mut &mut self.dst_guard {
-            I dst := mut opt_dst {
-                dst.release();
-            }
+        match &mut self.dst_guard {
+            Some(dst) => { dst.release(); },
+            None => {},
         }
     }
 }
 
 # Drop implementation: release both locks on scope exit
-X Drop for EdgeLockGuard {
-    F drop(mut self) {
+impl EdgeLockGuard {
+    fn drop(mut self) {
         self.release();
     }
 }
@@ -406,55 +407,55 @@ X Drop for EdgeLockGuard {
 # GraphRwLatch — Engine-level read-write latch for metadata operations
 # ============================================================================
 
-S GraphRwLatch {
+struct GraphRwLatch {
     latch: RwLock<()>,
 }
 
-X GraphRwLatch {
+impl GraphRwLatch {
     # Create new graph-level latch
-    F new() -> GraphRwLatch {
+    fn new() -> GraphRwLatch {
         GraphRwLatch {
             latch: RwLock.new(()),
         }
     }
 
     # Acquire read (shared) latch
-    F read_lock(mut self) -> GraphLatchGuard {
+    fn read_lock(&mut self) -> GraphLatchGuard {
         self.latch.read_lock();
-        GraphLatchGuard.new(&mut self, LatchMode.Read)
+        GraphLatchGuard.new(self, GraphLatchMode.Read)
     }
 
     # Acquire write (exclusive) latch
-    F write_lock(mut self) -> GraphLatchGuard {
+    fn write_lock(&mut self) -> GraphLatchGuard {
         self.latch.write_lock();
-        GraphLatchGuard.new(&mut self, LatchMode.Write)
+        GraphLatchGuard.new(self, GraphLatchMode.Write)
     }
 
     # Try to acquire read latch without blocking
-    F try_read_lock(mut self) -> Option<GraphLatchGuard> {
+    fn try_read_lock(&mut self) -> Option<GraphLatchGuard> {
         I self.latch.try_read_lock() {
-            Some(GraphLatchGuard.new(&mut self, LatchMode.Read))
-        } EL {
+            Some(GraphLatchGuard.new(self, GraphLatchMode.Read))
+        } else {
             None
         }
     }
 
     # Try to acquire write latch without blocking
-    F try_write_lock(mut self) -> Option<GraphLatchGuard> {
+    fn try_write_lock(&mut self) -> Option<GraphLatchGuard> {
         I self.latch.try_write_lock() {
-            Some(GraphLatchGuard.new(&mut self, LatchMode.Write))
-        } EL {
+            Some(GraphLatchGuard.new(self, GraphLatchMode.Write))
+        } else {
             None
         }
     }
 
     # Release read latch
-    F read_unlock(mut self) {
+    fn read_unlock(&mut self) {
         self.latch.read_unlock();
     }
 
     # Release write latch
-    F write_unlock(mut self) {
+    fn write_unlock(&mut self) {
         self.latch.write_unlock();
     }
 }
@@ -463,20 +464,20 @@ X GraphRwLatch {
 # Latch mode for engine-level operations
 # ============================================================================
 
-EN LatchMode = Read | Write;
+enum GraphLatchMode = Read | Write;
 
 # ============================================================================
 # GraphLatchGuard — RAII guard for graph-level latch
 # ============================================================================
 
-S GraphLatchGuard {
+struct GraphLatchGuard {
     latch: &mut GraphRwLatch,
-    mode: LatchMode,
+    mode: GraphLatchMode,
     held: bool,
 }
 
-X GraphLatchGuard {
-    F new(latch: &mut GraphRwLatch, mode: LatchMode) -> GraphLatchGuard {
+impl GraphLatchGuard {
+    fn new(latch: &mut GraphRwLatch, mode: GraphLatchMode) -> GraphLatchGuard {
         GraphLatchGuard {
             latch,
             mode,
@@ -485,30 +486,30 @@ X GraphLatchGuard {
     }
 
     # Release latch early (before drop)
-    F release(mut self) {
+    fn release(mut self) {
         I self.held {
-            M self.mode {
-                LatchMode.Read => self.latch.read_unlock(),
-                LatchMode.Write => self.latch.write_unlock(),
+            match self.mode {
+                GraphLatchMode.Read => self.latch.read_unlock(),
+                GraphLatchMode.Write => self.latch.write_unlock(),
             }
             self.held = false;
         }
     }
 
     # Get latch mode
-    F mode(self) -> LatchMode {
+    fn mode(self) -> GraphLatchMode {
         self.mode
     }
 
     # Check if latch is still held
-    F is_held(self) -> bool {
+    fn is_held(self) -> bool {
         self.held
     }
 }
 
 # Drop implementation: release latch on scope exit
-X Drop for GraphLatchGuard {
-    F drop(mut self) {
+impl GraphLatchGuard {
+    fn drop(mut self) {
         self.release();
     }
 }
@@ -518,33 +519,33 @@ X Drop for GraphLatchGuard {
 # ============================================================================
 
 # Sort two node IDs in ascending order for deadlock-free locking
-F order_node_ids(a: u64, b: u64) -> (u64, u64) {
+fn order_node_ids(a: u64, b: u64) -> (u64, u64) {
     I a < b {
         (a, b)
-    } EL {
+    } else {
         (b, a)
     }
 }
 
 # Lock multiple nodes in ID order to prevent deadlock
 # Returns guards in the same order as input node_ids
-F lock_nodes_ordered(
+fn lock_nodes_ordered(
     manager: &mut GraphLockManager,
     node_ids: &[u64],
     exclusive: bool
 ) -> Result<Vec<NodeLockGuard>, VaisError> {
     # Sort node IDs to ensure consistent lock ordering
     sorted_ids := mut Vec.with_capacity(node_ids.len());
-    i: u64 := mut 0;
+    i := mut 0u64;
     LW i < node_ids.len() {
         sorted_ids.push(node_ids[i]);
         i += 1;
     }
 
     # Simple bubble sort for small arrays
-    j: u64 := mut 0;
+    j := mut 0u64;
     LW j < sorted_ids.len() {
-        k: u64 := mut 0;
+        k := mut 0u64;
         LW k < sorted_ids.len() - 1 - j {
             I sorted_ids[k] > sorted_ids[k + 1] {
                 temp := mut sorted_ids[k];
@@ -558,11 +559,11 @@ F lock_nodes_ordered(
 
     # Acquire locks in sorted order
     guards := mut Vec.with_capacity(sorted_ids.len());
-    idx: u64 := mut 0;
+    idx := mut 0u64;
     LW idx < sorted_ids.len() {
         guard := mut I exclusive {
             manager.lock_node_exclusive(sorted_ids[idx])?
-        } EL {
+        } else {
             manager.lock_node_shared(sorted_ids[idx])?
         };
         guards.push(guard);

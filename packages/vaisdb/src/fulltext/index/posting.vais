@@ -3,34 +3,34 @@
 # Slotted page layout: PostingPageHeader + slot directory + PostingEntry data
 # WAL-first operations: all mutations logged before applied
 
-U std/vec
-U storage/bytes
-U std/option
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/buffer/pool
-U storage/page/allocator
-U storage/wal/group_commit
-U fulltext/types
+use std/vec
+use storage/bytes
+use std/option
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/buffer/pool
+use storage/page/allocator
+use storage/wal/group_commit
+use fulltext/types
 
 # ============================================================================
 # PostingSlot — Slot directory entry (4 bytes) pointing to PostingEntry
 # ============================================================================
 
-S PostingSlot {
+struct PostingSlot {
     offset: u16,     # Byte offset within page body (after headers)
     length: u16,     # Length of serialized PostingEntry
 }
 
-X PostingSlot {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl PostingSlot {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u16_le(self.offset)
         buf.write_u16_le(self.length)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<PostingSlot, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PostingSlot, VaisError> {
         Ok(PostingSlot {
             offset: read_u16_le_checked(buf)?,
             length: read_u16_le_checked(buf)?,
@@ -42,14 +42,14 @@ X PostingSlot {
 # PostingStore — Manages posting list pages
 # ============================================================================
 
-S PostingStore {
+struct PostingStore {
     page_size: u32,
     pool: &BufferPool,
     allocator: &PageAllocator,
 }
 
-X PostingStore {
-    F new(
+impl PostingStore {
+    fn new(
         page_size: u32,
         pool: &BufferPool,
         allocator: &PageAllocator,
@@ -63,7 +63,7 @@ X PostingStore {
     # If the current head page is full, allocates a new page and chains it
     # ========================================================================
 
-    F append_entry(
+    fn append_entry(
         mut self,
         head_page_id: u32,
         entry: &PostingEntry,
@@ -72,7 +72,7 @@ X PostingStore {
         gcm: &mut GroupCommitManager,
     ) -> Result<(u32, u16, u32), VaisError> {
         # Serialize entry to determine size
-        entry_buf := mut ByteBuffer.new(entry.serialized_size() as u64)
+        entry_buf := mut ByteBuffer.with_capacity(entry.serialized_size() as u64)
         entry.serialize(&entry_buf)
         entry_bytes := mut entry_buf.to_vec()
         entry_size := mut entry_bytes.len() as u32
@@ -83,7 +83,7 @@ X PostingStore {
 
         I current_page_id == NULL_PAGE {
             # No posting list exists yet — allocate first page
-            new_page_id := mut self.allocator.allocate_page(FILE_ID_FULLTEXT)?;
+            new_page_id := mut self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, 0u32, gcm)?;
             self.init_posting_page(new_page_id, term_hash, gcm)?;
             current_page_id = new_page_id
             new_head = new_page_id
@@ -91,8 +91,8 @@ X PostingStore {
 
         # Walk the page chain to find space
         L {
-            page_data := mut self.pool.get_page(current_page_id, FILE_ID_FULLTEXT)?;
-            buf := mut ByteBuffer.wrap_readonly(&page_data)
+            page_data := mut self.pool.get_page_by_id(current_page_id, FILE_ID_FULLTEXT)?;
+            buf := mut ByteBuffer.wrap_readonly(page_data)
 
             # Skip page header
             buf.seek(PAGE_HEADER_SIZE as u64)
@@ -101,7 +101,7 @@ X PostingStore {
             pph := mut PostingPageHeader.deserialize(&buf)?;
 
             # Calculate used space
-            used := mut PostingStore.calculate_used_space(&pph, self.page_size, &page_data)
+            used := mut PostingStore.calculate_used_space(&pph, self.page_size, page_data)
             available := mut self.page_size - PAGE_HEADER_SIZE - POSTING_PAGE_HEADER_SIZE - used
 
             # Need space for: slot entry (4B) + entry data
@@ -111,15 +111,15 @@ X PostingStore {
                 # Enough space — write entry to this page
                 slot_index := mut pph.entry_count
                 self.write_entry_to_page(current_page_id, &pph, &entry_bytes, gcm)?;
-                R Ok((current_page_id, slot_index, new_head))
+                return Ok((current_page_id, slot_index, new_head))
             }
 
             # Check if there's a next page
             I pph.next_posting_page != NULL_PAGE {
                 current_page_id = pph.next_posting_page
-            } EL {
+            } else {
                 # Allocate new page and chain it
-                new_page_id := mut self.allocator.allocate_page(FILE_ID_FULLTEXT)?;
+                new_page_id := mut self.allocator.alloc_page(FILE_ID_FULLTEXT, txn_id, 0u32, gcm)?;
                 self.init_posting_page(new_page_id, term_hash, gcm)?;
 
                 # Update current page's next pointer
@@ -128,7 +128,7 @@ X PostingStore {
                 # Write entry to new page
                 new_pph := mut PostingPageHeader.new(term_hash)
                 self.write_entry_to_page(new_page_id, &new_pph, &entry_bytes, gcm)?;
-                R Ok((new_page_id, 0, new_head))
+                return Ok((new_page_id, 0, new_head))
             }
         }
     }
@@ -137,7 +137,7 @@ X PostingStore {
     # Soft-delete a PostingEntry (set MVCC expire fields)
     # ========================================================================
 
-    F delete_entry(
+    fn delete_entry(
         mut self,
         head_page_id: u32,
         doc_id: u64,
@@ -149,8 +149,8 @@ X PostingStore {
         current_page_id := mut head_page_id
 
         LW current_page_id != NULL_PAGE {
-            page_data := mut self.pool.get_page_mut(current_page_id, FILE_ID_FULLTEXT)?;
-            buf := mut ByteBuffer.wrap(&page_data)
+            page_data := mut self.pool.get_page_mut_by_id(current_page_id, FILE_ID_FULLTEXT)?;
+            buf := mut ByteBuffer.wrap(page_data)
 
             # Skip page header
             buf.seek(PAGE_HEADER_SIZE as u64)
@@ -178,7 +178,7 @@ X PostingStore {
                     entry.set_expired(txn_id, cmd_id)
 
                     # Write back the modified entry
-                    entry_buf := mut ByteBuffer.new(entry.serialized_size() as u64)
+                    entry_buf := mut ByteBuffer.with_capacity(entry.serialized_size() as u64)
                     entry.serialize(&entry_buf)
                     entry_bytes := mut entry_buf.to_vec()
 
@@ -190,7 +190,7 @@ X PostingStore {
                     }
 
                     self.pool.mark_dirty(current_page_id)?;
-                    R Ok(true)
+                    return Ok(true)
                 }
 
                 i += 1
@@ -207,14 +207,14 @@ X PostingStore {
     # Read all posting entries from a posting list (all pages in chain)
     # ========================================================================
 
-    F read_all_entries(
+    fn read_all_entries(
         self,
         head_page_id: u32,
     ) -> Result<Vec<PostingEntry>, VaisError> {
         result := mut Vec.with_capacity(0)
 
         I head_page_id == NULL_PAGE {
-            R Ok(result)
+            return Ok(result)
         }
 
         current_page_id := mut head_page_id
@@ -236,14 +236,14 @@ X PostingStore {
     }
 
     # Read all entries from a single posting page
-    F read_page_entries(
+    fn read_page_entries(
         self,
         page_id: u32,
     ) -> Result<Vec<PostingEntry>, VaisError> {
         result := mut Vec.with_capacity(0)
 
-        page_data := mut self.pool.get_page(page_id, FILE_ID_FULLTEXT)?;
-        buf := mut ByteBuffer.wrap_readonly(&page_data)
+        page_data := mut self.pool.get_page_by_id(page_id, FILE_ID_FULLTEXT)?;
+        buf := mut ByteBuffer.wrap_readonly(page_data)
 
         # Skip page header
         buf.seek(PAGE_HEADER_SIZE as u64)
@@ -274,18 +274,18 @@ X PostingStore {
     }
 
     # Get the next page in the posting list chain
-    F get_next_page(self, page_id: u32) -> Result<u32, VaisError> {
-        page_data := mut self.pool.get_page(page_id, FILE_ID_FULLTEXT)?;
-        buf := mut ByteBuffer.wrap_readonly(&page_data)
+    fn get_next_page(self, page_id: u32) -> Result<u32, VaisError> {
+        page_data := mut self.pool.get_page_by_id(page_id, FILE_ID_FULLTEXT)?;
+        buf := mut ByteBuffer.wrap_readonly(page_data)
         buf.seek(PAGE_HEADER_SIZE as u64)
         pph := mut PostingPageHeader.deserialize(&buf)?;
         Ok(pph.next_posting_page)
     }
 
     # Get the entry count for a posting page
-    F get_entry_count(self, page_id: u32) -> Result<u16, VaisError> {
-        page_data := mut self.pool.get_page(page_id, FILE_ID_FULLTEXT)?;
-        buf := mut ByteBuffer.wrap_readonly(&page_data)
+    fn get_entry_count(self, page_id: u32) -> Result<u16, VaisError> {
+        page_data := mut self.pool.get_page_by_id(page_id, FILE_ID_FULLTEXT)?;
+        buf := mut ByteBuffer.wrap_readonly(page_data)
         buf.seek(PAGE_HEADER_SIZE as u64)
         pph := mut PostingPageHeader.deserialize(&buf)?;
         Ok(pph.entry_count)
@@ -296,13 +296,13 @@ X PostingStore {
     # ========================================================================
 
     # Initialize a new posting list page
-    F init_posting_page(
+    fn init_posting_page(
         mut self,
         page_id: u32,
         term_hash: u64,
         gcm: &mut GroupCommitManager,
     ) -> Result<(), VaisError> {
-        page_data := mut self.pool.get_page_mut(page_id, FILE_ID_FULLTEXT)?;
+        page_data := mut self.pool.get_page_mut_by_id(page_id, FILE_ID_FULLTEXT)?;
 
         # Write page header
         ph := mut PageHeader.new(
@@ -310,7 +310,7 @@ X PostingStore {
             PAGE_TYPE_INVERTED_POSTING,
             ENGINE_TAG_FULLTEXT,
         )
-        hdr_buf := mut ByteBuffer.new(PAGE_HEADER_SIZE as u64)
+        hdr_buf := mut ByteBuffer.with_capacity(PAGE_HEADER_SIZE as u64)
         ph.serialize(&hdr_buf)
         hdr_bytes := mut hdr_buf.to_vec()
         j := mut 0
@@ -321,7 +321,7 @@ X PostingStore {
 
         # Write posting page header
         pph := mut PostingPageHeader.new(term_hash)
-        pph_buf := mut ByteBuffer.new(POSTING_PAGE_HEADER_SIZE as u64)
+        pph_buf := mut ByteBuffer.with_capacity(POSTING_PAGE_HEADER_SIZE as u64)
         pph.serialize(&pph_buf)
         pph_bytes := mut pph_buf.to_vec()
         j = 0
@@ -338,14 +338,14 @@ X PostingStore {
     # The new slot entry grows the slot directory by SLOT_ENTRY_SIZE bytes,
     # shifting data_start right. We must relocate existing entry data to
     # keep slot offsets consistent with the new data_start.
-    F write_entry_to_page(
+    fn write_entry_to_page(
         mut self,
         page_id: u32,
         pph: &PostingPageHeader,
         entry_bytes: &[u8],
         gcm: &mut GroupCommitManager,
     ) -> Result<(), VaisError> {
-        page_data := mut self.pool.get_page_mut(page_id, FILE_ID_FULLTEXT)?;
+        page_data := mut self.pool.get_page_mut_by_id(page_id, FILE_ID_FULLTEXT)?;
 
         new_entry_count := mut pph.entry_count + 1
         slot_dir_start := mut (PAGE_HEADER_SIZE + POSTING_PAGE_HEADER_SIZE) as u64
@@ -359,7 +359,7 @@ X PostingStore {
         total_existing_data := mut 0
         data_offset := mut 0
         I pph.entry_count > 0 {
-            buf := mut ByteBuffer.wrap_readonly(&page_data)
+            buf := mut ByteBuffer.wrap_readonly(page_data)
             i := mut 0
             LW i < pph.entry_count {
                 sp := mut slot_dir_start + (i as u64 * SLOT_ENTRY_SIZE as u64)
@@ -387,7 +387,7 @@ X PostingStore {
 
         # Write the new slot directory entry (at the end of the old slot directory)
         new_slot := mut PostingSlot { offset: data_offset, length: entry_bytes.len() as u16 }
-        slot_buf := mut ByteBuffer.new(SLOT_ENTRY_SIZE as u64)
+        slot_buf := mut ByteBuffer.with_capacity(SLOT_ENTRY_SIZE as u64)
         new_slot.serialize(&slot_buf)
         slot_bytes := mut slot_buf.to_vec()
         slot_pos := mut slot_dir_start + (pph.entry_count as u64 * SLOT_ENTRY_SIZE as u64)
@@ -412,7 +412,7 @@ X PostingStore {
             next_posting_page: pph.next_posting_page,
             flags: pph.flags,
         }
-        pph_buf := mut ByteBuffer.new(POSTING_PAGE_HEADER_SIZE as u64)
+        pph_buf := mut ByteBuffer.with_capacity(POSTING_PAGE_HEADER_SIZE as u64)
         updated_pph.serialize(&pph_buf)
         pph_bytes := mut pph_buf.to_vec()
         j = 0
@@ -426,16 +426,16 @@ X PostingStore {
     }
 
     # Update the next_posting_page pointer in a page's header
-    F update_next_page(
+    fn update_next_page(
         mut self,
         page_id: u32,
         next_page_id: u32,
         gcm: &mut GroupCommitManager,
     ) -> Result<(), VaisError> {
-        page_data := mut self.pool.get_page_mut(page_id, FILE_ID_FULLTEXT)?;
+        page_data := mut self.pool.get_page_mut_by_id(page_id, FILE_ID_FULLTEXT)?;
 
         # Read current posting page header
-        buf := mut ByteBuffer.wrap_readonly(&page_data)
+        buf := mut ByteBuffer.wrap_readonly(page_data)
         buf.seek(PAGE_HEADER_SIZE as u64)
         pph := mut PostingPageHeader.deserialize(&buf)?;
 
@@ -447,7 +447,7 @@ X PostingStore {
             flags: pph.flags,
         }
 
-        pph_buf := mut ByteBuffer.new(POSTING_PAGE_HEADER_SIZE as u64)
+        pph_buf := mut ByteBuffer.with_capacity(POSTING_PAGE_HEADER_SIZE as u64)
         updated_pph.serialize(&pph_buf)
         pph_bytes := mut pph_buf.to_vec()
         j := mut 0
@@ -461,9 +461,9 @@ X PostingStore {
     }
 
     # Calculate used space in a posting page (slots + entry data)
-    F calculate_used_space(pph: &PostingPageHeader, page_size: u32, page_data: &[u8]) -> u32 {
+    fn calculate_used_space(pph: &PostingPageHeader, page_size: u32, page_data: &[u8]) -> u32 {
         I pph.entry_count == 0 {
-            R 0
+            return 0
         }
 
         slot_dir_size := mut pph.entry_count as u32 * SLOT_ENTRY_SIZE
@@ -477,7 +477,7 @@ X PostingStore {
         LW i < pph.entry_count {
             sp := mut slot_dir_start + (i as u64 * SLOT_ENTRY_SIZE as u64)
             buf.seek(sp)
-            M PostingSlot.deserialize(&buf) {
+            match PostingSlot.deserialize(&buf) {
                 Ok(slot) => { total_data += slot.length as u32; },
                 Err(_) => {},
             }
@@ -488,7 +488,7 @@ X PostingStore {
     }
 
     # Free all pages in a posting list chain
-    F free_posting_chain(
+    fn free_posting_chain(
         mut self,
         head_page_id: u32,
     ) -> Result<u32, VaisError> {
@@ -497,7 +497,7 @@ X PostingStore {
 
         LW current != NULL_PAGE {
             next := mut self.get_next_page(current)?;
-            self.allocator.free_page(current, FILE_ID_FULLTEXT)?;
+            self.allocator.free_page_simple(current, FILE_ID_FULLTEXT)?;
             freed += 1
             current = next
         }

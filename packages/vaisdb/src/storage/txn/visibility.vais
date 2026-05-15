@@ -3,13 +3,13 @@
 # Based on Stage 1 Section 5 and Stage 3 Section 3
 # CRITICAL: All three visibility functions (tuple, edge, posting) use this same logic
 
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/constants
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/constants
 
 # Unified visibility check
 # Works for tuples (MvccTupleMeta), graph edges (AdjEntry), and posting entries
-F is_visible(
+fn is_visible(
     txn_id_create: u64,
     txn_id_expire: u64,
     cmd_id: u32,
@@ -19,7 +19,7 @@ F is_visible(
 ) -> bool {
     # Fast-path: if creating txn was aborted, tuple was never committed → invisible
     I is_aborted_fast(txn_id_create, clog) {
-        R false
+        return false
     }
 
     created_by := mut txn_id_create
@@ -28,7 +28,7 @@ F is_visible(
     # If the expiring txn was aborted, treat as not expired
     expired_by_effective := mut I expired_by != INVALID_TXN_ID && !is_aborted_fast(expired_by, clog) {
         expired_by
-    } EL {
+    } else {
         INVALID_TXN_ID
     }
 
@@ -36,62 +36,62 @@ F is_visible(
     I created_by == snapshot.get_txn_id() {
         # Created by later command in same txn → invisible
         I cmd_id >= snapshot.get_cmd_id() {
-            R false
+            return false
         }
         # Not yet expired, or expired by later command
         I expired_by_effective == INVALID_TXN_ID {
-            R true
+            return true
         }
         # Expired by same transaction - check expire_cmd_id
         I expired_by_effective == snapshot.get_txn_id() {
             # Visible only if expiration happened in a LATER command
             # (expire_cmd_id == cmd_id means this command is doing the expiration)
-            R expire_cmd_id > snapshot.get_cmd_id()
+            return expire_cmd_id > snapshot.get_cmd_id()
         }
-        R true
+        return true
     }
 
     # Case 2: Created by committed transaction visible to this snapshot
     I !txn_is_committed_before(created_by, snapshot, clog) {
-        R false;  # Creator not yet committed or aborted
+        return false;  # Creator not yet committed or aborted
     }
 
     # Case 3: Check expiration
     I expired_by_effective == INVALID_TXN_ID {
-        R true;  # Not expired
+        return true;  # Not expired
     }
     # Expired by current transaction - check expire_cmd_id
     I expired_by_effective == snapshot.get_txn_id() {
-        R expire_cmd_id > snapshot.get_cmd_id()
+        return expire_cmd_id > snapshot.get_cmd_id()
     }
     I !txn_is_committed_before(expired_by_effective, snapshot, clog) {
-        R true;  # Expirer not yet committed = still visible
+        return true;  # Expirer not yet committed = still visible
     }
-    R false;  # Expired by committed transaction
+    return false;  # Expired by committed transaction
 }
 
 # Check if a transaction was committed before the snapshot
-F txn_is_committed_before(txn_id: u64, snapshot: &TxnSnapshot, clog: &Clog) -> bool {
+fn txn_is_committed_before(txn_id: u64, snapshot: &TxnSnapshot, clog: &Clog) -> bool {
     # Must be: txn_id < snapshot.txn_id AND txn_id NOT IN snapshot.active_txns AND committed
     I txn_id >= snapshot.get_txn_id() {
-        R false
+        return false
     }
     I snapshot.is_active(txn_id) {
-        R false
+        return false
     }
     clog.is_committed(txn_id)
 }
 
 # Fast-path check for aborted transactions
-F is_aborted_fast(txn_id: u64, clog: &Clog) -> bool {
+fn is_aborted_fast(txn_id: u64, clog: &Clog) -> bool {
     I txn_id == INVALID_TXN_ID {
-        R false
+        return false
     }
     clog.is_aborted(txn_id)
 }
 
 # Convenience: check visibility for a tuple's MVCC metadata
-F is_tuple_visible(
+fn is_tuple_visible(
     txn_id_create: u64,
     txn_id_expire: u64,
     cmd_id: u32,
@@ -103,7 +103,7 @@ F is_tuple_visible(
 }
 
 # Convenience: check visibility for a graph edge (AdjEntry)
-F is_edge_visible(
+fn is_edge_visible(
     txn_id_create: u64,
     txn_id_expire: u64,
     cmd_id: u32,
@@ -115,7 +115,7 @@ F is_edge_visible(
 }
 
 # Convenience: check visibility for a full-text posting entry
-F is_posting_visible_txn(
+fn is_posting_visible_txn(
     txn_id_create: u64,
     txn_id_expire: u64,
     cmd_id: u32,

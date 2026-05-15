@@ -2,24 +2,26 @@
 # Implements phrase query support by verifying consecutive token positions
 # Supports exact phrase matching and slop-based proximity search
 
-U std/vec
-U std/string
-U fulltext/types
-U fulltext/visibility
-U storage/txn/snapshot
-U storage/txn/clog
-U fulltext/search/bm25
+use std/vec
+use std/string
+use fulltext/types
+use fulltext/visibility
+use storage/txn/snapshot
+use storage/txn/clog
+use fulltext/search/bm25
 
 # ============================================================================
 # PhraseResult — Result of phrase search for a single document
 # ============================================================================
 
-S PhraseResult {
-    doc_id: u64,        # Document containing the phrase M score: f64,         # Relevance score for this M match_count: u32,   # Number of times the phrase appears in this document
+struct PhraseResult {
+    doc_id: u64,        # Document containing the phrase
+    score: f64,         # Relevance score for this match
+    match_count: u32,   # Number of times the phrase appears in this document
 }
 
-X PhraseResult {
-    F new(doc_id: u64, score: f64, match_count: u32) -> PhraseResult {
+impl PhraseResult {
+    fn new(doc_id: u64, score: f64, match_count: u32) -> PhraseResult {
         PhraseResult { doc_id, score, match_count }
     }
 }
@@ -28,11 +30,11 @@ X PhraseResult {
 # PhraseSearcher — Stateless phrase search implementation
 # ============================================================================
 
-S PhraseSearcher {}
+struct PhraseSearcher {}
 
-X PhraseSearcher {
+impl PhraseSearcher {
     # Create new phrase searcher
-    F new() -> PhraseSearcher {
+    fn new() -> PhraseSearcher {
         PhraseSearcher {}
     }
 
@@ -55,7 +57,7 @@ X PhraseSearcher {
     # - total_docs: total number of documents in corpus (for scoring)
     #
     # Returns: Vec of PhraseResult sorted by score (descending)
-    F search_phrase(
+    fn search_phrase(
         self,
         terms: &Vec<str>,
         posting_entries_per_term: &Vec<Vec<PostingEntry>>,
@@ -67,12 +69,12 @@ X PhraseSearcher {
     ) -> Vec<PhraseResult> {
         # Edge case: no terms or mismatched lengths
         I terms.len() == 0 || terms.len() != posting_entries_per_term.len() {
-            R Vec.with_capacity(0)
+            return Vec.with_capacity(0)
         }
 
         # Edge case: single term (not a phrase, but handle gracefully)
         I terms.len() == 1 {
-            R self.handle_single_term(
+            return self.handle_single_term(
                 &posting_entries_per_term[0],
                 snapshot,
                 clog,
@@ -110,7 +112,8 @@ X PhraseSearcher {
                     clog,
                 )
 
-                # Score this phrase M mut score = self.score_phrase(
+                # Score this phrase
+                score := mut self.score_phrase(
                     match_count,
                     doc_length,
                     avg_doc_length,
@@ -131,14 +134,14 @@ X PhraseSearcher {
 
     # Find documents appearing in ALL term posting lists (intersection)
     # Only considers visible postings
-    F intersect_by_doc_id(
+    fn intersect_by_doc_id(
         self,
         posting_entries_per_term: &Vec<Vec<PostingEntry>>,
         snapshot: &Snapshot,
         clog: &Clog,
     ) -> Vec<u64> {
         I posting_entries_per_term.len() == 0 {
-            R Vec.with_capacity(0)
+            return Vec.with_capacity(0)
         }
 
         # Start with doc_ids from first term (filtered by visibility)
@@ -176,7 +179,7 @@ X PhraseSearcher {
 
             # Early exit if no candidates remain
             I candidate_docs.len() == 0 {
-                R candidate_docs
+                return candidate_docs
             }
 
             term_idx += 1
@@ -187,7 +190,7 @@ X PhraseSearcher {
 
     # Collect all positions for each term in a specific document
     # Returns Vec<Vec<u32>> where outer index = term, inner = positions
-    F collect_positions_for_doc(
+    fn collect_positions_for_doc(
         self,
         doc_id: u64,
         posting_entries_per_term: &Vec<Vec<PostingEntry>>,
@@ -232,16 +235,16 @@ X PhraseSearcher {
     #   Check if term[2] has position P+2 (+slop)
     #   ...
     #   If all terms found at consecutive (+slop) positions, increment match_count
-    F count_phrase_matches(self, positions_per_term: &Vec<Vec<u32>>, slop: u32) -> u32 {
+    fn count_phrase_matches(self, positions_per_term: &Vec<Vec<u32>>, slop: u32) -> u32 {
         I positions_per_term.len() == 0 {
-            R 0
+            return 0
         }
 
         # Edge case: any term has no positions
         i := mut 0
         LW i < positions_per_term.len() {
             I positions_per_term[i].len() == 0 {
-                R 0
+                return 0
             }
             i += 1
         }
@@ -273,7 +276,7 @@ X PhraseSearcher {
 
     # Try to M phrase starting at base_pos
     # Returns true if all terms found at consecutive (+slop) positions
-    F try_match_phrase_at_position(
+    fn try_match_phrase_at_position(
         self,
         base_pos: u32,
         positions_per_term: &Vec<Vec<u32>>,
@@ -283,7 +286,7 @@ X PhraseSearcher {
         term_idx := mut 1
         LW term_idx < positions_per_term.len() {
             expected_pos := mut base_pos + (term_idx as u32)
-            min_pos := mut I expected_pos >= slop { expected_pos - slop } EL { 0 }
+            min_pos := mut I expected_pos >= slop { expected_pos - slop } else { 0 }
             max_pos := mut expected_pos + slop
 
             # Check if this term has a position in range [min_pos, max_pos]
@@ -294,7 +297,7 @@ X PhraseSearcher {
             )
 
             I !found {
-                R false
+                return false
             }
 
             term_idx += 1
@@ -304,11 +307,11 @@ X PhraseSearcher {
     }
 
     # Check if positions list contains any value in [min_pos, max_pos]
-    F has_position_in_range(self, positions: &Vec<u32>, min_pos: u32, max_pos: u32) -> bool {
+    fn has_position_in_range(self, positions: &Vec<u32>, min_pos: u32, max_pos: u32) -> bool {
         i := mut 0
         LW i < positions.len() {
             I positions[i] >= min_pos && positions[i] <= max_pos {
-                R true
+                return true
             }
             i += 1
         }
@@ -316,7 +319,7 @@ X PhraseSearcher {
     }
 
     # Calculate document length (total visible term frequencies across all terms)
-    F calculate_doc_length(
+    fn calculate_doc_length(
         self,
         doc_id: u64,
         posting_entries_per_term: &Vec<Vec<PostingEntry>>,
@@ -350,7 +353,7 @@ X PhraseSearcher {
     # This gives higher scores to:
     # - Phrases appearing multiple times in the document
     # - Shorter documents (relative to corpus average)
-    F score_phrase(
+    fn score_phrase(
         self,
         match_count: u32,
         doc_length: u32,
@@ -358,7 +361,7 @@ X PhraseSearcher {
         total_docs: u64,
     ) -> f64 {
         I match_count == 0 || doc_length == 0 {
-            R 0.0
+            return 0.0
         }
 
         # Corpus size component (IDF-like)
@@ -380,7 +383,7 @@ X PhraseSearcher {
     }
 
     # Handle single-term "phrase" (degenerate case)
-    F handle_single_term(
+    fn handle_single_term(
         self,
         postings: &Vec<PostingEntry>,
         snapshot: &Snapshot,
@@ -414,9 +417,9 @@ X PhraseSearcher {
     }
 
     # Deduplicate doc_ids in a sorted or unsorted list
-    F deduplicate_doc_ids(self, doc_ids: &Vec<u64>) -> Vec<u64> {
+    fn deduplicate_doc_ids(self, doc_ids: &Vec<u64>) -> Vec<u64> {
         I doc_ids.len() == 0 {
-            R Vec.with_capacity(0)
+            return Vec.with_capacity(0)
         }
 
         result := mut Vec.with_capacity(0)
@@ -445,7 +448,7 @@ X PhraseSearcher {
     }
 
     # Intersect two doc_id lists
-    F intersect_doc_id_lists(self, list1: &Vec<u64>, list2: &Vec<u64>) -> Vec<u64> {
+    fn intersect_doc_id_lists(self, list1: &Vec<u64>, list2: &Vec<u64>) -> Vec<u64> {
         result := mut Vec.with_capacity(0)
 
         i := mut 0
@@ -473,9 +476,9 @@ X PhraseSearcher {
     }
 
     # Sort positions in ascending order (simple bubble sort)
-    F sort_positions(self, positions: &Vec<u32>) -> Vec<u32> {
+    fn sort_positions(self, positions: &Vec<u32>) -> Vec<u32> {
         I positions.len() <= 1 {
-            R positions.clone()
+            return positions.clone()
         }
 
         result := mut positions.clone()
@@ -500,9 +503,9 @@ X PhraseSearcher {
     }
 
     # Sort results by score in descending order (simple bubble sort)
-    F sort_results_by_score(self, results: &Vec<PhraseResult>) {
+    fn sort_results_by_score(self, results: &Vec<PhraseResult>) {
         I results.len() <= 1 {
-            R
+            return
         }
 
         n := mut results.len()

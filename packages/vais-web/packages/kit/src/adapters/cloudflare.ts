@@ -1,4 +1,15 @@
-import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult } from "../types.js";
+import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult, RouteDefinition } from "../types.js";
+
+function collectRoutes(routes: RouteDefinition[]): RouteDefinition[] {
+  const result: RouteDefinition[] = [];
+  for (const route of routes) {
+    result.push(route);
+    if (route.children.length > 0) {
+      result.push(...collectRoutes(route.children));
+    }
+  }
+  return result;
+}
 
 /**
  * Generate JS code string for the Cloudflare Workers entry point.
@@ -6,7 +17,7 @@ import type { Adapter, RouteManifest, AdapterConfig, AdapterBuildResult } from "
  * route matching and SSR rendering, with static asset serving.
  */
 export function generateWorkerEntry(manifest: RouteManifest): string {
-  const routeEntries = manifest.routes
+  const routeEntries = collectRoutes(manifest.routes)
     .map((r) => {
       const isDynamic = r.segments.some(
         (s) => s.type === "dynamic" || s.type === "catch-all"
@@ -138,7 +149,7 @@ export function createCloudflareAdapter(): Adapter {
       generatedFiles[workerPath] = workerEntry;
 
       // Generate static asset entries in _assets/
-      for (const route of manifest.routes) {
+      for (const route of collectRoutes(manifest.routes)) {
         if (route.page) {
           const hasDynamic = route.segments.some(
             (s) => s.type === "dynamic" || s.type === "catch-all"

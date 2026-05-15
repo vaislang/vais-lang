@@ -3,15 +3,15 @@
 # Based on Phase 0 Stage 3 MVCC strategy: AdjEntry 42B packed layout
 # Error codes: EE=03 (graph), CC=01-10
 
-U storage/bytes
-U std/vec
-U std/string
-U std/option
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/page/mvcc
+use storage/bytes
+use std/vec
+use std/string
+use std/option
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/page/mvcc
 
 # ============================================================================
 # Constants
@@ -63,70 +63,70 @@ C INVALID_EDGE_ID: u64 = 0
 # Error Codes: EE=03 (graph)
 # ============================================================================
 
-F err_graph_node_not_found(node_id: u64) -> VaisError {
+fn err_graph_node_not_found(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0310001",
         "Graph node {node_id} not found"
     )
 }
 
-F err_graph_edge_not_found(edge_id: u64) -> VaisError {
+fn err_graph_edge_not_found(edge_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0310002",
         "Graph edge {edge_id} not found"
     )
 }
 
-F err_graph_node_corrupt(node_id: u64) -> VaisError {
+fn err_graph_node_corrupt(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0305001",
         "Graph node {node_id} data corrupted"
     ).with_severity(Fatal)
 }
 
-F err_graph_adj_corrupt(page_id: u32) -> VaisError {
+fn err_graph_adj_corrupt(page_id: u32) -> VaisError {
     VaisError.new(
         "VAIS-0305002",
         "Adjacency list page {page_id} corrupted"
     ).with_severity(Fatal)
 }
 
-F err_graph_too_many_labels(count: u16) -> VaisError {
+fn err_graph_too_many_labels(count: u16) -> VaisError {
     VaisError.new(
         "VAIS-0302001",
         "Too many labels: {count} exceeds max {MAX_LABELS_PER_NODE}"
     )
 }
 
-F err_graph_invalid_edge_type(edge_type: u16) -> VaisError {
+fn err_graph_invalid_edge_type(edge_type: u16) -> VaisError {
     VaisError.new(
         "VAIS-0309001",
         "Invalid edge type: {edge_type}"
     )
 }
 
-F err_graph_page_full(page_id: u32) -> VaisError {
+fn err_graph_page_full(page_id: u32) -> VaisError {
     VaisError.new(
         "VAIS-0303001",
         "Graph page {page_id} is full"
     )
 }
 
-F err_graph_duplicate_edge(src: u64, dst: u64, edge_type: u16) -> VaisError {
+fn err_graph_duplicate_edge(src: u64, dst: u64, edge_type: u16) -> VaisError {
     VaisError.new(
         "VAIS-0302002",
         "Duplicate edge from {src} to {dst} with type {edge_type}"
     )
 }
 
-F err_graph_self_loop(node_id: u64) -> VaisError {
+fn err_graph_self_loop(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0302003",
         "Self-loop not allowed: node {node_id}"
     )
 }
 
-F gra_err_graph_engine_closed() -> VaisError {
+fn gra_err_graph_engine_closed() -> VaisError {
     VaisError.new(
         "VAIS-0310003",
         "Graph engine is not open"
@@ -137,15 +137,15 @@ F gra_err_graph_engine_closed() -> VaisError {
 # GraphConfig — Immutable configuration
 # ============================================================================
 
-S GraphConfig {
+struct GraphConfig {
     max_labels_per_node: u16,    # Max labels a node can have (default 64)
     max_edge_types: u16,         # Max distinct edge types (default 4096)
     allow_self_loops: bool,      # Allow edges from node to itself
     page_size: u32,              # Page size (inherited from database)
 }
 
-X GraphConfig {
-    F default(page_size: u32) -> GraphConfig {
+impl GraphConfig {
+    fn default(page_size: u32) -> GraphConfig {
         GraphConfig {
             max_labels_per_node: MAX_LABELS_PER_NODE,
             max_edge_types: MAX_EDGE_TYPES,
@@ -155,17 +155,17 @@ X GraphConfig {
     }
 
     # Serialize (8 bytes)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u16_le(self.max_labels_per_node)
         buf.write_u16_le(self.max_edge_types)
-        loops_byte := I self.allow_self_loops { 1 } EL { 0 }
+        loops_byte := I self.allow_self_loops { 1 } else { 0 }
         buf.write_u8(loops_byte)
         buf.write_u8(0);  # reserved
         buf.write_u16_le(0);  # reserved
     }
 
     # Deserialize (8 bytes)
-    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<GraphConfig, VaisError> {
+    fn deserialize(buf: &ByteBuffer, page_size: u32) -> Result<GraphConfig, VaisError> {
         labels := read_u16_le_checked(buf)?;
         edges := read_u16_le_checked(buf)?;
         loops := read_u8_checked(buf)? != 0;
@@ -185,7 +185,7 @@ X GraphConfig {
 # GraphMeta — Graph metadata (stored in meta page)
 # ============================================================================
 
-S GraphMeta {
+struct GraphMeta {
     format_version: u8,
     total_nodes: u64,
     total_edges: u64,
@@ -195,8 +195,8 @@ S GraphMeta {
     config: GraphConfig,
 }
 
-X GraphMeta {
-    F new(config: GraphConfig) -> GraphMeta {
+impl GraphMeta {
+    fn new(config: GraphConfig) -> GraphMeta {
         GraphMeta {
             format_version: GRAPH_FORMAT_VERSION,
             total_nodes: 0,
@@ -209,21 +209,21 @@ X GraphMeta {
     }
 
     # Allocate next node ID (monotonically increasing)
-    F alloc_node_id(mut self) -> u64 {
+    fn alloc_node_id(mut self) -> u64 {
         id := mut self.next_node_id
         self.next_node_id += 1
         id
     }
 
     # Allocate next edge ID (monotonically increasing)
-    F alloc_edge_id(mut self) -> u64 {
+    fn alloc_edge_id(mut self) -> u64 {
         id := mut self.next_edge_id
         self.next_edge_id += 1
         id
     }
 
     # Serialize to ByteBuffer
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(self.format_version)
         buf.write_i64_le(self.total_nodes)
         buf.write_i64_le(self.total_edges)
@@ -234,7 +234,7 @@ X GraphMeta {
     }
 
     # Deserialize from ByteBuffer
-    F deserialize(buf: &ByteBuffer, page_size: u32) -> Result<GraphMeta, VaisError> {
+    fn deserialize(buf: &ByteBuffer, page_size: u32) -> Result<GraphMeta, VaisError> {
         format_version := mut read_u8_checked(buf)?;
         Ok(GraphMeta {
             format_version,
@@ -252,29 +252,29 @@ X GraphMeta {
 # EdgeTypeTable — Maps edge type strings to u16 IDs
 # ============================================================================
 
-S EdgeTypeTable {
+struct EdgeTypeTable {
     types: Vec<str>,   # Index = edge_type u16
 }
 
-X EdgeTypeTable {
-    F new() -> EdgeTypeTable {
+impl EdgeTypeTable {
+    fn new() -> EdgeTypeTable {
         EdgeTypeTable { types: Vec.with_capacity(0) }
     }
 
     # Get or create edge type ID for a string
-    F get_or_create(mut self, type_name: &str) -> Result<u16, VaisError> {
+    fn get_or_create(mut self, type_name: &str) -> Result<u16, VaisError> {
         # Search existing
         i := mut 0
         LW i < self.types.len() {
             I self.types[i] == *type_name {
-                R Ok(i as u16)
+                return Ok(i as u16)
             }
             i += 1
         }
 
         # Create new
         I self.types.len() >= MAX_EDGE_TYPES as u64 {
-            R Err(err_graph_invalid_edge_type(self.types.len() as u16))
+            return Err(err_graph_invalid_edge_type(self.types.len() as u16))
         }
         id := mut self.types.len() as u16
         self.types.push(type_name.clone())
@@ -282,17 +282,17 @@ X EdgeTypeTable {
     }
 
     # Lookup edge type name by ID
-    F get_name(self, edge_type: u16) -> Option<str> {
+    fn get_name(self, edge_type: u16) -> Option<str> {
         I (edge_type as u64) < self.types.len() {
             tmp := mut self.types[edge_type as u64]
             Some(tmp.clone())
-        } EL {
+        } else {
             None
         }
     }
 
     # Serialize
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u16_le(self.types.len() as u16)
         i := mut 0
         LW i < self.types.len() {
@@ -302,7 +302,7 @@ X EdgeTypeTable {
     }
 
     # Deserialize
-    F deserialize(buf: &ByteBuffer) -> Result<EdgeTypeTable, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<EdgeTypeTable, VaisError> {
         count := mut read_u16_le_checked(buf)? as u64
         types := mut Vec.with_capacity(count)
         i := mut 0
@@ -319,7 +319,7 @@ X EdgeTypeTable {
 # Per Phase 0 Stage 3: MVCC-aware edge in adjacency list
 # ============================================================================
 
-S AdjEntry {
+struct AdjEntry {
     target_node: u64,       # Destination (outgoing) or source (incoming) node ID
     edge_id: u64,           # Edge ID for property lookup
     edge_type: u16,         # Edge type (index into EdgeTypeTable)
@@ -329,9 +329,9 @@ S AdjEntry {
     expire_cmd_id: u32,     # Command ID within deleting transaction
 }
 
-X AdjEntry {
+impl AdjEntry {
     # Create new adjacency entry for edge insertion
-    F new(
+    fn new(
         target_node: u64,
         edge_id: u64,
         edge_type: u16,
@@ -350,7 +350,7 @@ X AdjEntry {
     }
 
     # Serialize to ByteBuffer (42 bytes packed, no padding)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.target_node)
         buf.write_i64_le(self.edge_id)
         buf.write_u16_le(self.edge_type)
@@ -361,7 +361,7 @@ X AdjEntry {
     }
 
     # Deserialize from ByteBuffer (42 bytes)
-    F deserialize(buf: &ByteBuffer) -> Result<AdjEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<AdjEntry, VaisError> {
         Ok(AdjEntry {
             target_node: read_i64_le_checked(buf)?,
             edge_id: read_i64_le_checked(buf)?,
@@ -374,18 +374,18 @@ X AdjEntry {
     }
 
     # Mark as expired (soft delete)
-    F set_expired(mut self, txn_id: u64, cmd_id: u32) {
+    fn set_expired(mut self, txn_id: u64, cmd_id: u32) {
         self.txn_id_expire = txn_id
         self.expire_cmd_id = cmd_id
     }
 
     # Check if entry is active (not expired)
-    F is_active(self) -> bool {
+    fn is_active(self) -> bool {
         self.txn_id_expire == INVALID_TXN_ID
     }
 
     # Clear expiration (rollback)
-    F clear_expired(mut self) {
+    fn clear_expired(mut self) {
         self.txn_id_expire = INVALID_TXN_ID
         self.expire_cmd_id = 0
     }
@@ -395,7 +395,7 @@ X AdjEntry {
 # GraphNode — Node with labels and MVCC metadata
 # ============================================================================
 
-S GraphNode {
+struct GraphNode {
     node_id: u64,
     out_adj_page: u32,     # First outgoing adjacency list page
     in_adj_page: u32,      # First incoming adjacency list page
@@ -411,9 +411,9 @@ S GraphNode {
     expire_cmd_id: u32,
 }
 
-X GraphNode {
+impl GraphNode {
     # Create new node
-    F new(
+    fn new(
         node_id: u64,
         labels: Vec<u16>,
         txn_id: u64,
@@ -435,7 +435,7 @@ X GraphNode {
     }
 
     # Serialize node (variable size: header 56B + labels 2B each)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
         buf.write_i32_le(self.out_adj_page)
         buf.write_i32_le(self.in_adj_page)
@@ -459,7 +459,7 @@ X GraphNode {
     }
 
     # Deserialize node
-    F deserialize(buf: &ByteBuffer) -> Result<GraphNode, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<GraphNode, VaisError> {
         node_id := mut read_i64_le_checked(buf)?;
         out_adj_page := mut read_i32_le_checked(buf)?;
         in_adj_page := mut read_i32_le_checked(buf)?;
@@ -499,33 +499,33 @@ X GraphNode {
     }
 
     # Mark node as deleted (set expire)
-    F mark_deleted(mut self, txn_id: u64, cmd_id: u32) {
+    fn mark_deleted(mut self, txn_id: u64, cmd_id: u32) {
         self.txn_id_expire = txn_id
         self.expire_cmd_id = cmd_id
         self.flags = self.flags & ~NODE_FLAG_ACTIVE
     }
 
     # Check if node is active
-    F is_active(self) -> bool {
+    fn is_active(self) -> bool {
         (self.flags & NODE_FLAG_ACTIVE) != 0
     }
 
     # Check if node has properties
-    F has_properties(self) -> bool {
+    fn has_properties(self) -> bool {
         self.property_page != NULL_PAGE
     }
 
     # Calculate serialized size
-    F serialized_size(self) -> u32 {
+    fn serialized_size(self) -> u32 {
         GRAPH_NODE_HEADER_SIZE + (self.labels.len() as u32 * 2)
     }
 
     # Has label
-    F has_label(self, label_id: u16) -> bool {
+    fn has_label(self, label_id: u16) -> bool {
         i := mut 0
         LW i < self.labels.len() {
             I self.labels[i] == label_id {
-                R true
+                return true
             }
             i += 1
         }
@@ -545,7 +545,7 @@ C PROP_TYPE_STRING: u8 = 3
 C PROP_TYPE_BOOL: u8 = 4
 C PROP_TYPE_BYTES: u8 = 5
 
-S PropertyValue {
+struct PropertyValue {
     prop_type: u8,
     int_val: i64,
     float_val: f64,
@@ -554,28 +554,28 @@ S PropertyValue {
     bytes_val: Vec<u8>,
 }
 
-X PropertyValue {
-    F null() -> PropertyValue {
+impl PropertyValue {
+    fn null() -> PropertyValue {
         PropertyValue { prop_type: PROP_TYPE_NULL, int_val: 0, float_val: 0.0, string_val: "", bool_val: false, bytes_val: Vec.with_capacity(0) }
     }
 
-    F from_int(v: i64) -> PropertyValue {
+    fn from_int(v: i64) -> PropertyValue {
         PropertyValue { prop_type: PROP_TYPE_INT, int_val: v, float_val: 0.0, string_val: "", bool_val: false, bytes_val: Vec.with_capacity(0) }
     }
 
-    F from_float(v: f64) -> PropertyValue {
+    fn from_float(v: f64) -> PropertyValue {
         PropertyValue { prop_type: PROP_TYPE_FLOAT, int_val: 0, float_val: v, string_val: "", bool_val: false, bytes_val: Vec.with_capacity(0) }
     }
 
-    F from_string(v: str) -> PropertyValue {
+    fn from_string(v: str) -> PropertyValue {
         PropertyValue { prop_type: PROP_TYPE_STRING, int_val: 0, float_val: 0.0, string_val: v, bool_val: false, bytes_val: Vec.with_capacity(0) }
     }
 
-    F from_bool(v: i64) -> PropertyValue {
+    fn from_bool(v: i64) -> PropertyValue {
         PropertyValue { prop_type: PROP_TYPE_BOOL, int_val: 0, float_val: 0.0, string_val: "", bool_val: v != 0, bytes_val: Vec.with_capacity(0) }
     }
 
-    F clone(self) -> PropertyValue {
+    fn clone(self) -> PropertyValue {
         PropertyValue {
             prop_type: self.prop_type,
             int_val: self.int_val,
@@ -587,14 +587,14 @@ X PropertyValue {
     }
 
     # Serialize property value
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(self.prop_type)
-        M self.prop_type {
+        match self.prop_type {
             PROP_TYPE_NULL => {},
             PROP_TYPE_INT => buf.write_i64_le(self.int_val),
             PROP_TYPE_FLOAT => buf.write_f64_le(self.float_val),
             PROP_TYPE_STRING => buf.write_str(&self.string_val),
-            PROP_TYPE_BOOL => buf.write_u8(I self.bool_val { 1 } EL { 0 }),
+            PROP_TYPE_BOOL => buf.write_u8(I self.bool_val { 1 } else { 0 }),
             PROP_TYPE_BYTES => {
                 buf.write_i32_le(self.bytes_val.len() as u32)
                 i := mut 0
@@ -608,9 +608,9 @@ X PropertyValue {
     }
 
     # Deserialize property value
-    F deserialize(buf: &ByteBuffer) -> Result<PropertyValue, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PropertyValue, VaisError> {
         prop_type := mut read_u8_checked(buf)?;
-        M prop_type {
+        match prop_type {
             PROP_TYPE_NULL => Ok(PropertyValue.null()),
             PROP_TYPE_INT => Ok(PropertyValue.from_int(read_i64_le_checked(buf)?)),
             PROP_TYPE_FLOAT => Ok(PropertyValue.from_float(read_f64_le_checked(buf)?)),
@@ -632,22 +632,22 @@ X PropertyValue {
 }
 
 # Property entry: key-value pair
-S PropertyEntry {
+struct PropertyEntry {
     key: str,
     value: PropertyValue,
 }
 
-X PropertyEntry {
-    F new(key: str, value: PropertyValue) -> PropertyEntry {
+impl PropertyEntry {
+    fn new(key: str, value: PropertyValue) -> PropertyEntry {
         PropertyEntry { key: key.clone(), value: value.clone() }
     }
 
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_str(&self.key)
         self.value.serialize(buf)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<PropertyEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PropertyEntry, VaisError> {
         Ok(PropertyEntry {
             key: read_str_checked(buf)?,
             value: PropertyValue.deserialize(buf)?,
@@ -659,17 +659,17 @@ X PropertyEntry {
 # Uses ByteBuffer as backing store to work within Vec's 8-byte element limit.
 # Entries are serialized into the buffer; count tracks number of entries.
 # get/set deserialize on-the-fly. This is correct but O(n) per access.
-S PropertyMap {
+struct PropertyMap {
     buf: ByteBuffer,
     count: i64,
 }
 
-X PropertyMap {
-    F new() -> PropertyMap {
+impl PropertyMap {
+    fn new() -> PropertyMap {
         PropertyMap { buf: ByteBuffer.new(), count: 0 }
     }
 
-    F set(mut self, key: str, value: PropertyValue) {
+    partial fn set(mut self, key: str, value: PropertyValue) {
         # Append entry to buffer (no update-in-place for simplicity)
         # For update: rebuild buffer without old key, then append new
         # Check if key exists
@@ -685,7 +685,7 @@ X PropertyMap {
                     # Replace with new value
                     PropertyEntry.new(key.clone(), value.clone()).serialize(&new_buf)
                     existing = true
-                } EL {
+                } else {
                     entry.serialize(&new_buf)
                 }
                 new_count += 1
@@ -700,22 +700,22 @@ X PropertyMap {
         self.count = new_count
     }
 
-    F get(self, key: &str) -> Option<&PropertyValue> {
-        I self.count == 0 { R None }
+    partial fn get(self, key: &str) -> Option<&PropertyValue> {
+        I self.count == 0 { return None }
         self.buf.rewind()
         i := mut 0
         LW i < self.count {
             entry := PropertyEntry.deserialize(&self.buf)!;
             I entry.key == *key {
-                R Some(&entry.value)
+                return Some(&entry.value)
             }
             i += 1
         }
         None
     }
 
-    F remove(mut self, key: &str) -> bool {
-        I self.count == 0 { R false }
+    partial fn remove(mut self, key: &str) -> bool {
+        I self.count == 0 { return false }
         new_buf := mut ByteBuffer.new()
         new_count := mut 0
         found := mut false
@@ -725,7 +725,7 @@ X PropertyMap {
             entry := PropertyEntry.deserialize(&self.buf)!;
             I entry.key == *key {
                 found = true
-            } EL {
+            } else {
                 entry.serialize(&new_buf)
                 new_count += 1
             }
@@ -736,16 +736,34 @@ X PropertyMap {
         found
     }
 
-    F len(self) -> u64 {
+    fn len(self) -> u64 {
         self.count
     }
 
-    F is_empty(self) -> bool {
+    fn is_empty(self) -> bool {
         self.count == 0
     }
 
+    fn entry_at(self, index: u64) -> Result<PropertyEntry, VaisError> {
+        I index >= (self.count as u64) {
+            return Err(err_internal("PropertyMap entry index out of range"))
+        }
+
+        self.buf.rewind()
+        i := mut 0u64
+        LW i <= index {
+            entry := mut PropertyEntry.deserialize(&self.buf)?;
+            I i == index {
+                return Ok(entry)
+            }
+            i += 1
+        }
+
+        Err(err_internal("PropertyMap entry index out of range"))
+    }
+
     # Serialize entire property map to bytes
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i32_le(self.count as u32)
         I self.count > 0 {
             self.buf.rewind()
@@ -759,7 +777,7 @@ X PropertyMap {
     }
 
     # Deserialize property map from bytes
-    F deserialize(buf: &ByteBuffer) -> Result<PropertyMap, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PropertyMap, VaisError> {
         count := mut read_i32_le_checked(buf)? as u64
         map_buf := mut ByteBuffer.new()
         i := mut 0
@@ -772,14 +790,14 @@ X PropertyMap {
     }
 
     # Serialize to standalone byte vector
-    F to_bytes(self) -> Vec<u8> {
+    fn to_bytes(self) -> Vec<u8> {
         buf := mut ByteBuffer.with_capacity(256)
-        self.serialize(&buf)
+        self.serialize(&mut buf)
         buf.to_vec()
     }
 
     # Deserialize from standalone byte vector
-    F from_bytes(data: &Vec<u8>) -> Result<PropertyMap, VaisError> {
+    fn from_bytes(data: &Vec<u8>) -> Result<PropertyMap, VaisError> {
         buf := mut ByteBuffer.new()
         i := mut 0
         LW i < data.len() {
@@ -796,51 +814,51 @@ X PropertyMap {
 # ============================================================================
 
 # Traversal stack/queue entry: (node_id, depth)
-S TraversalEntry {
+struct TraversalEntry {
     node_id: u64,
     depth: u32,
 }
 
 # Shortest path visited entry: (node_id, parent_id, edge_id)
-S VisitedEntry {
+struct VisitedEntry {
     node_id: u64,
     parent_id: u64,
     edge_id: u64,
 }
 
 # Node location in storage: (page_id, slot_index)
-S NodeLocation {
+struct NodeLocation {
     page_id: u32,
     slot_index: u16,
 }
 
 # Cycle detection color map: (node_id, color)
-S NodeColor {
+struct NodeColor {
     node_id: u64,
     color: u8,
 }
 
 # Cycle detection recursion path: (node_id, edge_id)
-S NodeEdgePair {
+struct NodeEdgePair {
     node_id: u64,
     edge_id: u64,
 }
 
 # Cycle detection stack: (node_id, adj_idx, edge_count)
-S CycleStackEntry {
+struct CycleStackEntry {
     node_id: u64,
     adj_idx: u64,
     edge_count: u64,
 }
 
 # Pattern matching binding: (variable_name, node_id)
-S PatternBinding {
+struct PatternBinding {
     var_name: str,
     node_id: u64,
 }
 
 # Node adjacency info for stats: (node_id, out_adj_page, in_adj_page)
-S NodeAdjInfo {
+struct NodeAdjInfo {
     node_id: u64,
     out_adj_page: u32,
     in_adj_page: u32,

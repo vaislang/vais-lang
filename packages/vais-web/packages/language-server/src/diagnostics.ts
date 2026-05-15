@@ -9,11 +9,8 @@
  *  - Accessibility warnings in templates
  */
 
-import {
-  Diagnostic,
-  DiagnosticSeverity,
-} from './lsp-types.js';
-import type { Range } from './lsp-types.js';
+import { DiagnosticSeverity } from './lsp-types.js';
+import type { Diagnostic, Range } from './lsp-types.js';
 import {
   parseVaisxFile,
   extractVariables,

@@ -2,15 +2,14 @@
 # Based on Stage 2: WAL Design
 # HNSW uses logical logging: record the result, not the process
 
-U storage/error
-U storage/bytes
-U storage/bytes
+use storage/error
+use storage/bytes
 
 # ============================================================================
 # HNSW_INSERT_NODE (32) - Insert node into HNSW index
 # ============================================================================
 
-S HnswInsertNodePayload {
+struct HnswInsertNodePayload {
     node_id: u64,
     layer: u8,
     neighbors: Vec<(u64, f32)>,     # (neighbor_id, distance) pairs
@@ -19,18 +18,21 @@ S HnswInsertNodePayload {
     affected_pages: Vec<(u8, u32)>, # All (file_id, page_id) pairs affected
 }
 
-X HnswInsertNodePayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl HnswInsertNodePayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
         buf.write_u8(self.layer)
 
         # Serialize neighbors
         buf.write_i32_le(self.neighbors.len() as u32)
-        LF item: &self.neighbors {
-            neighbor_id := item.0
-            distance := item.1
+        i := mut 0
+        LW i < self.neighbors.len() {
+            item := mut self.neighbors[i]
+            neighbor_id: u64 := item.0
+            distance: f32 := item.1
             buf.write_i64_le(neighbor_id)
-            buf.put_f32_le(distance)
+            buf.write_f32_le(f32_bits(distance))
+            i += 1
         }
 
         buf.write_u8(self.file_id)
@@ -38,25 +40,31 @@ X HnswInsertNodePayload {
 
         # Serialize affected_pages
         buf.write_i32_le(self.affected_pages.len() as u32)
-        LF item: &self.affected_pages {
-            fid := item.0
-            pid := item.1
+        j := mut 0
+        LW j < self.affected_pages.len() {
+            item := mut self.affected_pages[j]
+            fid: u8 := item.0
+            pid: u32 := item.1
             buf.write_u8(fid)
             buf.write_i32_le(pid)
+            j += 1
         }
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<HnswInsertNodePayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<HnswInsertNodePayload, VaisError> {
         node_id := mut read_i64_le_checked(buf)?;
         layer := mut read_u8_checked(buf)?;
 
         # Deserialize neighbors
         neighbors_count := mut read_i32_le_checked(buf)? as u64
-        neighbors := mut Vec.with_capacity(neighbors_count)
+        neighbors: Vec<(u64, f32)> := mut Vec.with_capacity(neighbors_count)
         LF _: 0..neighbors_count {
-            neighbor_id := mut read_i64_le_checked(buf)?;
-            distance := mut get_f32_le_checked(buf)? as f32;
-            neighbors.push((neighbor_id, distance))
+            neighbor_read := mut read_i64_le_checked(buf)?;
+            distance_read := mut get_f32_le_checked(buf)?;
+            neighbor_id: u64 := neighbor_read
+            distance: f32 := distance_read as f32
+            neighbor: (u64, f32) := (neighbor_id, distance)
+            neighbors.push(neighbor)
         }
 
         file_id := mut read_u8_checked(buf)?;
@@ -64,11 +72,14 @@ X HnswInsertNodePayload {
 
         # Deserialize affected_pages
         affected_count := mut read_i32_le_checked(buf)? as u64
-        affected_pages := mut Vec.with_capacity(affected_count)
+        affected_pages: Vec<(u8, u32)> := mut Vec.with_capacity(affected_count)
         LF _: 0..affected_count {
-            fid := mut read_u8_checked(buf)?;
-            pid := mut read_i32_le_checked(buf)?;
-            affected_pages.push((fid, pid))
+            fid_read := mut read_u8_checked(buf)?;
+            pid_read := mut read_i32_le_checked(buf)?;
+            fid: u8 := fid_read as u8
+            pid: u32 := pid_read as u32
+            page: (u8, u32) := (fid, pid)
+            affected_pages.push(page)
         }
 
         Ok(HnswInsertNodePayload {
@@ -86,33 +97,36 @@ X HnswInsertNodePayload {
 # HNSW_DELETE_NODE (33) - Delete node from HNSW index
 # ============================================================================
 
-S HnswDeleteNodePayload {
+struct HnswDeleteNodePayload {
     node_id: u64,
     layers_affected: Vec<u8>,
     file_id: u8,
     page_id: u32,
 }
 
-X HnswDeleteNodePayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl HnswDeleteNodePayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
 
         # Serialize layers_affected
         buf.write_i32_le(self.layers_affected.len() as u32)
-        LF layer: &self.layers_affected {
+        i := mut 0
+        LW i < self.layers_affected.len() {
+            layer := mut self.layers_affected[i]
             buf.write_u8(layer)
+            i += 1
         }
 
         buf.write_u8(self.file_id)
         buf.write_i32_le(self.page_id)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<HnswDeleteNodePayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<HnswDeleteNodePayload, VaisError> {
         node_id := mut read_i64_le_checked(buf)?;
 
         # Deserialize layers_affected
         layers_count := mut read_i32_le_checked(buf)? as u64
-        layers_affected := mut Vec.with_capacity(layers_count)
+        layers_affected: Vec<u8> := mut Vec.with_capacity(layers_count)
         LF _: 0..layers_count {
             layers_affected.push(read_u8_checked(buf)?)
         }
@@ -133,7 +147,7 @@ X HnswDeleteNodePayload {
 # HNSW_UPDATE_EDGES (34) - Update edge connections
 # ============================================================================
 
-S HnswUpdateEdgesPayload {
+struct HnswUpdateEdgesPayload {
     node_id: u64,
     layer: u8,
     old_neighbors: Vec<u64>,
@@ -142,8 +156,8 @@ S HnswUpdateEdgesPayload {
     page_id: u32,
 }
 
-X HnswUpdateEdgesPayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl HnswUpdateEdgesPayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
         buf.write_u8(self.layer)
         write_vec_u64(buf, &self.old_neighbors)
@@ -152,7 +166,7 @@ X HnswUpdateEdgesPayload {
         buf.write_i32_le(self.page_id)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<HnswUpdateEdgesPayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<HnswUpdateEdgesPayload, VaisError> {
         node_id := mut read_i64_le_checked(buf)?;
         layer := mut read_u8_checked(buf)?;
         old_neighbors := mut read_vec_u64(buf)?;
@@ -175,22 +189,22 @@ X HnswUpdateEdgesPayload {
 # HNSW_LAYER_PROMOTE (35) - Promote node to higher layer
 # ============================================================================
 
-S HnswLayerPromotePayload {
+struct HnswLayerPromotePayload {
     node_id: u64,
     new_max_layer: u8,
     file_id: u8,
     page_id: u32,
 }
 
-X HnswLayerPromotePayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl HnswLayerPromotePayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
         buf.write_u8(self.new_max_layer)
         buf.write_u8(self.file_id)
         buf.write_i32_le(self.page_id)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<HnswLayerPromotePayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<HnswLayerPromotePayload, VaisError> {
         node_id := mut read_i64_le_checked(buf)?;
         new_max_layer := mut read_u8_checked(buf)?;
         file_id := mut read_u8_checked(buf)?;
@@ -209,22 +223,22 @@ X HnswLayerPromotePayload {
 # VECTOR_DATA_WRITE (36) - Write vector data
 # ============================================================================
 
-S VectorDataWritePayload {
+struct VectorDataWritePayload {
     file_id: u8,
     page_id: u32,
     offset: u16,
     vector_data: Vec<u8>,
 }
 
-X VectorDataWritePayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl VectorDataWritePayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(self.file_id)
         buf.write_i32_le(self.page_id)
         buf.write_u16_le(self.offset)
         write_bytes(buf, &self.vector_data)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<VectorDataWritePayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<VectorDataWritePayload, VaisError> {
         file_id := mut read_u8_checked(buf)?;
         page_id := mut read_i32_le_checked(buf)?;
         offset := mut read_u16_le_checked(buf)?;
@@ -243,18 +257,18 @@ X VectorDataWritePayload {
 # QUANTIZATION_UPDATE (37) - Update quantization codebook
 # ============================================================================
 
-S QuantizationUpdatePayload {
+struct QuantizationUpdatePayload {
     index_id: u32,
     codebook: Vec<u8>,
 }
 
-X QuantizationUpdatePayload {
-    F serialize(self, buf: &mut ByteBuffer) {
+impl QuantizationUpdatePayload {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i32_le(self.index_id)
         write_bytes(buf, &self.codebook)
     }
 
-    F deserialize(buf: &ByteBuffer) -> Result<QuantizationUpdatePayload, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<QuantizationUpdatePayload, VaisError> {
         index_id := mut read_i32_le_checked(buf)?;
         codebook := mut read_bytes(buf)?;
 

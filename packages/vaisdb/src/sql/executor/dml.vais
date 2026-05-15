@@ -3,35 +3,35 @@
 # and index maintenance. Follows the same ExecContext pattern as scan executors.
 # Error codes: EE=01 (SQL), CC=03 (DML), NNN=001-010
 
-U storage/bytes
-U storage/error
-U storage/constants
-U storage/buffer/pool
-U storage/page/heap
-U storage/page/tuple
-U storage/page/mvcc
-U storage/txn/visibility
-U storage/btree/tree
-U storage/btree/insert
-U storage/btree/delete
-U storage/bytes
-U storage/wal/record_types
-U storage/wal/record_rel
-U sql/types
-U sql/row
-U sql/parser/ast
-U sql/catalog/schema
-U sql/catalog/constraints
-U sql/executor/mod
-U sql/executor/expr_eval
-U sql/executor/scan
+use storage/bytes
+use storage/error
+use storage/constants
+use storage/buffer/pool
+use storage/page/heap
+use storage/page/tuple
+use storage/page/mvcc
+use storage/txn/visibility
+use storage/btree/tree
+use storage/btree/insert
+use storage/btree/delete
+use storage/bytes
+use storage/wal/record_types
+use storage/wal/record_rel
+use sql/types
+use sql/row
+use sql/parser/ast
+use sql/catalog/schema
+use sql/catalog/constraints
+use sql/executor/mod
+use sql/executor/expr_eval
+use sql/executor/scan
 
 # ============================================================================
 # Error constructors (EE=01 SQL, CC=03 DML)
 # ============================================================================
 
 # VAIS-0103001: Insert failed — no space on any page
-F err_insert_no_space(table: str) -> VaisError {
+fn err_insert_no_space(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0103001",
         "INSERT failed: no free page found L table '{table}'"
@@ -39,7 +39,7 @@ F err_insert_no_space(table: str) -> VaisError {
 }
 
 # VAIS-0103002: Update failed — row not found
-F err_update_not_found(table: str) -> VaisError {
+fn err_update_not_found(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0103002",
         "UPDATE failed: target row not found in table '{table}'"
@@ -47,7 +47,7 @@ F err_update_not_found(table: str) -> VaisError {
 }
 
 # VAIS-0103003: Delete failed — row not found
-F err_delete_not_found(table: str) -> VaisError {
+fn err_delete_not_found(table: str) -> VaisError {
     VaisError.new(
         "VAIS-0103003",
         "DELETE failed: target row not found in table '{table}'"
@@ -55,7 +55,7 @@ F err_delete_not_found(table: str) -> VaisError {
 }
 
 # VAIS-0103004: Column not found in table
-F exe_err_column_not_found(column: str, table: str) -> VaisError {
+fn exe_err_column_not_found(column: str, table: str) -> VaisError {
     VaisError.new(
         "VAIS-0103004",
         "Column '{column}' not found in table '{table}'"
@@ -63,7 +63,7 @@ F exe_err_column_not_found(column: str, table: str) -> VaisError {
 }
 
 # VAIS-0103005: Value count mismatch
-F err_value_count_mismatch(expected: u64, actual: u64) -> VaisError {
+fn err_value_count_mismatch(expected: u64, actual: u64) -> VaisError {
     VaisError.new(
         "VAIS-0103005",
         "INSERT value count mismatch: expected {expected}, got {actual}"
@@ -71,7 +71,7 @@ F err_value_count_mismatch(expected: u64, actual: u64) -> VaisError {
 }
 
 # VAIS-0103006: INSERT ... SELECT source error
-F err_insert_source(detail: str) -> VaisError {
+fn err_insert_source(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0103006",
         "INSERT source error: {detail}"
@@ -82,12 +82,12 @@ F err_insert_source(detail: str) -> VaisError {
 # DML Result — returned by INSERT/UPDATE/DELETE executors
 # ============================================================================
 
-S DmlResult {
+struct DmlResult {
     rows_affected: u64,
 }
 
-X DmlResult {
-    F new(rows_affected: u64) -> DmlResult {
+impl DmlResult {
+    fn new(rows_affected: u64) -> DmlResult {
         DmlResult { rows_affected }
     }
 }
@@ -108,19 +108,30 @@ X DmlResult {
 #      f. Insert into heap page
 #      g. Insert into all indexes (PK, UNIQUE, regular)
 #   3. Return rows_affected count
-F execute_insert(
+fn execute_insert(
     insert: &InsertStmt,
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
     table_info := mut ctx.catalog.get_table(&insert.table_name)?;
-    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
-    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
+    column_refs := mut ctx.catalog.get_columns(table_info.table_id)?;
+    columns := mut Vec.with_capacity(column_refs.len())
+    LF col: &column_refs {
+        columns.push((**col).clone())
+    }
+    index_refs := mut ctx.catalog.get_indexes_for_table(table_info.table_id)?;
+    indexes := mut Vec.with_capacity(index_refs.len())
+    LF idx: &index_refs {
+        indexes.push((**idx).clone())
+    }
 
     # Build schema types array
     schema := mut Vec.with_capacity(columns.len())
-    LF col: &columns {
+    ci := mut 0
+    LW ci < columns.len() {
+        col := columns[ci]
         schema.push(col.data_type)
+        ci += 1
     }
 
     # Determine column ordering for the INSERT
@@ -128,10 +139,13 @@ F execute_insert(
     # If not specified: values must M all columns in order
     column_names := mut I insert.columns.len() > 0 {
         insert.columns.clone()
-    } EL {
+    } else {
         names := mut Vec.with_capacity(columns.len())
-        LF col: &columns {
+        ci := mut 0
+        LW ci < columns.len() {
+            col := columns[ci]
             names.push(col.name.clone())
+            ci += 1
         }
         names
     }
@@ -147,12 +161,12 @@ F execute_insert(
 
     rows_affected := mut 0
 
-    M &insert.source {
+    match &insert.source {
         Values { rows } => {
             LF row_exprs: rows {
                 # Validate value count
                 I row_exprs.len() != column_names.len() {
-                    R Err(err_value_count_mismatch(column_names.len(), row_exprs.len()))
+                    return Err(err_value_count_mismatch(column_names.len(), row_exprs.len()))
                 }
 
                 # Evaluate expressions to get SqlValues
@@ -160,7 +174,7 @@ F execute_insert(
                 dummy_row := mut Row.null_row(0)
                 dummy_eval := mut EvalContext.new()
                 LF expr: row_exprs {
-                    val := mut eval_expr(expr, &dummy_row, &dummy_eval)?;
+                    val := mut eval_expr(&expr, &dummy_row, &dummy_eval)?;
                     values.push(val)
                 }
 
@@ -207,7 +221,7 @@ F execute_insert(
             # and feeding results into the same insert pipeline
             # This requires the full query executor pipeline which will be
             # integrated when the query planner is complete (Task 13)
-            R Err(err_insert_source("INSERT ... SELECT not yet implemented"))
+            return Err(err_insert_source("INSERT ... SELECT not yet implemented"))
         },
     }
 
@@ -229,19 +243,30 @@ F execute_insert(
 #      e. Insert new tuple version
 #      f. Update indexes (remove old, insert new for changed indexed columns)
 #   3. Return rows_affected count
-F execute_update(
+fn execute_update(
     update: &UpdateStmt,
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
     table_info := mut ctx.catalog.get_table(&update.table_name)?;
-    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
-    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
+    column_refs := mut ctx.catalog.get_columns(table_info.table_id)?;
+    columns := mut Vec.with_capacity(column_refs.len())
+    LF col: &column_refs {
+        columns.push((**col).clone())
+    }
+    index_refs := mut ctx.catalog.get_indexes_for_table(table_info.table_id)?;
+    indexes := mut Vec.with_capacity(index_refs.len())
+    LF idx: &index_refs {
+        indexes.push((**idx).clone())
+    }
 
     # Build schema
     schema := mut Vec.with_capacity(columns.len())
-    LF col: &columns {
+    ci := mut 0
+    LW ci < columns.len() {
+        col := columns[ci]
         schema.push(col.data_type)
+        ci += 1
     }
 
     # Resolve assignment column indices
@@ -271,7 +296,7 @@ F execute_update(
     has_more := mut true
     LW has_more {
         _next := scanner.next(ctx)?;
-        M _next {
+        match _next {
             Some(exec_row) => {
                 matching_rows.push((
                     exec_row.page_id,
@@ -295,7 +320,7 @@ F execute_update(
         # Build new row by applying assignments
         new_values := mut Vec.with_capacity(columns.len())
         LF i: 0..columns.len() {
-            new_values.push(old_row.get(i).clone())
+            new_values.push((*old_row.get(i)).clone())
         }
 
         LF j: 0..update.assignments.len() {
@@ -357,19 +382,30 @@ F execute_update(
 #      b. Mark tuple as expired (MVCC delete — sets txn_id_expire)
 #      c. Remove from all indexes
 #   3. Return rows_affected count
-F execute_delete(
+fn execute_delete(
     delete: &DeleteStmt,
     ctx: &ExecContext,
 ) -> Result<DmlResult, VaisError> {
     # Look up table metadata
     table_info := mut ctx.catalog.get_table(&delete.table_name)?;
-    columns := mut ctx.catalog.get_columns(table_info.table_id)?;
-    indexes := mut ctx.catalog.get_table_indexes(table_info.table_id)?;
+    column_refs := mut ctx.catalog.get_columns(table_info.table_id)?;
+    columns := mut Vec.with_capacity(column_refs.len())
+    LF col: &column_refs {
+        columns.push((**col).clone())
+    }
+    index_refs := mut ctx.catalog.get_indexes_for_table(table_info.table_id)?;
+    indexes := mut Vec.with_capacity(index_refs.len())
+    LF idx: &index_refs {
+        indexes.push((**idx).clone())
+    }
 
     # Build schema
     schema := mut Vec.with_capacity(columns.len())
-    LF col: &columns {
+    ci := mut 0
+    LW ci < columns.len() {
+        col := columns[ci]
         schema.push(col.data_type)
+        ci += 1
     }
 
     # Scan table for matching rows
@@ -385,7 +421,7 @@ F execute_delete(
     has_more := mut true
     LW has_more {
         _next := scanner.next(ctx)?;
-        M _next {
+        match _next {
             Some(exec_row) => {
                 matching_rows.push((
                     exec_row.page_id,
@@ -434,7 +470,7 @@ F execute_delete(
 # Walks the page chain to find a page with enough free space
 # If no existing page has space, allocates a new page
 # Returns (page_id, slot_id)
-F insert_tuple_into_heap(
+fn insert_tuple_into_heap(
     table_info: &TableInfo,
     tuple: &Tuple,
     ctx: &ExecContext,
@@ -452,9 +488,9 @@ F insert_tuple_into_heap(
             # Found a page with space
             slot_id := mut heap.insert_tuple(tuple)?;
             flushed := mut heap.flush()
-            ctx.pool.write_page(frame_id, flushed)?;
+            ctx.pool.write_page(frame_id)?;
             ctx.pool.unpin_page(frame_id, true)
-            R Ok((current_page_id, slot_id))
+            return Ok((current_page_id, slot_id))
         }
 
         next := mut heap.get_header().next_page
@@ -473,14 +509,14 @@ F insert_tuple_into_heap(
     link_new_page(table_info.first_page_id, new_page_id, ctx)?;
 
     flushed := mut new_heap.flush()
-    ctx.pool.write_page(new_frame, flushed)?;
+    ctx.pool.write_page(new_frame)?;
     ctx.pool.unpin_page(new_frame, true)
 
     Ok((new_page_id, slot_id))
 }
 
 # Link a new heap page to the end of the existing page chain
-F link_new_page(
+fn link_new_page(
     first_page_id: u32,
     new_page_id: u32,
     ctx: &ExecContext,
@@ -488,7 +524,7 @@ F link_new_page(
     I first_page_id == 0 || first_page_id == NULL_PAGE {
         # Table has no pages yet — this is the first page
         # Table metadata would need updating; for now the caller handles this
-        R Ok(())
+        return Ok(())
     }
 
     # Walk to the last page in the chain
@@ -504,9 +540,9 @@ F link_new_page(
             header := mut heap.get_header_mut()
             header.next_page = new_page_id
             flushed := mut heap.flush()
-            ctx.pool.write_page(frame_id, flushed)?;
+            ctx.pool.write_page(frame_id)?;
             ctx.pool.unpin_page(frame_id, true)
-            R Ok(())
+            return Ok(())
         }
 
         ctx.pool.unpin_page(frame_id, false)
@@ -515,7 +551,7 @@ F link_new_page(
 }
 
 # Mark a tuple as expired by setting txn_id_expire in MVCC metadata
-F mark_tuple_expired(
+fn mark_tuple_expired(
     page_id: u32,
     slot_id: u16,
     ctx: &ExecContext,
@@ -527,7 +563,7 @@ F mark_tuple_expired(
     heap.delete_tuple(slot_id, ctx.txn_id, ctx.cmd_id)?;
 
     flushed := mut heap.flush()
-    ctx.pool.write_page(frame_id, flushed)?;
+    ctx.pool.write_page(frame_id)?;
     ctx.pool.unpin_page(frame_id, true)
 
     Ok(())
@@ -538,7 +574,7 @@ F mark_tuple_expired(
 # ============================================================================
 
 # Insert a row into all indexes for the table
-F insert_into_indexes(
+fn insert_into_indexes(
     row: &Row,
     tid: u32,
     indexes: &[IndexInfo],
@@ -549,11 +585,14 @@ F insert_into_indexes(
         col_indices := mut resolve_index_columns(&idx.columns, columns)?;
         key := mut build_index_key_from_row(row, col_indices.as_slice())
 
+        # Step 13 A4-10: explicit init of all required BTree fields.
         tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
             height: 0,
+            entry_count: 0,
+            latch_table: LatchTable::new(DEFAULT_LATCH_CAPACITY),
         }
 
         btree_insert(&tree, &key, tid, ctx.txn_id, ctx.gcm, ctx.pool)?;
@@ -562,7 +601,7 @@ F insert_into_indexes(
 }
 
 # Remove a row from all indexes for the table
-F delete_from_indexes(
+fn delete_from_indexes(
     row: &Row,
     tid: u32,
     indexes: &[IndexInfo],
@@ -573,11 +612,14 @@ F delete_from_indexes(
         col_indices := mut resolve_index_columns(&idx.columns, columns)?;
         key := mut build_index_key_from_row(row, col_indices.as_slice())
 
+        # Step 13 A4-10: explicit init of all required BTree fields.
         tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
             height: 0,
+            entry_count: 0,
+            latch_table: LatchTable::new(DEFAULT_LATCH_CAPACITY),
         }
 
         btree_delete(&tree, &key, ctx.txn_id, ctx.gcm, ctx.pool)?;
@@ -587,7 +629,7 @@ F delete_from_indexes(
 
 # Update indexes when a row changes
 # Only updates indexes where the indexed columns have changed
-F update_indexes(
+fn update_indexes(
     old_row: &Row,
     new_row: &Row,
     old_tid: u32,
@@ -602,11 +644,14 @@ F update_indexes(
         old_key := mut build_index_key_from_row(old_row, col_indices.as_slice())
         new_key := mut build_index_key_from_row(new_row, col_indices.as_slice())
 
+        # Step 13 A4-10: explicit init of all required BTree fields.
         tree := mut BTree {
             file_id: FILE_ID_DATA,
             root_page_id: idx.root_page_id,
             page_size: ctx.pool.page_size,
             height: 0,
+            entry_count: 0,
+            latch_table: LatchTable::new(DEFAULT_LATCH_CAPACITY),
         }
 
         # Only update if the indexed values changed
@@ -614,7 +659,7 @@ F update_indexes(
             # Remove old key, insert new key
             btree_delete(&tree, &old_key, ctx.txn_id, ctx.gcm, ctx.pool)?;
             btree_insert(&tree, &new_key, new_tid, ctx.txn_id, ctx.gcm, ctx.pool)?;
-        } EL {
+        } else {
             # Key unchanged but TID changed — update the value
             btree_delete(&tree, &old_key, ctx.txn_id, ctx.gcm, ctx.pool)?;
             btree_insert(&tree, &new_key, new_tid, ctx.txn_id, ctx.gcm, ctx.pool)?;
@@ -629,7 +674,7 @@ F update_indexes(
 
 # Resolve INSERT column names to table column indices
 # Returns a mapping: position in INSERT values → position in table row
-F resolve_insert_columns(
+fn resolve_insert_columns(
     insert_columns: &[str],
     table_columns: &[ColumnInfo],
     table_name: &str,
@@ -645,7 +690,7 @@ F resolve_insert_columns(
             }
         }
         I !found {
-            R Err(exe_err_column_not_found(col_name.clone(), table_name.clone()))
+            return Err(exe_err_column_not_found(col_name.clone(), table_name.clone()))
         }
     }
 
@@ -655,7 +700,7 @@ F resolve_insert_columns(
 # Build a full row values array from partial INSERT values
 # Maps INSERT values to their correct positions in the full row
 # Unspecified columns get Null (defaults applied by ConstraintChecker)
-F build_full_row_values(
+fn build_full_row_values(
     insert_values: &[SqlValue],
     column_indices: &[u64],
     total_columns: u64,
@@ -667,7 +712,7 @@ F build_full_row_values(
 
     LF i: 0..insert_values.len() {
         I i < column_indices.len() {
-            full[column_indices[i]] = insert_values[i].clone()
+            full[column_indices[i]] = (*insert_values[i]).clone()
         }
     }
 
@@ -675,14 +720,14 @@ F build_full_row_values(
 }
 
 # Find column index by name
-F find_column_index(
+fn find_column_index(
     col_name: &str,
     columns: &[ColumnInfo],
     table_name: &str,
 ) -> Result<u64, VaisError> {
     LF i: 0..columns.len() {
         I &columns[i].name == col_name {
-            R Ok(i)
+            return Ok(i)
         }
     }
     Err(exe_err_column_not_found(col_name.clone(), table_name.clone()))
@@ -693,7 +738,7 @@ F find_column_index(
 # ============================================================================
 
 # Build TUPLE_INSERT WAL payload bytes
-F build_tuple_insert_wal(
+fn build_tuple_insert_wal(
     file_id: u8,
     page_id: u32,
     slot: u16,
@@ -712,7 +757,7 @@ F build_tuple_insert_wal(
 }
 
 # Build TUPLE_DELETE WAL payload bytes
-F build_tuple_delete_wal(
+fn build_tuple_delete_wal(
     file_id: u8,
     page_id: u32,
     slot: u16,
@@ -730,7 +775,7 @@ F build_tuple_delete_wal(
 }
 
 # Build TUPLE_UPDATE WAL payload bytes
-F build_tuple_update_wal(
+fn build_tuple_update_wal(
     file_id: u8,
     page_id: u32,
     slot: u16,

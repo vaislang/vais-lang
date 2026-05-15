@@ -11,95 +11,99 @@
 # node, edge, index, traversal, query, integration
 
 # Core types
-U types
+use types
 
 # Visibility functions
-U visibility
+use visibility
 
 # WAL manager
-U wal
+use wal
 
 # Concurrency control
-U concurrency
+use concurrency
 
 # Statistics
-U stats
+use stats
 
 # Node storage
-U node/storage
+use node/storage
 
 # Edge storage (adjacency + properties)
-U edge/adj
-U edge/storage
+use edge/adj
+use edge/storage
 
 # Indexes
-U index/label
-U index/property
+use index/label
+use index/property
 
 # Traversal algorithms
-U traversal/bfs
-U traversal/dfs
-U traversal/shortest_path
-U traversal/cycle
+use traversal/bfs
+use traversal/dfs
+use traversal/shortest_path
+use traversal/cycle
 
 # Query functions
-U query/traverse_fn
-U query/pattern
+use query/traverse_fn
+use query/pattern
 
 # Integration with other engines
-U integration/sql_join
-U integration/vector
+use integration/sql_join
+use integration/vector
 
 # Dependencies
-U std/option
-U std/vec
-U std/string
-U storage/error
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U storage/wal/group_commit
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/constants
+use std/option
+use std/vec
+use std/string
+use storage/error
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use storage/wal/group_commit
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/constants
 
 # ============================================================================
 # Error Codes: EE=03 (graph), CC=10 (module), NNN=001-005
 # ============================================================================
 
-F err_graph_engine_closed() -> VaisError {
+fn err_graph_engine_closed() -> VaisError {
     VaisError.new(
         "VAIS-0310001",
         "Graph engine is not open"
     )
 }
 
-F err_node_not_found(node_id: u64) -> VaisError {
+fn err_node_not_found(node_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0310002",
         "Node {node_id} not found"
     )
 }
 
-F err_edge_not_found(edge_id: u64) -> VaisError {
+fn err_edge_not_found(edge_id: u64) -> VaisError {
     VaisError.new(
         "VAIS-0310003",
         "Edge {edge_id} not found"
     )
 }
 
-F err_invalid_edge_type(edge_type: str) -> VaisError {
+fn err_invalid_edge_type(edge_type: str) -> VaisError {
     VaisError.new(
         "VAIS-0310004",
         "Invalid edge type: {edge_type}"
     )
 }
 
-F err_graph_traversal_failed(detail: str) -> VaisError {
+fn err_graph_traversal_failed(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0310005",
         "Graph traversal failed: {detail}"
     )
+}
+
+fn graph_property_key_id(key: &str) -> u16 {
+    (key.len() % 65536) as u16
 }
 
 # ============================================================================
@@ -108,7 +112,7 @@ F err_graph_traversal_failed(detail: str) -> VaisError {
 
 # GraphEngine manages a property graph with nodes, edges, labels, and properties
 # Integrates: node storage, edge storage, adjacency lists, indexes, traversal, WAL
-S GraphEngine {
+struct GraphEngine {
     config: GraphConfig,              # Graph configuration (page sizes, limits)
     meta: GraphMeta,                  # Metadata (total_nodes, total_edges, etc.)
     edge_type_table: EdgeTypeTable,   # Edge type name → ID mapping
@@ -127,14 +131,14 @@ S GraphEngine {
     gcm: &GroupCommitManager,         # Shared group commit manager
 }
 
-X GraphEngine {
+impl GraphEngine {
     # ========================================================================
     # Constructor — Create new graph engine instance
     # ========================================================================
 
     ## Create new GraphEngine instance (does not load from disk)
     ## Call open() to load metadata and indexes
-    F new(
+    fn new(
         config: GraphConfig,
         pool: &BufferPool,
         allocator: &PageAllocator,
@@ -187,18 +191,20 @@ X GraphEngine {
     # ========================================================================
 
     ## Open engine: load meta page, edge type table, indexes
-    F open(mut self) -> Result<(), VaisError> {
+    fn open(mut self) -> Result<(), VaisError> {
         I self.is_open {
-            R Ok(())
+            return Ok(())
         }
 
         # Load metadata from page 0 of FILE_ID_GRAPH
         meta_data := self.pool.read_page(FILE_ID_GRAPH, 0)?;
-        self.meta = GraphMeta.deserialize(&meta_data)?;
+        meta_buf := mut ByteBuffer.wrap_readonly(&meta_data)
+        self.meta = GraphMeta.deserialize(&meta_buf, self.config.page_size)?;
 
         # Load edge type table
         edge_type_data := self.pool.read_page(FILE_ID_GRAPH, 1)?;
-        self.edge_type_table = EdgeTypeTable.deserialize(&edge_type_data)?;
+        edge_type_buf := mut ByteBuffer.wrap_readonly(&edge_type_data)
+        self.edge_type_table = EdgeTypeTable.deserialize(&edge_type_buf)?;
 
         # Open indexes
         self.label_index.open()?;
@@ -212,20 +218,38 @@ X GraphEngine {
     }
 
     ## Close engine: flush dirty pages, release resources
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         I !self.is_open {
-            R Ok(())
+            return Ok(())
         }
 
         # Flush metadata page
         meta_buf := mut ByteBuffer.new()
-        self.meta.serialize(&mut meta_buf)?;
-        self.pool.write_page(FILE_ID_GRAPH, 0, &meta_buf.to_vec())?;
+        self.meta.serialize(&mut meta_buf)
+        meta_bytes := mut meta_buf.to_vec()
+        meta_frame := mut self.pool.fetch_page(FILE_ID_GRAPH, 0)?;
+        meta_page := mut self.pool.get_page_mut(meta_frame)
+        mi := mut 0
+        LW mi < meta_bytes.len() {
+            meta_page[mi] = meta_bytes[mi]
+            mi += 1
+        }
+        self.pool.unpin_page(meta_frame, true)
+        self.pool.write_page(meta_frame)?;
 
         # Flush edge type table
         edge_type_buf := mut ByteBuffer.new()
-        self.edge_type_table.serialize(&mut edge_type_buf)?;
-        self.pool.write_page(FILE_ID_GRAPH, 1, &edge_type_buf.to_vec())?;
+        self.edge_type_table.serialize(&mut edge_type_buf)
+        edge_type_bytes := mut edge_type_buf.to_vec()
+        edge_type_frame := mut self.pool.fetch_page(FILE_ID_GRAPH, 1)?;
+        edge_type_page := mut self.pool.get_page_mut(edge_type_frame)
+        eti := mut 0
+        LW eti < edge_type_bytes.len() {
+            edge_type_page[eti] = edge_type_bytes[eti]
+            eti += 1
+        }
+        self.pool.unpin_page(edge_type_frame, true)
+        self.pool.write_page(edge_type_frame)?;
 
         # Close indexes
         self.label_index.close()?;
@@ -244,7 +268,7 @@ X GraphEngine {
 
     ## Create node: WAL-log, write node page, update indexes
     ## Returns node_id (unique identifier for this node)
-    F create_node(
+    fn create_node(
         mut self,
         txn_id: u64,
         labels: &Vec<str>,
@@ -253,17 +277,18 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<u64, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # 1. WAL-log node creation (WAL-first)
         node_id := self.meta.alloc_node_id()
+        property_bytes := mut properties.to_bytes()
         self.wal_mgr.log_node_insert(
-            node_id,
             txn_id,
+            node_id,
             0, # cmd_id = 0 (first command)
             labels,
-            properties,
+            &property_bytes,
         )?;
 
         # 2. Resolve label strings to label IDs
@@ -277,23 +302,28 @@ X GraphEngine {
 
         # 3. Write node to storage
         node := mut GraphNode.new(node_id, label_ids, txn_id, 0)
-        (page_id, slot_index) := self.node_store.write_node(&node, txn_id)?;
+        node_loc := mut self.node_store.write_node(&node, txn_id)?;
 
         # 4. Update label indexes
         li := mut 0
         LW li < label_ids.len() {
             self.label_index.insert_label(
                 node_id, label_ids[li], txn_id,
-                &mut self.gcm, &mut self.pool, self.allocator,
+                self.gcm, self.pool, self.allocator,
             )?;
             li += 1
         }
 
         # 5. Update property indexes
-        LF item: properties {
-            key := item.0
-            value := item.1
-            self.prop_index.insert_property(key, value, node_id, true, txn_id)?;
+        pi := mut 0
+        LW pi < properties.len() {
+            entry := mut properties.entry_at(pi)?;
+            prop_key_id := mut graph_property_key_id(&entry.key)
+            self.prop_index.insert_property(
+                node_id, prop_key_id, &entry.value, txn_id,
+                self.gcm, self.pool, self.allocator,
+            )?;
+            pi += 1
         }
 
         # 6. Update metadata
@@ -303,7 +333,7 @@ X GraphEngine {
     }
 
     ## Delete node: WAL-log, soft-delete node, expire all edges
-    F delete_node(
+    fn delete_node(
         mut self,
         txn_id: u64,
         node_id: u64,
@@ -312,27 +342,38 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<(), VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Acquire node lock
-        lock_guard := mut self.lock_mgr.lock_node(node_id, txn_id)?;
+        lock_guard := mut self.lock_mgr.lock_node_exclusive(node_id)?;
 
         # 1. Get node to fetch labels and properties
         node := self.node_store.read_node(node_id)?;
 
         # 2. WAL-log node deletion
-        self.wal_mgr.log_node_delete(node_id, txn_id, cmd_id)?;
+        old_labels := mut Vec.with_capacity(node.labels.len())
+        li := mut 0
+        LW li < node.labels.len() {
+            old_labels.push("{node.labels[li]}")
+            li += 1
+        }
+        old_properties := mut Vec.with_capacity(0)
+        I node.property_page != NULL_PAGE {
+            props_for_wal := mut self.prop_store.read_properties(node.property_page)?;
+            old_properties = props_for_wal.to_bytes()
+        }
+        self.wal_mgr.log_node_delete(txn_id, node_id, 0, &old_labels, &old_properties)?;
 
         # 3. Soft-delete node (set txn_id_expire)
         self.node_store.delete_node(node_id, txn_id, cmd_id)?;
 
         # 4. Remove from label indexes
-        li := mut 0
+        li = 0
         LW li < node.labels.len() {
             self.label_index.remove_label(
                 node_id, node.labels[li], txn_id,
-                &mut self.gcm, &mut self.pool,
+                self.gcm, self.pool,
             )?;
             li += 1
         }
@@ -341,8 +382,13 @@ X GraphEngine {
         I node.property_page != NULL_PAGE {
             props := mut self.prop_store.read_properties(node.property_page)?;
             pi := mut 0
-            LW pi < props.entries.len() {
-                self.prop_index.remove_property(&props.entries[pi].key, node_id, true, txn_id)?;
+            LW pi < props.len() {
+                entry := mut props.entry_at(pi)?;
+                prop_key_id := mut graph_property_key_id(&entry.key)
+                self.prop_index.remove_property(
+                    node_id, prop_key_id, &entry.value, txn_id,
+                    self.gcm, self.pool,
+                )?;
                 pi += 1
             }
         }
@@ -382,14 +428,14 @@ X GraphEngine {
     }
 
     ## Get node by ID (requires page_id and slot_index from index lookup)
-    F get_node(
+    fn get_node(
         self,
         node_id: u64,
         page_id: u32,
         slot_index: u16,
     ) -> Result<GraphNode, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         self.node_store.read_node_at(page_id, slot_index)
@@ -401,7 +447,7 @@ X GraphEngine {
 
     ## Create edge: WAL-log, add to adjacency lists (bidirectional), write properties
     ## Returns edge_id (unique identifier for this edge)
-    F create_edge(
+    fn create_edge(
         mut self,
         txn_id: u64,
         src: u64,
@@ -412,28 +458,22 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<u64, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Validate nodes exist and are visible
         src_node := self.node_store.read_node(src)?;
         I !is_node_visible(&src_node, snapshot, clog) {
-            R Err(err_node_not_found(src))
+            return Err(err_node_not_found(src))
         }
 
         dst_node := self.node_store.read_node(dst)?;
         I !is_node_visible(&dst_node, snapshot, clog) {
-            R Err(err_node_not_found(dst))
+            return Err(err_node_not_found(dst))
         }
 
-        # Acquire locks (src < dst to avoid deadlock)
-        (node1, node2) := I src < dst {
-            (src, dst)
-        } EL {
-            (dst, src)
-        }
-        lock1 := mut self.lock_mgr.lock_node(node1, txn_id)?;
-        lock2 := mut self.lock_mgr.lock_node(node2, txn_id)?;
+        # Acquire locks in stable node-id order.
+        edge_lock := mut self.lock_mgr.lock_edge(src, dst)?;
 
         # 1. Get or create edge type ID
         edge_type_id := self.edge_type_table.get_or_create(edge_type)?;
@@ -442,14 +482,16 @@ X GraphEngine {
         edge_id := self.meta.alloc_edge_id()
 
         # 3. WAL-log edge creation
+        property_bytes := mut properties.to_bytes()
         self.wal_mgr.log_edge_insert(
+            txn_id,
             edge_id,
             src,
             dst,
-            edge_type_id,
-            txn_id,
-            0, # cmd_id = 0
-            properties,
+            edge_type,
+            &property_bytes,
+            src_node.out_adj_page,
+            dst_node.in_adj_page,
         )?;
 
         # 4. Write edge properties
@@ -465,10 +507,15 @@ X GraphEngine {
         self.adj_mgr.add_edge(dst_node.in_adj_page, in_entry, txn_id)?;
 
         # 7. Update property indexes (edge properties)
-        ei := mut 0
-        LW ei < properties.entries.len() {
-            self.prop_index.insert_property(&properties.entries[ei].key, &properties.entries[ei].value, edge_id, false, txn_id)?;
-            ei += 1
+        pi := mut 0
+        LW pi < properties.len() {
+            entry := mut properties.entry_at(pi)?;
+            prop_key_id := mut graph_property_key_id(&entry.key)
+            self.prop_index.insert_property(
+                edge_id, prop_key_id, &entry.value, txn_id,
+                self.gcm, self.pool, self.allocator,
+            )?;
+            pi += 1
         }
 
         # 8. Update metadata
@@ -478,7 +525,7 @@ X GraphEngine {
     }
 
     ## Delete edge: WAL-log, expire in both adjacency lists
-    F delete_edge(
+    fn delete_edge(
         mut self,
         txn_id: u64,
         edge_id: u64,
@@ -489,24 +536,22 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<(), VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
-        # Acquire locks
-        (node1, node2) := I src < dst {
-            (src, dst)
-        } EL {
-            (dst, src)
-        }
-        lock1 := mut self.lock_mgr.lock_node(node1, txn_id)?;
-        lock2 := mut self.lock_mgr.lock_node(node2, txn_id)?;
+        # Acquire locks in stable node-id order.
+        edge_lock := mut self.lock_mgr.lock_edge(src, dst)?;
 
-        # 1. WAL-log edge deletion
-        self.wal_mgr.log_edge_delete(edge_id, src, dst, txn_id, cmd_id)?;
-
-        # 2. Get nodes
+        # 1. Get nodes
         src_node := self.node_store.read_node(src)?;
         dst_node := self.node_store.read_node(dst)?;
+
+        # 2. WAL-log edge deletion
+        old_data := mut Vec.with_capacity(0)
+        self.wal_mgr.log_edge_delete(
+            txn_id, edge_id, src, dst,
+            src_node.out_adj_page, dst_node.in_adj_page, &old_data,
+        )?;
 
         # 3. Expire in src's outgoing adjacency list
         self.adj_mgr.expire_edge(
@@ -531,7 +576,7 @@ X GraphEngine {
     }
 
     ## Get neighbors (outgoing or incoming edges) with MVCC filtering
-    F get_neighbors(
+    fn get_neighbors(
         self,
         node_id: u64,
         adj_page: u32,
@@ -540,19 +585,19 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<Vec<AdjEntry>, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # If no adjacency page, return empty
         I adj_page == NULL_PAGE {
-            R Ok(Vec.with_capacity(0))
+            return Ok(Vec.with_capacity(0))
         }
 
         # Read all entries from adjacency page(s)
         all_entries := self.adj_mgr.read_all_entries(adj_page)?;
 
         # Filter visible entries
-        visible := ind_filter_visible_entries(&all_entries, snapshot, clog)
+        visible := filter_visible_entries(&all_entries, snapshot, clog)
 
         Ok(visible)
     }
@@ -562,7 +607,7 @@ X GraphEngine {
     # ========================================================================
 
     ## BFS traversal starting from a node
-    F traverse_bfs(
+    fn traverse_bfs(
         self,
         start: u64,
         config: &TraversalConfig,
@@ -570,19 +615,19 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<TraversalResult, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Validate start node exists
         start_node := self.node_store.read_node(start)?;
         I !is_node_visible(&start_node, snapshot, clog) {
-            R Err(err_node_not_found(start))
+            return Err(err_node_not_found(start))
         }
 
         # Create BFS traversal
         traversal := mut BfsTraversal.new(
             self.pool, &self.node_store,
-            snapshot.clone(), clog,
+            (*snapshot).clone(), clog,
         )
 
         # Execute traversal
@@ -592,7 +637,7 @@ X GraphEngine {
     }
 
     ## Find shortest path between two nodes
-    F find_shortest_path(
+    fn find_shortest_path(
         self,
         start: u64,
         end: u64,
@@ -601,24 +646,24 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<Option<PathResult>, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Validate nodes exist
         start_node := self.node_store.read_node(start)?;
         I !is_node_visible(&start_node, snapshot, clog) {
-            R Err(err_node_not_found(start))
+            return Err(err_node_not_found(start))
         }
 
         end_node := self.node_store.read_node(end)?;
         I !is_node_visible(&end_node, snapshot, clog) {
-            R Err(err_node_not_found(end))
+            return Err(err_node_not_found(end))
         }
 
         # Create shortest path finder
         finder := mut ShortestPathFinder.new(
             self.pool, &self.node_store,
-            snapshot.clone(), clog,
+            (*snapshot).clone(), clog,
         )
 
         # Execute search
@@ -632,18 +677,18 @@ X GraphEngine {
     # ========================================================================
 
     ## Scan nodes by label with MVCC filtering
-    F scan_by_label(
+    fn scan_by_label(
         self,
         label_id: u16,
         snapshot: &Snapshot,
         clog: &Clog,
     ) -> Result<Vec<u64>, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Scan label index (takes label_id and pool)
-        node_ids := self.label_index.scan_by_label(label_id, &mut self.pool)?;
+        node_ids := self.label_index.scan_by_label(label_id, self.pool)?;
 
         # Filter visible nodes
         visible := mut Vec.with_capacity(0)
@@ -658,7 +703,7 @@ X GraphEngine {
     }
 
     ## Lookup nodes by property value
-    F lookup_by_property(
+    fn lookup_by_property(
         self,
         key: &str,
         value: &PropertyValue,
@@ -666,11 +711,12 @@ X GraphEngine {
         clog: &Clog,
     ) -> Result<Vec<u64>, VaisError> {
         I !self.is_open {
-            R Err(err_graph_engine_closed())
+            return Err(err_graph_engine_closed())
         }
 
         # Lookup property index
-        node_ids := self.prop_index.lookup_by_property(key, value, true)?;
+        prop_key_id := mut graph_property_key_id(key)
+        node_ids := self.prop_index.lookup_by_property(prop_key_id, value, self.pool)?;
 
         # Filter visible nodes
         visible := mut Vec.with_capacity(0)
@@ -689,22 +735,22 @@ X GraphEngine {
     # ========================================================================
 
     ## Get current statistics (snapshot)
-    F graph_stats(self) -> &GraphStats {
+    fn graph_stats(self) -> &GraphStats {
         &self.stats
     }
 
     ## Get node count
-    F node_count(self) -> u64 {
+    fn node_count(self) -> u64 {
         self.meta.total_nodes
     }
 
     ## Get edge count
-    F edge_count(self) -> u64 {
+    fn edge_count(self) -> u64 {
         self.meta.total_edges
     }
 
     ## Check if engine is open
-    F is_open(self) -> bool {
+    fn is_open(self) -> bool {
         self.is_open
     }
 }

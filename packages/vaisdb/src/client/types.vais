@@ -2,18 +2,20 @@
 # Connection string parsing, client configuration, result sets, row data access
 # Error codes: EE=07 (client), CC=01
 
-U std/vec
-U std/string
-U std/option
-U storage/bytes
-U storage/error
+use std/vec
+use std/string
+use std/option
+use storage/bytes
+use storage/error
+
+impl fn __strlen(s: str) -> i64
 
 # ============================================================================
 # Connection String
 # ============================================================================
 
 # Parsed connection parameters from "vaisdb://user:pass@host:port/dbname"
-S ConnectionString {
+struct ConnectionString {
     host: str,
     port: u16,
     database: str,
@@ -22,8 +24,8 @@ S ConnectionString {
     application_name: str,
 }
 
-X ConnectionString {
-    F new() -> ConnectionString {
+impl ConnectionString {
+    fn new() -> ConnectionString {
         ConnectionString {
             host: "localhost",
             port: 5433,
@@ -35,18 +37,18 @@ X ConnectionString {
     }
 
     # Parse "vaisdb://user:pass@host:port/dbname"
-    F parse(conn_str: &str) -> Result<ConnectionString, VaisError> {
+    fn parse(conn_str: &str) -> Result<ConnectionString, VaisError> {
         len := mut __strlen(conn_str)
 
         # Check scheme: "vaisdb://" = 9 chars
         I len < 10 {
-            R Err(err_client_parse_error("Connection string too short"))
+            return Err(err_client_parse_error("Connection string too short"))
         }
 
         # Verify scheme prefix: v=118, a=97, i=105, s=115, d=100, b=98
-        I conn_str[0] != 118 || conn_str[1] != 97 || conn_str[2] != 105 || conn_str[3] != 115 ||
-          conn_str[4] != 100 || conn_str[5] != 98 || conn_str[6] != 58 || conn_str[7] != 47 || conn_str[8] != 47 {
-            R Err(err_client_parse_error("Missing 'vaisdb://' scheme"))
+        I str_byte_at(conn_str, 0) != 118 || str_byte_at(conn_str, 1) != 97 || str_byte_at(conn_str, 2) != 105 || str_byte_at(conn_str, 3) != 115 ||
+          str_byte_at(conn_str, 4) != 100 || str_byte_at(conn_str, 5) != 98 || str_byte_at(conn_str, 6) != 58 || str_byte_at(conn_str, 7) != 47 || str_byte_at(conn_str, 8) != 47 {
+            return Err(err_client_parse_error("Missing 'vaisdb://' scheme"))
         }
 
         pos := mut 9;  # after "vaisdb://"
@@ -60,7 +62,7 @@ X ConnectionString {
         at_pos := mut -1
         scan := mut pos
         LW scan < len {
-            I conn_str[scan] == 64 {  # '@'
+            I str_byte_at(conn_str, scan) == 64 {  # '@'
                 at_pos = scan as i64
                 scan = len;  # exit loop
             }
@@ -76,7 +78,7 @@ X ConnectionString {
             colon_pos := mut -1
             s := mut auth_start
             LW s < auth_end {
-                I conn_str[s] == 58 {  # ':'
+                I str_byte_at(conn_str, s) == 58 {  # ':'
                     colon_pos = s as i64
                     s = auth_end;  # exit loop
                 }
@@ -87,7 +89,7 @@ X ConnectionString {
                 user_bytes := mut Vec.with_capacity(0)
                 u := mut auth_start
                 LW u < colon_pos as u64 {
-                    user_bytes.push(conn_str[u])
+                    user_bytes.push(str_byte_at(conn_str, u))
                     u += 1
                 }
                 user = from_utf8(user_bytes)?;
@@ -95,15 +97,15 @@ X ConnectionString {
                 pass_bytes := mut Vec.with_capacity(0)
                 p := mut (colon_pos + 1) as u64
                 LW p < auth_end {
-                    pass_bytes.push(conn_str[p])
+                    pass_bytes.push(str_byte_at(conn_str, p))
                     p += 1
                 }
                 password = from_utf8(pass_bytes)?;
-            } EL {
+            } else {
                 user_bytes := mut Vec.with_capacity(0)
                 u := mut auth_start
                 LW u < auth_end {
-                    user_bytes.push(conn_str[u])
+                    user_bytes.push(str_byte_at(conn_str, u))
                     u += 1
                 }
                 user = from_utf8(user_bytes)?;
@@ -117,20 +119,20 @@ X ConnectionString {
         slash_pos := mut -1
         s2 := mut pos
         LW s2 < len {
-            I conn_str[s2] == 47 {  # '/'
+            I str_byte_at(conn_str, s2) == 47 {  # '/'
                 slash_pos = s2 as i64
                 s2 = len
             }
             s2 += 1
         }
 
-        host_port_end := mut I slash_pos >= 0 { slash_pos as u64 } EL { len }
+        host_port_end := mut I slash_pos >= 0 { slash_pos as u64 } else { len }
 
         # Find ':' in host:port section
         colon_pos2 := mut -1
         s3 := mut pos
         LW s3 < host_port_end {
-            I conn_str[s3] == 58 {  # ':'
+            I str_byte_at(conn_str, s3) == 58 {  # ':'
                 colon_pos2 = s3 as i64
                 s3 = host_port_end
             }
@@ -141,7 +143,7 @@ X ConnectionString {
             host_bytes := mut Vec.with_capacity(0)
             h := mut pos
             LW h < colon_pos2 as u64 {
-                host_bytes.push(conn_str[h])
+                host_bytes.push(str_byte_at(conn_str, h))
                 h += 1
             }
             host = from_utf8(host_bytes)?;
@@ -150,22 +152,22 @@ X ConnectionString {
             port_val := mut 0
             pp := mut (colon_pos2 + 1) as u64
             LW pp < host_port_end {
-                ch := mut conn_str[pp]
+                ch := mut str_byte_at(conn_str, pp)
                 I ch < 48 || ch > 57 {
-                    R Err(err_client_parse_error("Invalid port number"))
+                    return Err(err_client_parse_error("Invalid port number"))
                 }
                 port_val = port_val * 10 + (ch - 48) as u32
                 pp += 1
             }
             I port_val > 65535 || port_val == 0 {
-                R Err(err_client_parse_error("Port out of range (1-65535)"))
+                return Err(err_client_parse_error("Port out of range (1-65535)"))
             }
             port = port_val as u16
-        } EL {
+        } else {
             host_bytes := mut Vec.with_capacity(0)
             h := mut pos
             LW h < host_port_end {
-                host_bytes.push(conn_str[h])
+                host_bytes.push(str_byte_at(conn_str, h))
                 h += 1
             }
             I host_bytes.len() > 0 {
@@ -180,7 +182,7 @@ X ConnectionString {
                 db_bytes := mut Vec.with_capacity(0)
                 d := mut db_start
                 LW d < len {
-                    db_bytes.push(conn_str[d])
+                    db_bytes.push(str_byte_at(conn_str, d))
                     d += 1
                 }
                 I db_bytes.len() > 0 {
@@ -199,9 +201,9 @@ X ConnectionString {
         })
     }
 
-    F with_application_name(mut self, name: str) -> ConnectionString {
+    fn with_application_name(mut self, name: str) -> ConnectionString {
         self.application_name = name
-        self
+        (*self)
     }
 }
 
@@ -209,15 +211,15 @@ X ConnectionString {
 # Client Config
 # ============================================================================
 
-S ClientConfig {
+struct ClientConfig {
     connection: ConnectionString,
     connect_timeout_sec: u32,
     query_timeout_sec: u32,
     pool_size: u32,
 }
 
-X ClientConfig {
-    F new() -> ClientConfig {
+impl ClientConfig {
+    fn new() -> ClientConfig {
         ClientConfig {
             connection: ConnectionString.new(),
             connect_timeout_sec: 10,
@@ -226,7 +228,7 @@ X ClientConfig {
         }
     }
 
-    F from_connection_string(conn_str: &str) -> Result<ClientConfig, VaisError> {
+    fn from_connection_string(conn_str: &str) -> Result<ClientConfig, VaisError> {
         parsed := mut ConnectionString.parse(conn_str)?;
         Ok(ClientConfig {
             connection: parsed,
@@ -236,19 +238,19 @@ X ClientConfig {
         })
     }
 
-    F with_connect_timeout(mut self, seconds: u32) -> ClientConfig {
+    fn with_connect_timeout(mut self, seconds: u32) -> ClientConfig {
         self.connect_timeout_sec = seconds
-        self
+        (*self)
     }
 
-    F with_query_timeout(mut self, seconds: u32) -> ClientConfig {
+    fn with_query_timeout(mut self, seconds: u32) -> ClientConfig {
         self.query_timeout_sec = seconds
-        self
+        (*self)
     }
 
-    F with_pool_size(mut self, size: u32) -> ClientConfig {
+    fn with_pool_size(mut self, size: u32) -> ClientConfig {
         self.pool_size = size
-        self
+        (*self)
     }
 }
 
@@ -256,50 +258,50 @@ X ClientConfig {
 # Column Info & Row
 # ============================================================================
 
-S ColumnInfo {
+struct ColumnInfo {
     name: str,
     type_tag: u8,
 }
 
-X ColumnInfo {
-    F new(name: str, type_tag: u8) -> ColumnInfo {
+impl ColumnInfo {
+    fn new(name: str, type_tag: u8) -> ColumnInfo {
         ColumnInfo { name, type_tag }
     }
 }
 
 # Row — raw cell data (None = NULL)
-S ClientRow {
+struct ClientRow {
     values: Vec<Option<Vec<u8>>>,
 }
 
-X ClientRow {
-    F new() -> ClientRow {
+impl ClientRow {
+    fn new() -> ClientRow {
         ClientRow { values: Vec.with_capacity(0) }
     }
 
-    F from_values(values: Vec<Option<Vec<u8>>>) -> ClientRow {
+    fn from_values(values: Vec<Option<Vec<u8>>>) -> ClientRow {
         ClientRow { values }
     }
 
-    F is_null(self, index: u64) -> bool {
+    fn is_null(self, index: u64) -> bool {
         I index >= self.values.len() {
-            R true
+            return true
         }
-        M &self.values[index] {
+        match &self.values[index] {
             None => true,
             Some(_) => false,
         }
     }
 
     # Get string value (decode from UTF-8)
-    F get_string(self, index: u64) -> Option<str> {
+    fn get_string(self, index: u64) -> Option<str> {
         I index >= self.values.len() {
-            R None
+            return None
         }
-        M &self.values[index] {
+        match &self.values[index] {
             None => None,
             Some(data) => {
-                M from_utf8(data.clone()) {
+                match from_utf8(data) {
                     Ok(s) => Some(s),
                     Err(_) => None,
                 }
@@ -308,18 +310,18 @@ X ClientRow {
     }
 
     # Get i64 value (little-endian 8 bytes via ByteBuffer)
-    F get_int(self, index: u64) -> Option<i64> {
+    fn get_int(self, index: u64) -> Option<i64> {
         I index >= self.values.len() {
-            R None
+            return None
         }
-        M &self.values[index] {
+        match &self.values[index] {
             None => None,
             Some(data) => {
                 I data.len() != 8 {
-                    R None
+                    return None
                 }
                 buf := mut ByteBuffer.from_slice(data)
-                M read_i64_le_checked(buf) {
+                match read_i64_le_checked(&buf) {
                     Ok(raw) => Some(raw as i64),
                     Err(_) => None,
                 }
@@ -328,18 +330,18 @@ X ClientRow {
     }
 
     # Get f64 value (8 bytes via ByteBuffer, bit-cast)
-    F get_float(self, index: u64) -> Option<f64> {
+    fn get_float(self, index: u64) -> Option<f64> {
         I index >= self.values.len() {
-            R None
+            return None
         }
-        M &self.values[index] {
+        match &self.values[index] {
             None => None,
             Some(data) => {
                 I data.len() != 8 {
-                    R None
+                    return None
                 }
                 buf := mut ByteBuffer.from_slice(data)
-                M read_i64_le_checked(buf) {
+                match read_i64_le_checked(&buf) {
                     Ok(raw) => Some(raw as f64),
                     Err(_) => None,
                 }
@@ -348,22 +350,22 @@ X ClientRow {
     }
 
     # Get bool value (1 byte: 0 or 1)
-    F get_bool(self, index: u64) -> Option<bool> {
+    fn get_bool(self, index: u64) -> Option<bool> {
         I index >= self.values.len() {
-            R None
+            return None
         }
-        M &self.values[index] {
+        match &self.values[index] {
             None => None,
             Some(data) => {
                 I data.len() < 1 {
-                    R None
+                    return None
                 }
                 Some(data[0] != 0)
             },
         }
     }
 
-    F column_count(self) -> u64 {
+    fn column_count(self) -> u64 {
         self.values.len()
     }
 }
@@ -372,15 +374,15 @@ X ClientRow {
 # Client Result
 # ============================================================================
 
-S ClientResult {
+struct ClientResult {
     columns: Vec<ColumnInfo>,
     rows: Vec<ClientRow>,
     affected_rows: u64,
     tag: str,
 }
 
-X ClientResult {
-    F new() -> ClientResult {
+impl ClientResult {
+    fn new() -> ClientResult {
         ClientResult {
             columns: Vec.with_capacity(0),
             rows: Vec.with_capacity(0),
@@ -389,11 +391,11 @@ X ClientResult {
         }
     }
 
-    F with_rows(columns: Vec<ColumnInfo>, rows: Vec<ClientRow>, tag: str) -> ClientResult {
+    fn with_rows(columns: Vec<ColumnInfo>, rows: Vec<ClientRow>, tag: str) -> ClientResult {
         ClientResult { columns, rows, affected_rows: 0, tag }
     }
 
-    F with_affected(affected: u64, tag: str) -> ClientResult {
+    fn with_affected(affected: u64, tag: str) -> ClientResult {
         ClientResult {
             columns: Vec.with_capacity(0),
             rows: Vec.with_capacity(0),
@@ -402,11 +404,11 @@ X ClientResult {
         }
     }
 
-    F column_count(self) -> u64 {
+    fn column_count(self) -> u64 {
         self.columns.len()
     }
 
-    F row_count(self) -> u64 {
+    fn row_count(self) -> u64 {
         self.rows.len()
     }
 }
@@ -415,7 +417,7 @@ X ClientResult {
 # Client State
 # ============================================================================
 
-EN ClientState {
+enum ClientState {
     Disconnected,
     Connected,
     InTransaction,
@@ -425,49 +427,49 @@ EN ClientState {
 # Error Constructors (EE=07 client, CC=01)
 # ============================================================================
 
-F err_client_connect_failed(host: str, port: u16) -> VaisError {
+fn err_client_connect_failed(host: str, port: u16) -> VaisError {
     VaisError.new(
         "VAIS-0701001",
         "Connection failed to {host}:{port}"
     ).with_hint("Check network connectivity and server status")
 }
 
-F err_client_timeout(seconds: u32) -> VaisError {
+fn err_client_timeout(seconds: u32) -> VaisError {
     VaisError.new(
         "VAIS-0701002",
         "Client operation timeout after {seconds} seconds"
     ).with_hint("Increase timeout or check server load")
 }
 
-F err_client_parse_error(detail: str) -> VaisError {
+fn err_client_parse_error(detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0701003",
         "Connection string parse error: {detail}"
     ).with_hint("Expected format: vaisdb://user:pass@host:port/dbname")
 }
 
-F err_client_not_connected() -> VaisError {
+fn err_client_not_connected() -> VaisError {
     VaisError.new(
         "VAIS-0701004",
         "Client is not connected to server"
     ).with_hint("Call connect() before executing queries")
 }
 
-F err_client_not_in_transaction() -> VaisError {
+fn err_client_not_in_transaction() -> VaisError {
     VaisError.new(
         "VAIS-0701005",
         "Not in transaction"
     ).with_hint("Call begin() first")
 }
 
-F err_client_already_in_transaction() -> VaisError {
+fn err_client_already_in_transaction() -> VaisError {
     VaisError.new(
         "VAIS-0701006",
         "Already in transaction"
     ).with_hint("Commit or rollback current transaction first")
 }
 
-F err_client_prepared_not_found(name: str) -> VaisError {
+fn err_client_prepared_not_found(name: str) -> VaisError {
     VaisError.new(
         "VAIS-0701007",
         "Prepared statement not found: '{name}'"

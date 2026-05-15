@@ -13,15 +13,16 @@
 # - Estimated nodes visited = Σ(degree^i) for i=0..depth (geometric series)
 # - Edge type filter reduces effective degree: degree' = degree × (filtered_types / total_types)
 
-U storage/error.{VaisError};
-U sql/parser/ast.{Expr, BinOp};
-U sql/planner/mod.{estimate_selectivity};
-U planner/types.{
+use storage/error.{VaisError};
+use sql/parser/ast.{Expr, BinOp};
+use sql/planner/mod.{estimate_selectivity};
+use sql/types.{SqlValue};
+use planner/types.{
     HybridPlanNode, HybridCost, GraphTraverseNodeParams,
     DIRECTION_OUTGOING, DIRECTION_INCOMING, DIRECTION_BOTH,
     err_hybrid_plan_failed
 };
-U planner/cost_model.{GraphStats, estimate_graph_traverse_cost};
+use planner/cost_model.{GraphStats, estimate_graph_traverse_cost};
 
 # ============================================================================
 # Error Codes: EE=00 (common/planner), CC=08 (planner), DD=21 (graph_plan)
@@ -29,7 +30,7 @@ U planner/cost_model.{GraphStats, estimate_graph_traverse_cost};
 
 C ERR_CODE_GRAPH_PLAN_FAILED: Str = "VAIS-0008021";
 
-F err_graph_plan_failed(reason: Str) -> VaisError {
+fn err_graph_plan_failed(reason: Str) -> VaisError {
     VaisError.new(ERR_CODE_GRAPH_PLAN_FAILED, "Graph plan build failed: {reason}")
 }
 
@@ -38,10 +39,10 @@ F err_graph_plan_failed(reason: Str) -> VaisError {
 # ============================================================================
 
 # Analyze query intent to choose BFS vs DFS
-EN TraversalHint = PreferBFS | PreferDFS | NoPreference;
+enum TraversalHint = PreferBFS | PreferDFS | NoPreference;
 
 # Detect traversal hint from query parameters
-F detect_traversal_hint(params: &GraphTraverseNodeParams) -> TraversalHint {
+fn detect_traversal_hint(params: &GraphTraverseNodeParams) -> TraversalHint {
     # Heuristics:
     # - If max_depth is small (< 4), prefer BFS (bounded breadth search)
     # - If return_paths is true and max_depth is small, prefer BFS (shortest paths)
@@ -53,21 +54,21 @@ F detect_traversal_hint(params: &GraphTraverseNodeParams) -> TraversalHint {
         I params.return_paths {
             # Shortest path queries: BFS is optimal
             TraversalHint.PreferBFS
-        } EL {
+        } else {
             TraversalHint.PreferBFS
         }
-    } EL I params.max_depth >= 6 || params.max_depth == 0 {
+    } else I params.max_depth >= 6 || params.max_depth == 0 {
         # Deep or unlimited traversal: DFS is better
         TraversalHint.PreferDFS
-    } EL {
+    } else {
         # Medium depth: no strong preference
         TraversalHint.NoPreference
     }
 }
 
 # Apply traversal hint to decide use_dfs flag
-F apply_traversal_hint(hint: TraversalHint, current_use_dfs: bool) -> bool {
-    M hint {
+fn apply_traversal_hint(hint: TraversalHint, current_use_dfs: bool) -> bool {
+    match hint {
         TraversalHint.PreferBFS => false,
         TraversalHint.PreferDFS => true,
         TraversalHint.NoPreference => current_use_dfs,  # Keep user's choice
@@ -83,19 +84,19 @@ F apply_traversal_hint(hint: TraversalHint, current_use_dfs: bool) -> bool {
 #   WHERE edge_type = 'FRIEND' → extract ["FRIEND"]
 #   WHERE edge_type IN ('FRIEND', 'COLLEAGUE') → extract ["FRIEND", "COLLEAGUE"]
 #   WHERE edge_type = 'FRIEND' AND node.age > 30 → extract ["FRIEND"], residual: node.age > 30
-F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Expr>) {
-    M where_clause {
+fn extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Expr>) {
+    match where_clause {
         # Single equality: edge_type = 'FRIEND'
         Expr.BinaryOp { left, op, right } => {
-            M op {
+            match op {
                 BinOp.Eq => {
-                    M (left.as_ref(), right.as_ref()) {
+                    match (left.as_ref(), right.as_ref()) {
                         (Expr.ColumnRef { column, .. }, Expr.Literal { value }) => {
                             I column == "edge_type" || column == "type" || column == "label" {
                                 # Extract edge type from literal
-                                M value {
-                                    sql/types.SqlValue.StringVal { v } => {
-                                        R (Some(vec![v.clone()]), None);
+                                match value {
+                                    SqlValue.StringVal { v } => {
+                                        tmp := mut Vec.with_capacity(1u64); tmp.push(v.clone()); return (Some(tmp), None);
                                     },
                                     _ => {},
                                 }
@@ -106,14 +107,14 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
                 },
                 BinOp.And => {
                     # Conjunction: extract from both sides
-                    (left_types, left_residual) := mut extract_edge_type_filter(left);
-                    (right_types, right_residual) := mut extract_edge_type_filter(right);
+                    (left_types, left_residual) := mut extract_edge_type_filter(left.as_ref());
+                    (right_types, right_residual) := mut extract_edge_type_filter(right.as_ref());
 
                     # Merge edge types
-                    merged_types := mut M (left_types, right_types) {
-                        (Some(mut lt), Some(rt)) => {
-                            lt.extend(rt);
-                            Some(lt)
+                    merged_types := mut match (left_types, right_types) {
+                        (Some(lt), Some(rt)) => {
+                            lt_mut := mut lt; lt_mut.extend(rt);
+                            Some(lt_mut)
                         },
                         (Some(lt), None) => Some(lt),
                         (None, Some(rt)) => Some(rt),
@@ -121,7 +122,7 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
                     };
 
                     # Merge residuals
-                    merged_residual := mut M (left_residual, right_residual) {
+                    merged_residual := mut match (left_residual, right_residual) {
                         (Some(lr), Some(rr)) => {
                             Some(Expr.BinaryOp {
                                 left: Box.new(lr),
@@ -134,7 +135,7 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
                         (None, None) => None,
                     };
 
-                    R (merged_types, merged_residual);
+                    return (merged_types, merged_residual);
                 },
                 _ => {},
             }
@@ -142,17 +143,17 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
 
         # IN list: edge_type IN ('FRIEND', 'COLLEAGUE')
         Expr.InList { expr, list, negated } => {
-            M expr.as_ref() {
+            match expr.as_ref() {
                 Expr.ColumnRef { column, .. } => {
                     I column == "edge_type" || column == "type" || column == "label" {
                         I !*negated {
                             # Extract all edge types from IN list
                             types := mut Vec.new();
                             LF item: list {
-                                M item {
+                                match item {
                                     Expr.Literal { value } => {
-                                        M value {
-                                            sql/types.SqlValue.StringVal { v } => {
+                                        match value {
+                                            SqlValue.StringVal { v } => {
                                                 types.push(v.clone());
                                             },
                                             _ => {},
@@ -162,7 +163,7 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
                                 }
                             }
                             I types.len() > 0 {
-                                R (Some(types), None);
+                                return (Some(types), None);
                             }
                         }
                     }
@@ -175,7 +176,7 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
     }
 
     # No edge type filter found: R all as residual
-    (None, Some(where_clause.clone()))
+    (None, Some((*where_clause).clone()))
 }
 
 # ============================================================================
@@ -184,17 +185,17 @@ F extract_edge_type_filter(where_clause: &Expr) -> (Option<Vec<Str>>, Option<Exp
 
 # Push predicates into GraphTraverseNodeParams.filter
 # Separate edge-level predicates (pushed into edge_type_filter) from node-level predicates (kept as filter)
-F push_predicates(
+fn push_predicates(
     params: GraphTraverseNodeParams,
     where_clause: Option<Expr>,
 ) -> GraphTraverseNodeParams {
-    M where_clause {
+    match where_clause {
         Some(expr) => {
             # Extract edge type filter
-            (edge_types, residual) := mut extract_edge_type_filter(expr);
+            (edge_types, residual) := mut extract_edge_type_filter(&expr);
 
             # Merge edge types with existing filter
-            merged_edge_filter := mut M (params.edge_type_filter, edge_types) {
+            merged_edge_filter := mut match (params.edge_type_filter, edge_types) {
                 (Some(existing), Some(new_types)) => {
                     combined := mut existing.clone();
                     combined.extend(new_types);
@@ -206,7 +207,7 @@ F push_predicates(
             };
 
             # Merge residual with existing filter
-            merged_filter := mut M (params.filter, residual) {
+            merged_filter := mut match (params.filter, residual) {
                 (Some(existing), Some(new_residual)) => {
                     Some(Expr.BinaryOp {
                         left: Box.new(existing),
@@ -246,7 +247,7 @@ F push_predicates(
 #
 # Returns:
 # - HybridPlanNode.GraphTraverse with computed HybridCost and optimal traversal algorithm
-F build_graph_plan(
+fn build_graph_plan(
     params: GraphTraverseNodeParams,
     stats: &GraphStats,
     where_clause: Option<Expr>,
@@ -287,16 +288,16 @@ F build_graph_plan(
 # ============================================================================
 
 # Build a GraphTraverse plan node with an alias (for subquery or JOIN)
-F build_graph_plan_with_alias(
+fn build_graph_plan_with_alias(
     params: GraphTraverseNodeParams,
     stats: &GraphStats,
     where_clause: Option<Expr>,
     alias: Str,
 ) -> Result<HybridPlanNode, VaisError> {
-    node := mut build_graph_plan(params, stats, where_clause)?;
+    node := mut build_graph_plan(params.clone(), stats, where_clause)?;
 
     # Unwrap and re-wrap with alias
-    M node {
+    match node {
         HybridPlanNode.GraphTraverse { params, cost, .. } => {
             Ok(HybridPlanNode.GraphTraverse {
                 params,

@@ -2,30 +2,30 @@
 # Applies undo log chain to rollback transaction changes
 # Based on Stage 3 Section 6 (Transaction Timeout) and Stage 1 Section 10
 
-U storage/bytes
-U storage/constants
-U storage/error
-U storage/txn/undo
-U storage/txn/undo_entry
-U storage/buffer/pool
-U storage/page/header
-U storage/page/slot
-U storage/page/mvcc
+use storage/bytes
+use storage/constants
+use storage/error
+use storage/txn/undo
+use storage/txn/undo_entry
+use storage/buffer/pool
+use storage/page/header
+use storage/page/slot
+use storage/page/mvcc
 
 # Rollback executor: traverses undo chain and reverses operations
-S RollbackExecutor {
+struct RollbackExecutor {
     undo_log: UndoLog,
 }
 
-X RollbackExecutor {
+impl RollbackExecutor {
     # Create a new rollback executor
-    F new(undo_log: UndoLog) -> RollbackExecutor {
+    fn new(undo_log: UndoLog) -> RollbackExecutor {
         RollbackExecutor { undo_log }
     }
 
     # Rollback a transaction by following its undo chain
     # Returns the number of undo entries processed
-    F rollback_transaction(
+    fn rollback_transaction(
         self,
         txn_id: u64,
         undo_ptr: u64,
@@ -33,7 +33,7 @@ X RollbackExecutor {
     ) -> Result<u32, VaisError> {
         I undo_ptr == NULL_UNDO_PTR {
             # No undo entries, nothing to rollback
-            R Ok(0)
+            return Ok(0)
         }
 
         # Read the entire undo chain
@@ -44,13 +44,13 @@ X RollbackExecutor {
         LF entry: entries {
             # Verify this entry belongs to the transaction being rolled back
             I entry.txn_id != txn_id {
-                R Err(err_internal(
+                return Err(err_internal(
                     "Undo entry txn_id mismatch: expected {txn_id}, got {entry.txn_id}"
                 ))
             }
 
             # Apply the reverse operation
-            M entry.entry_type {
+            match entry.entry_type {
                 UNDO_INSERT => {
                     # Undo an INSERT: delete the tuple (mark slot dead)
                     self.undo_insert(&entry, pool)?;
@@ -64,7 +64,7 @@ X RollbackExecutor {
                     self.undo_update(&entry, pool)?;
                 },
                 _ => {
-                    R Err(err_internal("Invalid undo entry type: {entry.entry_type}"))
+                    return Err(err_internal("Invalid undo entry type: {entry.entry_type}"))
                 }
             }
 
@@ -75,7 +75,7 @@ X RollbackExecutor {
     }
 
     # Undo an INSERT operation: mark the slot as dead
-    F undo_insert(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
+    fn undo_insert(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page containing the tuple
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
         frame := mut pool.get_frame_mut(frame_id)
@@ -102,13 +102,13 @@ X RollbackExecutor {
         frame.mark_dirty()
 
         # Unpin
-        pool.unpin_page(frame_id)?;
+        pool.unpin_page(frame_id, true)?;
 
         Ok(())
     }
 
     # Undo a DELETE operation: restore the old tuple data
-    F undo_delete(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
+    fn undo_delete(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
         frame := mut pool.get_frame_mut(frame_id)
@@ -119,7 +119,7 @@ X RollbackExecutor {
         slot := mut HeapPageSlot.read_at_index(page_data, entry.slot_id)?;
 
         I slot.tuple_off == 0 {
-            R Err(err_internal("Cannot undo DELETE: slot is already dead"))
+            return Err(err_internal("Cannot undo DELETE: slot is already dead"))
         }
 
         # Read the MVCC metadata at the tuple location
@@ -141,13 +141,13 @@ X RollbackExecutor {
         frame.mark_dirty()
 
         # Unpin
-        pool.unpin_page(frame_id)?;
+        pool.unpin_page(frame_id, true)?;
 
         Ok(())
     }
 
     # Undo an UPDATE operation: restore the old tuple data
-    F undo_update(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
+    fn undo_update(self, entry: &UndoEntry, pool: &mut BufferPool) -> Result<(), VaisError> {
         # Fetch the heap page
         frame_id := mut pool.fetch_page(entry.file_id, entry.page_id)?;
         frame := mut pool.get_frame_mut(frame_id)
@@ -158,12 +158,12 @@ X RollbackExecutor {
         slot := mut HeapPageSlot.read_at_index(page_data, entry.slot_id)?;
 
         I slot.tuple_off == 0 {
-            R Err(err_internal("Cannot undo UPDATE: slot is dead"))
+            return Err(err_internal("Cannot undo UPDATE: slot is dead"))
         }
 
         # Verify the old_data fits in the current slot
         I entry.data_len > slot.tuple_len as u32 {
-            R Err(err_internal(
+            return Err(err_internal(
                 "Undo UPDATE data too large: {entry.data_len} > {slot.tuple_len}"
             ))
         }
@@ -183,7 +183,7 @@ X RollbackExecutor {
         frame.mark_dirty()
 
         # Unpin
-        pool.unpin_page(frame_id)?;
+        pool.unpin_page(frame_id, true)?;
 
         Ok(())
     }

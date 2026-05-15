@@ -21,7 +21,7 @@
  */
 
 import http from "node:http";
-import type { RenderOptions, RenderResult } from "../types.js";
+import type { AddressInfo } from "node:net";
 import { renderToString } from "./renderer.js";
 
 // ---------------------------------------------------------------------------
@@ -58,9 +58,9 @@ export interface SsrRenderResponse {
 
 export interface SsrServiceConfig {
   /** Port for the SSR service (default: 3001) */
-  port: number;
+  port?: number;
   /** Host to bind (default: "127.0.0.1") */
-  host: string;
+  host?: string;
   /** Component renderer function — resolves file path to HTML */
   renderComponent: (
     filePath: string,
@@ -72,6 +72,17 @@ export interface SsrServiceConfig {
     layoutChain: string[];
     params: Record<string, string>;
   } | null>;
+}
+
+export interface SsrServiceHandle {
+  /** Bound host */
+  host: string;
+  /** Bound port. When config.port is 0, this is the OS-assigned port. */
+  port: number;
+  /** Base URL for the running SSR service */
+  url: string;
+  /** Stop accepting render requests and release the listener. */
+  close: () => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,14 +104,15 @@ export interface SsrServiceConfig {
  *   renderComponent: async (path, props) => { ... },
  *   resolveRoute: async (path) => { ... },
  * });
- * // service.close() to shut down
+ * await service.close();
  * ```
  */
 export async function createSsrService(
   config: SsrServiceConfig
-): Promise<{ close: () => void }> {
+): Promise<SsrServiceHandle> {
   const { port = 3001, host = "127.0.0.1", renderComponent, resolveRoute } =
     config;
+  let serviceUrl = `http://${host}:${port}`;
 
   const server = http.createServer(async (req, res) => {
     // Only accept POST /ssr/render
@@ -129,14 +141,24 @@ export async function createSsrService(
       }
 
       // Render to string
+      const renderComponentWithProps = (filePath: string) =>
+        renderComponent(filePath, request.props);
       const result = await renderToString({
         route: {
-          route: { page: resolved.page, layouts: resolved.layoutChain },
+          route: {
+            pattern: request.route,
+            segments: [],
+            page: resolved.page,
+            middleware: [],
+            children: [],
+          },
           layoutChain: resolved.layoutChain,
           params: resolved.params,
-          url: new URL(request.route, `http://${host}:${port}`),
-        } as any,
-        renderComponent,
+          errorBoundary: null,
+          loading: null,
+          middlewareChain: [],
+        },
+        renderComponent: renderComponentWithProps,
         head: request.head,
         scripts: request.scripts,
         styles: request.styles,
@@ -166,9 +188,24 @@ export async function createSsrService(
 
   return new Promise((resolve) => {
     server.listen(port, host, () => {
-      console.log(`[vaisx-ssr] SSR service listening on http://${host}:${port}`);
+      const address = server.address() as AddressInfo | null;
+      const actualPort = address?.port ?? port;
+      serviceUrl = `http://${host}:${actualPort}`;
+      console.log(`[vaisx-ssr] SSR service listening on ${serviceUrl}`);
       resolve({
-        close: () => server.close(),
+        host,
+        port: actualPort,
+        url: serviceUrl,
+        close: () =>
+          new Promise((resolveClose, rejectClose) => {
+            server.close((err) => {
+              if (err) {
+                rejectClose(err);
+                return;
+              }
+              resolveClose();
+            });
+          }),
       });
     });
   });

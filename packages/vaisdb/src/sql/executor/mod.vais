@@ -3,65 +3,65 @@
 # Each executor node produces rows one at a time via next()
 # Predicate pushdown is supported via optional filter expressions
 
-U storage/error
-U sql/types
-U sql/row
+use storage/error
+use sql/types
+use sql/row
 
 # ============================================================================
 # Executor Result — a single row produced by an executor node
 # ============================================================================
 
 # ExecutorRow wraps a Row with optional provenance info (table alias, page/slot)
-S ExecutorRow {
+struct ExecutorRow {
     row: Row,
     table_alias: Option<str>,     # Source table alias (for multi-table queries)
     page_id: u32,                 # Heap page where this row lives (for UPDATE/DELETE)
     slot_id: u16,                 # Slot within heap page (for UPDATE/DELETE)
 }
 
-X ExecutorRow {
+impl ExecutorRow {
     # Create from a Row with physical location
-    F new(row: Row, page_id: u32, slot_id: u16) -> ExecutorRow {
+    fn new(row: Row, page_id: u32, slot_id: u16) -> ExecutorRow {
         ExecutorRow {
             row,
-            table_alias: None,
+            table_alias: Option.None,
             page_id,
             slot_id,
         }
     }
 
     # Create with table alias
-    F with_alias(row: Row, alias: str, page_id: u32, slot_id: u16) -> ExecutorRow {
+    fn with_alias(row: Row, alias: str, page_id: u32, slot_id: u16) -> ExecutorRow {
         ExecutorRow {
             row,
-            table_alias: Some(alias),
+            table_alias: Option.Some(alias),
             page_id,
             slot_id,
         }
     }
 
     # Create a virtual row (no physical location — e.g. from join/aggregation)
-    F virtual(row: Row) -> ExecutorRow {
+    fn virtual(row: Row) -> ExecutorRow {
         ExecutorRow {
             row,
-            table_alias: None,
+            table_alias: Option.None,
             page_id: 0,
             slot_id: 0,
         }
     }
 
     # Get reference to the row
-    F get_row(self) -> &Row {
+    fn get_row(self) -> &Row {
         &self.row
     }
 
     # Get value at column index
-    F get(self, idx: u64) -> &SqlValue {
+    fn get(self, idx: u64) -> &SqlValue {
         self.row.get(idx)
     }
 
     # Get column count
-    F column_count(self) -> u64 {
+    fn column_count(self) -> u64 {
         self.row.column_count()
     }
 }
@@ -70,13 +70,13 @@ X ExecutorRow {
 # ExecContext — shared execution state passed to all executor nodes
 # ============================================================================
 
-U storage/buffer/pool
-U storage/txn/snapshot
-U storage/txn/clog
-U storage/wal/group_commit
-U sql/catalog/manager
+use storage/buffer/pool
+use storage/txn/snapshot
+use storage/txn/clog
+use storage/wal/group_commit
+use sql/catalog/manager
 
-S ExecContext {
+struct ExecContext {
     pool: &mut BufferPool,
     snapshot: &Snapshot,
     clog: &Clog,
@@ -86,8 +86,8 @@ S ExecContext {
     cmd_id: u32,
 }
 
-X ExecContext {
-    F new(
+impl ExecContext {
+    fn new(
         pool: &mut BufferPool,
         snapshot: &Snapshot,
         clog: &Clog,
@@ -112,29 +112,29 @@ X ExecContext {
 # Column metadata for executor output schema
 # ============================================================================
 
-S ExecColumn {
+struct ExecColumn {
     name: str,
     table: Option<str>,
     data_type: SqlType,
     nullable: bool,
 }
 
-U sql/types
+use sql/types
 
-X ExecColumn {
-    F new(name: str, data_type: SqlType, nullable: bool) -> ExecColumn {
+impl ExecColumn {
+    fn new(name: str, data_type: SqlType, nullable: bool) -> ExecColumn {
         ExecColumn {
             name,
-            table: None,
+            table: Option.None,
             data_type,
             nullable,
         }
     }
 
-    F with_table(name: str, table: str, data_type: SqlType, nullable: bool) -> ExecColumn {
+    fn with_table(name: str, table: str, data_type: SqlType, nullable: bool) -> ExecColumn {
         ExecColumn {
             name,
-            table: Some(table),
+            table: Option.Some(table),
             data_type,
             nullable,
         }
@@ -145,15 +145,15 @@ X ExecColumn {
 # Executor Statistics — for EXPLAIN ANALYZE
 # ============================================================================
 
-S ExecStats {
+struct ExecStats {
     rows_produced: u64,
     rows_scanned: u64,
     pages_read: u64,
     filter_rejected: u64,
 }
 
-X ExecStats {
-    F new() -> ExecStats {
+impl ExecStats {
+    fn new() -> ExecStats {
         ExecStats {
             rows_produced: 0,
             rows_scanned: 0,
@@ -162,19 +162,33 @@ X ExecStats {
         }
     }
 
-    F add_scanned(mut self, count: u64) {
+    fn add_scanned(mut self, count: u64) {
         self.rows_scanned += count
     }
 
-    F add_produced(mut self) {
+    fn add_produced(mut self) {
         self.rows_produced += 1
     }
 
-    F add_page_read(mut self) {
+    fn add_page_read(mut self) {
         self.pages_read += 1
     }
 
-    F add_rejected(mut self) {
+    fn add_rejected(mut self) {
         self.filter_rejected += 1
     }
+}
+
+# ============================================================================
+# Executor Trait — Volcano iterator protocol
+# ============================================================================
+#
+# open/next/close are the classic Volcano triad. Implementations may ignore
+# ctx for simple nodes; subquery executors call next() without a ctx and
+# thus expect a zero-arg variant here.
+
+trait Executor {
+    fn open(mut self) -> Result<(), VaisError>
+    fn next(mut self) -> Result<Option<ExecutorRow>, VaisError>
+    fn close(mut self) -> Result<(), VaisError>
 }

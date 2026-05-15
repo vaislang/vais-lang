@@ -92,7 +92,7 @@
 ```bash
 # 전체 파이프라인 (strict 빌드)
 cd /Users/sswoo/study/projects/vais-lang/packages/vaisdb
-mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/std /tmp/vais-lib/std
+mkdir -p /tmp/vais-lib && ln -sf /Users/sswoo/study/projects/vais/compiler/std /tmp/vais-lib/std
 for test in test_graph test_vector test_btree test_buffer_pool test_wal test_fulltext test_transaction test_planner; do
   VAIS_DEP_PATHS="$(pwd)/src:/tmp/vais-lib/std" VAIS_STD_PATH="/tmp/vais-lib/std" \
     ~/.cargo/bin/vaisc build tests/*/${test}.vais --emit-ir -o /tmp/${test}.ll --force-rebuild 2>&1 | grep "^error\["

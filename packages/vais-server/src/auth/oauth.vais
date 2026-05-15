@@ -2,14 +2,17 @@
 # Supports Google, GitHub, and custom providers.
 # get_authorization_url → redirect user → exchange_code → OAuthToken
 
-U std/string
-U std/vec
+use std/string
+use std/vec
+use std/error
+use std/http_client
+use src/auth/runtime
 
 # ============================================================================
 # OAuthProvider — supported identity providers
 # ============================================================================
 
-EN OAuthProvider {
+enum OAuthProvider {
     Google,
     Github,
     Custom,
@@ -19,7 +22,7 @@ EN OAuthProvider {
 # OAuthConfig — per-provider registration parameters
 # ============================================================================
 
-S OAuthConfig {
+struct OAuthConfig {
     provider:      OAuthProvider,
     client_id:     str,
     client_secret: str,
@@ -29,9 +32,9 @@ S OAuthConfig {
     scopes:        Vec<str>,
 }
 
-X OAuthConfig {
+impl OAuthConfig {
     # Google OAuth 2.0 defaults
-    F google(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+    fn google(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
         scopes := Vec.new()
         scopes.push("openid")
         scopes.push("email")
@@ -49,7 +52,7 @@ X OAuthConfig {
     }
 
     # GitHub OAuth 2.0 defaults
-    F github(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
+    fn github(client_id: str, client_secret: str, redirect_uri: str) -> OAuthConfig {
         scopes := Vec.new()
         scopes.push("read:user")
         scopes.push("user:email")
@@ -66,16 +69,29 @@ X OAuthConfig {
     }
 
     # Custom provider
-    F custom(client_id: str, client_secret: str, redirect_uri: str,
+    fn custom(client_id: str, client_secret: str, redirect_uri: str,
              authorize_url: str, token_url: str) -> OAuthConfig {
         OAuthConfig {
             provider:      OAuthProvider.Custom,
-            client_id,
-            client_secret,
-            redirect_uri,
-            authorize_url,
-            token_url,
+            client_id: client_id,
+            client_secret: client_secret,
+            redirect_uri: redirect_uri,
+            authorize_url: authorize_url,
+            token_url: token_url,
             scopes: Vec.new(),
+        }
+    }
+
+    fn custom_with_scopes(client_id: str, client_secret: str, redirect_uri: str,
+             authorize_url: str, token_url: str, scopes: Vec<str>) -> OAuthConfig {
+        OAuthConfig {
+            provider:      OAuthProvider.Custom,
+            client_id: client_id,
+            client_secret: client_secret,
+            redirect_uri: redirect_uri,
+            authorize_url: authorize_url,
+            token_url: token_url,
+            scopes: scopes,
         }
     }
 }
@@ -84,7 +100,7 @@ X OAuthConfig {
 # OAuthToken — token response from the provider's token endpoint
 # ============================================================================
 
-S OAuthToken {
+struct OAuthToken {
     access_token:  str,
     token_type:    str,
     expires_in:    i64,
@@ -92,14 +108,14 @@ S OAuthToken {
     scope:         str,
 }
 
-X OAuthToken {
-    F new(access_token: str, token_type: str, expires_in: i64,
+impl OAuthToken {
+    fn new(access_token: str, token_type: str, expires_in: i64,
           refresh_token: str, scope: str) -> OAuthToken {
         OAuthToken { access_token: access_token, token_type: token_type, expires_in: expires_in, refresh_token: refresh_token, scope: scope }
     }
 
     # Check if this token carries a refresh token
-    F has_refresh(self) -> bool {
+    fn has_refresh(self) -> bool {
         self.refresh_token != ""
     }
 }
@@ -108,20 +124,18 @@ X OAuthToken {
 # OAuthStateParam — CSRF protection state included in the authorization URL
 # ============================================================================
 
-S OAuthStateParam {
+struct OAuthStateParam {
     value: str,
 }
 
-X OAuthStateParam {
-    # Generate a random-looking state value from the current timestamp.
-    # FUTURE: replace with cryptographic random bytes.
-    F generate() -> OAuthStateParam {
-        t     := current_time_ms()
-        state := "state_" + i64_to_str(t)
+impl OAuthStateParam {
+    # Generate a cryptographically random state value.
+    fn generate() -> OAuthStateParam {
+        state := "state_" + auth_random_hex(32)
         OAuthStateParam { value: state }
     }
 
-    F from(value: str) -> OAuthStateParam {
+    fn from(value: str) -> OAuthStateParam {
         OAuthStateParam { value }
     }
 }
@@ -132,37 +146,29 @@ X OAuthStateParam {
 
 # Build the URL to which the user should be redirected to begin OAuth.
 # A CSRF state parameter is automatically appended.
-F get_authorization_url(config: OAuthConfig) -> str {
+fn get_authorization_url(config: OAuthConfig) -> str {
     state      := OAuthStateParam.generate()
-    scope_str  := oauth_join_scopes(config.scopes, 0, "")
+    scope_str  := oauth_scope_str(config)
 
-    url := config.authorize_url
-         + "?client_id="     + config.client_id
-         + "&redirect_uri="  + config.redirect_uri
-         + "&response_type=code"
-         + "&state="         + state.value
+    url := config.authorize_url + "?client_id=" + config.client_id + "&redirect_uri=" + config.redirect_uri + "&response_type=code" + "&state=" + state.value
 
     I scope_str != "" {
         url + "&scope=" + scope_str
-    } EL {
+    } else {
         url
     }
 }
 
 # Build the authorization URL with an explicit state value (useful for tests
 # or when the caller manages state externally).
-F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
-    scope_str := oauth_join_scopes(config.scopes, 0, "")
+fn get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
+    scope_str := oauth_scope_str(config)
 
-    url := config.authorize_url
-         + "?client_id="     + config.client_id
-         + "&redirect_uri="  + config.redirect_uri
-         + "&response_type=code"
-         + "&state="         + state
+    url := config.authorize_url + "?client_id=" + config.client_id + "&redirect_uri=" + config.redirect_uri + "&response_type=code" + "&state=" + state
 
     I scope_str != "" {
         url + "&scope=" + scope_str
-    } EL {
+    } else {
         url
     }
 }
@@ -170,15 +176,15 @@ F get_authorization_url_with_state(config: OAuthConfig, state: str) -> str {
 # Exchange an authorization code for an OAuthToken.
 # In production this would issue an HTTP POST to config.token_url.
 # FUTURE(std/http_client): perform the real network request.
-F exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
+fn exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
     I code == "" {
-        R Err(VaisError.new(400, "Authorization code is empty"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "Authorization code is empty"))
     }
     I config.client_id == "" {
-        R Err(VaisError.new(500, "OAuth client_id is not configured"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_id is not configured"))
     }
     I config.client_secret == "" {
-        R Err(VaisError.new(500, "OAuth client_secret is not configured"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_secret is not configured"))
     }
 
     # Simulate a successful token exchange.
@@ -186,27 +192,69 @@ F exchange_code(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError>
     #   grant_type=authorization_code&code=<code>&redirect_uri=<uri>
     #   &client_id=<id>&client_secret=<secret>
     # and parses the JSON response.
-    now        := current_time_ms()
-    mock_token := "at_" + code + "_" + i64_to_str(now)
-
     token := OAuthToken.new(
-        mock_token,
+        "mock_access_token",
         "Bearer",
         3600,
-        "rt_" + mock_token,
-        oauth_join_scopes(config.scopes, 0, ""),
+        "mock_refresh_token",
+        oauth_scope_str(config),
     )
 
     Ok(token)
 }
 
+# Exchange an authorization code using the configured provider token endpoint.
+fn exchange_code_live(code: str, config: OAuthConfig) -> Result<OAuthToken, VaisError> {
+    I code == "" {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "Authorization code is empty"))
+    }
+    I config.client_id == "" {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_id is not configured"))
+    }
+    I config.client_secret == "" {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth client_secret is not configured"))
+    }
+    I config.token_url == "" {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-500", "OAuth token_url is not configured"))
+    }
+
+    form := "grant_type=authorization_code&code=" + code + "&redirect_uri=" + config.redirect_uri + "&client_id=" + config.client_id + "&client_secret=" + config.client_secret
+    client := HttpClient::new()
+    response := client.post_form(config.token_url, form)
+    I response.is_success() != 1 {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-502", "OAuth token endpoint request failed"))
+    }
+
+    parse_oauth_token_response(response.body_text(), oauth_scope_str(config))
+}
+
+fn parse_oauth_token_response(body: str, default_scope: str) -> Result<OAuthToken, VaisError> {
+    access_token := oauth_json_string(body, "access_token")
+    I access_token == "" {
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-502", "OAuth token response missing access_token"))
+    }
+
+    token_type := mut oauth_json_string(body, "token_type")
+    I token_type == "" {
+        token_type = "Bearer"
+    }
+
+    refresh_token := oauth_json_string(body, "refresh_token")
+    scope := mut oauth_json_string(body, "scope")
+    I scope == "" {
+        scope = default_scope
+    }
+
+    OAuthToken.new(access_token, token_type, oauth_json_i64(body, "expires_in"), refresh_token, scope)
+}
+
 # Validate that a state parameter returned by the provider matches the expected value.
-F validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
+fn validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
     I returned == "" {
-        R Err(VaisError.new(400, "Missing OAuth state parameter"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "Missing OAuth state parameter"))
     }
     I returned != expected {
-        R Err(VaisError.new(400, "OAuth state mismatch — possible CSRF attack"))
+        return Err(VaisError.new("VAIS-SERVER-OAUTH-400", "OAuth state mismatch - possible CSRF attack"))
     }
     Ok(true)
 }
@@ -215,36 +263,101 @@ F validate_state(returned: str, expected: str) -> Result<bool, VaisError> {
 # Helpers
 # ============================================================================
 
-# Join Vec<str> scopes with space separator (OAuth convention).
-F oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
-    I i >= scopes.len() { R acc }
-    s := scopes.get(i)
-    I acc == "" {
-        oauth_join_scopes(scopes, i + 1, s)
-    } EL {
-        oauth_join_scopes(scopes, i + 1, acc + " " + s)
+fn oauth_scope_str(config: OAuthConfig) -> str {
+    match config.provider {
+        OAuthProvider.Google => "openid email profile",
+        OAuthProvider.Github => "read:user user:email",
+        OAuthProvider.Custom => oauth_join_scopes(config.scopes, 0, ""),
     }
+}
+
+# Join Vec<str> scopes with space separator (OAuth convention).
+fn oauth_join_scopes(scopes: Vec<str>, i: i64, acc: str) -> str {
+    out := mut acc
+    idx := mut i
+    L idx < scopes.len() {
+        s := scopes.get(idx)
+        I out == "" {
+            out = s
+        } else {
+            out = out + " " + s
+        }
+        idx = idx + 1
+    }
+    out
+}
+
+fn oauth_json_string(body: str, key: str) -> str {
+    needle := "\"" + key + "\":\""
+    start := oauth_find_needle(body, needle, 0)
+    I start < 0 {
+        return ""
+    }
+    value_start := start + needle.len()
+    end := oauth_find_quote(body, value_start)
+    I end < 0 {
+        return ""
+    }
+    body.substring(value_start, end)
+}
+
+fn oauth_json_i64(body: str, key: str) -> i64 {
+    needle := "\"" + key + "\":"
+    start := oauth_find_needle(body, needle, 0)
+    I start < 0 {
+        return 0
+    }
+    value_start := start + needle.len()
+    oauth_parse_i64_from(body, value_start, 0)
+}
+
+fn oauth_find_quote(s: str, i: i64) -> i64 {
+    I i >= s.len() { return -1 }
+    I s.char_at(i) == 34 { return i }
+    oauth_find_quote(s, i + 1)
+}
+
+fn oauth_find_needle(s: str, needle: str, i: i64) -> i64 {
+    I needle.len() == 0 { return i }
+    I i + needle.len() > s.len() { return -1 }
+    I oauth_starts_at(s, needle, i, 0) {
+        return i
+    }
+    oauth_find_needle(s, needle, i + 1)
+}
+
+fn oauth_starts_at(s: str, needle: str, start: i64, j: i64) -> bool {
+    I j >= needle.len() { return true }
+    I s.char_at(start + j) != needle.char_at(j) { return false }
+    oauth_starts_at(s, needle, start, j + 1)
+}
+
+fn oauth_parse_i64_from(s: str, i: i64, acc: i64) -> i64 {
+    I i >= s.len() { return acc }
+    c := s.char_at(i)
+    I c < 48 || c > 57 { return acc }
+    oauth_parse_i64_from(s, i + 1, acc * 10 + (c - 48))
 }
 
 # ============================================================================
 # Numeric utilities
 # ============================================================================
 
-F i64_to_str(n: i64) -> str {
-    I n == 0 { R "0" }
-    I n < 0  { R "-" + i64_to_str(0 - n) }
-    i64_to_str_rec(n, "")
+fn oauth_i64_to_str(n: i64) -> str {
+    I n == 0 { return "0" }
+    I n < 0  { return "-" + oauth_i64_to_str(0 - n) }
+    value := mut n
+    out := mut ""
+    L value > 0 {
+        digit := value % 10
+        out = oauth_digit_char(digit) + out
+        value = value / 10
+    }
+    out
 }
 
-F i64_to_str_rec(n: i64, acc: str) -> str {
-    I n == 0 { R acc }
-    digit := n % 10
-    ch    := digit_char(digit)
-    i64_to_str_rec(n / 10, ch + acc)
-}
-
-F digit_char(d: i64) -> str {
-    M d {
+fn oauth_digit_char(d: i64) -> str {
+    match d {
         0 => "0",
         1 => "1",
         2 => "2",
@@ -258,9 +371,3 @@ F digit_char(d: i64) -> str {
         _ => "0",
     }
 }
-
-# ============================================================================
-# External runtime stubs
-# ============================================================================
-
-X F current_time_ms() -> i64

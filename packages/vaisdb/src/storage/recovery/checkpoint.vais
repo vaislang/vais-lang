@@ -11,28 +11,28 @@
 # 6. Update meta page with checkpoint LSN
 # 7. WAL segments before checkpoint LSN are safe to truncate/archive
 
-U storage/file
-U std/sync
-U storage/bytes
+use storage/file
+use std/sync
+use storage/bytes
 
-U storage/error
-U storage/constants
-U storage/wal/header
-U storage/wal/record_types
-U storage/wal/writer
-U storage/wal/lsn
-U storage/buffer/pool
-U storage/page/meta
+use storage/error
+use storage/constants
+use storage/wal/header
+use storage/wal/record_types
+use storage/wal/writer
+use storage/wal/lsn
+use storage/buffer/pool
+use storage/page/meta
 
 # Checkpoint configuration
-S CheckpointConfig {
+struct CheckpointConfig {
     interval_sec: u32,         # Seconds between checkpoints (default 300)
     wal_size_trigger: u64,     # WAL size in bytes that triggers checkpoint (default 256MB)
     force_flush: bool,         # Force flush all dirty pages (vs gradual)
 }
 
-X CheckpointConfig {
-    F default() -> CheckpointConfig {
+impl CheckpointConfig {
+    fn default() -> CheckpointConfig {
         CheckpointConfig {
             interval_sec: DEFAULT_CHECKPOINT_INTERVAL_SEC,
             wal_size_trigger: DEFAULT_CHECKPOINT_WAL_SIZE,
@@ -42,7 +42,7 @@ X CheckpointConfig {
 }
 
 # Checkpoint result information
-S CheckpointResult {
+struct CheckpointResult {
     begin_lsn: u64,            # LSN of CHECKPOINT_BEGIN record
     end_lsn: u64,              # LSN of CHECKPOINT_END record
     pages_flushed: u32,        # Number of dirty pages flushed
@@ -50,15 +50,15 @@ S CheckpointResult {
 }
 
 # Checkpoint state tracking
-S CheckpointState {
+struct CheckpointState {
     in_progress: bool,
     last_checkpoint_lsn: u64,       # LSN of last successful checkpoint
     last_checkpoint_time: u64,      # Timestamp of last checkpoint (us)
     checkpoint_count: u64,          # Total checkpoints completed
 }
 
-X CheckpointState {
-    F new() -> CheckpointState {
+impl CheckpointState {
+    fn new() -> CheckpointState {
         CheckpointState {
             in_progress: false,
             last_checkpoint_lsn: NULL_LSN,
@@ -69,14 +69,14 @@ X CheckpointState {
 }
 
 # Checkpoint Manager
-S CheckpointManager {
+struct CheckpointManager {
     config: CheckpointConfig,
     state: CheckpointState,
     lock: Mutex<()>,
 }
 
-X CheckpointManager {
-    F new(config: CheckpointConfig) -> CheckpointManager {
+impl CheckpointManager {
+    fn new(config: CheckpointConfig) -> CheckpointManager {
         CheckpointManager {
             config,
             state: CheckpointState.new(),
@@ -84,30 +84,31 @@ X CheckpointManager {
         }
     }
 
-    F with_defaults() -> CheckpointManager {
+    fn with_defaults() -> CheckpointManager {
         CheckpointManager.new(CheckpointConfig.default())
     }
 
     # Perform a full checkpoint
     # Steps: CHECKPOINT_BEGIN → flush dirty pages → fsync → CHECKPOINT_END → update meta
-    F perform_checkpoint(
+    fn perform_checkpoint(
         mut self,
         writer: &mut WalWriter,
         pool: &mut BufferPool,
+        meta_file: &File,
         active_txn_ids: &[u64],
     ) -> Result<CheckpointResult, VaisError> {
         guard := mut self.lock.lock()
 
         I self.state.in_progress {
-            # guard.drop() # disabled for dev compiler
-            R Err(err_internal("Checkpoint already in progress"))
+            guard.unlock()
+            return Err(err_internal("Checkpoint already in progress"))
         }
         self.state.in_progress = true
-        # guard.drop() # disabled for dev compiler
+        guard.unlock()
 
         # Step 1: Write CHECKPOINT_BEGIN with active transaction list
         begin_payload := mut CheckpointBeginPayload {
-            active_txns: active_txn_ids.to_vec(),
+            active_txns: copy_checkpoint_txns(active_txn_ids),
         }
         begin_buf := mut ByteBuffer.with_capacity(8 + active_txn_ids.len() * 8)
         begin_payload.serialize(&begin_buf)
@@ -143,63 +144,78 @@ X CheckpointManager {
         # Step 5.5: Mark all buffer pool pages as needing FPI on next modification
         pool.set_all_needs_fpi()
 
-        # Step 6: Update checkpoint state
+        # Step 6: Update durable meta page checkpoint LSN
+        persist_checkpoint_lsn(meta_file, end_lsn)?;
+
+        # Step 7: Update checkpoint state
         guard2 := mut self.lock.lock()
         self.state.last_checkpoint_lsn = end_lsn
         self.state.last_checkpoint_time = time_micros()
         self.state.checkpoint_count += 1
         self.state.in_progress = false
-        # guard2.drop() # disabled for dev compiler
+        guard2.unlock()
 
         Ok(CheckpointResult {
             begin_lsn,
             end_lsn,
             pages_flushed,
-            active_txns: active_txn_ids.to_vec(),
+            active_txns: copy_checkpoint_txns(active_txn_ids),
         })
     }
 
     # Check if a checkpoint is needed based on configuration
-    F needs_checkpoint(self, current_wal_size: u64) -> bool {
+    fn needs_checkpoint(self, current_wal_size: u64) -> bool {
         # Check WAL size trigger
         I current_wal_size >= self.config.wal_size_trigger {
-            R true
+            return true
         }
 
         # Check time-based trigger
         now := mut time_micros()
         elapsed_sec := mut (now - self.state.last_checkpoint_time) / 1_000_000
         I elapsed_sec >= self.config.interval_sec as u64 {
-            R true
+            return true
         }
 
         false
     }
 
     # Get the LSN of the last successful checkpoint
-    F last_checkpoint_lsn(self) -> u64 {
+    fn last_checkpoint_lsn(self) -> u64 {
         self.state.last_checkpoint_lsn
     }
 
     # Set the last checkpoint LSN (used during recovery)
-    F set_last_checkpoint_lsn(mut self, lsn: u64) {
+    fn set_last_checkpoint_lsn(mut self, lsn: u64) {
         self.state.last_checkpoint_lsn = lsn
     }
 
     # Get checkpoint statistics
-    F checkpoint_count(self) -> u64 {
+    fn checkpoint_count(self) -> u64 {
         self.state.checkpoint_count
     }
 
     # Check if checkpoint is currently running
-    F is_in_progress(self) -> bool {
+    fn is_in_progress(self) -> bool {
         self.state.in_progress
     }
 }
 
+fn persist_checkpoint_lsn(meta_file: &File, checkpoint_lsn: u64) -> Result<(), VaisError> {
+    probe := mut meta_file.read_at(0, PAGE_SIZE_8K as u64)?;
+    meta := mut MetaPageHeader.read_from_page(&probe)?;
+    meta.set_checkpoint_lsn(checkpoint_lsn)
+
+    page_buf := mut Vec.with_capacity(meta.page_size as u64)
+    page_buf.resize(meta.page_size as u64, 0u8)
+    meta.write_to_page(&page_buf)
+    meta_file.write_at(0, &page_buf[0..page_buf.len()])?;
+    meta_file.fsync()
+}
+
 # Write a Full Page Image (FPI) for a page
 # Called on first modification to a page after each checkpoint
-F write_fpi(
+fn write_fpi(
     writer: &mut WalWriter,
     txn_id: u64,
     file_id: u8,
@@ -209,7 +225,7 @@ F write_fpi(
     payload := mut FpiPayload {
         file_id,
         page_id,
-        page_data: page_data.to_vec(),
+        page_data: copy_checkpoint_bytes(page_data),
     }
     buf := mut ByteBuffer.with_capacity(16 + page_data.len())
     payload.serialize(&buf)
@@ -218,49 +234,74 @@ F write_fpi(
 }
 
 # FPI page identifier (replaces tuple)
-S FpiPageId {
+struct FpiPageId {
     file_id: u8,
     page_id: u32,
 }
 
 # FPI tracking: tracks which pages have had FPI written since last checkpoint
 # First modification to a page after checkpoint writes FPI before the actual modification
-S FpiTracker {
+struct FpiTracker {
     pages_with_fpi: Vec<FpiPageId>,
     lock: Mutex<()>,
 }
 
-X FpiTracker {
-    F new() -> FpiTracker {
+impl FpiTracker {
+    fn new() -> FpiTracker {
+        pages_with_fpi: Vec<FpiPageId> := mut Vec.with_capacity(0)
         FpiTracker {
-            pages_with_fpi: Vec.with_capacity(0),
+            pages_with_fpi,
             lock: Mutex.new(()),
         }
     }
 
     # Check if FPI has been written for this page since last checkpoint
-    F has_fpi(self, file_id: u8, page_id: u32) -> bool {
+    fn has_fpi(self, file_id: u8, page_id: u32) -> bool {
         guard := mut self.lock.lock()
         LF page_with_fpi: &self.pages_with_fpi {
             fid := mut page_with_fpi.file_id
             pid := mut page_with_fpi.page_id
             I fid == file_id && pid == page_id {
-                R true
+                guard.unlock()
+                return true
             }
         }
+        guard.unlock()
         false
     }
 
     # Record that FPI was written for this page
-    F mark_fpi_written(mut self, file_id: u8, page_id: u32) {
+    fn mark_fpi_written(mut self, file_id: u8, page_id: u32) {
         guard := mut self.lock.lock()
         entry := mut FpiPageId { file_id: file_id, page_id: page_id }
         self.pages_with_fpi.push(entry)
+        guard.unlock()
     }
 
     # Clear all FPI tracking (called after each checkpoint)
-    F reset(mut self) {
+    fn reset(mut self) {
         guard := mut self.lock.lock()
         self.pages_with_fpi.clear()
+        guard.unlock()
     }
+}
+
+fn copy_checkpoint_txns(txns: &[u64]) -> Vec<u64> {
+    result: Vec<u64> := mut Vec.with_capacity(txns.len())
+    i := mut 0
+    LW i < txns.len() {
+        result.push(txns[i])
+        i += 1
+    }
+    result
+}
+
+fn copy_checkpoint_bytes(data: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(data.len())
+    i := mut 0
+    LW i < data.len() {
+        result.push(data[i])
+        i += 1
+    }
+    result
 }

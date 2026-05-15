@@ -19,12 +19,12 @@
 #
 # Error codes: VAIS-0206NNN (EE=02 vector, CC=06 quantize)
 
-U storage/bytes
-U std/math
-U storage/error
-U vector/quantize/scalar
-U vector/quantize/pq
-U vector/distance
+use storage/bytes
+use std/math
+use storage/error
+use vector/quantize/scalar
+use vector/quantize/pq
+use vector/distance
 
 # ============================================================================
 # Error Handling
@@ -32,7 +32,7 @@ U vector/distance
 
 # Error: Invalid quantization strategy
 # Code: VAIS-0206010
-F err_invalid_strategy() -> VaisError {
+fn err_invalid_strategy() -> VaisError {
     VaisError.new(
         "VAIS-0206010",
         "Invalid quantization strategy for current configuration"
@@ -41,7 +41,7 @@ F err_invalid_strategy() -> VaisError {
 
 # Error: Quantization manager not trained
 # Code: VAIS-0206011
-F err_manager_not_trained() -> VaisError {
+fn err_manager_not_trained() -> VaisError {
     VaisError.new(
         "VAIS-0206011",
         "QuantizationManager not trained - call train() before encode/decode"
@@ -50,7 +50,7 @@ F err_manager_not_trained() -> VaisError {
 
 # Error: Strategy mismatch during decode
 # Code: VAIS-0206012
-F err_strategy_mismatch(expected: QuantizationStrategy, got: u8) -> VaisError {
+fn err_strategy_mismatch(expected: QuantizationStrategy, got: u8) -> VaisError {
     VaisError.new(
         "VAIS-0206012",
         "Strategy mismatch: expected {expected:?}, got tag {got}"
@@ -63,7 +63,7 @@ F err_strategy_mismatch(expected: QuantizationStrategy, got: u8) -> VaisError {
 
 # Quantization strategy enum
 # Determines how vectors are compressed/stored
-EN QuantizationStrategy {
+enum QuantizationStrategy {
     None,
     Scalar,
     PQ,
@@ -75,7 +75,7 @@ EN QuantizationStrategy {
 
 # Adaptive quantization manager
 # Automatically selects and manages quantization strategy
-S QuantizationManager {
+struct QuantizationManager {
     strategy: QuantizationStrategy,           # Current strategy
     dim: u32,                                 # Vector dimensionality
     scalar_quantizer: Option<ScalarQuantizer>, # Scalar quantizer (I strategy=Scalar)
@@ -84,10 +84,10 @@ S QuantizationManager {
     trained: bool,                            # Whether manager has been trained
 }
 
-X QuantizationManager {
+impl QuantizationManager {
     # Create a new quantization manager for the given vector dimension
     # Initially uses None strategy (full precision)
-    F new(dim: u32) -> QuantizationManager {
+    fn new(dim: u32) -> QuantizationManager {
         QuantizationManager {
             strategy: None,
             dim,
@@ -104,7 +104,7 @@ X QuantizationManager {
     # - vector_count < 1,000,000    → Scalar (4x compression)
     # - vector_count >= 1,000,000   → PQ (64x compression)
     # - Override if memory_budget too small (escalate to next level)
-    F auto_select(
+    fn auto_select(
         &mut self,
         vector_count: u64,
         memory_budget_bytes: u64
@@ -127,12 +127,12 @@ X QuantizationManager {
                 # Escalate to Scalar
                 I mem_scalar <= memory_budget_bytes {
                     selected_strategy = Scalar
-                } EL I mem_pq <= memory_budget_bytes {
+                } else I mem_pq <= memory_budget_bytes {
                     # Escalate to PQ
                     selected_strategy = PQ
                 }
             }
-        } EL I vector_count < 1000000 {
+        } else I vector_count < 1000000 {
             # Medium dataset: prefer Scalar
             selected_strategy = Scalar
 
@@ -143,7 +143,7 @@ X QuantizationManager {
                     selected_strategy = PQ
                 }
             }
-        } EL {
+        } else {
             # Large dataset (>= 1M): prefer PQ
             selected_strategy = PQ
 
@@ -158,8 +158,8 @@ X QuantizationManager {
     # Train the quantization manager on sample vectors
     # Delegates to scalar or PQ quantizer based on selected strategy
     # Requires at least 100 vectors for Scalar, 256 for PQ
-    F train(mut self, vectors: &[&[f32]]) -> Result<(), VaisError> {
-        M self.strategy {
+    fn train(mut self, vectors: &[&[f32]]) -> Result<(), VaisError> {
+        match self.strategy {
             None => {
                 # No training needed for full precision
                 self.trained = true
@@ -182,17 +182,17 @@ X QuantizationManager {
                     # Try common values: 64, 32, 16, 8, 4, 2
                     I self.dim % 64 == 0 {
                         num_subspaces = 64
-                    } EL I self.dim % 32 == 0 {
+                    } else I self.dim % 32 == 0 {
                         num_subspaces = 32
-                    } EL I self.dim % 16 == 0 {
+                    } else I self.dim % 16 == 0 {
                         num_subspaces = 16
-                    } EL I self.dim % 8 == 0 {
+                    } else I self.dim % 8 == 0 {
                         num_subspaces = 8
-                    } EL I self.dim % 4 == 0 {
+                    } else I self.dim % 4 == 0 {
                         num_subspaces = 4
-                    } EL I self.dim % 2 == 0 {
+                    } else I self.dim % 2 == 0 {
                         num_subspaces = 2
-                    } EL {
+                    } else {
                         num_subspaces = 1
                     }
                 }
@@ -210,12 +210,12 @@ X QuantizationManager {
     # Encode a vector using the current quantization strategy
     # Returns variable-length encoded bytes depending on strategy
     # Format: [strategy_tag: u8] [encoded_data: variable]
-    F encode(self, vector: &[f32]) -> Result<Vec<u8>, VaisError> {
+    fn encode(self, vector: &[f32]) -> Result<Vec<u8>, VaisError> {
         I !self.trained {
-            R Err(err_manager_not_trained())
+            return Err(err_manager_not_trained())
         }
 
-        M self.strategy {
+        match self.strategy {
             None => {
                 # No compression: just serialize f32 values
                 # Tag: 0 for None
@@ -240,7 +240,7 @@ X QuantizationManager {
             Scalar => {
                 # Scalar quantization (i8)
                 # Tag: 1 for Scalar
-                M self.scalar_quantizer {
+                match self.scalar_quantizer {
                     Option.Some(q) => {
                         quantized := mut q.quantize(vector)?;
                         encoded := mut Vec.with_capacity(0)
@@ -261,7 +261,7 @@ X QuantizationManager {
             PQ => {
                 # Product quantization
                 # Tag: 2 for PQ
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => {
                         code := mut q.encode(vector)?;
                         encoded := mut Vec.with_capacity(0)
@@ -284,32 +284,35 @@ X QuantizationManager {
 
     # Decode encoded bytes back to approximate f32 vector
     # Reads strategy tag and delegates to appropriate quantizer
-    F decode(self, encoded: &[u8]) -> Result<Vec<f32>, VaisError> {
+    fn decode(self, encoded: &[u8]) -> Result<Vec<f32>, VaisError> {
         I !self.trained {
-            R Err(err_manager_not_trained())
+            return Err(err_manager_not_trained())
         }
 
         I encoded.len() == 0 {
-            R Err(err_invalid_strategy())
+            return Err(err_invalid_strategy())
         }
 
         strategy_tag := mut encoded[0]
         data := mut &encoded[1..]
 
-        M strategy_tag {
+        match strategy_tag {
             0 => {
                 # None strategy: deserialize f32 values
                 I data.len() % 4 != 0 {
-                    R Err(err_invalid_strategy())
+                    return Err(err_invalid_strategy())
                 }
 
                 vector := mut Vec.with_capacity(0)
                 i := mut 0
                 LW i < data.len() {
 
-                    # Read 4 bytes as f32 (little-endian)
-                    bytes := mut [data[i], data[i+1], data[i+2], data[i+3]]
-                    val := mut f32.from_le_bytes(bytes)
+                    # Read 4 bytes as f32 (little-endian, via u32 bit pattern)
+                    bits := (data[i] as u32)
+                        | ((data[i+1] as u32) << 8)
+                        | ((data[i+2] as u32) << 16)
+                        | ((data[i+3] as u32) << 24)
+                    val := mut bits as f32
                     vector.push(val)
 
                     i = i + 4
@@ -319,7 +322,7 @@ X QuantizationManager {
             },
             1 => {
                 # Scalar strategy
-                M self.scalar_quantizer {
+                match self.scalar_quantizer {
                     Option.Some(q) => {
                         # Convert u8 back to i8
                         quantized := mut Vec.with_capacity(0)
@@ -336,9 +339,16 @@ X QuantizationManager {
             },
             2 => {
                 # PQ strategy
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => {
-                        code := mut data.to_vec()
+                        code := mut Vec.with_capacity(data.len())
+                        code.push(0u8)  # seed element type
+                        code.clear()
+                        _ci := mut 0i64
+                        LW _ci < data.len() as i64 {
+                            code.push(data[_ci] as u8)
+                            _ci = _ci + 1
+                        }
                         q.decode(&code)
                     },
                     Option.None => Err(err_invalid_strategy()),
@@ -350,23 +360,23 @@ X QuantizationManager {
 
     # Compute approximate distance from query to encoded vector
     # Uses quantization-aware distance computation when possible
-    F approximate_distance(
+    fn approximate_distance(
         &self,
         query: &[f32],
         encoded: &[u8]
     ) -> Result<f32, VaisError> {
         I !self.trained {
-            R Err(err_manager_not_trained())
+            return Err(err_manager_not_trained())
         }
 
         I encoded.len() == 0 {
-            R Err(err_invalid_strategy())
+            return Err(err_invalid_strategy())
         }
 
         strategy_tag := mut encoded[0]
         data := mut &encoded[1..]
 
-        M strategy_tag {
+        match strategy_tag {
             0 => {
                 # None strategy: exact L2 distance
                 decoded := mut self.decode(encoded)?;
@@ -375,7 +385,7 @@ X QuantizationManager {
             },
             1 => {
                 # Scalar strategy: quantized distance
-                M self.scalar_quantizer {
+                match self.scalar_quantizer {
                     Option.Some(q) => {
                         # Quantize query and compute quantized L2 distance
                         query_quantized := mut q.quantize(query)?;
@@ -396,7 +406,7 @@ X QuantizationManager {
             },
             2 => {
                 # PQ strategy: ADC distance
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => {
                         dist_table := mut q.build_distance_table(query)?;
                         code := mut data
@@ -411,17 +421,17 @@ X QuantizationManager {
     }
 
     # Get current quantization strategy
-    F get_strategy(self) -> QuantizationStrategy {
+    fn get_strategy(self) -> QuantizationStrategy {
         self.strategy
     }
 
     # Get compression ratio for current strategy
-    F compression_ratio(self) -> f32 {
-        M self.strategy {
+    fn compression_ratio(self) -> f32 {
+        match self.strategy {
             None => 1.0,
             Scalar => 4.0,
             PQ => {
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => q.compression_ratio(),
                     Option.None => 1.0,
                 }
@@ -430,12 +440,12 @@ X QuantizationManager {
     }
 
     # Get memory per encoded vector in bytes (excluding strategy tag)
-    F memory_per_vector(self) -> u64 {
-        M self.strategy {
+    fn memory_per_vector(self) -> u64 {
+        match self.strategy {
             None => (self.dim as u64) * 4,
             Scalar => self.dim as u64,
             PQ => {
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => q.memory_per_vector(),
                     Option.None => (self.dim as u64) * 4,
                 }
@@ -445,7 +455,7 @@ X QuantizationManager {
 
     # Set oversample factor for compressed search
     # Default: 3.0 (search k*3 candidates, re-rank to k)
-    F set_oversample_factor(mut self, factor: f32) {
+    fn set_oversample_factor(mut self, factor: f32) {
         self.oversample_factor = factor
     }
 
@@ -456,9 +466,9 @@ X QuantizationManager {
     # - oversample_factor (f32)
     # - trained (u8): 0 or 1
     # - quantizer data (if Scalar or PQ)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         # Write strategy tag
-        strategy_tag := mut M self.strategy {
+        strategy_tag := mut match self.strategy {
             None => 0,
             Scalar => 1,
             PQ => 2,
@@ -467,22 +477,22 @@ X QuantizationManager {
 
         # Write metadata
         buf.write_i32_le(self.dim)
-        buf.put_f32_le(self.oversample_factor)
-        buf.write_u8(I self.trained { 1 } EL { 0 })
+        buf.write_f32_le(f32_bits(self.oversample_factor))
+        buf.write_u8(I self.trained { 1 } else { 0 })
 
         # Write quantizer data
-        M self.strategy {
+        match self.strategy {
             None => {
                 # No quantizer data for None strategy
             },
             Scalar => {
-                M self.scalar_quantizer {
+                match self.scalar_quantizer {
                     Option.Some(q) => q.serialize(buf),
                     Option.None => {},
                 }
             },
             PQ => {
-                M self.pq_quantizer {
+                match self.pq_quantizer {
                     Option.Some(q) => q.serialize(buf),
                     Option.None => {},
                 }
@@ -491,7 +501,7 @@ X QuantizationManager {
     }
 
     # Deserialize quantization manager from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<QuantizationManager, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<QuantizationManager, VaisError> {
         # Read strategy tag
         strategy_tag := mut read_u8_checked(buf)?;
 
@@ -502,13 +512,13 @@ X QuantizationManager {
         trained := mut trained_byte == 1
 
         # Reconstruct strategy and quantizer
-        mut strategy: QuantizationStrategy
+        strategy := mut QuantizationStrategy.None
         scalar_quantizer := mut Option.None
         pq_quantizer := mut Option.None
 
-        M strategy_tag {
+        match strategy_tag {
             0 => {
-                strategy = None
+                strategy = QuantizationStrategy.None
             },
             1 => {
                 strategy = Scalar
@@ -521,7 +531,7 @@ X QuantizationManager {
                 pq_quantizer = Option.Some(q)
             },
             _ => {
-                R Err(err_invalid_strategy())
+                return Err(err_invalid_strategy())
             },
         }
 
@@ -536,12 +546,12 @@ X QuantizationManager {
     }
 
     # Check if manager is trained
-    F is_trained(self) -> bool {
+    fn is_trained(self) -> bool {
         self.trained
     }
 
     # Get vector dimension
-    F dimension(self) -> u32 {
+    fn dimension(self) -> u32 {
         self.dim
     }
 }

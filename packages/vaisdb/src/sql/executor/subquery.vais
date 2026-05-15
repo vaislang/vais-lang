@@ -6,44 +6,45 @@
 # SetOperationExecutor: UNION, INTERSECT, EXCEPT
 # Error codes: EE=01 (SQL), CC=07 (Subquery), NNN=001-005
 
-U std/hashmap
-U std/result
-U std/option
-U std/vec
-U std/str
-U std/box
+use std/hashmap
+use std/hashset
+use std/result
+use std/option
+use std/vec
+use std/string
+use std/box
 
-U storage/error
-U sql/types
-U sql/row
-U sql/parser/ast
-U sql/executor/mod
-U sql/executor/expr_eval
+use storage/error
+use sql/types
+use sql/row
+use sql/parser/ast
+use sql/executor/mod
+use sql/executor/expr_eval
 
 # ============================================================================
 # CTE Context - Shared storage for materialized CTEs
 # ============================================================================
 
-S CteContext {
+struct CteContext {
     materialized: HashMap<str, Vec<Row>>,
 }
 
-X CteContext {
-    F new() -> CteContext {
+impl CteContext {
+    fn new() -> CteContext {
         CteContext {
             materialized: HashMap.with_capacity(16),
         }
     }
 
-    F insert(mut self, name: str, rows: Vec<Row>) {
+    fn insert(mut self, name: str, rows: Vec<Row>) {
         self.materialized.insert(name, rows)
     }
 
-    F get(self, name: &str) -> Option<&Vec<Row>> {
+    fn get(self, name: &str) -> Option<&Vec<Row>> {
         self.materialized.get(name)
     }
 
-    F clear(mut self) {
+    fn clear(mut self) {
         self.materialized.clear()
     }
 }
@@ -55,17 +56,17 @@ X CteContext {
 # Forward declaration: we need a way to build an executor from SelectQuery
 # In practice, this would be provided by the planner/builder module
 # For now, we define the signature as a placeholder
-W ExecutorBuilder {
-    F build_select(query: &SelectQuery, ctx: &ExecContext, eval_ctx: &EvalContext, cte_ctx: &CteContext) -> Result<Box<dyn Executor>, VaisError>
+trait ExecutorBuilder {
+    fn build_select(query: &SelectQuery, ctx: &ExecContext, eval_ctx: &EvalContext, cte_ctx: &CteContext) -> Result<Box<dyn Executor>, VaisError>
 }
 
-S SubqueryExecutor {
+struct SubqueryExecutor {
     child: Box<dyn Executor>,
     stats: ExecStats,
 }
 
-X SubqueryExecutor {
-    F new(child: Box<dyn Executor>) -> SubqueryExecutor {
+impl SubqueryExecutor {
+    fn new(child: Box<dyn Executor>) -> SubqueryExecutor {
         SubqueryExecutor {
             child,
             stats: ExecStats.new(),
@@ -74,7 +75,7 @@ X SubqueryExecutor {
 
     # Evaluate the subquery and return a single scalar value
     # Errors if subquery returns more than one row
-    F eval(mut self) -> Result<SqlValue, VaisError> {
+    fn eval(mut self) -> Result<SqlValue, VaisError> {
         self.child.open()?;
 
         result_val := mut Null
@@ -83,7 +84,7 @@ X SubqueryExecutor {
         has_more := mut true
         LW has_more {
             _next := self.child.next()?;
-            M _next {
+            match _next {
                 Option.None => { has_more = false; },
                 Option.Some(exec_row) => {
                     row_count += 1
@@ -91,7 +92,7 @@ X SubqueryExecutor {
 
                     I row_count > 1 {
                         self.child.close()?;
-                        R Result.Err(VaisError.new(
+                        return Result.Err(VaisError.new(
                             "VAIS-E0107002",
                             "Scalar subquery returned more than one row"
                         ))
@@ -100,7 +101,7 @@ X SubqueryExecutor {
                     # Get first column value
                     row := mut exec_row.get_row()
                     I row.column_count() > 0 {
-                        result_val = row.get(0).clone()
+                        result_val = (*row.get(0)).clone()
                     }
                 },
             }
@@ -110,7 +111,7 @@ X SubqueryExecutor {
         Result.Ok(result_val)
     }
 
-    F stats(self) -> &ExecStats {
+    fn stats(self) -> &ExecStats {
         &self.stats
     }
 }
@@ -120,7 +121,7 @@ X SubqueryExecutor {
 # ============================================================================
 
 # Execute IN subquery and check if expr value is in the result set
-F eval_in_subquery(
+fn eval_in_subquery(
     expr_val: &SqlValue,
     child: &mut Box<dyn Executor>,
     negated: bool,
@@ -134,7 +135,7 @@ F eval_in_subquery(
     has_more := mut true
     LW has_more {
         _next := child.next()?;
-        M _next {
+        match _next {
             Option.None => { has_more = false; },
             Option.Some(exec_row) => {
                 stats.add_scanned(1)
@@ -144,8 +145,8 @@ F eval_in_subquery(
                     val := mut row.get(0)
 
                     # Compare using SQL equals (NULL propagation)
-                    M expr_val.equals(val) {
-                        BoolVal { v: true } => {
+                    match expr_val.equals(val) {
+                        SqlValue.BoolVal { v: true } => {
                             found = true
                             has_more = false
                         },
@@ -165,11 +166,11 @@ F eval_in_subquery(
     # IN: found -> TRUE, not found but NULL seen -> NULL, not found -> FALSE
     # NOT IN: found -> FALSE, not found but NULL seen -> NULL, not found -> TRUE
     result := mut I found {
-        BoolVal { v: !negated }
-    } EL I found_null {
+        SqlValue.BoolVal { v: !negated }
+    } else I found_null {
         Null
-    } EL {
-        BoolVal { v: negated }
+    } else {
+        SqlValue.BoolVal { v: negated }
     }
 
     Result.Ok(result)
@@ -180,7 +181,7 @@ F eval_in_subquery(
 # ============================================================================
 
 # Execute EXISTS subquery and check if at least one row is returned
-F eval_exists(
+fn eval_exists(
     child: &mut Box<dyn Executor>,
     negated: bool,
     stats: &mut ExecStats,
@@ -190,7 +191,7 @@ F eval_exists(
     exists := mut false
 
     _next := child.next()?;
-    M _next {
+    match _next {
         Option.Some(_) => {
             exists = true
             stats.add_scanned(1)
@@ -201,9 +202,9 @@ F eval_exists(
     child.close()?;
 
     result := mut I negated {
-        BoolVal { v: !exists }
-    } EL {
-        BoolVal { v: exists }
+        SqlValue.BoolVal { v: !exists }
+    } else {
+        SqlValue.BoolVal { v: exists }
     }
 
     Result.Ok(result)
@@ -213,7 +214,7 @@ F eval_exists(
 # CteRefExecutor - Reads from materialized CTE
 # ============================================================================
 
-S CteRefExecutor {
+struct CteRefExecutor {
     cte_name: str,
     cte_ctx: &CteContext,
     materialized: Option<Vec<Row>>,
@@ -221,8 +222,8 @@ S CteRefExecutor {
     stats: ExecStats,
 }
 
-X CteRefExecutor {
-    F new(cte_name: str, cte_ctx: &CteContext) -> CteRefExecutor {
+impl CteRefExecutor {
+    fn new(cte_name: str, cte_ctx: &CteContext) -> CteRefExecutor {
         CteRefExecutor {
             cte_name,
             cte_ctx,
@@ -232,9 +233,9 @@ X CteRefExecutor {
         }
     }
 
-    F open(mut self) -> Result<(), VaisError> {
+    fn open(mut self) -> Result<(), VaisError> {
         # Lookup CTE by name
-        M self.cte_ctx.get(&self.cte_name) {
+        match self.cte_ctx.get(&self.cte_name) {
             Option.Some(rows) => {
                 self.materialized = Option.Some(rows.clone())
                 self.cursor = 0
@@ -249,32 +250,32 @@ X CteRefExecutor {
         }
     }
 
-    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
-        M &self.materialized {
+    fn next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+        match &self.materialized {
             Option.None => {
                 Result.Err(VaisError.new("VAIS-E0107001", "CteRefExecutor not opened"))
             },
             Option.Some(rows) => {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
-                } EL {
+                } else {
                     row := mut &rows[self.cursor]
                     self.cursor += 1
                     self.stats.add_produced()
                     self.stats.add_scanned(1)
-                    Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
+                    Result.Ok(Option.Some(ExecutorRow.virtual((*row).clone())))
                 }
             },
         }
     }
 
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         self.materialized = Option.None
         self.cursor = 0
         Result.Ok(())
     }
 
-    F stats(self) -> &ExecStats {
+    fn stats(self) -> &ExecStats {
         &self.stats
     }
 }
@@ -283,7 +284,7 @@ X CteRefExecutor {
 # SetOperationExecutor - UNION, INTERSECT, EXCEPT
 # ============================================================================
 
-S SetOperationExecutor {
+struct SetOperationExecutor {
     left: Box<dyn Executor>,
     right: Box<dyn Executor>,
     op_kind: SetOpKind,
@@ -293,8 +294,8 @@ S SetOperationExecutor {
     stats: ExecStats,
 }
 
-X SetOperationExecutor {
-    F new(
+impl SetOperationExecutor {
+    fn new(
         left: Box<dyn Executor>,
         right: Box<dyn Executor>,
         op_kind: SetOpKind,
@@ -311,12 +312,12 @@ X SetOperationExecutor {
         }
     }
 
-    F open(mut self) -> Result<(), VaisError> {
-        M self.op_kind {
+    fn open(mut self) -> Result<(), VaisError> {
+        match self.op_kind {
             Union => {
                 I self.all {
                     self.open_union_all()?;
-                } EL {
+                } else {
                     self.open_union()?;
                 }
             },
@@ -331,25 +332,25 @@ X SetOperationExecutor {
         Result.Ok(())
     }
 
-    F next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
-        M &self.materialized {
+    fn next(mut self) -> Result<Option<ExecutorRow>, VaisError> {
+        match &self.materialized {
             Option.None => {
                 Result.Err(VaisError.new("VAIS-E0107001", "SetOperationExecutor not opened"))
             },
             Option.Some(rows) => {
                 I self.cursor >= rows.len() {
                     Result.Ok(Option.None)
-                } EL {
+                } else {
                     row := mut &rows[self.cursor]
                     self.cursor += 1
                     self.stats.add_produced()
-                    Result.Ok(Option.Some(ExecutorRow.virtual(row.clone())))
+                    Result.Ok(Option.Some(ExecutorRow.virtual((*row).clone())))
                 }
             },
         }
     }
 
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         self.materialized = Option.None
         self.cursor = 0
         self.left.close()?;
@@ -357,12 +358,12 @@ X SetOperationExecutor {
         Result.Ok(())
     }
 
-    F stats(self) -> &ExecStats {
+    fn stats(self) -> &ExecStats {
         &self.stats
     }
 
     # UNION ALL: concatenate left and right
-    F open_union_all(mut self) -> Result<(), VaisError> {
+    fn open_union_all(mut self) -> Result<(), VaisError> {
         self.left.open()?;
         self.right.open()?;
 
@@ -372,11 +373,11 @@ X SetOperationExecutor {
         has_left := mut true
         LW has_left {
             _left := self.left.next()?;
-            M _left {
+            match _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
-                    result.push(exec_row.get_row().clone())
+                    result.push((*exec_row.get_row()).clone())
                 },
             }
         }
@@ -385,11 +386,11 @@ X SetOperationExecutor {
         has_right := mut true
         LW has_right {
             _right := self.right.next()?;
-            M _right {
+            match _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
-                    result.push(exec_row.get_row().clone())
+                    result.push((*exec_row.get_row()).clone())
                 },
             }
         }
@@ -401,7 +402,7 @@ X SetOperationExecutor {
     }
 
     # UNION: concatenate left and right, then deduplicate
-    F open_union(mut self) -> Result<(), VaisError> {
+    fn open_union(mut self) -> Result<(), VaisError> {
         self.left.open()?;
         self.right.open()?;
 
@@ -412,7 +413,7 @@ X SetOperationExecutor {
         has_left := mut true
         LW has_left {
             _left := self.left.next()?;
-            M _left {
+            match _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -421,13 +422,13 @@ X SetOperationExecutor {
                     # Hash all row values
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
 
                     I !seen.contains(&hash) {
                         seen.insert(hash)
-                        result.push(row.clone())
+                        result.push((*row).clone())
                     }
                 },
             }
@@ -437,7 +438,7 @@ X SetOperationExecutor {
         has_right := mut true
         LW has_right {
             _right := self.right.next()?;
-            M _right {
+            match _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -446,13 +447,13 @@ X SetOperationExecutor {
                     # Hash all row values
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
 
                     I !seen.contains(&hash) {
                         seen.insert(hash)
-                        result.push(row.clone())
+                        result.push((*row).clone())
                     }
                 },
             }
@@ -465,7 +466,7 @@ X SetOperationExecutor {
     }
 
     # INTERSECT: materialize right into HashSet, probe from left
-    F open_intersect(mut self) -> Result<(), VaisError> {
+    fn open_intersect(mut self) -> Result<(), VaisError> {
         self.left.open()?;
         self.right.open()?;
 
@@ -475,7 +476,7 @@ X SetOperationExecutor {
         has_right := mut true
         LW has_right {
             _right := self.right.next()?;
-            M _right {
+            match _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -483,7 +484,7 @@ X SetOperationExecutor {
 
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
                     right_hashes.insert(hash)
@@ -498,7 +499,7 @@ X SetOperationExecutor {
         has_left := mut true
         LW has_left {
             _left := self.left.next()?;
-            M _left {
+            match _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -506,14 +507,14 @@ X SetOperationExecutor {
 
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
 
                     # Only emit if in right side and not already seen (dedup)
                     I right_hashes.contains(&hash) && !seen.contains(&hash) {
                         seen.insert(hash)
-                        result.push(row.clone())
+                        result.push((*row).clone())
                     }
                 },
             }
@@ -526,7 +527,7 @@ X SetOperationExecutor {
     }
 
     # EXCEPT: materialize right into HashSet, emit left rows NOT in right
-    F open_except(mut self) -> Result<(), VaisError> {
+    fn open_except(mut self) -> Result<(), VaisError> {
         self.left.open()?;
         self.right.open()?;
 
@@ -536,7 +537,7 @@ X SetOperationExecutor {
         has_right := mut true
         LW has_right {
             _right := self.right.next()?;
-            M _right {
+            match _right {
                 Option.None => { has_right = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -544,7 +545,7 @@ X SetOperationExecutor {
 
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
                     right_hashes.insert(hash)
@@ -559,7 +560,7 @@ X SetOperationExecutor {
         has_left := mut true
         LW has_left {
             _left := self.left.next()?;
-            M _left {
+            match _left {
                 Option.None => { has_left = false; },
                 Option.Some(exec_row) => {
                     self.stats.add_scanned(1)
@@ -567,14 +568,14 @@ X SetOperationExecutor {
 
                     values := mut Vec.with_capacity(0)
                     LF i: 0..row.column_count() {
-                        values.push(row.get(i).clone())
+                        values.push((*row.get(i)).clone())
                     }
                     hash := mut group_key_hash(&values)
 
                     # Only emit if NOT in right side and not already seen (dedup)
                     I !right_hashes.contains(&hash) && !seen.contains(&hash) {
                         seen.insert(hash)
-                        result.push(row.clone())
+                        result.push((*row).clone())
                     }
                 },
             }

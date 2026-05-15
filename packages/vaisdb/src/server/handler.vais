@@ -2,34 +2,34 @@
 # Bridges wire protocol messages → SQL parser → planner/executor → wire responses
 # Handles simple query protocol, extended query (parse/bind/execute), SET commands
 
-U std/vec
-U std/string
-U std/option
-U std/bytebuffer
-U std/hashmap
-U storage/error
-U storage/bytes
-U server/types
-U server/protocol
-U server/connection
-U server/auth
+use std/vec
+use std/string
+use std/option
+use std/bytebuffer
+use std/hashmap
+use storage/error
+use storage/bytes
+use server/types
+use server/protocol
+use server/connection
+use server/auth
 
 # ============================================================================
 # QueryHandler — processes wire protocol messages for a connection
 # ============================================================================
 
-S QueryHandler {
+struct QueryHandler {
     conn_id: u64,
 }
 
-X QueryHandler {
-    F new(conn_id: u64) -> QueryHandler {
+impl QueryHandler {
+    fn new(conn_id: u64) -> QueryHandler {
         QueryHandler { conn_id }
     }
 
     # Process a single framed message and return response bytes.
     # Returns Vec of response byte buffers to send to client.
-    F handle_message(
+    fn handle_message(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
@@ -38,21 +38,21 @@ X QueryHandler {
 
         I msg_type == MSG_TYPE_QUERY {
             self.handle_simple_query(msg, pool)
-        } EL I msg_type == MSG_TYPE_PARSE {
+        } else I msg_type == MSG_TYPE_PARSE {
             self.handle_parse(msg, pool)
-        } EL I msg_type == MSG_TYPE_BIND {
+        } else I msg_type == MSG_TYPE_BIND {
             self.handle_bind(msg, pool)
-        } EL I msg_type == MSG_TYPE_EXECUTE {
+        } else I msg_type == MSG_TYPE_EXECUTE {
             self.handle_execute(msg, pool)
-        } EL I msg_type == MSG_TYPE_DESCRIBE {
+        } else I msg_type == MSG_TYPE_DESCRIBE {
             self.handle_describe(msg, pool)
-        } EL I msg_type == MSG_TYPE_CLOSE_STMT {
+        } else I msg_type == MSG_TYPE_CLOSE_STMT {
             self.handle_close_stmt(msg, pool)
-        } EL I msg_type == MSG_TYPE_SYNC {
+        } else I msg_type == MSG_TYPE_SYNC {
             self.handle_sync(pool)
-        } EL I msg_type == MSG_TYPE_TERMINATE {
+        } else I msg_type == MSG_TYPE_TERMINATE {
             self.handle_terminate(pool)
-        } EL {
+        } else {
             Err(err_protocol_error("Unknown message type: {msg_type}"))
         }
     }
@@ -62,19 +62,21 @@ X QueryHandler {
     # ========================================================================
 
     # Handle simple query: parse SQL → execute → return results
-    F handle_simple_query(
+    fn handle_simple_query(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
         reader := mut msg.payload_reader();
         sql := mut deserialize_query(&reader)?;
-        responses := mut Vec.with_capacity(0);
+        responses: Vec<Vec<u8>> := mut Vec.with_capacity(0);
 
         # Update connection state to InQuery
-        pool.with_connection(self.conn_id, |conn| {
-            conn.set_state(InQuery)
-        })??;
+        guard := mut pool.connections.lock()
+        match guard.get_mut(&self.conn_id) {
+            Some(conn) => { conn.set_state(InQuery)?; },
+            None => {},
+        }
 
         # FUTURE(integration): Route to SQL execution pipeline
         # parse_sql -> HybridPlanner.execute_query / Executor.execute_dml / DDL / txn mgmt
@@ -84,18 +86,22 @@ X QueryHandler {
         responses.push(serialize_command_complete(&tag));
 
         # Return to Ready state
-        pool.with_connection(self.conn_id, |conn| {
-            conn.set_state(Ready)
-        })??;
+        guard2 := mut pool.connections.lock()
+        match guard2.get_mut(&self.conn_id) {
+            Some(conn) => { conn.set_state(Ready)?; },
+            None => {},
+        }
 
         # Send ReadyForQuery
-        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
-            M conn.get_txn_state() {
+        guard3 := mut pool.connections.lock()
+        txn_state := mut match guard3.get(&self.conn_id) {
+            Some(conn) => match conn.get_txn_state() {
                 Idle => Idle,
                 InBlock => InBlock,
                 Failed => Failed,
-            }
-        })?;
+            },
+            None => Idle,
+        };
         responses.push(serialize_ready(&txn_state));
 
         Ok(responses)
@@ -107,33 +113,35 @@ X QueryHandler {
 
     # Handle Parse: prepare a statement
     # FUTURE(closure-capture): requires lambda capture for pool.with_connection
-    F handle_parse(
+    fn handle_parse(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        Ok(Vec.with_capacity(0))
+        empty: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+        Ok(empty)
     }
 
     # Handle Bind: bind parameters to a prepared statement → create portal
     # FUTURE(closure-capture): requires lambda capture for pool.with_connection
-    F handle_bind(
+    fn handle_bind(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        Ok(Vec.with_capacity(0))
+        empty: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+        Ok(empty)
     }
 
     # Handle Execute: execute a bound portal
-    F handle_execute(
+    fn handle_execute(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
         reader := mut msg.payload_reader();
         exec_msg := mut deserialize_execute(&reader)?;
-        responses := mut Vec.with_capacity(0);
+        responses: Vec<Vec<u8>> := mut Vec.with_capacity(0);
 
         # FUTURE(integration): Look up portal, resolve bound statement + params, execute
         # Placeholder: return empty CommandComplete
@@ -145,49 +153,56 @@ X QueryHandler {
 
     # Handle Describe: return parameter/column descriptions
     # FUTURE(closure-capture): requires lambda capture for pool.with_connection_ref
-    F handle_describe(
+    fn handle_describe(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        Ok(Vec.with_capacity(0))
+        empty: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+        Ok(empty)
     }
 
     # Handle CloseStmt: close a prepared statement or portal
     # FUTURE(closure-capture): requires lambda capture for pool.with_connection
-    F handle_close_stmt(
+    fn handle_close_stmt(
         mut self,
         msg: &FramedMessage,
         pool: &mut ConnectionPool,
     ) -> Result<Vec<Vec<u8>>, VaisError> {
-        Ok(Vec.with_capacity(0))
+        empty: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+        Ok(empty)
     }
 
     # Handle Sync: mark end of extended query sequence
-    F handle_sync(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+    fn handle_sync(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
         # Clear all portals
-        pool.with_connection(self.conn_id, |conn| {
-            conn.clear_portals();
-        })?;
+        guard4 := mut pool.connections.lock()
+        match guard4.get_mut(&self.conn_id) {
+            Some(conn) => { conn.clear_portals(); },
+            None => {},
+        }
 
         # Send ReadyForQuery
-        txn_state := mut pool.with_connection_ref(self.conn_id, |conn| {
-            M conn.get_txn_state() {
+        guard5 := mut pool.connections.lock()
+        txn_state := mut match guard5.get(&self.conn_id) {
+            Some(conn) => match conn.get_txn_state() {
                 Idle => Idle,
                 InBlock => InBlock,
                 Failed => Failed,
-            }
-        })?;
+            },
+            None => Idle,
+        };
 
-        responses := mut Vec.with_capacity(0);
+        responses: Vec<Vec<u8>> := mut Vec.with_capacity(0);
         responses.push(serialize_ready(&txn_state));
         Ok(responses)
     }
 
     # Handle Terminate: client disconnecting
-    F handle_terminate(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
+    fn handle_terminate(mut self, pool: &mut ConnectionPool) -> Result<Vec<Vec<u8>>, VaisError> {
         pool.remove_connection(self.conn_id);
-        Ok(Vec.with_capacity(0))  # No response sent for terminate
+        empty: Vec<Vec<u8>> := mut Vec.with_capacity(0)
+        Ok(empty)  # No response sent for terminate
     }
 }
 
@@ -199,17 +214,17 @@ X QueryHandler {
 
 # Classify SQL string to a command tag for CommandComplete
 # Examines the first keyword to determine the command type
-F classify_sql_tag(sql: &Str) -> Str {
-    bytes := mut sql.as_bytes();
-    len := mut bytes.len();
+fn classify_sql_tag(sql: &Str) -> Str {
+    bytes: Vec<u8> := sql.as_bytes();
+    len := bytes.len();
 
     # Skip leading whitespace
     pos := mut 0;
     LW pos < len {
-        ch := mut bytes[pos];
+        ch := mut bytes.get(pos as i64);
         I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
             pos = len;  # exit
-        } EL {
+        } else {
             pos += 1;
         }
     }
@@ -218,11 +233,11 @@ F classify_sql_tag(sql: &Str) -> Str {
     start := mut 0;
     s := mut 0;
     LW s < len {
-        ch := mut bytes[s];
+        ch := mut bytes.get(s as i64);
         I ch != 32 && ch != 9 && ch != 10 && ch != 13 {
             start = s;
             s = len;
-        } EL {
+        } else {
             s += 1;
         }
     }
@@ -230,28 +245,28 @@ F classify_sql_tag(sql: &Str) -> Str {
     # Find end of first word
     end := mut start;
     LW end < len {
-        ch := mut bytes[end];
+        ch := mut bytes.get(end as i64);
         I ch == 32 || ch == 9 || ch == 10 || ch == 13 || ch == 59 {
             end = end;  # found boundary, keep position
             LW end < len { end = len; }  # exit outer loop
-        } EL {
+        } else {
             end += 1;
         }
     }
 
     # Extract first word and uppercase it
-    word := mut Vec.with_capacity(0);
+    word: Vec<u8> := mut Vec.with_capacity(0);
     w := mut start;
     word_end := mut end;
     I word_end > start + 20 {
         word_end = start + 20;  # limit to 20 chars
     }
     LW w < word_end {
-        ch := mut bytes[w];
+        ch := mut bytes.get(w as i64);
         # To uppercase: if 'a'-'z' (97-122), subtract 32
         I ch >= 97 && ch <= 122 {
             word.push(ch - 32);
-        } EL {
+        } else {
             word.push(ch);
         }
         w += 1;
@@ -261,36 +276,36 @@ F classify_sql_tag(sql: &Str) -> Str {
     I word.len() >= 6 && word[0] == 83 && word[1] == 69 && word[2] == 76 &&
       word[3] == 69 && word[4] == 67 && word[5] == 84 {
         "SELECT 0"
-    } EL I word.len() >= 6 && word[0] == 73 && word[1] == 78 && word[2] == 83 &&
+    } else I word.len() >= 6 && word[0] == 73 && word[1] == 78 && word[2] == 83 &&
       word[3] == 69 && word[4] == 82 && word[5] == 84 {
         "INSERT 0 0"
-    } EL I word.len() >= 6 && word[0] == 85 && word[1] == 80 && word[2] == 68 &&
+    } else I word.len() >= 6 && word[0] == 85 && word[1] == 80 && word[2] == 68 &&
       word[3] == 65 && word[4] == 84 && word[5] == 69 {
         "UPDATE 0"
-    } EL I word.len() >= 6 && word[0] == 68 && word[1] == 69 && word[2] == 76 &&
+    } else I word.len() >= 6 && word[0] == 68 && word[1] == 69 && word[2] == 76 &&
       word[3] == 69 && word[4] == 84 && word[5] == 69 {
         "DELETE 0"
-    } EL I word.len() >= 6 && word[0] == 67 && word[1] == 82 && word[2] == 69 &&
+    } else I word.len() >= 6 && word[0] == 67 && word[1] == 82 && word[2] == 69 &&
       word[3] == 65 && word[4] == 84 && word[5] == 69 {
         "CREATE TABLE"
-    } EL I word.len() >= 4 && word[0] == 68 && word[1] == 82 && word[2] == 79 &&
+    } else I word.len() >= 4 && word[0] == 68 && word[1] == 82 && word[2] == 79 &&
       word[3] == 80 {
         "DROP TABLE"
-    } EL I word.len() >= 5 && word[0] == 66 && word[1] == 69 && word[2] == 71 &&
+    } else I word.len() >= 5 && word[0] == 66 && word[1] == 69 && word[2] == 71 &&
       word[3] == 73 && word[4] == 78 {
         "BEGIN"
-    } EL I word.len() >= 6 && word[0] == 67 && word[1] == 79 && word[2] == 77 &&
+    } else I word.len() >= 6 && word[0] == 67 && word[1] == 79 && word[2] == 77 &&
       word[3] == 77 && word[4] == 73 && word[5] == 84 {
         "COMMIT"
-    } EL I word.len() >= 8 && word[0] == 82 && word[1] == 79 && word[2] == 76 &&
+    } else I word.len() >= 8 && word[0] == 82 && word[1] == 79 && word[2] == 76 &&
       word[3] == 76 && word[4] == 66 && word[5] == 65 && word[6] == 67 && word[7] == 75 {
         "ROLLBACK"
-    } EL I word.len() >= 7 && word[0] == 69 && word[1] == 88 && word[2] == 80 &&
+    } else I word.len() >= 7 && word[0] == 69 && word[1] == 88 && word[2] == 80 &&
       word[3] == 76 && word[4] == 65 && word[5] == 73 && word[6] == 78 {
         "EXPLAIN"
-    } EL I word.len() >= 3 && word[0] == 83 && word[1] == 69 && word[2] == 84 {
+    } else I word.len() >= 3 && word[0] == 83 && word[1] == 69 && word[2] == 84 {
         "SET"
-    } EL {
+    } else {
         "OK"
     }
 }
@@ -302,11 +317,12 @@ F classify_sql_tag(sql: &Str) -> Str {
 # Convert an SqlValue to wire bytes for RowData transmission.
 # Returns None for NULL values.
 # type_tag: SQL type tag for encoding guidance
-F sql_value_to_wire_bytes(type_tag: u8, is_null: bool, data: &[u8]) -> Option<Vec<u8>> {
+fn sql_value_to_wire_bytes(type_tag: u8, is_null: bool, data: &[u8]) -> Option<Vec<u8>> {
     I is_null {
         None
-    } EL {
+    } else {
         # FUTURE(slice-to-vec): implement data.to_vec() for slices
-        Some(Vec.with_capacity(0))
+        empty: Vec<u8> := mut Vec.with_capacity(0)
+        Some(empty)
     }
 }

@@ -1,22 +1,21 @@
 # Database Open/Create
 # Implements the 7-step startup sequence from Stage 1 Section 11
 
-U storage/file
-U std/vec
-U std/dir
-U std/time
-U std/random
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/meta
-U storage/page/bootstrap
-U storage/page/file_header
-U storage/page/types
-U storage/checksum
+use storage/file
+use std/vec
+use std/time
+use std/random
+use storage/constants
+use storage/error.{VaisError, err_internal}
+use storage/page/header
+use storage/page/meta
+use storage/page/bootstrap
+use storage/page/file_header
+use storage/page/types
+use storage/checksum
 
 # Database handle - manages all files in the .vaisdb directory
-S Database {
+struct Database {
     db_path: str,              # Path to .vaisdb directory
     page_size: u32,            # Page size (8192 or 16384)
     meta: MetaPageHeader,      # Cached meta page header
@@ -29,12 +28,12 @@ S Database {
     lock_file: File,           # lock file handle
 }
 
-X Database {
+impl Database {
     # Create a new database at the given path
-    F create(db_path: str, page_size: u32) -> Result<Database, VaisError> {
+    fn create(db_path: str, page_size: u32) -> Result<Database, VaisError> {
         # Validate page size
         I page_size != 8192 && page_size != 16384 {
-            R Err(err_internal("Page size must be 8192 or 16384"))
+            return Err(err_internal("Page size must be 8192 or 16384"))
         }
 
         # Create directory structure
@@ -87,7 +86,7 @@ X Database {
     }
 
     # Open an existing database (7-step startup sequence)
-    F open(db_path: str) -> Result<Database, VaisError> {
+    fn open(db_path: str) -> Result<Database, VaisError> {
         # Step 1: Open data.vdb → read page 0 → verify magic → extract page_size
         data_file := mut File.open("{db_path}/{FILE_NAME_DATA}", "rw")?;
         page0_buf := mut data_file.read_at(0, 8192)?;  # Read min page size first
@@ -133,8 +132,8 @@ X Database {
     }
 
     # Get file handle by file_id
-    F get_file(self, file_id: u8) -> &File {
-        M file_id {
+    fn get_file(self, file_id: u8) -> &File {
+        match file_id {
             0 => &self.data_file,
             1 => &self.vectors_file,
             2 => &self.graph_file,
@@ -145,8 +144,8 @@ X Database {
     }
 
     # Get mutable file handle by file_id
-    F get_file_mut(mut self, file_id: u8) -> &mut File {
-        M file_id {
+    fn get_file_mut(mut self, file_id: u8) -> &mut File {
+        match file_id {
             0 => &self.data_file,
             1 => &self.vectors_file,
             2 => &self.graph_file,
@@ -157,7 +156,7 @@ X Database {
     }
 
     # Flush meta page to disk
-    F flush_meta(mut self) -> Result<(), VaisError> {
+    fn flush_meta(mut self) -> Result<(), VaisError> {
         page_buf := mut Vec.with_capacity(self.page_size as u64)
         page_buf.resize(self.page_size as u64, 0u8)
         self.meta.write_to_page(&page_buf)
@@ -168,35 +167,35 @@ X Database {
     }
 
     # Close the database (release lock, close files)
-    F close(mut self) -> Result<(), VaisError> {
+    fn close(mut self) -> Result<(), VaisError> {
         self.flush_meta()?;
         self.lock_file.flock_unlock()?;
         Ok(())
     }
 
     # Get database path
-    F path(self) -> &str {
+    fn path(self) -> &str {
         &self.db_path
     }
 
     # Get page size
-    F get_page_size(self) -> u32 {
+    fn get_page_size(self) -> u32 {
         self.page_size
     }
 
     # Get meta header reference
-    F get_meta(self) -> &MetaPageHeader {
+    fn get_meta(self) -> &MetaPageHeader {
         &self.meta
     }
 
     # Get mutable meta header
-    F get_meta_mut(mut self) -> &mut MetaPageHeader {
+    fn get_meta_mut(mut self) -> &mut MetaPageHeader {
         &self.meta
     }
 }
 
 # Helper: write bootstrap page to data.vdb
-F write_bootstrap_page(file: &File, page_size: u32) -> Result<(), VaisError> {
+fn write_bootstrap_page(file: &File, page_size: u32) -> Result<(), VaisError> {
     bootstrap := mut BootstrapPage.new(page_size)
     page_buf := mut Vec.with_capacity(page_size as u64)
     page_buf.resize(page_size as u64, 0u8)
@@ -207,7 +206,7 @@ F write_bootstrap_page(file: &File, page_size: u32) -> Result<(), VaisError> {
 }
 
 # Helper: write initial empty freelist page at page 1
-F write_initial_freelist(file: &File, page_size: u32, file_id: u8) -> Result<(), VaisError> {
+fn write_initial_freelist(file: &File, page_size: u32, file_id: u8) -> Result<(), VaisError> {
     header := mut PageHeader.new(1, PAGE_TYPE_FREELIST, ENGINE_TAG_COMMON)
     page_buf := mut Vec.with_capacity(page_size as u64)
     page_buf.resize(page_size as u64, 0u8)
@@ -225,7 +224,7 @@ F write_initial_freelist(file: &File, page_size: u32, file_id: u8) -> Result<(),
 }
 
 # Helper: create an engine file with header + freelist
-F create_engine_file(db_path: &str, file_name: &str, file_id: u8, page_size: u32) -> Result<File, VaisError> {
+fn create_engine_file(db_path: &str, file_name: &str, file_id: u8, page_size: u32) -> Result<File, VaisError> {
     file := mut File.open("{db_path}/{file_name}", "rw+")?;
 
     # Write file header at page 0
@@ -244,29 +243,28 @@ F create_engine_file(db_path: &str, file_name: &str, file_id: u8, page_size: u32
 }
 
 # Helper: open and verify an engine file
-F open_and_verify_file(db_path: &str, file_name: &str, expected_file_id: u8, page_size: u32) -> Result<File, VaisError> {
+fn open_and_verify_file(db_path: &str, file_name: &str, expected_file_id: u8, page_size: u32) -> Result<File, VaisError> {
     file := mut File.open("{db_path}/{file_name}", "rw")?;
     page_buf := mut file.read_at(0, page_size as u64)?;
     file_header := mut FileHeader.read_from_page(&page_buf)?;
     file_header.validate()?;
 
     I file_header.file_id != expected_file_id {
-        R Err(err_internal("File ID mismatch in {file_name}"))
+        return Err(err_internal("File ID mismatch in {file_name}"))
     }
     I file_header.page_size != page_size {
-        R Err(err_internal("Page size mismatch in {file_name}"))
+        return Err(err_internal("Page size mismatch in {file_name}"))
     }
 
     Ok(file)
 }
 
 # Generate a random UUID v4
-F generate_uuid() -> Vec<u8> {
+fn generate_uuid() -> Vec<u8> {
     uuid := mut Vec.with_capacity(16)
     uuid.resize(16, 0u8)
-    rng := mut Random.new()
     LF i: 0..16 {
-        uuid[i] = rng.uniform(0, 255) as u8
+        uuid[i] = random_range(0, 255) as u8
     }
     # Set version 4 (bits 4-7 of byte 6)
     uuid[6] = (uuid[6] & 15) | 64

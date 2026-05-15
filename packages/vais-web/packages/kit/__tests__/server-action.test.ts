@@ -244,6 +244,30 @@ describe("validateFormData", () => {
     expect(result.valid).toBe(false);
     expect(Object.keys(result.errors).length).toBe(2);
   });
+
+  it("accepts uploaded files for file fields", () => {
+    const schema: FormSchema = [{ name: "asset", type: "file", required: true }];
+    const file = new File(["hello"], "hello.txt", { type: "text/plain" });
+    const fd = new FormData();
+    fd.append("asset", file);
+
+    const result = validateFormData(fd, schema);
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual({});
+    expect(result.data.asset).toBe(file);
+  });
+
+  it("rejects empty browser file inputs for required file fields", () => {
+    const schema: FormSchema = [{ name: "asset", type: "file", required: true }];
+    const fd = new FormData();
+    fd.append("asset", new File([], ""));
+
+    const result = validateFormData(fd, schema);
+
+    expect(result.valid).toBe(false);
+    expect(result.errors.asset).toBe("asset is required");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -313,6 +337,95 @@ describe("handleServerAction", () => {
       csrfToken: CSRF_TOKEN,
     });
     expect(res.status).toBe(403);
+  });
+
+  it("returns 401 when authRequired has no bearer token or session cookie", async () => {
+    const req = makeActionRequest("POST", { __vx_csrf: CSRF_TOKEN });
+    const res = await handleServerAction({
+      request: req,
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { authRequired: true },
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe("Bearer");
+  });
+
+  it("accepts authRequired actions with a bearer token", async () => {
+    const req = makeActionRequest(
+      "POST",
+      { __vx_csrf: CSRF_TOKEN },
+      { authorization: "Bearer action-token" }
+    );
+    const res = await handleServerAction({
+      request: req,
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { authRequired: true },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts authRequired actions with a vx_session cookie", async () => {
+    const req = makeActionRequest(
+      "POST",
+      { __vx_csrf: CSRF_TOKEN },
+      { cookie: "theme=dark; vx_session=session-1" }
+    );
+    const res = await handleServerAction({
+      request: req,
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { authRequired: true },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 429 after the configured rate limit budget is exhausted", async () => {
+    const headers = { "x-forwarded-for": "203.0.113.42" };
+    const makeLimitedRequest = () =>
+      makeActionRequest("POST", { __vx_csrf: CSRF_TOKEN }, headers);
+
+    const first = await handleServerAction({
+      request: makeLimitedRequest(),
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { rateLimit: "2/min" },
+    });
+    const second = await handleServerAction({
+      request: makeLimitedRequest(),
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { rateLimit: "2/min" },
+    });
+    const third = await handleServerAction({
+      request: makeLimitedRequest(),
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { rateLimit: "2/min" },
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(third.status).toBe(429);
+    expect(third.headers.get("x-ratelimit-limit")).toBe("2");
+    expect(third.headers.get("x-ratelimit-remaining")).toBe("0");
+    expect(Number(third.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
+
+  it("returns 500 for invalid rate limit configuration", async () => {
+    const req = makeActionRequest(
+      "POST",
+      { __vx_csrf: CSRF_TOKEN },
+      { "x-forwarded-for": "203.0.113.43" }
+    );
+    const res = await handleServerAction({
+      request: req,
+      actionFn: successAction,
+      csrfToken: CSRF_TOKEN,
+      options: { rateLimit: "many/min" },
+    });
+    expect(res.status).toBe(500);
   });
 
   it("returns 403 when CSRF token is invalid", async () => {

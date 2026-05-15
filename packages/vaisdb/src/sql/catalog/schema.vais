@@ -7,11 +7,13 @@
 #   "I:" + name        for indexes
 #   "IT:" + table_id   for table-to-index reverse lookup
 
-U storage/bytes
-U storage/error
-U storage/bytes
-U std/vec
-U sql/types
+use storage/bytes
+use storage/error
+use storage/bytes
+use std/vec
+use sql/types
+
+impl fn __strlen(s: str) -> i64
 
 # ============================================================================
 # System Table ID Constants
@@ -47,7 +49,7 @@ C CATALOG_TAG_POLICY: u8 = 7
 # TableInfo — Metadata for a single table
 # ============================================================================
 
-S TableInfo {
+struct TableInfo {
     table_id: u32,
     name: str,
     column_count: u16,
@@ -57,9 +59,9 @@ S TableInfo {
     row_count_estimate: u64,   # Approximate row count for optimizer
 }
 
-X TableInfo {
+impl TableInfo {
     # Create a new user table info
-    F new(table_id: u32, name: str, column_count: u16, first_page_id: u32) -> TableInfo {
+    fn new(table_id: u32, name: str, column_count: u16, first_page_id: u32) -> TableInfo {
         TableInfo {
             table_id,
             name,
@@ -72,7 +74,7 @@ X TableInfo {
     }
 
     # Create a system table info
-    F new_system(table_id: u32, name: str, column_count: u16, first_page_id: u32) -> TableInfo {
+    fn new_system(table_id: u32, name: str, column_count: u16, first_page_id: u32) -> TableInfo {
         TableInfo {
             table_id,
             name,
@@ -87,12 +89,12 @@ X TableInfo {
     # Serialize TableInfo to ByteBuffer
     # Format: tag(1B) + table_id(4B) + name(len-prefixed) + column_count(2B)
     #         + is_system(1B) + heap_file_id(1B) + first_page_id(4B) + row_count_estimate(8B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_TABLE)
         buf.write_i32_le(self.table_id)
         write_string(buf, &self.name)
         buf.write_u16_le(self.column_count)
-        buf.write_u8(I self.is_system { 1 } EL { 0 })
+        buf.write_u8(I self.is_system { 1 } else { 0 })
         buf.write_u8(self.heap_file_id)
         buf.write_i32_le(self.first_page_id)
         buf.write_i64_le(self.row_count_estimate)
@@ -100,10 +102,10 @@ X TableInfo {
 
     # Deserialize TableInfo from ByteBuffer
     # Expects the tag byte to have already been read or reads it
-    F deserialize(buf: &ByteBuffer) -> Result<TableInfo, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<TableInfo, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_TABLE {
-            R Err(err_internal("Expected TABLE catalog tag 1, got 0x{tag:02x}"))
+            return Err(err_internal("Expected TABLE catalog tag 1, got 0x{tag:02x}"))
         }
 
         table_id := mut read_i32_le_checked(buf)?;
@@ -127,12 +129,12 @@ X TableInfo {
 
     # Generate B+Tree key for catalog lookup
     # Key format: "T:" + name
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         table_key(&self.name)
     }
 
     # Clone this TableInfo
-    F clone(self) -> TableInfo {
+    fn clone(self) -> TableInfo {
         TableInfo {
             table_id: self.table_id,
             name: self.name.clone(),
@@ -149,7 +151,7 @@ X TableInfo {
 # ColumnInfo — Metadata for a single column within a table
 # ============================================================================
 
-S ColumnInfo {
+struct ColumnInfo {
     table_id: u32,
     column_index: u16,         # 0-based position in row
     name: str,
@@ -159,29 +161,29 @@ S ColumnInfo {
     is_primary_key: bool,
 }
 
-X ColumnInfo {
+impl ColumnInfo {
     # Create a new column info
-    F new(table_id: u32, column_index: u16, name: str, data_type: SqlType) -> ColumnInfo {
+    fn new(table_id: u32, column_index: u16, name: str, data_type: SqlType) -> ColumnInfo {
         ColumnInfo {
             table_id,
             column_index,
             name,
             data_type,
             nullable: true,
-            default_value: None,
+            default_value: Option.None,
             is_primary_key: false,
         }
     }
 
     # Create a column marked as primary key
-    F new_primary_key(table_id: u32, column_index: u16, name: str, data_type: SqlType) -> ColumnInfo {
+    fn new_primary_key(table_id: u32, column_index: u16, name: str, data_type: SqlType) -> ColumnInfo {
         ColumnInfo {
             table_id,
             column_index,
             name,
             data_type,
             nullable: false,
-            default_value: None,
+            default_value: Option.None,
             is_primary_key: true,
         }
     }
@@ -190,30 +192,30 @@ X ColumnInfo {
     # Format: tag(1B) + table_id(4B) + column_index(2B) + name(len-prefixed)
     #         + data_type(via serialize) + nullable(1B)
     #         + has_default(1B) + [default_value(len-prefixed)] + is_primary_key(1B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_COLUMN)
         buf.write_i32_le(self.table_id)
         buf.write_u16_le(self.column_index)
         write_string(buf, &self.name)
         self.data_type.serialize(buf)
-        buf.write_u8(I self.nullable { 1 } EL { 0 })
-        M &self.default_value {
-            Some(dv) => {
+        buf.write_u8(I self.nullable { 1 } else { 0 })
+        match &self.default_value {
+            Option.Some(dv) => {
                 buf.write_u8(1)
                 write_string(buf, dv)
             },
-            None => {
+            Option.None => {
                 buf.write_u8(0)
             },
         }
-        buf.write_u8(I self.is_primary_key { 1 } EL { 0 })
+        buf.write_u8(I self.is_primary_key { 1 } else { 0 })
     }
 
     # Deserialize ColumnInfo from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<ColumnInfo, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<ColumnInfo, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_COLUMN {
-            R Err(err_internal("Expected COLUMN catalog tag 2, got 0x{tag:02x}"))
+            return Err(err_internal("Expected COLUMN catalog tag 2, got 0x{tag:02x}"))
         }
 
         table_id := mut read_i32_le_checked(buf)?;
@@ -222,10 +224,9 @@ X ColumnInfo {
         data_type := mut SqlType.deserialize(buf)?;
         nullable_byte := mut read_u8_checked(buf)?;
         has_default := mut read_u8_checked(buf)?;
-        default_value := mut I has_default != 0 {
-            Some(read_string(buf)?)
-        } EL {
-            None
+        default_value := mut Option.None
+        I has_default != 0 {
+            default_value = Option.Some(read_string(buf)?)
         }
         is_pk_byte := mut read_u8_checked(buf)?;
 
@@ -242,8 +243,8 @@ X ColumnInfo {
 
     # Generate B+Tree key for catalog lookup
     # Key format: "C:" + table_id(4 bytes LE) + ":" + column_index(2 bytes LE)
-    F to_catalog_key(self) -> Vec<u8> {
-        key := mut Vec.with_capacity(9)
+    fn to_catalog_key(self) -> Vec<u8> {
+        key: Vec<u8> := mut Vec.with_capacity(9)
         # Prefix "C:"
         key.push(67);  # 'C'
         key.push(58);  # ':'
@@ -261,16 +262,16 @@ X ColumnInfo {
     }
 
     # Clone this ColumnInfo
-    F clone(self) -> ColumnInfo {
+    fn clone(self) -> ColumnInfo {
         ColumnInfo {
             table_id: self.table_id,
             column_index: self.column_index,
             name: self.name.clone(),
             data_type: self.data_type,
             nullable: self.nullable,
-            default_value: M &self.default_value {
-                Some(dv) => Some(dv.clone()),
-                None => None,
+            default_value: match &self.default_value {
+                Option.Some(dv) => Option.Some(dv.clone()),
+                Option.None => Option.None,
             },
             is_primary_key: self.is_primary_key,
         }
@@ -281,7 +282,7 @@ X ColumnInfo {
 # IndexInfo — Metadata for a single index
 # ============================================================================
 
-S IndexInfo {
+struct IndexInfo {
     index_id: u32,
     name: str,
     table_id: u32,
@@ -291,9 +292,9 @@ S IndexInfo {
     root_page_id: u32,         # B+Tree root page for this index
 }
 
-X IndexInfo {
+impl IndexInfo {
     # Create a new index info
-    F new(index_id: u32, name: str, table_id: u32, columns: Vec<str>, root_page_id: u32) -> IndexInfo {
+    fn new(index_id: u32, name: str, table_id: u32, columns: Vec<str>, root_page_id: u32) -> IndexInfo {
         IndexInfo {
             index_id,
             name,
@@ -306,7 +307,7 @@ X IndexInfo {
     }
 
     # Create a primary key index
-    F new_primary(index_id: u32, name: str, table_id: u32, columns: Vec<str>, root_page_id: u32) -> IndexInfo {
+    fn new_primary(index_id: u32, name: str, table_id: u32, columns: Vec<str>, root_page_id: u32) -> IndexInfo {
         IndexInfo {
             index_id,
             name,
@@ -322,32 +323,34 @@ X IndexInfo {
     # Format: tag(1B) + index_id(4B) + name(len-prefixed) + table_id(4B)
     #         + column_count(2B) + [column_name(len-prefixed)]...
     #         + is_unique(1B) + is_primary(1B) + root_page_id(4B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_INDEX)
         buf.write_i32_le(self.index_id)
         write_string(buf, &self.name)
         buf.write_i32_le(self.table_id)
         buf.write_u16_le(self.columns.len() as u16)
-        LF col: &self.columns {
-            write_string(buf, col)
+        i := mut 0
+        LW i < self.columns.len() {
+            write_string(buf, self.columns[i])
+            i += 1
         }
-        buf.write_u8(I self.is_unique { 1 } EL { 0 })
-        buf.write_u8(I self.is_primary { 1 } EL { 0 })
+        buf.write_u8(I self.is_unique { 1 } else { 0 })
+        buf.write_u8(I self.is_primary { 1 } else { 0 })
         buf.write_i32_le(self.root_page_id)
     }
 
     # Deserialize IndexInfo from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<IndexInfo, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<IndexInfo, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_INDEX {
-            R Err(err_internal("Expected INDEX catalog tag 3, got 0x{tag:02x}"))
+            return Err(err_internal("Expected INDEX catalog tag 3, got 0x{tag:02x}"))
         }
 
         index_id := mut read_i32_le_checked(buf)?;
         name := mut read_string(buf)?;
         table_id := mut read_i32_le_checked(buf)?;
         col_count := mut read_u16_le_checked(buf)? as u64
-        columns := mut Vec.with_capacity(col_count)
+        columns: Vec<str> := mut Vec.with_capacity(col_count)
         LF _: 0..col_count {
             columns.push(read_string(buf)?)
         }
@@ -368,14 +371,14 @@ X IndexInfo {
 
     # Generate B+Tree key for catalog lookup
     # Key format: "I:" + name
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         index_key(&self.name)
     }
 
     # Generate secondary B+Tree key for table-to-index reverse lookup
     # Key format: "IT:" + table_id(4 bytes BE) + ":" + index_name
-    F to_table_index_key(self) -> Vec<u8> {
-        key := mut Vec.with_capacity(8 + self.name.len())
+    fn to_table_index_key(self) -> Vec<u8> {
+        key: Vec<u8> := mut Vec.with_capacity(8 + self.name.len())
         # Prefix "IT:"
         key.push(73);  # 'I'
         key.push(84);  # 'T'
@@ -398,7 +401,7 @@ X IndexInfo {
     }
 
     # Clone this IndexInfo
-    F clone(self) -> IndexInfo {
+    fn clone(self) -> IndexInfo {
         IndexInfo {
             index_id: self.index_id,
             name: self.name.clone(),
@@ -417,8 +420,8 @@ X IndexInfo {
 
 # Build lookup key for a table by name
 # Key format: "T:" + name (ASCII bytes)
-F table_key(name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(2 + name.len())
+fn table_key(name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(2 + name.len())
     key.push(84);  # 'T'
     key.push(58);  # ':'
     _i := mut 0
@@ -433,8 +436,8 @@ F table_key(name: &str) -> Vec<u8> {
 # Build prefix key for all columns of a table
 # Key format: "C:" + table_id(4 bytes BE)
 # Used as the start key in a range scan to find all columns for a table
-F columns_key_prefix(table_id: u32) -> Vec<u8> {
-    key := mut Vec.with_capacity(6)
+fn columns_key_prefix(table_id: u32) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(6)
     key.push(67);  # 'C'
     key.push(58);  # ':'
     # table_id as 4 bytes big-endian
@@ -448,9 +451,9 @@ F columns_key_prefix(table_id: u32) -> Vec<u8> {
 # Build end key for column range scan (exclusive upper bound)
 # Key format: "C:" + (table_id + 1)(4 bytes BE)
 # This ensures we scan all columns for table_id but no columns for table_id+1
-F columns_key_end(table_id: u32) -> Vec<u8> {
+fn columns_key_end(table_id: u32) -> Vec<u8> {
     next_id := mut table_id + 1
-    key := mut Vec.with_capacity(6)
+    key: Vec<u8> := mut Vec.with_capacity(6)
     key.push(67);  # 'C'
     key.push(58);  # ':'
     key.push(((next_id >> 24) & 255) as u8)
@@ -462,8 +465,8 @@ F columns_key_end(table_id: u32) -> Vec<u8> {
 
 # Build lookup key for an index by name
 # Key format: "I:" + name (ASCII bytes)
-F index_key(name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(2 + name.len())
+fn index_key(name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(2 + name.len())
     key.push(73);  # 'I'
     key.push(58);  # ':'
     _i := mut 0
@@ -478,8 +481,8 @@ F index_key(name: &str) -> Vec<u8> {
 # Build prefix key for all indexes belonging to a table
 # Key format: "IT:" + table_id(4 bytes BE)
 # Used as start key in range scan to find all indexes for a table
-F index_key_prefix_for_table(table_id: u32) -> Vec<u8> {
-    key := mut Vec.with_capacity(7)
+fn index_key_prefix_for_table(table_id: u32) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(7)
     key.push(73);  # 'I'
     key.push(84);  # 'T'
     key.push(58);  # ':'
@@ -493,9 +496,9 @@ F index_key_prefix_for_table(table_id: u32) -> Vec<u8> {
 
 # Build end key for index-by-table range scan (exclusive upper bound)
 # Key format: "IT:" + (table_id + 1)(4 bytes BE)
-F index_key_end_for_table(table_id: u32) -> Vec<u8> {
+fn index_key_end_for_table(table_id: u32) -> Vec<u8> {
     next_id := mut table_id + 1
-    key := mut Vec.with_capacity(7)
+    key: Vec<u8> := mut Vec.with_capacity(7)
     key.push(73);  # 'I'
     key.push(84);  # 'T'
     key.push(58);  # ':'
@@ -516,21 +519,21 @@ F index_key_end_for_table(table_id: u32) -> Vec<u8> {
 # UserCatalogEntry — Catalog record for a database user
 # ============================================================================
 
-S UserCatalogEntry {
+struct UserCatalogEntry {
     user_id: u64,
     username: str,
     is_superuser: bool,
     can_login: bool,
 }
 
-X UserCatalogEntry {
-    F new(user_id: u64, username: str, is_superuser: bool, can_login: bool) -> UserCatalogEntry {
+impl UserCatalogEntry {
+    fn new(user_id: u64, username: str, is_superuser: bool, can_login: bool) -> UserCatalogEntry {
         UserCatalogEntry { user_id, username, is_superuser, can_login }
     }
 
     # Serialize to ByteBuffer
     # Format: tag(1B) + user_id(8B) + username(len-prefixed) + flags(1B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_USER)
         buf.write_i64_le(self.user_id)
         write_string(buf, &self.username)
@@ -541,10 +544,10 @@ X UserCatalogEntry {
     }
 
     # Deserialize from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<UserCatalogEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<UserCatalogEntry, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_USER {
-            R Err(err_internal("Expected USER catalog tag 4, got 0x{tag:02x}"))
+            return Err(err_internal("Expected USER catalog tag 4, got 0x{tag:02x}"))
         }
         user_id := mut read_i64_le_checked(buf)?;
         username := mut read_string(buf)?;
@@ -558,12 +561,12 @@ X UserCatalogEntry {
     }
 
     # B+Tree key: "U:" + username
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         user_key(&self.username)
     }
 
     # Clone
-    F clone(self) -> UserCatalogEntry {
+    fn clone(self) -> UserCatalogEntry {
         UserCatalogEntry {
             user_id: self.user_id,
             username: self.username.clone(),
@@ -577,20 +580,20 @@ X UserCatalogEntry {
 # RoleCatalogEntry — Catalog record for a database role
 # ============================================================================
 
-S RoleCatalogEntry {
+struct RoleCatalogEntry {
     role_id: u64,
     role_name: str,
     is_system: bool,
 }
 
-X RoleCatalogEntry {
-    F new(role_id: u64, role_name: str, is_system: bool) -> RoleCatalogEntry {
+impl RoleCatalogEntry {
+    fn new(role_id: u64, role_name: str, is_system: bool) -> RoleCatalogEntry {
         RoleCatalogEntry { role_id, role_name, is_system }
     }
 
     # Serialize to ByteBuffer
     # Format: tag(1B) + role_id(8B) + role_name(len-prefixed) + flags(1B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_ROLE)
         buf.write_i64_le(self.role_id)
         write_string(buf, &self.role_name)
@@ -600,10 +603,10 @@ X RoleCatalogEntry {
     }
 
     # Deserialize from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<RoleCatalogEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<RoleCatalogEntry, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_ROLE {
-            R Err(err_internal("Expected ROLE catalog tag 5, got 0x{tag:02x}"))
+            return Err(err_internal("Expected ROLE catalog tag 5, got 0x{tag:02x}"))
         }
         role_id := mut read_i64_le_checked(buf)?;
         role_name := mut read_string(buf)?;
@@ -616,12 +619,12 @@ X RoleCatalogEntry {
     }
 
     # B+Tree key: "R:" + role_name
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         role_key(&self.role_name)
     }
 
     # Clone
-    F clone(self) -> RoleCatalogEntry {
+    fn clone(self) -> RoleCatalogEntry {
         RoleCatalogEntry {
             role_id: self.role_id,
             role_name: self.role_name.clone(),
@@ -634,7 +637,7 @@ X RoleCatalogEntry {
 # GrantCatalogEntry — Catalog record for a privilege grant
 # ============================================================================
 
-S GrantCatalogEntry {
+struct GrantCatalogEntry {
     grant_id: u64,
     role_id: u64,
     object_type: u8,          # OBJ_TYPE_* from security/types
@@ -643,8 +646,8 @@ S GrantCatalogEntry {
     with_grant_option: bool,
 }
 
-X GrantCatalogEntry {
-    F new(
+impl GrantCatalogEntry {
+    fn new(
         grant_id: u64,
         role_id: u64,
         object_type: u8,
@@ -661,7 +664,7 @@ X GrantCatalogEntry {
     # Serialize to ByteBuffer
     # Format: tag(1B) + grant_id(8B) + role_id(8B) + object_type(1B) +
     #         object_name(len-prefixed) + privilege_mask(1B) + flags(1B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_GRANT)
         buf.write_i64_le(self.grant_id)
         buf.write_i64_le(self.role_id)
@@ -674,10 +677,10 @@ X GrantCatalogEntry {
     }
 
     # Deserialize from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<GrantCatalogEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<GrantCatalogEntry, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_GRANT {
-            R Err(err_internal("Expected GRANT catalog tag 6, got 0x{tag:02x}"))
+            return Err(err_internal("Expected GRANT catalog tag 6, got 0x{tag:02x}"))
         }
         grant_id := mut read_i64_le_checked(buf)?;
         role_id := mut read_i64_le_checked(buf)?;
@@ -694,12 +697,12 @@ X GrantCatalogEntry {
 
     # B+Tree key: "G:" + role_id(8B BE) + ":" + object_name
     # Grouping by role_id allows efficient range scan of all grants for a role
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         grant_key(self.role_id, &self.object_name)
     }
 
     # Clone
-    F clone(self) -> GrantCatalogEntry {
+    fn clone(self) -> GrantCatalogEntry {
         GrantCatalogEntry {
             grant_id: self.grant_id,
             role_id: self.role_id,
@@ -715,7 +718,7 @@ X GrantCatalogEntry {
 # PolicyCatalogEntry — Catalog record for a row-level security policy
 # ============================================================================
 
-S PolicyCatalogEntry {
+struct PolicyCatalogEntry {
     policy_id: u64,
     policy_name: str,
     table_name: str,
@@ -724,8 +727,8 @@ S PolicyCatalogEntry {
     enabled: bool,
 }
 
-X PolicyCatalogEntry {
-    F new(
+impl PolicyCatalogEntry {
+    fn new(
         policy_id: u64,
         policy_name: str,
         table_name: str,
@@ -741,7 +744,7 @@ X PolicyCatalogEntry {
     # Serialize to ByteBuffer
     # Format: tag(1B) + policy_id(8B) + policy_name(len-prefixed) +
     #         table_name(len-prefixed) + policy_type(1B) + cmd_scope(1B) + flags(1B)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_u8(CATALOG_TAG_POLICY)
         buf.write_i64_le(self.policy_id)
         write_string(buf, &self.policy_name)
@@ -754,10 +757,10 @@ X PolicyCatalogEntry {
     }
 
     # Deserialize from ByteBuffer
-    F deserialize(buf: &ByteBuffer) -> Result<PolicyCatalogEntry, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<PolicyCatalogEntry, VaisError> {
         tag := mut read_u8_checked(buf)?;
         I tag != CATALOG_TAG_POLICY {
-            R Err(err_internal("Expected POLICY catalog tag 7, got 0x{tag:02x}"))
+            return Err(err_internal("Expected POLICY catalog tag 7, got 0x{tag:02x}"))
         }
         policy_id := mut read_i64_le_checked(buf)?;
         policy_name := mut read_string(buf)?;
@@ -774,12 +777,12 @@ X PolicyCatalogEntry {
 
     # B+Tree key: "P:" + table_name + ":" + policy_name
     # Grouping by table_name allows efficient lookup of all policies for a table
-    F to_catalog_key(self) -> Vec<u8> {
+    fn to_catalog_key(self) -> Vec<u8> {
         policy_key(&self.table_name, &self.policy_name)
     }
 
     # Clone
-    F clone(self) -> PolicyCatalogEntry {
+    fn clone(self) -> PolicyCatalogEntry {
         PolicyCatalogEntry {
             policy_id: self.policy_id,
             policy_name: self.policy_name.clone(),
@@ -797,8 +800,8 @@ X PolicyCatalogEntry {
 
 # Build lookup key for a user by username
 # Key format: "U:" + username (ASCII bytes)
-F user_key(username: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(2 + username.len())
+fn user_key(username: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(2 + username.len())
     key.push(85);  # 'U'
     key.push(58);  # ':'
     _i := mut 0
@@ -812,20 +815,20 @@ F user_key(username: &str) -> Vec<u8> {
 
 # Build prefix key for all users (for range scan)
 # Key format: "U:"
-F user_key_prefix() -> Vec<u8> {
+fn user_key_prefix() -> Vec<u8> {
     two_byte_key(85, 58)
 }
 
 # Build end key for user range scan (exclusive upper bound)
 # Key format: "U;" (next byte after ':')
-F user_key_end() -> Vec<u8> {
+fn user_key_end() -> Vec<u8> {
     two_byte_key(85, 59)
 }
 
 # Build lookup key for a role by name
 # Key format: "R:" + role_name (ASCII bytes)
-F role_key(role_name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(2 + role_name.len())
+fn role_key(role_name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(2 + role_name.len())
     key.push(82);  # 'R'
     key.push(58);  # ':'
     _i := mut 0
@@ -839,20 +842,20 @@ F role_key(role_name: &str) -> Vec<u8> {
 
 # Build prefix key for all roles (for range scan)
 # Key format: "R:"
-F role_key_prefix() -> Vec<u8> {
+fn role_key_prefix() -> Vec<u8> {
     two_byte_key(82, 58)
 }
 
 # Build end key for role range scan (exclusive upper bound)
 # Key format: "R;"
-F role_key_end() -> Vec<u8> {
+fn role_key_end() -> Vec<u8> {
     two_byte_key(82, 59)
 }
 
 # Build lookup key for a grant: role_id + object_name
 # Key format: "G:" + role_id(8B BE) + ":" + object_name
-F grant_key(role_id: u64, object_name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(11 + object_name.len())
+fn grant_key(role_id: u64, object_name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(11 + object_name.len())
     key.push(71);  # 'G'
     key.push(58);  # ':'
     # role_id as 8 bytes big-endian (for correct sort order)
@@ -876,8 +879,8 @@ F grant_key(role_id: u64, object_name: &str) -> Vec<u8> {
 
 # Build prefix key for all grants of a specific role
 # Key format: "G:" + role_id(8B BE)
-F grant_key_prefix_for_role(role_id: u64) -> Vec<u8> {
-    key := mut Vec.with_capacity(10)
+fn grant_key_prefix_for_role(role_id: u64) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(10)
     key.push(71);  # 'G'
     key.push(58);  # ':'
     key.push(((role_id >> 56) & 255) as u8)
@@ -893,9 +896,9 @@ F grant_key_prefix_for_role(role_id: u64) -> Vec<u8> {
 
 # Build end key for grant range scan for a role (exclusive upper bound)
 # Key format: "G:" + (role_id + 1)(8B BE)
-F grant_key_end_for_role(role_id: u64) -> Vec<u8> {
+fn grant_key_end_for_role(role_id: u64) -> Vec<u8> {
     next_id := mut role_id + 1
-    key := mut Vec.with_capacity(10)
+    key: Vec<u8> := mut Vec.with_capacity(10)
     key.push(71);  # 'G'
     key.push(58);  # ':'
     key.push(((next_id >> 56) & 255) as u8)
@@ -911,20 +914,20 @@ F grant_key_end_for_role(role_id: u64) -> Vec<u8> {
 
 # Build prefix key for all grants (for full grant scan)
 # Key format: "G:"
-F grant_key_prefix() -> Vec<u8> {
+fn grant_key_prefix() -> Vec<u8> {
     two_byte_key(71, 58)
 }
 
 # Build end key for all grants range scan
 # Key format: "G;"
-F grant_key_end() -> Vec<u8> {
+fn grant_key_end() -> Vec<u8> {
     two_byte_key(71, 59)
 }
 
 # Build lookup key for a policy by table + policy name
 # Key format: "P:" + table_name + ":" + policy_name
-F policy_key(table_name: &str, policy_name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(3 + table_name.len() + policy_name.len())
+fn policy_key(table_name: &str, policy_name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(3 + table_name.len() + policy_name.len())
     key.push(80);  # 'P'
     key.push(58);  # ':'
     _i := mut 0
@@ -945,8 +948,8 @@ F policy_key(table_name: &str, policy_name: &str) -> Vec<u8> {
 
 # Build prefix key for all policies on a table
 # Key format: "P:" + table_name + ":"
-F policy_key_prefix_for_table(table_name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(3 + table_name.len())
+fn policy_key_prefix_for_table(table_name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(3 + table_name.len())
     key.push(80);  # 'P'
     key.push(58);  # ':'
     _i := mut 0
@@ -961,8 +964,8 @@ F policy_key_prefix_for_table(table_name: &str) -> Vec<u8> {
 
 # Build end key for policy range scan for a table (exclusive upper bound)
 # Key format: "P:" + table_name + ";"
-F policy_key_end_for_table(table_name: &str) -> Vec<u8> {
-    key := mut Vec.with_capacity(3 + table_name.len())
+fn policy_key_end_for_table(table_name: &str) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(3 + table_name.len())
     key.push(80);  # 'P'
     key.push(58);  # ':'
     _i := mut 0
@@ -977,18 +980,18 @@ F policy_key_end_for_table(table_name: &str) -> Vec<u8> {
 
 # Build prefix key for all policies (for full scan)
 # Key format: "P:"
-F policy_key_prefix() -> Vec<u8> {
+fn policy_key_prefix() -> Vec<u8> {
     two_byte_key(80, 58)
 }
 
 # Build end key for all policies range scan
 # Key format: "P;"
-F policy_key_end() -> Vec<u8> {
+fn policy_key_end() -> Vec<u8> {
     two_byte_key(80, 59)
 }
 
-F two_byte_key(first: u8, second: u8) -> Vec<u8> {
-    key := mut Vec.with_capacity(2)
+fn two_byte_key(first: u8, second: u8) -> Vec<u8> {
+    key: Vec<u8> := mut Vec.with_capacity(2)
     key.push(first)
     key.push(second)
     key

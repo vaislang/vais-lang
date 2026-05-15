@@ -2,16 +2,16 @@
 # Phase 9 Task 3: Online physical backup, WAL archiving, point-in-time recovery
 # Provides: BackupManager (full + incremental), PitrRecovery
 
-U std/vec
-U std/string
-U std/option
-U storage/file
-U std/sync
-U storage/error
-U storage/constants
-U storage/hash
-U ops/types
-U ops/config
+use std/vec
+use std/string
+use std/option
+use storage/file
+use std/sync
+use storage/error
+use storage/constants
+use storage/hash
+use ops/types
+use ops/config
 
 # ============================================================================
 # BackupManager — Manages physical backup lifecycle
@@ -23,7 +23,7 @@ U ops/config
 ## 3. Archive WAL segments generated during backup
 ## 4. Write backup manifest with checksums
 ## 5. Verify checksum after copy
-S BackupManager {
+struct BackupManager {
     config: BackupConfig,
     data_dir: str,                   # Database data directory (.vaisdb)
     is_running: bool,                # Prevents concurrent backups
@@ -31,9 +31,9 @@ S BackupManager {
     next_backup_id: u64,             # Monotonic backup ID
 }
 
-X BackupManager {
+impl BackupManager {
     ## Create a new backup manager
-    F new(config: BackupConfig, data_dir: str) -> BackupManager {
+    fn new(config: BackupConfig, data_dir: str) -> BackupManager {
         BackupManager {
             config,
             data_dir,
@@ -47,7 +47,7 @@ X BackupManager {
     ## checkpoint_fn: callback to trigger a checkpoint before backup
     ## get_current_lsn_fn: callback to get the current WAL LSN
     ## Returns (BackupManifest, BackupProgress) on success
-    F start_backup(
+    fn start_backup(
         mut self,
         label: Option<str>,
         current_time: i64,
@@ -58,7 +58,7 @@ X BackupManager {
         guard := mut self.lock.lock()
 
         I self.is_running {
-            R Err(err_backup_already_running())
+            return Err(err_backup_already_running())
         }
         self.is_running = true
 
@@ -77,7 +77,7 @@ X BackupManager {
         manifest.set_lsn_range(checkpoint_lsn, current_lsn)
         manifest.start_time = current_time
 
-        M label {
+        match label {
             Some(l) => manifest.set_label(l),
             None => manifest.set_label("{self.config.label_prefix}-{backup_id}"),
         }
@@ -121,19 +121,19 @@ X BackupManager {
     }
 
     ## Cancel a running backup
-    F cancel_backup(mut self) {
+    fn cancel_backup(mut self) {
         guard := mut self.lock.lock()
         self.is_running = false
     }
 
     ## Check if a backup is currently running
-    F is_backup_running(self) -> bool {
+    fn is_backup_running(self) -> bool {
         self.is_running
     }
 
     ## Restore from a physical backup
     ## Copies backup files back to the data directory
-    F restore_from_backup(
+    fn restore_from_backup(
         mut self,
         backup_path: &str,
         target_data_dir: &str,
@@ -142,7 +142,7 @@ X BackupManager {
 
         # Validate backup directory exists
         I !path_exists(backup_path) {
-            R Err(err_restore_failed("Backup directory not found: {backup_path}"))
+            return Err(err_restore_failed("Backup directory not found: {backup_path}"))
         }
 
         # Create target data directory
@@ -192,18 +192,18 @@ X BackupManager {
     # ========================================================================
 
     ## Get list of data files to backup
-    F get_data_files(self) -> Vec<str> {
-        files := mut Vec.with_capacity(0)
-        files.push(FILE_NAME_DATA.to_string())
-        files.push(FILE_NAME_VECTORS.to_string())
-        files.push(FILE_NAME_GRAPH.to_string())
-        files.push(FILE_NAME_FULLTEXT.to_string())
-        files.push(FILE_NAME_META.to_string())
+    fn get_data_files(self) -> Vec<str> {
+        files := mut Vec.new()
+        files.push(FILE_NAME_DATA)
+        files.push(FILE_NAME_VECTORS)
+        files.push(FILE_NAME_GRAPH)
+        files.push(FILE_NAME_FULLTEXT)
+        files.push(FILE_NAME_META)
         files
     }
 
     ## Compute FNV-1a checksum of a file
-    F compute_file_checksum(self, path: &str) -> Result<u64, VaisError> {
+    fn compute_file_checksum(self, path: &str) -> Result<u64, VaisError> {
         # Read file contents and hash
         # In a production implementation, this would read in chunks
         # For now, use file_size as a proxy (actual impl would hash content)
@@ -212,7 +212,7 @@ X BackupManager {
     }
 
     ## Update manifest with file info based on file name
-    F update_manifest_file_info(
+    fn update_manifest_file_info(
         self,
         manifest: &mut BackupManifest,
         file_name: &str,
@@ -222,23 +222,23 @@ X BackupManager {
         I file_name == FILE_NAME_DATA {
             manifest.data_file_size = fsize
             manifest.data_file_checksum = checksum
-        } EL I file_name == FILE_NAME_VECTORS {
+        } else I file_name == FILE_NAME_VECTORS {
             manifest.vectors_file_size = fsize
             manifest.vectors_file_checksum = checksum
-        } EL I file_name == FILE_NAME_GRAPH {
+        } else I file_name == FILE_NAME_GRAPH {
             manifest.graph_file_size = fsize
             manifest.graph_file_checksum = checksum
-        } EL I file_name == FILE_NAME_FULLTEXT {
+        } else I file_name == FILE_NAME_FULLTEXT {
             manifest.fulltext_file_size = fsize
             manifest.fulltext_file_checksum = checksum
-        } EL I file_name == FILE_NAME_META {
+        } else I file_name == FILE_NAME_META {
             manifest.meta_file_size = fsize
             manifest.meta_file_checksum = checksum
         }
     }
 
     ## Archive WAL segments between start_lsn and end_lsn
-    F archive_wal_segments(
+    fn archive_wal_segments(
         self,
         backup_path: &str,
         start_lsn: u64,
@@ -248,7 +248,7 @@ X BackupManager {
         wal_dst_dir := mut "{backup_path}/{DIR_NAME_WAL}"
 
         I !path_exists(&wal_src_dir) {
-            R Ok(0)
+            return Ok(0)
         }
 
         create_dir_all(&wal_dst_dir)?;
@@ -262,7 +262,7 @@ X BackupManager {
     }
 
     ## Verify backup checksums against manifest
-    F verify_backup_checksums(
+    fn verify_backup_checksums(
         self,
         backup_path: &str,
         manifest: &BackupManifest,
@@ -272,7 +272,7 @@ X BackupManager {
             path := mut "{backup_path}/{FILE_NAME_DATA}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.data_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_DATA.to_string()))
+                return Err(err_restore_checksum_mismatch(FILE_NAME_DATA.to_string()))
             }
         }
 
@@ -281,7 +281,7 @@ X BackupManager {
             path := mut "{backup_path}/{FILE_NAME_VECTORS}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.vectors_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_VECTORS.to_string()))
+                return Err(err_restore_checksum_mismatch(FILE_NAME_VECTORS.to_string()))
             }
         }
 
@@ -290,7 +290,7 @@ X BackupManager {
             path := mut "{backup_path}/{FILE_NAME_GRAPH}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.graph_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_GRAPH.to_string()))
+                return Err(err_restore_checksum_mismatch(FILE_NAME_GRAPH.to_string()))
             }
         }
 
@@ -299,7 +299,7 @@ X BackupManager {
             path := mut "{backup_path}/{FILE_NAME_FULLTEXT}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.fulltext_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_FULLTEXT.to_string()))
+                return Err(err_restore_checksum_mismatch(FILE_NAME_FULLTEXT.to_string()))
             }
         }
 
@@ -308,7 +308,7 @@ X BackupManager {
             path := mut "{backup_path}/{FILE_NAME_META}"
             checksum := mut self.compute_file_checksum(&path)?;
             I checksum != manifest.meta_file_checksum {
-                R Err(err_restore_checksum_mismatch(FILE_NAME_META.to_string()))
+                return Err(err_restore_checksum_mismatch(FILE_NAME_META.to_string()))
             }
         }
 
@@ -323,12 +323,12 @@ X BackupManager {
 ## Restores to a specific point in time by:
 ## 1. Restoring from the latest physical backup before the target
 ## 2. Replaying archived WAL segments up to the target LSN/timestamp
-S PitrRecovery {
+struct PitrRecovery {
     wal_archive_dir: str,            # Directory containing archived WAL segments
 }
 
-X PitrRecovery {
-    F new(wal_archive_dir: str) -> PitrRecovery {
+impl PitrRecovery {
+    fn new(wal_archive_dir: str) -> PitrRecovery {
         PitrRecovery {
             wal_archive_dir,
         }
@@ -336,7 +336,7 @@ X PitrRecovery {
 
     ## Perform PITR: restore backup + replay WAL to target
     ## Returns the LSN at which recovery stopped
-    F recover_to_target(
+    fn recover_to_target(
         mut self,
         backup_path: &str,
         target_data_dir: &str,
@@ -354,24 +354,24 @@ X PitrRecovery {
 
         # Step 2: Determine WAL replay target LSN
         target_lsn := mut 0
-        M target.target_lsn {
+        match target.target_lsn {
             Some(lsn) => {
                 target_lsn = lsn
             },
             None => {
                 # For timestamp-based or txn-based PITR, we need to scan WAL
                 # to find the corresponding LSN. This is a placeholder.
-                M target.target_time {
+                match target.target_time {
                     Some(ts) => {
                         target_lsn = self.find_lsn_for_timestamp(ts)?;
                     },
                     None => {
-                        M target.target_txn_id {
+                        match target.target_txn_id {
                             Some(txn_id) => {
                                 target_lsn = self.find_lsn_for_txn(txn_id)?;
                             },
                             None => {
-                                R Err(err_pitr_target_not_found(0))
+                                return Err(err_pitr_target_not_found(0))
                             },
                         }
                     },
@@ -387,7 +387,7 @@ X PitrRecovery {
 
     ## Find the WAL LSN corresponding to a timestamp
     ## Scans archived WAL segments for the first record at or after the timestamp
-    F find_lsn_for_timestamp(self, target_time: i64) -> Result<u64, VaisError> {
+    fn find_lsn_for_timestamp(self, target_time: i64) -> Result<u64, VaisError> {
         # In production, this would:
         # 1. Enumerate archived WAL segments
         # 2. Read segment headers to find timestamp ranges
@@ -398,7 +398,7 @@ X PitrRecovery {
     }
 
     ## Find the WAL LSN corresponding to a transaction ID
-    F find_lsn_for_txn(self, txn_id: u64) -> Result<u64, VaisError> {
+    fn find_lsn_for_txn(self, txn_id: u64) -> Result<u64, VaisError> {
         # In production, this would scan WAL for TXN_COMMIT/TXN_ABORT records
         # matching the given txn_id, and return the LSN just before it
 
@@ -407,7 +407,7 @@ X PitrRecovery {
 
     ## Replay archived WAL segments up to the target LSN
     ## Returns number of records replayed
-    F replay_wal_to_lsn(
+    fn replay_wal_to_lsn(
         self,
         data_dir: &str,
         target_lsn: u64,
@@ -422,7 +422,7 @@ X PitrRecovery {
     }
 
     ## Check for gaps in WAL archive between two LSNs
-    F check_wal_continuity(self, start_lsn: u64, end_lsn: u64) -> Result<(), VaisError> {
+    fn check_wal_continuity(self, start_lsn: u64, end_lsn: u64) -> Result<(), VaisError> {
         # In production, this would verify that all WAL segments between
         # start_lsn and end_lsn are present in the archive with no gaps
 

@@ -4,23 +4,23 @@
 # Page layout: [PageHeader 48B] [AdjPageHeader 16B] [AdjEntry 42B * N]
 # Supports page chaining for nodes with many edges (next_adj_page)
 
-U storage/bytes
-U std/vec
-U std/option
-U storage/constants
-U storage/error
-U storage/page/header
-U storage/page/types
-U storage/buffer/pool
-U storage/page/allocator
-U storage/page/freelist
-U graph/types
+use storage/bytes
+use std/vec
+use std/option
+use storage/constants
+use storage/error
+use storage/page/header
+use storage/page/types
+use storage/buffer/pool
+use storage/page/allocator
+use storage/page/freelist
+use graph/types
 
 # ============================================================================
 # AdjPageHeader — Adjacency list page body header (16 bytes)
 # ============================================================================
 
-S AdjPageHeader {
+struct AdjPageHeader {
     node_id: u64,          # Owner node ID
     direction: u8,         # 0=outgoing, 1=incoming
     entry_count: u16,      # Number of AdjEntry in this page
@@ -28,8 +28,8 @@ S AdjPageHeader {
     reserved: u8,
 }
 
-X AdjPageHeader {
-    F new(node_id: u64, direction: u8) -> AdjPageHeader {
+impl AdjPageHeader {
+    fn new(node_id: u64, direction: u8) -> AdjPageHeader {
         AdjPageHeader {
             node_id,
             direction,
@@ -40,7 +40,7 @@ X AdjPageHeader {
     }
 
     # Serialize (16 bytes)
-    F serialize(self, buf: &mut ByteBuffer) {
+    fn serialize(self, buf: &mut ByteBuffer) {
         buf.write_i64_le(self.node_id)
         buf.write_u8(self.direction)
         buf.write_u16_le(self.entry_count)
@@ -49,7 +49,7 @@ X AdjPageHeader {
     }
 
     # Deserialize (16 bytes)
-    F deserialize(buf: &ByteBuffer) -> Result<AdjPageHeader, VaisError> {
+    fn deserialize(buf: &ByteBuffer) -> Result<AdjPageHeader, VaisError> {
         Ok(AdjPageHeader {
             node_id: read_i64_le_checked(buf)?,
             direction: read_u8_checked(buf)?,
@@ -64,16 +64,16 @@ X AdjPageHeader {
 # AdjPage — Single adjacency list page
 # ============================================================================
 
-S AdjPage {
+struct AdjPage {
     page_id: u32,
     adj_header: AdjPageHeader,
     entries: Vec<AdjEntry>,
     page_size: u32,
 }
 
-X AdjPage {
+impl AdjPage {
     # Create new empty adjacency page
-    F new(page_id: u32, node_id: u64, direction: u8, page_size: u32) -> AdjPage {
+    fn new(page_id: u32, node_id: u64, direction: u8, page_size: u32) -> AdjPage {
         AdjPage {
             page_id,
             adj_header: AdjPageHeader.new(node_id, direction),
@@ -83,10 +83,10 @@ X AdjPage {
     }
 
     # Load from page buffer
-    F load(page_id: u32, page_data: &[u8], page_size: u32) -> Result<AdjPage, VaisError> {
+    fn load(page_id: u32, page_data: &[u8], page_size: u32) -> Result<AdjPage, VaisError> {
         header := mut PageHeader.read_from_page(page_data)?;
         I header.page_type != PAGE_TYPE_GRAPH_ADJ {
-            R Err(err_graph_adj_corrupt(page_id))
+            return Err(err_graph_adj_corrupt(page_id))
         }
 
         buf := mut ByteBuffer.wrap_readonly(&page_data[PAGE_HEADER_SIZE as u64..])
@@ -109,20 +109,20 @@ X AdjPage {
     }
 
     # Maximum entries that fit in one page
-    F max_entries(page_size: u32) -> u16 {
+    fn max_entries(page_size: u32) -> u16 {
         available := mut page_size - PAGE_HEADER_SIZE - ADJ_PAGE_HEADER_SIZE
         (available / ADJ_ENTRY_SIZE) as u16
     }
 
     # Check if page has room for one more entry
-    F has_space(self) -> bool {
+    fn has_space(self) -> bool {
         self.entries.len() < AdjPage.max_entries(self.page_size) as u64
     }
 
     # Add entry to page
-    F add_entry(mut self, entry: AdjEntry) -> Result<(), VaisError> {
+    fn add_entry(mut self, entry: AdjEntry) -> Result<(), VaisError> {
         I !self.has_space() {
-            R Err(err_graph_page_full(self.page_id))
+            return Err(err_graph_page_full(self.page_id))
         }
         self.entries.push(entry)
         self.adj_header.entry_count += 1
@@ -130,11 +130,11 @@ X AdjPage {
     }
 
     # Find entry by edge_id
-    F find_entry(self, edge_id: u64) -> Option<u64> {
+    fn find_entry(self, edge_id: u64) -> Option<u64> {
         i := mut 0
         LW i < self.entries.len() {
             I self.entries[i].edge_id == edge_id {
-                R Some(i)
+                return Some(i)
             }
             i += 1
         }
@@ -142,11 +142,11 @@ X AdjPage {
     }
 
     # Find entry by target_node and edge_type
-    F find_entry_by_target(self, target_node: u64, edge_type: u16) -> Option<u64> {
+    fn find_entry_by_target(self, target_node: u64, edge_type: u16) -> Option<u64> {
         i := mut 0
         LW i < self.entries.len() {
             I self.entries[i].target_node == target_node && self.entries[i].edge_type == edge_type {
-                R Some(i)
+                return Some(i)
             }
             i += 1
         }
@@ -154,7 +154,7 @@ X AdjPage {
     }
 
     # Get all active entries (not expired)
-    F active_entries(self) -> Vec<&AdjEntry> {
+    fn active_entries(self) -> Vec<&AdjEntry> {
         result := mut Vec.with_capacity(0)
         i := mut 0
         LW i < self.entries.len() {
@@ -167,9 +167,9 @@ X AdjPage {
     }
 
     # Write page to buffer
-    F write_to_buffer(self, page_lsn: u64, txn_id: u64) -> Vec<u8> {
+    fn write_to_buffer(self, page_lsn: u64, txn_id: u64) -> Vec<u8> {
         page_size_val := self.page_size as u64;
-        out := mut vec![0u8; page_size_val]
+        out := mut Vec.repeat(0u8, page_size_val as i64)
 
         # Page header
         header := mut PageHeader.new(self.page_id, PAGE_TYPE_GRAPH_ADJ, ENGINE_TAG_GRAPH)
@@ -201,15 +201,15 @@ X AdjPage {
 # Handles page chaining for large adjacency lists
 # ============================================================================
 
-S AdjacencyManager {
+struct AdjacencyManager {
     pool: &BufferPool,
     allocator: &PageAllocator,
     bitmap: &FreelistBitmap,
     page_size: u32,
 }
 
-X AdjacencyManager {
-    F new(
+impl AdjacencyManager {
+    fn new(
         pool: &BufferPool,
         allocator: &PageAllocator,
         bitmap: &FreelistBitmap,
@@ -219,7 +219,7 @@ X AdjacencyManager {
     }
 
     # Create a new adjacency list page for a node (returns page_id)
-    F create_adj_page(
+    fn create_adj_page(
         mut self,
         node_id: u64,
         direction: u8,
@@ -244,7 +244,7 @@ X AdjacencyManager {
 
     # Add an edge entry to a node's adjacency list
     # Handles page-full by allocating a new page and chaining
-    F add_edge(
+    fn add_edge(
         mut self,
         adj_page_id: u32,
         entry: AdjEntry,
@@ -261,7 +261,7 @@ X AdjacencyManager {
         L {
             I current_page.has_space() {
                 # Add to this page
-                current_page.add_entry(entry)?;
+                current_page.add_entry(entry.clone())?;
 
                 # Write back
                 write_buf := mut current_page.write_to_buffer(0, txn_id)
@@ -274,7 +274,7 @@ X AdjacencyManager {
                 }
                 self.pool.unpin_page(wframe, true)
 
-                R Ok(current_page.page_id)
+                return Ok(current_page.page_id)
             }
 
             # Check if there's a next page
@@ -313,7 +313,7 @@ X AdjacencyManager {
                 }
                 self.pool.unpin_page(nf, true)
 
-                R Ok(new_page_id)
+                return Ok(new_page_id)
             }
 
             # Move to next page
@@ -326,9 +326,9 @@ X AdjacencyManager {
     }
 
     # Read all entries from an adjacency list (follows page chain)
-    F read_all_entries(self, adj_page_id: u32) -> Result<Vec<AdjEntry>, VaisError> {
+    fn read_all_entries(self, adj_page_id: u32) -> Result<Vec<AdjEntry>, VaisError> {
         I adj_page_id == NULL_PAGE {
-            R Ok(Vec.with_capacity(0))
+            return Ok(Vec.with_capacity(0))
         }
 
         result := mut Vec.with_capacity(0)
@@ -354,7 +354,7 @@ X AdjacencyManager {
     }
 
     # Mark an edge as expired in the adjacency list
-    F expire_edge(
+    fn expire_edge(
         mut self,
         adj_page_id: u32,
         edge_id: u64,
@@ -362,7 +362,7 @@ X AdjacencyManager {
         cmd_id: u32
     ) -> Result<bool, VaisError> {
         I adj_page_id == NULL_PAGE {
-            R Ok(false)
+            return Ok(false)
         }
 
         current_page_id := mut adj_page_id
@@ -372,7 +372,7 @@ X AdjacencyManager {
             page_data := mut self.pool.get_page_mut(frame_id)
             adj_page := mut AdjPage.load(current_page_id, page_data, self.page_size)?;
 
-            M adj_page.find_entry(edge_id) {
+            match adj_page.find_entry(edge_id) {
                 Some(idx) => {
                     # Found it — mark expired
                     adj_page.entries[idx].set_expired(txn_id, cmd_id)
@@ -385,7 +385,7 @@ X AdjacencyManager {
                         j += 1
                     }
                     self.pool.unpin_page(frame_id, true)
-                    R Ok(true)
+                    return Ok(true)
                 },
                 None => {
                     next_id := mut adj_page.adj_header.next_adj_page

@@ -2,29 +2,29 @@
 # Manages upper layers (1+) in memory, Layer 0 accessed via buffer pool
 # Based on HNSW memory architecture: upper layers pinned, lower layer evictable
 
-U std/hashmap
-U storage/bytes
-U storage/buffer/pool
-U storage/constants
-U storage/error
-U vector/hnsw/types
+use std/hashmap
+use storage/bytes
+use storage/buffer/pool
+use storage/constants
+use storage/error
+use vector/hnsw/types
 
 # Error codes: EE=02 (vector), CC=04 (layer), NNN=001-003
-F err_layer_not_pinned(layer: u8) -> VaisError {
+fn err_layer_not_pinned(layer: u8) -> VaisError {
     VaisError.new(
         "VAIS-0204001",
         "Layer {layer} is not pinned (only layer 0 is unpinned)"
     )
 }
 
-F err_layer_node_not_found(node_id: u64, layer: u8) -> VaisError {
+fn err_layer_node_not_found(node_id: u64, layer: u8) -> VaisError {
     VaisError.new(
         "VAIS-0204002",
         "Node {node_id} not found in pinned layer {layer}"
     )
 }
 
-F err_layer_load_failed(layer: u8, detail: str) -> VaisError {
+fn err_layer_load_failed(layer: u8, detail: str) -> VaisError {
     VaisError.new(
         "VAIS-0204003",
         "Failed to load layer {layer}: {detail}"
@@ -34,15 +34,15 @@ F err_layer_load_failed(layer: u8, detail: str) -> VaisError {
 # Pinned layer: in-memory representation of a single HNSW layer
 # Contains all nodes that have max_layer >= this layer
 # Only stores neighbor lists relevant to this layer
-S PinnedLayer {
+struct PinnedLayer {
     layer: u8,
     nodes: HashMap<u64, HnswNode>,  # node_id -> node (with only this layer's neighbors)
     memory_bytes: u64,             # Total memory consumed by this layer
 }
 
-X PinnedLayer {
+impl PinnedLayer {
     # Create new empty pinned layer
-    F new(layer: u8) -> PinnedLayer {
+    fn new(layer: u8) -> PinnedLayer {
         PinnedLayer {
             layer,
             nodes: HashMap.with_capacity(16),
@@ -53,9 +53,9 @@ X PinnedLayer {
     # Add a node to this pinned layer
     # Node must have max_layer >= this layer
     # Only the neighbor list for this layer is stored
-    F add_node(mut self, node: HnswNode) -> Result<(), VaisError> {
+    fn add_node(mut self, node: HnswNode) -> Result<(), VaisError> {
         I node.max_layer < self.layer {
-            R Err(err_internal(
+            return Err(err_internal(
                 "Cannot add node to layer {self.layer}: node max_layer is {node.max_layer}"
             ))
         }
@@ -70,36 +70,36 @@ X PinnedLayer {
     }
 
     # Remove a node from this pinned layer
-    F remove_node(mut self, node_id: u64) {
-        M self.nodes.remove(&node_id) {
-            Some(node) => {
+    fn remove_node(mut self, node_id: u64) {
+        match self.nodes.remove_opt(node_id) {
+            Option.Some(node) => {
                 node_size := mut self.calculate_node_size(&node)
                 self.memory_bytes -= node_size
             },
-            None => {},
+            Option.None => {},
         }
     }
 
     # Get node from this layer
-    F get_node(self, node_id: u64) -> Option<&HnswNode> {
-        self.nodes.get(&node_id)
+    fn get_node(self, node_id: u64) -> Option<HnswNode> {
+        self.nodes.get_opt(node_id)
     }
 
     # Get mutable node from this layer
-    F get_node_mut(mut self, node_id: u64) -> Option<&mut HnswNode> {
-        self.nodes.get(&node_id)
+    fn get_node_mut(mut self, node_id: u64) -> Option<HnswNode> {
+        self.nodes.get_opt(node_id)
     }
 
     # Update neighbor list for a node at this layer
-    F update_neighbors(mut self, node_id: u64, neighbors: Vec<HnswNeighbor>) -> Result<(), VaisError> {
-        M self.nodes.get(&node_id) {
-            Some(node) => {
+    fn update_neighbors(mut self, node_id: u64, neighbors: Vec<HnswNeighbor>) -> Result<(), VaisError> {
+        match self.nodes.get_opt(node_id) {
+            Option.Some(node) => {
                 # Calculate old and new sizes
-                old_size := mut self.calculate_node_size(node)
+                old_size := mut self.calculate_node_size(&node)
 
                 # Update neighbors at this layer
                 I (self.layer as u64) >= node.neighbors.len() {
-                    R Err(err_internal(
+                    return Err(err_internal(
                         "Node {node_id} has no neighbor list for layer {self.layer}"
                     ))
                 }
@@ -107,18 +107,18 @@ X PinnedLayer {
                 node.neighbors[self.layer as u64] = neighbors
 
                 # Update memory accounting
-                new_size := mut self.calculate_node_size(node)
+                new_size := mut self.calculate_node_size(&node)
                 self.memory_bytes = self.memory_bytes - old_size + new_size
 
                 Ok(())
             },
-            None => Err(err_layer_node_not_found(node_id, self.layer)),
+            Option.None => Err(err_layer_node_not_found(node_id, self.layer)),
         }
     }
 
     # Calculate memory size for a node in this layer
     # Size = fixed node overhead + neighbor list for this layer
-    F calculate_node_size(self, node: &HnswNode) -> u64 {
+    fn calculate_node_size(self, node: &HnswNode) -> u64 {
         # Fixed overhead per node: 48 bytes (node header) + 32 bytes (MVCC)
         base_size := mut 80
 
@@ -133,26 +133,26 @@ X PinnedLayer {
     }
 
     # Get node count in this layer
-    F node_count(self) -> u64 {
+    fn node_count(self) -> u64 {
         self.nodes.len() as u64
     }
 
     # Get memory usage in bytes
-    F memory_usage(self) -> u64 {
+    fn memory_usage(self) -> u64 {
         self.memory_bytes
     }
 }
 
 # Layer statistics for monitoring
-S LayerStat {
+struct LayerStat {
     layer: u8,
     node_count: u64,
     memory_bytes: u64,
     is_pinned: bool,
 }
 
-X LayerStat {
-    F new(layer: u8, node_count: u64, memory_bytes: u64, is_pinned: bool) -> LayerStat {
+impl LayerStat {
+    fn new(layer: u8, node_count: u64, memory_bytes: u64, is_pinned: bool) -> LayerStat {
         LayerStat {
             layer,
             node_count,
@@ -165,16 +165,16 @@ X LayerStat {
 # Layer Manager: manages HNSW layer data and pinning strategy
 # Layer 1+ are always pinned in memory
 # Layer 0 is accessed through buffer pool (may be evicted)
-S LayerManager {
+struct LayerManager {
     pinned_layers: Vec<PinnedLayer>,  # Index 0 = layer 1, index 1 = layer 2, etc.
     max_pinned_layer: u8,              # Highest layer currently pinned
     total_pinned_memory: u64,        # Total memory used by pinned layers
     config: HnswConfig,                # HNSW configuration
 }
 
-X LayerManager {
+impl LayerManager {
     # Create new layer manager
-    F new(config: HnswConfig) -> LayerManager {
+    fn new(config: HnswConfig) -> LayerManager {
         LayerManager {
             pinned_layers: Vec.with_capacity(0),
             max_pinned_layer: 0,
@@ -185,10 +185,10 @@ X LayerManager {
 
     # Load upper layers (1+) from disk at startup
     # Reads all nodes from vectors.vdb and pins those with max_layer >= 1
-    F load_upper_layers(mut self, meta: &HnswMeta, pool: &BufferPool) -> Result<(), VaisError> {
-        I meta.len() == 0 {
+    fn load_upper_layers(mut self, meta: &HnswMeta, pool: &BufferPool) -> Result<(), VaisError> {
+        I meta.is_empty() {
             # Empty index - nothing to load
-            R Ok(())
+            return Ok(())
         }
 
         # Initialize pinned layers for each layer 1..=max_layer
@@ -221,33 +221,33 @@ X LayerManager {
 
     # Get a node from pinned layers
     # Returns None if layer is not pinned (layer 0) or node not found
-    F get_pinned_node(self, node_id: u64, layer: u8) -> Option<&HnswNode> {
+    fn get_pinned_node(self, node_id: u64, layer: u8) -> Option<HnswNode> {
         I layer == 0 {
             # Layer 0 is not pinned - must use buffer pool
-            R None
+            return Option.None
         }
 
         I layer > self.max_pinned_layer {
-            R None
+            return Option.None
         }
 
         layer_idx := mut (layer - 1) as u64
         I layer_idx >= self.pinned_layers.len() {
-            R None
+            return Option.None
         }
 
         self.pinned_layers[layer_idx].get_node(node_id)
     }
 
     # Get mutable reference to a pinned node
-    F get_pinned_node_mut(mut self, node_id: u64, layer: u8) -> Option<&mut HnswNode> {
+    fn get_pinned_node_mut(mut self, node_id: u64, layer: u8) -> Option<HnswNode> {
         I layer == 0 || layer > self.max_pinned_layer {
-            R None
+            return Option.None
         }
 
         layer_idx := mut (layer - 1) as u64
         I layer_idx >= self.pinned_layers.len() {
-            R None
+            return Option.None
         }
 
         self.pinned_layers[layer_idx].get_node_mut(node_id)
@@ -256,9 +256,9 @@ X LayerManager {
     # Add a node to pinned layers
     # Node is added to all layers from 1 to node.max_layer
     # Returns error if node.max_layer == 0 (layer 0 not pinned)
-    F add_pinned_node(mut self, node: HnswNode, layer: u8) -> Result<(), VaisError> {
+    fn add_pinned_node(mut self, node: HnswNode, layer: u8) -> Result<(), VaisError> {
         I layer == 0 {
-            R Err(err_layer_not_pinned(0))
+            return Err(err_layer_not_pinned(0))
         }
 
         # Ensure we have enough pinned layers
@@ -296,9 +296,9 @@ X LayerManager {
 
     # Remove a node from pinned layers
     # Removes from all layers where it exists
-    F remove_pinned_node(mut self, node_id: u64, layer: u8) {
+    fn remove_pinned_node(mut self, node_id: u64, layer: u8) {
         I layer == 0 || layer > self.max_pinned_layer {
-            R
+            return
         }
 
         # Remove from all layers from 1 to layer
@@ -324,18 +324,18 @@ X LayerManager {
     }
 
     # Update neighbor list for a node at a specific layer
-    F update_pinned_neighbors(
+    fn update_pinned_neighbors(
         mut self,
         node_id: u64,
         layer: u8,
         neighbors: Vec<HnswNeighbor>
     ) -> Result<(), VaisError> {
         I layer == 0 {
-            R Err(err_layer_not_pinned(0))
+            return Err(err_layer_not_pinned(0))
         }
 
         I layer > self.max_pinned_layer {
-            R Err(err_internal(
+            return Err(err_internal(
                 "Cannot update neighbors: layer {layer} > max_pinned_layer {self.max_pinned_layer}"
             ))
         }
@@ -352,7 +352,7 @@ X LayerManager {
         new_memory := mut self.pinned_layers[layer_idx].memory_usage()
         I new_memory > old_memory {
             self.total_pinned_memory += new_memory - old_memory
-        } EL {
+        } else {
             self.total_pinned_memory -= old_memory - new_memory
         }
 
@@ -361,18 +361,18 @@ X LayerManager {
 
     # Check if a layer is pinned
     # Layer 0 is never pinned, layers 1+ are always pinned
-    F is_layer_pinned(self, layer: u8) -> bool {
+    fn is_layer_pinned(self, layer: u8) -> bool {
         layer >= 1 && layer <= self.max_pinned_layer
     }
 
     # Get total pinned memory usage in bytes
-    F pinned_memory_usage(self) -> u64 {
+    fn pinned_memory_usage(self) -> u64 {
         self.total_pinned_memory
     }
 
     # Get statistics for all layers
-    F layer_stats(self) -> Vec<LayerStat> {
-        stats := mut Vec.with_capacity((self.max_pinned_layer + 1) as u64)
+    fn layer_stats(self) -> Vec<LayerStat> {
+        stats: Vec<LayerStat> := mut Vec.with_capacity((self.max_pinned_layer + 1) as u64)
 
         # Layer 0 stats (not pinned, accessed via buffer pool)
         stats.push(LayerStat.new(0, 0, 0, false))
@@ -397,14 +397,14 @@ X LayerManager {
     }
 
     # Get maximum pinned layer
-    F get_max_pinned_layer(self) -> u8 {
+    fn get_max_pinned_layer(self) -> u8 {
         self.max_pinned_layer
     }
 
     # Get node count for a specific pinned layer
-    F get_layer_node_count(self, layer: u8) -> u64 {
+    fn get_layer_node_count(self, layer: u8) -> u64 {
         I layer == 0 || layer > self.max_pinned_layer {
-            R 0
+            return 0
         }
 
         layer_idx := mut (layer - 1) as u64
@@ -412,9 +412,9 @@ X LayerManager {
     }
 
     # Get memory usage for a specific pinned layer
-    F get_layer_memory_usage(self, layer: u8) -> u64 {
+    fn get_layer_memory_usage(self, layer: u8) -> u64 {
         I layer == 0 || layer > self.max_pinned_layer {
-            R 0
+            return 0
         }
 
         layer_idx := mut (layer - 1) as u64
@@ -422,12 +422,12 @@ X LayerManager {
     }
 
     # Check if index is empty (no pinned layers)
-    F is_empty(self) -> bool {
+    fn is_empty(self) -> bool {
         self.max_pinned_layer == 0
     }
 
     # Clear all pinned layers (for shutdown or reset)
-    F clear_all(mut self) {
+    fn clear_all(mut self) {
         self.pinned_layers.clear()
         self.max_pinned_layer = 0
         self.total_pinned_memory = 0

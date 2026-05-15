@@ -3,18 +3,18 @@
 # WAL-first: write WAL record BEFORE modifying pages
 # Based on Stage 2 - BTREE_SPLIT, BTREE_MERGE, BTREE_INSERT, BTREE_DELETE
 
-U storage/error
-U storage/wal/header
-U storage/wal/record_types
-U storage/wal/record_rel
-U storage/wal/group_commit
-U storage/bytes
+use storage/error
+use storage/wal/header
+use storage/wal/record_types
+use storage/wal/record_rel
+use storage/wal/group_commit
+use storage/bytes
 
 # WAL-integrated B+Tree operations
 # All methods write WAL records before returning
 
 # Log a B+Tree insert operation
-F wal_btree_insert(
+fn wal_btree_insert(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -25,19 +25,18 @@ F wal_btree_insert(
     payload := mut BtreeInsertPayload {
         file_id,
         page_id,
-        key: key.to_vec(),
-        value: value.to_vec(),
+        key: copy_wal_bytes(key),
+        value: copy_wal_bytes(value),
     }
 
     buf := mut ByteBuffer.with_capacity(256)
     payload.serialize(&buf)
-    data := mut buf.as_bytes()
 
-    gcm.write_record(txn_id, BTREE_INSERT, ENGINE_RELATIONAL, data)
+    gcm.write_record(txn_id, BTREE_INSERT, ENGINE_RELATIONAL, buf.as_bytes())
 }
 
 # Log a B+Tree delete operation
-F wal_btree_delete(
+fn wal_btree_delete(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -48,20 +47,19 @@ F wal_btree_delete(
     payload := mut BtreeDeletePayload {
         file_id,
         page_id,
-        key: key.to_vec(),
-        old_value: old_value.to_vec(),
+        key: copy_wal_bytes(key),
+        old_value: copy_wal_bytes(old_value),
     }
 
     buf := mut ByteBuffer.with_capacity(256)
     payload.serialize(&buf)
-    data := mut buf.as_bytes()
 
-    gcm.write_record(txn_id, BTREE_DELETE, ENGINE_RELATIONAL, data)
+    gcm.write_record(txn_id, BTREE_DELETE, ENGINE_RELATIONAL, buf.as_bytes())
 }
 
 # Log a B+Tree page split
 # WAL order: PAGE_ALLOC first, then BTREE_SPLIT
-F wal_btree_split(
+fn wal_btree_split(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -71,9 +69,13 @@ F wal_btree_split(
     direction: u8,     # 0 = left, 1 = right
 ) -> Result<(u64, u64), VaisError> {
     # Step 1: Log page allocation
+    # Step 13 A4-10: explicit page_type required (was relying on silent
+    # zero-init; 0 happens to be the BTREE page type by convention but
+    # was never declared in source).
     alloc_payload := mut PageAllocPayload {
         file_id,
         page_id: new_page_id,
+        page_type: 0,  # BTREE page (convention: see PageType constants)
     }
     alloc_buf := mut ByteBuffer.with_capacity(16)
     alloc_payload.serialize(&alloc_buf)
@@ -86,7 +88,7 @@ F wal_btree_split(
         file_id,
         page_id,
         new_page_id,
-        split_key: split_key.to_vec(),
+        split_key: copy_wal_bytes(split_key),
         direction,
     }
     split_buf := mut ByteBuffer.with_capacity(256)
@@ -100,7 +102,7 @@ F wal_btree_split(
 
 # Log a B+Tree node merge
 # WAL order: BTREE_MERGE first, then PAGE_DEALLOC
-F wal_btree_merge(
+fn wal_btree_merge(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -137,7 +139,7 @@ F wal_btree_merge(
 
 # High-level: WAL-integrated insert into B+Tree
 # Writes WAL record, then performs the insert
-F wal_insert(
+fn wal_insert(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -152,7 +154,7 @@ F wal_insert(
 }
 
 # High-level: WAL-integrated delete from B+Tree
-F wal_delete(
+fn wal_delete(
     gcm: &mut GroupCommitManager,
     txn_id: u64,
     file_id: u8,
@@ -162,4 +164,14 @@ F wal_delete(
 ) -> Result<u64, VaisError> {
     lsn := mut wal_btree_delete(gcm, txn_id, file_id, page_id, key, old_tid_bytes)?;
     Ok(lsn)
+}
+
+fn copy_wal_bytes(data: &[u8]) -> Vec<u8> {
+    result: Vec<u8> := mut Vec.with_capacity(data.len())
+    i := mut 0
+    LW i < data.len() {
+        result.push(data[i])
+        i += 1
+    }
+    result
 }

@@ -33,10 +33,15 @@ export function validateFormData(formData: FormData, schema: FormSchema): Valida
 
   for (const field of schema) {
     const raw = formData.get(field.name);
+    const missingFile =
+      field.type === "file"
+      && raw instanceof File
+      && raw.name === ""
+      && raw.size === 0;
 
     // Required check
     if (field.required) {
-      if (raw === null || raw === undefined || raw === "") {
+      if (raw === null || raw === undefined || raw === "" || missingFile) {
         errors[field.name] = `${field.name} is required`;
         continue;
       }
